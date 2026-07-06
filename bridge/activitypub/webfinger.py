@@ -1,0 +1,140 @@
+"""WebFinger (RFC 7033) resolution, both directions.
+
+Outbound: turn ``user@instance.org`` into that user's Actor IRI, the first
+step of the bot's ``follow @user@instance.org`` command.
+
+Inbound: answer ``GET /.well-known/webfinger?resource=acct:user@bridge.domain``
+for our own locally-linked profiles so remote servers can discover them.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+ACCT_RE = re.compile(r"^acct:([^@]+)@(.+)$")
+
+
+class WebfingerError(Exception):
+    """Raised when a webfinger lookup fails or returns an unusable document."""
+
+
+class WebfingerNotFoundError(WebfingerError):
+    """The server was actually reached and gave an authoritative answer:
+    there's no such account. Either a 4xx status (most commonly 404), or a
+    well-formed response with no matching ActivityPub link at all (e.g. a
+    webfinger endpoint that only knows about email/OpenID identities, not a
+    real fediverse account). Distinct from ``WebfingerUnreachableError``
+    because a caller can tell the user "no such account" with confidence
+    here, rather than "couldn't check right now"."""
+
+
+class WebfingerUnreachableError(WebfingerError):
+    """The server's answer, if it has one, couldn't be gotten at all: DNS
+    failure, connection refused/timed out, TLS error, a 5xx (its own
+    problem, not a verdict on the account), or a response that couldn't
+    even be parsed. Distinct from ``WebfingerNotFoundError`` because this
+    means genuinely not knowing whether the account exists, only that it
+    couldn't be checked right now -- worth telling the user differently
+    (try again later) than a confirmed "no such account"."""
+
+
+@dataclass(frozen=True)
+class ParsedAcct:
+    username: str
+    domain: str
+
+
+def parse_acct(resource: str) -> ParsedAcct:
+    """Parse an ``acct:user@domain`` resource string."""
+    match = ACCT_RE.match(resource)
+    if not match:
+        raise WebfingerError(f"Not a well-formed acct: URI: {resource!r}")
+    return ParsedAcct(username=match.group(1), domain=match.group(2))
+
+
+async def resolve_remote_actor_id(http_client: httpx.AsyncClient, acct: str) -> str:
+    """Resolve ``user@instance.org`` (with or without a leading ``@``) to an Actor IRI.
+
+    Performs ``GET https://instance.org/.well-known/webfinger?resource=acct:user@instance.org``
+    and extracts the ``self`` link with type ``application/activity+json``.
+
+    Never lets a raw ``httpx`` exception escape -- every failure mode ends
+    up as either ``WebfingerNotFoundError`` (the server confirmed there's
+    no such account) or ``WebfingerUnreachableError`` (couldn't get an
+    answer at all), so a caller can tell those apart and give the user an
+    accurate message instead of an unhandled exception (and a bare 404, or
+    a DNS/connection failure, showing up as a crash in the logs instead of
+    something callers ever see or handle).
+    """
+    handle = acct[1:] if acct.startswith("@") else acct
+    if "@" not in handle:
+        raise WebfingerError(f"Expected user@domain, got {acct!r}")
+    _username, domain = handle.split("@", 1)
+
+    url = f"https://{domain}/.well-known/webfinger"
+    # RFC 7033 mandates a JRD response but doesn't require the client to send
+    # any particular Accept header -- most servers reply with JSON either
+    # way, but at least one real one (Mastodon) strictly content-negotiates
+    # on it and returns a bare 400 Bad Request to a request with no Accept
+    # header at all, rather than defaulting to JSON.
+    try:
+        response = await http_client.get(
+            url, params={"resource": f"acct:{handle}"}, headers={"Accept": "application/jrd+json, application/json"}
+        )
+    except httpx.RequestError as exc:
+        # Never got a response at all -- DNS failure, connection refused,
+        # timeout, TLS error, ... -- so this is "couldn't check", not "no
+        # such account".
+        raise WebfingerUnreachableError(f"Could not reach {domain}: {exc}") from exc
+
+    if response.status_code >= 500:
+        # The server's own problem, not a verdict on whether the account
+        # exists.
+        raise WebfingerUnreachableError(
+            f"{domain} returned a server error ({response.status_code}) resolving {handle!r}"
+        )
+    if response.status_code >= 400:
+        # An authoritative "no" from a server that IS actually there --
+        # most commonly a plain 404 for an unknown user.
+        raise WebfingerNotFoundError(f"{domain} has no account {handle!r} ({response.status_code})")
+
+    try:
+        document = response.json()
+    except ValueError as exc:
+        raise WebfingerUnreachableError(
+            f"{domain} returned a webfinger response that isn't valid JSON for {handle!r}"
+        ) from exc
+
+    for link in document.get("links", []):
+        if link.get("rel") == "self" and "activity+json" in (link.get("type") or ""):
+            href = link.get("href")
+            if href:
+                return href
+
+    raise WebfingerNotFoundError(f"No ActivityPub actor link found in webfinger response for {handle!r}")
+
+
+def build_local_webfinger_document(
+    *, username: str, bridge_domain: str, actor_url: str
+) -> dict[str, Any]:
+    """Build the JRD document this bridge serves for one of its locally-linked profiles."""
+    return {
+        "subject": f"acct:{username}@{bridge_domain}",
+        "aliases": [actor_url],
+        "links": [
+            {
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": actor_url,
+            },
+            {
+                "rel": "http://webfinger.net/rel/profile-page",
+                "type": "text/html",
+                "href": actor_url,
+            },
+        ],
+    }

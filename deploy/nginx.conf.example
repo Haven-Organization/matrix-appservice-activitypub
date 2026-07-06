@@ -1,0 +1,100 @@
+# Sample reverse-proxy config for running this bridge on the SAME public
+# domain as your Synapse homeserver -- recommended, since it makes a user's
+# Matrix ID and fediverse handle the same string, e.g. @alice:example.org ==
+# @alice@example.org. Adjust upstream ports and server_name to match your
+# config.yaml and existing Synapse setup.
+#
+# Assumptions:
+#   - Synapse's Client-Server API is reachable at 127.0.0.1:8008
+#   - This bridge is reachable at 127.0.0.1:8090 (bridge.listen_host/listen_port
+#     in config.yaml)
+#   - Synapse (or an existing static-file location you already have) serves
+#     /.well-known/matrix/server and /.well-known/matrix/client itself
+#   - You already have TLS certificates for your domain (e.g. via certbot)
+#
+# AppService transaction delivery (Synapse -> bridge) is *not* proxied here.
+# By default config.yaml's bridge.internal_base_url has Synapse deliver those
+# directly to http://127.0.0.1:8090, bypassing the public internet entirely --
+# only the federation-facing ActivityPub surface below needs to be public.
+#
+# Media (post attachments, profile avatars) is also served by the bridge
+# itself at /media/{server}/{id}, not proxied straight through to Synapse's
+# own media API -- Matrix media downloads require an access token (MSC3916)
+# that remote fediverse servers don't have, so the bridge fetches from
+# Synapse authenticated as itself and re-serves the bytes publicly.
+
+upstream matrix_appservice_activitypub {
+    server 127.0.0.1:8090;
+}
+
+upstream synapse {
+    server 127.0.0.1:8008;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name example.org;  # <-- same domain as bridge.domain / synapse.server_name
+
+    ssl_certificate     /etc/letsencrypt/live/example.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.org/privkey.pem;
+
+    # Raise to match Synapse's max_upload_size if you proxy media uploads here too.
+    client_max_body_size 50M;
+
+    # These are inherited by every location below that doesn't set its own
+    # proxy_set_header directives (nginx: a location's own proxy_set_header
+    # entirely replaces the parent's, it doesn't merge) -- if you ever add a
+    # location with its own proxy_set_header for some other reason, you MUST
+    # repeat "Host $host" there too, or HTTP Signature verification will
+    # fail for every single remote server (the signed string includes the
+    # Host header verbatim; without this, nginx defaults to sending the
+    # proxy_pass upstream's own name instead of the real public hostname).
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+
+    # -- ActivityPub: WebFinger --------------------------------------------
+    # Exact match so this never shadows /.well-known/matrix/* below --
+    # nginx always prefers the most specific (exact) match available.
+    location = /.well-known/webfinger {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+
+    # -- ActivityPub: actor / inbox / outbox / followers / following / media -
+    location ~ ^/(actor|inbox|outbox|followers|following|media)/ {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+
+    # -- ActivityPub: shared inbox -------------------------------------------
+    # Exact match for the bare path -- the regex above requires a trailing
+    # /{username}, so without this, POSTs to the shared inbox (which some
+    # implementations use regardless of what's advertised in
+    # endpoints.sharedInbox, or even by convention if it's not advertised at
+    # all) fall through to a 404 before ever reaching the bridge.
+    location = /inbox {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+
+    # -- Matrix's own well-known discovery (server-to-server + clients) ----
+    location = /.well-known/matrix/server {
+        proxy_pass http://synapse;
+    }
+    location = /.well-known/matrix/client {
+        proxy_pass http://synapse;
+        add_header Access-Control-Allow-Origin * always;
+    }
+
+    # -- Matrix Client-Server, federation, media, and admin APIs -----------
+    location ~ ^/(_matrix|_synapse/client) {
+        proxy_pass http://synapse;
+    }
+
+    # Synapse's federation listener (commonly port 8448) is independent of
+    # this bridge and isn't covered here -- keep whatever federation
+    # termination (this same server block on 8448, or a separate one) you
+    # already have configured.
+}

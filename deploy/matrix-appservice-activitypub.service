@@ -1,0 +1,51 @@
+[Unit]
+Description=Matrix <-> ActivityPub Federation Bridge
+Documentation=https://github.com/yourorg/matrix-appservice-activitypub
+# Adjust to your actual Synapse unit name. Remove if Synapse runs elsewhere.
+After=network-online.target matrix-synapse.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Create this user/group first, e.g.:
+#   useradd --system --home-dir /opt/matrix-appservice-activitypub --shell /usr/sbin/nologin matrix-appservice-activitypub
+User=matrix-appservice-activitypub
+Group=matrix-appservice-activitypub
+
+WorkingDirectory=/opt/matrix-appservice-activitypub
+Environment=BRIDGE_CONFIG=/opt/matrix-appservice-activitypub/config.yaml
+# Uses the system Python and its packages (e.g. Arch's python-fastapi, uvicorn,
+# python-httpx, python-yaml, python-cryptography from the distro repos) rather
+# than a venv -- swap back to /opt/matrix-appservice-activitypub/.venv/bin/python if you
+# installed dependencies via scripts/setup.sh instead.
+ExecStart=/usr/bin/python3 /opt/matrix-appservice-activitypub/main.py
+
+Restart=on-failure
+RestartSec=5s
+
+# -- Sandboxing -----------------------------------------------------------
+# Native execution (no container) still benefits from systemd's own isolation.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Only the bridge's own bookkeeping (storage.data_dir in config.yaml) needs
+# to be writable -- everything else in WorkingDirectory stays read-only.
+ReadWritePaths=/opt/matrix-appservice-activitypub/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

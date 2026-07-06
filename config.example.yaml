@@ -1,0 +1,134 @@
+# Matrix <-> ActivityPub federation bridge configuration.
+#
+# Copy this file to config.yaml and fill in real values. Secrets (tokens) should
+# never be committed to version control.
+
+bridge:
+  # Public domain used to mint ActivityPub actor IDs, e.g. https://<domain>/actor/<user>
+  domain: bridge.example.org
+  # Base URL this bridge is publicly reachable at (may sit behind a reverse proxy
+  # doing TLS termination, in which case this differs from listen_host/listen_port).
+  public_base_url: https://bridge.example.org
+  # Host/port the bridge's own HTTP server binds to.
+  listen_host: 127.0.0.1
+  listen_port: 8090
+  # Address Synapse should push AppService transactions (room events) to.
+  # Defaults to http://{listen_host}:{listen_port} -- i.e. directly, bypassing
+  # the public internet/reverse proxy, since Synapse and the bridge normally
+  # run on the same host. Only set this if they're on different hosts and
+  # need an explicit reachable address instead.
+  # internal_base_url: http://127.0.0.1:8090
+  # Whether Matrix users from OTHER homeservers who knock on a remote
+  # account's mirrored room get auto-accepted like local users do. Off by
+  # default: mirrored posts are public fediverse content, but who gets
+  # auto-admitted into this server's rooms is this server's call. Someone
+  # already in the room can always invite a federated user manually.
+  # accept_federated_knocks: false
+  # Default number of posts ";backfill" pulls from a remote actor's outbox
+  # (or, run in a Matrix thread mirroring an AP conversation, from that
+  # post's own replies) when no explicit count is given. A Matrix server
+  # admin can override this per-use with an explicit argument; anyone else
+  # always gets this default.
+  # backfill_default_count: 15
+  # Whether to set org.matrix.msc4501.social.profile_room_id (MSC4133
+  # Extensible Profiles) on every ghost (a Remote User Room mirroring a
+  # fediverse account), pointing at that room. Never set on local users'
+  # own profiles either way, only ghosts. On by default; turn off if your
+  # homeserver doesn't support MSC4133 (e.g. Dendrite, or the original
+  # archived Conduit), since every attempt there is a guaranteed-failing
+  # request otherwise. Harmless either way (best-effort, logged and
+  # swallowed on failure), just pure waste if you know it'll never work.
+  # set_msc4501_profile_room_id: true
+
+synapse:
+  # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.
+  base_url: http://localhost:8008
+  # The homeserver's server_name (the part after the colon in @user:server.name).
+  server_name: matrix.example.org
+  # Access token for an account with admin: true, used for the Admin API.
+  admin_token: "syt_replace_me"
+
+appservice:
+  # Path to the AppService registration YAML. Generate it with:
+  #   python -m bridge.appservice config.yaml appservice-registration.yaml
+  # and add the resulting path to Synapse's homeserver.yaml `app_service_config_files`.
+  registration_path: ./appservice-registration.yaml
+  # Unique appservice id, must match the `id` field in the registration file.
+  id: matrix-appservice-activitypub
+  # hs_token / as_token are shared secrets you generate yourself -- not issued
+  # by Synapse or anything else. They just need to be long, random, and
+  # different from each other (treat them like passwords). Generate a pair with:
+  #   python3 -c "import secrets; print(secrets.token_hex(32))"
+  # hs_token is what Synapse presents to the bridge on every request (to push
+  # AppService transactions); as_token is what the bridge presents to Synapse
+  # on every Client-Server API call.
+  hs_token: "hs_replace_me"
+  as_token: "as_replace_me"
+  # Localpart prefix for ghosted ActivityPub users,
+  # e.g. "ap_" -> @ap_user_instance.org:bridge.example.org
+  user_prefix: "ap_"
+  # Localpart of the bridge bot user that handles !bridge commands.
+  bot_localpart: "bridgebot"
+  # Optional display name / avatar for the bot's own Matrix profile. Applied
+  # on every startup; leave unset to not manage either.
+  # bot_display_name: "Fediverse Bridge"
+  # bot_avatar_mxc must be an mxc:// URI, not a file path or http(s) URL --
+  # upload an image with any Matrix client (or reuse one already on your
+  # server) and copy its mxc:// URI from there.
+  # bot_avatar_mxc: "mxc://bridge.example.org/SomeMediaId"
+
+storage:
+  # Directory for the bridge's own bookkeeping state (actor keypairs, sqlite cache).
+  # No ActivityPub post content or media is stored here -- that lives in Matrix.
+  data_dir: ./data
+  # "sqlite" (default) -- a single file at {data_dir}/bridge.db, no setup
+  # needed. "postgresql" -- connects to the server described below instead;
+  # useful if you already run Postgres for something else (e.g. Synapse
+  # itself) and would rather not also manage a separate sqlite file, or need
+  # the bridge's bookkeeping reachable from more than one host. Either way
+  # the data stored is identical -- same tables, same content -- so this can
+  # be changed later without losing anything currently tracked (there's no
+  # automatic migration between the two yet, though: switching backends on
+  # an existing deployment starts that backend's storage empty).
+  backend: sqlite
+  # Only read when backend is "postgresql". Either set `dsn` directly
+  # (postgresql://user:pass@host:port/dbname) or fill in the discrete
+  # fields below -- `dsn` wins if both are present. The discrete form exists
+  # mainly so a password with special characters doesn't have to be
+  # hand-URL-escaped into a DSN string here.
+  # postgres:
+  #   dsn: "postgresql://matrix_appservice_activitypub:replace_me@localhost:5432/matrix_appservice_activitypub"
+  #   host: localhost
+  #   port: 5432
+  #   database: matrix_appservice_activitypub
+  #   user: matrix_appservice_activitypub
+  #   password: "replace_me"
+  #   min_pool_size: 1
+  #   max_pool_size: 10
+
+federation:
+  # Timeout (seconds) for outgoing ActivityPub HTTP requests (inbox delivery,
+  # actor/webfinger lookups).
+  request_timeout: 15
+  # How long fetched remote actor public keys are cached, in seconds.
+  actor_key_cache_ttl: 3600
+  # Maximum allowed clock skew (seconds) between the Date header on an incoming
+  # signed request and local time, before the signature is rejected.
+  max_clock_skew: 3600
+  # How far in the past (days) a mirrored post's own "published" time is
+  # trusted to set the Matrix event's displayed timestamp, before falling
+  # back to "now" instead. Keep this comfortably BELOW your homeserver's own
+  # retention.default_policy.max_lifetime, if you have one configured in
+  # homeserver.yaml -- confirmed live that Synapse silently accepts (200 OK)
+  # but never actually persists/exposes an event whose custom timestamp is
+  # older than that policy allows, which is worse than just showing "now".
+  # There's no way for the bridge to detect your retention policy on its
+  # own, so this must be set by hand. Raise it (or set a very large value)
+  # if your homeserver has no retention policy limiting history at all.
+  max_backdate_days: 730
+
+logging:
+  # ERROR by default to keep the service journal quiet -- switch to INFO
+  # temporarily (systemctl edit / restart) only while actively investigating
+  # an issue, then switch back.
+  level: ERROR
