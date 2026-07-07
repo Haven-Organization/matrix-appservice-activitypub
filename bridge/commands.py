@@ -1135,7 +1135,7 @@ async def _establish_remote_follow(
             request, room_id=new_room_id, actor_id=remote_actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
-        await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+        await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
     else:
         try:
@@ -2659,7 +2659,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             request, room_id=new_room_id, actor_id=author_actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
-        await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+        await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
     else:
         try:
@@ -3757,7 +3757,7 @@ async def _replace_remote_actor_room(
         request, room_id=new_room_id, actor_id=remote_room.actor_id,
         display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
     )
-    await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+    await add_bridge_widget(request, room_id=new_room_id)
     await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
 
     tombstone_body = f"This room has been replaced -- {username}@{domain}'s posts now mirror into {new_room_id} instead."
@@ -3854,7 +3854,7 @@ async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str,
         request, room_id=new_room_id, actor_id=actor_id,
         display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
     )
-    await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+    await add_bridge_widget(request, room_id=new_room_id)
 
     tombstone_body = f"This room has been replaced -- your DMs with {display_name} now continue in {new_room_id} instead."
     await _send_tombstone(request, old_room_id=old_room_id, new_room_id=new_room_id, as_user_id=mxid, body=tombstone_body)
@@ -3924,7 +3924,7 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
         request, room_id=new_room_id, actor_id=actor_id,
         display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
     )
-    await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+    await add_bridge_widget(request, room_id=new_room_id)
 
     tombstone_body = (
         f"This room has been replaced -- your chat with {display_name} now continues in {new_room_id} instead."

@@ -1246,7 +1246,7 @@ async def ensure_ghost_dm_room(
             request, room_id=dm_room_id, actor_id=actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
-        await add_bridge_widget(request, room_id=dm_room_id, as_user_id=mxid)
+        await add_bridge_widget(request, room_id=dm_room_id)
     else:
         # The room already existed -- but the recipient may have left it
         # since (e.g. after an earlier DM conversation wrapped up, or --
@@ -1436,7 +1436,7 @@ async def ensure_ghost_chat_room(
             request, room_id=chat_room_id, actor_id=actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
-        await add_bridge_widget(request, room_id=chat_room_id, as_user_id=mxid)
+        await add_bridge_widget(request, room_id=chat_room_id)
     else:
         # Same reasoning as ensure_ghost_dm_room: re-invite if they've left,
         # unless they've silenced actor_id -- also what stops a blocked
@@ -1648,7 +1648,7 @@ async def import_note(
             request, room_id=new_room_id, actor_id=author_actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
-        await add_bridge_widget(request, room_id=new_room_id, as_user_id=mxid)
+        await add_bridge_widget(request, room_id=new_room_id)
         await set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
     elif inviter:
         try:
