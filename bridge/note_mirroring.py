@@ -1231,15 +1231,11 @@ async def ensure_ghost_dm_room(
                 # needing to run `;dm` again. See maybe_handle_knock's
                 # _resolve_ghost_room_inviter for the acceptance side.
                 join_rule=KNOCK_JOIN_RULE,
-                # mxid (the room's creator, as_user_id above) is deliberately
-                # NOT listed here -- room v12 gives creators implicit,
-                # immutable "infinite" power level and REJECTS the whole
-                # m.room.power_levels event if the creator appears in its
-                # own `users` (see SynapseClient.create_room's docstring).
-                # Every earlier room version already defaults a room's
-                # creator to 100 on its own, so omitting it changes nothing
-                # except making this forward-compatible.
-                power_level_content_override={"users": {bot_mxid: 100}},
+                # bot_mxid kept at the same level as the ghost creator,
+                # regardless of room version -- see SynapseClient.create_room's
+                # own additional_creators docstring for how it handles pre-v12
+                # vs v12+ differently under the hood.
+                additional_creators=[bot_mxid],
                 room_type=SOCIAL_PROFILE_ROOM_TYPE,
             )
         except SynapseError:
@@ -1428,9 +1424,9 @@ async def ensure_ghost_chat_room(
                 preset="trusted_private_chat",
                 # Knockable -- see ensure_ghost_dm_room's identical reasoning.
                 join_rule=KNOCK_JOIN_RULE,
-                # mxid (the creator) deliberately omitted -- see the
-                # identical reasoning in ensure_ghost_dm_room above.
-                power_level_content_override={"users": {bot_mxid: 100}},
+                # bot_mxid kept at the same level as the ghost creator -- see
+                # the identical reasoning in ensure_ghost_dm_room above.
+                additional_creators=[bot_mxid],
             )
         except SynapseError:
             logger.warning("Could not create chat room for %s with %s", actor_id, matrix_user_id, exc_info=True)
@@ -1635,9 +1631,9 @@ async def import_note(
             avatar_mxc=avatar_mxc,
             room_type=SOCIAL_PROFILE_ROOM_TYPE,
             join_rule=KNOCK_JOIN_RULE,
-            # mxid (the creator) deliberately omitted -- see
+            # bot_mxid kept at the same level as the ghost creator -- see
             # ensure_ghost_dm_room's identical reasoning.
-            power_level_content_override={"users": {bot_mxid: 100}},
+            additional_creators=[bot_mxid],
         )
         remote_room = RemoteActorRoom(
             actor_id=author_actor_id,

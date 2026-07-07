@@ -40,6 +40,19 @@ class MediaDownload:
     content_disposition: str | None = None
 
 
+def _room_version_is_v12_or_later(version: str) -> bool:
+    """Numeric room versions ("1".."12"+) compare as ints; a handful of
+    historical/experimental versions are non-numeric strings (e.g. an
+    unstable MSC identifier some servers used before a version got its
+    real number) -- treated as pre-v12 rather than raising, since that's
+    the older, more conservative power-levels behavior and by far the
+    common case for anything not cleanly numeric."""
+    try:
+        return int(version) >= 12
+    except ValueError:
+        return False
+
+
 class SynapseClient:
     """Wraps the subset of the Client-Server and Admin APIs the bridge needs.
 
@@ -62,6 +75,9 @@ class SynapseClient:
         self._as_token = as_token
         self._admin_token = admin_token
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=timeout)
+        # Fetched once and cached (a running homeserver's own configured
+        # default doesn't change) -- see _resolve_room_version_for_creation.
+        self._default_room_version: str | None = None
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -130,6 +146,43 @@ class SynapseClient:
         actually up and answering requests yet, not whether any particular
         credential works."""
         return await self._request("GET", "/_matrix/client/versions")
+
+    async def get_capabilities(self) -> dict[str, Any]:
+        """``GET /_matrix/client/v3/capabilities`` -- unlike ``get_versions``,
+        this one's authenticated (any valid access token; the AS token
+        itself, representing the appservice's own sender user, works fine
+        without an explicit ``as_user_id``)."""
+        return await self._request("GET", "/_matrix/client/v3/capabilities", token=self._as_token)
+
+    async def _resolve_room_version_for_creation(self, room_version: str | None) -> str:
+        """The room version ``create_room`` will actually end up using --
+        ``room_version`` itself if given, otherwise this homeserver's own
+        configured default (fetched once via ``get_capabilities`` and
+        cached, since that's not something that changes while this process
+        is running). ``create_room`` needs to know this ahead of the
+        request, not just accept whatever Synapse ends up doing, because
+        the correct SHAPE of ``power_level_content_override``/
+        ``additional_creators`` for "give someone full creator-tier parity"
+        is opposite between pre-v12 and v12+ rooms (see ``create_room``'s
+        own docstring) -- silently guessing wrong produces a real,
+        confirmed-live 400 from Synapse, not a degraded-but-working room."""
+        if room_version:
+            return room_version
+        if self._default_room_version is None:
+            try:
+                caps = await self.get_capabilities()
+                self._default_room_version = (
+                    caps.get("capabilities", {}).get("m.room_versions", {}).get("default") or "1"
+                )
+            except SynapseError:
+                # Matches every other version-uncertain default in this
+                # file: assume the more restrictive/older behavior (pre-v12
+                # power-levels semantics) rather than the newer one, since
+                # that's what the overwhelming majority of rooms actually
+                # are and it degrades to an explicit, catchable SynapseError
+                # rather than silently doing the wrong thing either way.
+                self._default_room_version = "1"
+        return self._default_room_version
 
     async def register_appservice_user(self, localpart: str) -> str:
         """Provision a ghost user via the AppService registration flow. Returns the full MXID."""
@@ -204,22 +257,38 @@ class SynapseClient:
         """Create a room. Returns the room ID.
 
         ``room_version``, if omitted, falls back to whatever this
-        homeserver's own configured default room version is -- NOT
-        necessarily room v12, even though ``power_level_content_override``
-        omitting the creator (see below) is only valid on v12. Any caller
-        relying on that omission MUST pass ``room_version`` explicitly
-        rather than assume the server default is v12.
+        homeserver's own configured default room version is -- this method
+        resolves that default itself (see ``_resolve_room_version_for_creation``)
+        precisely so ``additional_creators`` (below) can always do the right
+        thing regardless, without every caller needing to know or guess
+        which version applies.
 
-        ``additional_creators`` sets ``creation_content.additional_creators``
-        (room v12+ only) -- the v12 mechanism for giving someone OTHER than
-        the room's own creator (``as_user_id`` above) genuine creator-tier
-        status: permanent, immutable, and NOT expressible as a number in
-        ``power_level_content_override`` (v12 rejects an additional creator
-        also appearing in the power_levels ``users`` map, at any level). Use
-        this for a peer that should stand alongside the creator (e.g. the
-        bridge bot, historically kept at the same level as whichever ghost
-        created the room) -- not for someone who should merely be a highly
-        privileged but still-revocable member (plain ``users`` override).
+        ``additional_creators`` gives someone OTHER than the room's own
+        creator (``as_user_id`` above) genuine creator-tier parity --
+        permanent, unrevocable-by-ordinary-moderation status, for a peer
+        that should stand alongside the creator (e.g. the bridge bot,
+        historically kept at the same level as whichever ghost created the
+        room) rather than someone who should merely be a highly privileged
+        but still-revocable member (plain ``power_level_content_override``
+        instead). This is expressed completely differently depending on
+        the room's actual version, which is why this method handles the
+        translation itself instead of leaving it to callers:
+
+        - Room v12+: sets ``creation_content.additional_creators`` -- v12's
+          own dedicated mechanism, since v12 reserves numeric power level
+          100 for creators specifically and rejects a ``power_levels``
+          event listing a creator (or anyone else claiming 100 outside
+          this mechanism) at all.
+        - Pre-v12: no such mechanism exists; expressed instead as an
+          explicit ``power_level_content_override.users`` grant of 100 for
+          each of ``additional_creators``, ALWAYS restating ``as_user_id``
+          itself at 100 in the same override too. That restating is
+          required, not cosmetic: Synapse rejects a ``power_level_content_override``
+          that grants anyone power level 100 without the actual room
+          creator ALSO appearing in it at 100 (confirmed live 2026-07-07 --
+          not itself a version-specific rule, just a general sanity check
+          that doesn't otherwise come up, since a plain ``users`` override
+          not involving level 100 at all is unaffected).
 
         ``room_type`` sets ``creation_content.type`` -- a room's type is
         immutable once created (unlike ordinary state), so this is the only
@@ -241,11 +310,26 @@ class SynapseClient:
 
         ``power_level_content_override`` is applied on top of the preset's
         normally-computed ``m.room.power_levels`` content (per the C-S API
-        spec), not a full replacement -- e.g. ``{"users": {mxid: 100}}``
-        grants that one user admin while every other default (redact
+        spec), not a full replacement -- e.g. ``{"users": {mxid: 99}}``
+        grants that one user near-admin while every other default (redact
         threshold, invite threshold, ...) stays whatever the preset would
-        normally set.
+        normally set. Deliberately NOT the right tool for granting someone
+        exactly level 100 unless they're the actual creator -- see
+        ``additional_creators`` above for that.
         """
+        effective_version = await self._resolve_room_version_for_creation(room_version)
+        is_v12_plus = _room_version_is_v12_or_later(effective_version)
+
+        override = dict(power_level_content_override) if power_level_content_override else None
+        if additional_creators and not is_v12_plus:
+            override = dict(override or {})
+            users_override = dict(override.get("users") or {})
+            if as_user_id:
+                users_override.setdefault(as_user_id, 100)
+            for peer in additional_creators:
+                users_override[peer] = 100
+            override["users"] = users_override
+
         body: dict[str, Any] = {"preset": preset, "is_direct": is_direct}
         if room_version:
             body["room_version"] = room_version
@@ -262,17 +346,18 @@ class SynapseClient:
             initial_state.append({"type": "m.room.join_rules", "state_key": "", "content": {"join_rule": join_rule}})
         if initial_state:
             body["initial_state"] = initial_state
-        if room_type or predecessor or additional_creators:
+        additional_creators_for_v12 = additional_creators if (additional_creators and is_v12_plus) else None
+        if room_type or predecessor or additional_creators_for_v12:
             creation_content: dict[str, Any] = {}
             if room_type:
                 creation_content["type"] = room_type
             if predecessor:
                 creation_content["predecessor"] = predecessor
-            if additional_creators:
-                creation_content["additional_creators"] = additional_creators
+            if additional_creators_for_v12:
+                creation_content["additional_creators"] = additional_creators_for_v12
             body["creation_content"] = creation_content
-        if power_level_content_override:
-            body["power_level_content_override"] = power_level_content_override
+        if override:
+            body["power_level_content_override"] = override
         result = await self._request(
             "POST", "/_matrix/client/v3/createRoom", token=self._as_token, json_body=body, as_user_id=as_user_id
         )

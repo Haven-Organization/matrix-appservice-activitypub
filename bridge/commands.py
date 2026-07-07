@@ -1107,12 +1107,11 @@ async def _establish_remote_follow(
             avatar_mxc=avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
             join_rule=_KNOCK_JOIN_RULE,
-            # mxid (the creator, as_user_id above) deliberately omitted --
-            # room v12 rejects m.room.power_levels outright if the creator
-            # appears in its own `users` (see
-            # SynapseClient.create_room's docstring); every earlier room
-            # version already defaults a room's creator to 100 on its own.
-            power_level_content_override={"users": {bot_mxid: 100}},
+            # bot_mxid kept at the same level as the ghost creator,
+            # regardless of room version -- see SynapseClient.create_room's
+            # own additional_creators docstring for how it handles pre-v12
+            # vs v12+ differently under the hood.
+            additional_creators=[bot_mxid],
         )
         remote_room = RemoteActorRoom(
             actor_id=remote_actor_id,
@@ -2643,9 +2642,9 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             avatar_mxc=avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
             join_rule=_KNOCK_JOIN_RULE,
-            # mxid (the creator) deliberately omitted -- see
+            # bot_mxid kept at the same level as the ghost creator -- see
             # _establish_remote_follow's identical reasoning.
-            power_level_content_override={"users": {bot_mxid: 100}},
+            additional_creators=[bot_mxid],
         )
         remote_room = RemoteActorRoom(
             actor_id=author_actor_id,
@@ -3906,9 +3905,13 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
             preset="trusted_private_chat",
             # Knockable -- see ensure_ghost_dm_room's identical reasoning.
             join_rule=_KNOCK_JOIN_RULE,
-            # mxid (the creator) deliberately omitted -- see
-            # _establish_remote_follow's identical reasoning.
-            power_level_content_override={"users": {bot_mxid: 100}},
+            # bot_mxid kept at the same level as the ghost creator -- see
+            # _establish_remote_follow's identical reasoning. Also forces
+            # room_version, matching _replace_dm_room's identical
+            # reasoning -- this path had simply been missed when the other
+            # replace paths were brought up to explicit v12.
+            additional_creators=[bot_mxid],
+            room_version=_REPLACE_ROOM_VERSION,
             predecessor=predecessor,
         )
     except SynapseError as exc:
