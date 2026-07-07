@@ -199,6 +199,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_attachments,
+    extract_banner_url,
     extract_icon_url,
     fetch_actor,
     resolve_actor_inbox,
@@ -226,6 +227,7 @@ from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.notifications import NOTIFICATIONS_ROOM_NAME as _NOTIFICATIONS_ROOM_NAME
 from bridge.notifications import ensure_bot_dm_invite, notification_actor_html, notify_user, welcome_new_user
 from bridge.note_mirroring import KNOCK_JOIN_RULE as _KNOCK_JOIN_RULE
+from bridge.note_mirroring import PROFILE_BANNER_STATE_TYPE
 from bridge.note_mirroring import REPLACE_ROOM_VERSION as _REPLACE_ROOM_VERSION
 from bridge.note_mirroring import SOCIAL_PROFILE_ROOM_TYPE as _SOCIAL_PROFILE_ROOM_TYPE
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
@@ -246,6 +248,10 @@ from bridge.note_mirroring import (
 )
 from bridge.note_mirroring import send_bridge_info as _send_bridge_info
 from bridge.note_mirroring import set_ghost_profile_room_id as _set_ghost_profile_room_id
+from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
+from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
+from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
+from bridge.note_mirroring import SOCIAL_PROFILE_USER_ID_STATE_TYPE, SOCIAL_PROFILE_USER_ID_POWER_LEVEL
 from bridge.note_mirroring import source_post_url as _source_post_url
 from bridge.reaction_bridge import send_boost
 from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, RemoteActorRoom
@@ -270,15 +276,6 @@ _COMMAND_KEYWORDS = (
     r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|help"
 )
 
-# No stable Matrix state event exists yet for a room's "banner"/header image
-# (distinct from m.room.avatar) as of 2026-07 -- MSC4221 ("Room Banners":
-# https://github.com/matrix-org/matrix-spec-proposals/pull/4221) proposes
-# m.room.banner for exactly this, but per that MSC's own "Unstable prefix"
-# section, implementations should use page.codeberg.everypizza.room.banner
-# until it's actually merged, not m.room.banner itself (the same
-# "don't use the future stable name early" reasoning as SOCIAL_PROFILE_ROOM_TYPE
-# for MSC4501). Content shape mirrors m.room.avatar's own: {"url": "mxc://..."}.
-PROFILE_BANNER_STATE_TYPE = "page.codeberg.everypizza.room.banner"
 
 _COMMAND_RE = re.compile(rf"\b({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | re.DOTALL)
 
@@ -1080,6 +1077,8 @@ async def _establish_remote_follow(
         # cache _resolve_and_invite_ghost checks, so a later reply/reaction
         # from this same actor doesn't think this still needs (re-)applying.
         avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
+        banner_url = extract_banner_url(actor_doc)
+        banner_mxc = await fetch_and_upload_media(http_client, synapse, banner_url) if banner_url else None
 
         await ensure_ghost_user(
             synapse,
@@ -1110,8 +1109,16 @@ async def _establish_remote_follow(
             # bot_mxid kept at the same level as the ghost creator,
             # regardless of room version -- see SynapseClient.create_room's
             # own additional_creators docstring for how it handles pre-v12
-            # vs v12+ differently under the hood.
+            # vs v12+ differently under the hood. events'
+            # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches
+            # _handle_create_profile's identical reasoning -- redundant
+            # with mxid already being this room's creator, but set anyway
+            # for a client checking the state event itself rather than
+            # falling back to m.room.create.
             additional_creators=[bot_mxid],
+            power_level_content_override={
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
         remote_room = RemoteActorRoom(
             actor_id=remote_actor_id,
@@ -1120,6 +1127,7 @@ async def _establish_remote_follow(
             inbox_url=inbox,
             display_name=display_name,
             icon_url=icon_url,
+            banner_url=banner_url,
             # This branch only ever runs when nobody on the server has
             # followed this actor before (see get_remote_actor_room's None
             # check above) -- flags the room for a one-time auto-backfill
@@ -1137,6 +1145,9 @@ async def _establish_remote_follow(
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
+        if banner_mxc:
+            await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
     else:
         try:
             await synapse.invite_user(remote_room.room_id, sender, as_user_id=remote_room.ghost_user_id)
@@ -2617,6 +2628,8 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         display_name = author_doc.get("name") or username
         icon_url = extract_icon_url(author_doc)
         avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
+        banner_url = extract_banner_url(author_doc)
+        banner_mxc = await fetch_and_upload_media(http_client, synapse, banner_url) if banner_url else None
 
         await ensure_ghost_user(
             synapse,
@@ -2643,8 +2656,13 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
             join_rule=_KNOCK_JOIN_RULE,
             # bot_mxid kept at the same level as the ghost creator -- see
-            # _establish_remote_follow's identical reasoning.
+            # _establish_remote_follow's identical reasoning. events'
+            # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches that same
+            # function's identical reasoning too.
             additional_creators=[bot_mxid],
+            power_level_content_override={
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
         remote_room = RemoteActorRoom(
             actor_id=author_actor_id,
@@ -2653,6 +2671,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             inbox_url=author_doc.get("inbox") or "",
             display_name=display_name,
             icon_url=icon_url,
+            banner_url=banner_url,
         )
         await repository.register_remote_actor_room(remote_room)
         await _send_bridge_info(
@@ -2661,6 +2680,9 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
+        if banner_mxc:
+            await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
     else:
         try:
             await synapse.invite_user(remote_room.room_id, sender, as_user_id=remote_room.ghost_user_id)
@@ -3059,7 +3081,14 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
             # sender is never locked out of moderating its own creation
             # (kicking the owner back out, e.g. as part of `delete
             # profile`) by them being at the exact same power level.
-            power_level_content_override={"users": {sender: 99}},
+            # events' SOCIAL_PROFILE_USER_ID_STATE_TYPE override is
+            # MSC4501's own explicit guidance -- without it, any Moderator
+            # (not just this room's actual owner) could reassign the
+            # profile out from under sender.
+            power_level_content_override={
+                "users": {sender: 99},
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
     except SynapseError as exc:
         logger.warning("Could not create profile room for %s: %s", sender, exc)
@@ -3101,6 +3130,7 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
         display_name=display_name, avatar_mxc=matrix_avatar_mxc, as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
+    await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=sender, as_user_id=bot_mxid)
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
 
     verb = "Re-created" if existing is not None else "Created"
@@ -3194,6 +3224,14 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
     except SynapseError:
         logger.info("Could not set room name/avatar for %s's profile room", sender, exc_info=True)
         room_styling_failed = True
+
+    # Same best-effort caveat as room name/avatar above -- an already-
+    # existing room's power levels weren't set up by us at creation time
+    # the way _handle_create_profile's own power_level_content_override
+    # is, so protecting this is only possible if the bot happens to have
+    # high enough power here already.
+    await _set_profile_user_id(request, room_id=room_id, matrix_user_id=sender, as_user_id=_bot_mxid(config))
+    await _protect_profile_user_id_power_level(request, room_id=room_id)
 
     verb = "Relinked" if existing is not None else "Linked"
     message = f"{verb}! This room now publishes as {username}@{config.bridge.domain}."
@@ -3631,8 +3669,12 @@ async def _replace_profile_room(
             predecessor=predecessor,
             join_rule=_KNOCK_JOIN_RULE,
             # owner is 99, not 100, and bot_mxid (the creator) is omitted
-            # entirely -- see _handle_create_profile's identical reasoning.
-            power_level_content_override={"users": {owner: 99}},
+            # entirely -- see _handle_create_profile's identical reasoning,
+            # including for the events override below.
+            power_level_content_override={
+                "users": {owner: 99},
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
     except SynapseError as exc:
         logger.warning("Could not create replacement profile room for %s: %s", actor_record.username, exc)
@@ -3649,6 +3691,7 @@ async def _replace_profile_room(
         display_name=display_name, avatar_mxc=matrix_avatar_mxc, as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
+    await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=owner, as_user_id=bot_mxid)
     await add_room_to_space(request, matrix_user_id=owner, child_room_id=new_room_id)
 
     tombstone_body = (
@@ -3688,6 +3731,8 @@ async def _replace_remote_actor_room(
     localpart = ghost_localpart(config.appservice.user_prefix, username, domain)
     mxid = ghost_mxid(config.appservice.user_prefix, username, domain, config.synapse.server_name)
     avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
+    banner_url = extract_banner_url(actor_doc) if actor_doc else None
+    banner_mxc = await fetch_and_upload_media(http_client, synapse, banner_url) if banner_url else None
 
     await ensure_ghost_user(
         synapse,
@@ -3738,6 +3783,13 @@ async def _replace_remote_actor_room(
             # are deliberately NOT elevated -- ordinary local users, not
             # bridge infrastructure.
             additional_creators=[bot_mxid],
+            # events' SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches
+            # every other Remote User Room creation path's identical
+            # reasoning -- independent of additional_creators above, which
+            # only handles bot/ghost power parity, not this.
+            power_level_content_override={
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
     except SynapseError as exc:
         logger.warning("Could not create replacement room for %s: %s", remote_room.actor_id, exc)
@@ -3751,6 +3803,7 @@ async def _replace_remote_actor_room(
         inbox_url=remote_room.inbox_url or actor_doc.get("inbox") or "",
         display_name=display_name,
         icon_url=icon_url,
+        banner_url=banner_url,
     )
     await repository.register_remote_actor_room(new_remote_room)
     await _send_bridge_info(
@@ -3759,6 +3812,9 @@ async def _replace_remote_actor_room(
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+    await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
+    if banner_mxc:
+        await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
 
     tombstone_body = f"This room has been replaced -- {username}@{domain}'s posts now mirror into {new_room_id} instead."
     await _send_tombstone(
@@ -3909,7 +3965,7 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
             # _establish_remote_follow's identical reasoning. Also forces
             # room_version, matching _replace_dm_room's identical
             # reasoning -- this path had simply been missed when the other
-            # replace paths were brought up to explicit v12.
+            # replace paths were brought up to explicit v12 (2026-07-07).
             additional_creators=[bot_mxid],
             room_version=_REPLACE_ROOM_VERSION,
             predecessor=predecessor,

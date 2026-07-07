@@ -57,6 +57,7 @@ import html
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from fastapi import Request
@@ -66,6 +67,7 @@ from bridge.activitypub.models import Activity
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_attachments,
+    extract_banner_url,
     extract_icon_url,
     fetch_actor,
     resolve_actor_inbox,
@@ -78,11 +80,13 @@ from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
+    SOCIAL_REPOST_OF_FIELD,
     actor_html_with_avatar,
     import_note,
     is_silenced,
     mirror_chat_message,
     mirror_direct_message,
+    mirrored_post_event_type,
     note_is_direct_message,
     note_mentions_local_actor,
     notify_mentioned_locals,
@@ -92,6 +96,7 @@ from bridge.note_mirroring import (
 )
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
 from bridge.note_mirroring import resolve_and_invite_ghost as _resolve_and_invite_ghost
+from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
 from bridge.note_mirroring import source_post_url as _source_post_url
 from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, ReactionRecord, RemoteActorRoom
 from bridge.synapse_client import SynapseError
@@ -264,15 +269,25 @@ def _scaled_dimensions(width: int | None, height: int | None, max_dimension: int
 
 async def _fetch_post_preview(
     request: Request, target: FederatedEvent
-) -> tuple[str, dict[str, object] | None, dict[str, object] | None]:
+) -> tuple[str, dict[str, object], dict[str, object] | None, dict[str, object] | None]:
     """Best-effort fetch of the Matrix event ``target`` mirrors, reduced to
-    ``(truncated_text, image_or_None, video_or_None)`` for a compact
-    notification preview. Needed because the notification itself is sent
+    ``(truncated_text, full_content, image_or_None, video_or_None)`` for a
+    compact notification preview (``truncated_text``) plus, separately,
+    the event's complete, untouched ``content`` dict (``full_content``)
+    for a caller that needs the real thing instead of a text-only
+    preview -- e.g. ``m.social.repost_of.content`` (see
+    ``_quoted_post_render``), which MSC4501 wants as a genuine full copy
+    of whatever the reposted post's own event content actually was
+    (``msgtype``, ``url``, ``info``, and all -- not just its ``body``,
+    which is blank for an uncaptioned image/video and would otherwise
+    make ``repost_of`` look broken for exactly the posts a snippet can't
+    represent anyway). Needed because the notification itself is sent
     into a different room entirely (the bot's DM with the post's owner)
     than the one the actual post event lives in, so it can't just be
     quoted the way an ordinary same-room Matrix reply would be -- this
-    fetches and condenses it by hand instead. Returns ``("", None, None)``
-    if the event can't be fetched at all (e.g. it's since been redacted).
+    fetches and condenses it by hand instead. Returns ``("", {}, None,
+    None)`` if the event can't be fetched at all (e.g. it's since been
+    redacted).
 
     ``image``/``video``, when present, are each ``{"mxc", "mimetype",
     "width", "height", "filename"}`` -- already scaled down to a small
@@ -296,9 +311,10 @@ async def _fetch_post_preview(
         logger.info(
             "Could not fetch %s in %s for a notification preview", target.event_id, target.room_id, exc_info=True
         )
-        return "", None, None
+        return "", {}, None, None
 
     content = event.get("content") or {}
+    full_content = content
     raw_body = (content.get("body") or "").strip()
     event_filename = (content.get("filename") or "").strip()
     msgtype = content.get("msgtype")
@@ -349,7 +365,7 @@ async def _fetch_post_preview(
             "filename": event_filename or filename_with_extension(raw_body or "video", video_mimetype),
         }
 
-    return body, image, video
+    return body, full_content, image, video
 
 
 def build_preview_media_content(
@@ -525,7 +541,7 @@ async def _notify_post_owner(
     mxid = ghost_mxid(config.appservice.user_prefix, reactor_username, domain, config.synapse.server_name)
     link = matrix_to_link(target.room_id, target.event_id)
 
-    preview_text, preview_image, preview_video = await _fetch_post_preview(request, target)
+    preview_text, _full_content, preview_image, preview_video = await _fetch_post_preview(request, target)
     preview_media = preview_video or preview_image
 
     # preview_text alongside preview_media means the post had BOTH media
@@ -720,15 +736,41 @@ def _strip_quote_tail_html(safe_html: str, quote_uri: str) -> str:
     return pattern.sub("", safe_html).rstrip()
 
 
+@dataclass
+class QuotedPostRender:
+    """Result of ``_quoted_post_render``. ``quoted_ref`` is
+    ``(room_id, event_id)`` for the quoted post's own Matrix mirror, if it
+    has one -- used for ``m.social.repost_of``'s required ``room_id``/
+    ``event_id`` fields, ``None`` when the quoted post was only ever
+    fetched fresh over ActivityPub (so there's no Matrix event to point
+    at, and ``m.social.repost_of`` can't be attached at all -- in that
+    case ``full_content`` is also ``None``, for the same reason).
+    ``full_content`` is the quoted post's own complete, untouched Matrix
+    event ``content`` dict -- unlike the other fields here, which are all
+    deliberately truncated/condensed for the quote-card rendering,
+    MSC4501 wants a genuine full copy in ``m.social.repost_of.content``,
+    not a preview snippet, and specifically the real event content
+    (``msgtype``, ``url``, ``info``, etc.) rather than just extracted
+    text, since a plain-text-only copy would be blank for an uncaptioned
+    image/video post."""
+
+    plain_tail: str
+    html_tail: str
+    preview_image: dict[str, object] | None
+    preview_video: dict[str, object] | None
+    quoted_ref: tuple[str, str] | None
+    full_content: dict[str, object] | None
+
+
 async def _quoted_post_render(
     request: Request, quoter_actor_id: str, quote_uri: str, *, quoter_has_own_attachment: bool
-) -> tuple[str, str, dict[str, object] | None, dict[str, object] | None]:
-    """``(plain_tail, html_tail, preview_image, preview_video)`` rendering a
-    quote-post's "X reposted Y's post" line plus a preview of the quoted
-    post -- for appending after the quoter's own (already stripped of any
-    "RT: <link>" fallback, see ``_strip_quote_tail``) caption text. Mirrors
-    ``bridge.commands._handle_repost``'s identical outbound rendering, so a
-    quote reads the same regardless of which side of the bridge made it.
+) -> QuotedPostRender:
+    """Renders a quote-post's "X reposted Y's post" line plus a preview of
+    the quoted post -- for appending after the quoter's own (already
+    stripped of any "RT: <link>" fallback, see ``_strip_quote_tail``)
+    caption text. Mirrors ``bridge.commands._handle_repost``'s identical
+    outbound rendering, so a quote reads the same regardless of which side
+    of the bridge made it.
 
     ``preview_image``/``preview_video`` are ALSO returned separately for
     ``merge_quote_preview_attachment`` to turn into the event's own real
@@ -754,20 +796,27 @@ async def _quoted_post_render(
     repository = request.app.state.repository
     existing = await repository.get_federated_event_by_ap_object(quote_uri)
     preview_text = ""
+    full_content: dict[str, object] | None = None
     preview_image: dict[str, object] | None = None
     preview_video: dict[str, object] | None = None
     quoted_author_id: str | None = None
+    quoted_ref: tuple[str, str] | None = None
     post_link = quote_uri
     if existing is not None:
-        preview_text, preview_image, preview_video = await _fetch_post_preview(request, existing)
+        preview_text, full_content, preview_image, preview_video = await _fetch_post_preview(request, existing)
         quoted_author_id = existing.author_actor_id
         post_link = matrix_to_link(existing.room_id, existing.event_id)
+        quoted_ref = (existing.room_id, existing.event_id)
     else:
         try:
             quoted_obj = await fetch_actor(request.app.state.http_client, quote_uri)
         except RemoteActorFetchError:
             quoted_obj = None
         if quoted_obj is not None and quoted_obj.get("type") == "Note":
+            # No local Matrix mirror exists for this quoted post at all
+            # (quoted_ref stays None below), so there's no real event
+            # ``content`` to hand back either -- m.social.repost_of won't
+            # be attached regardless, per its own required room_id/event_id.
             preview_text, _ = strip_to_matrix_message(quoted_obj.get("content") or "")
             if len(preview_text) > _PREVIEW_TEXT_LIMIT:
                 preview_text = preview_text[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
@@ -812,7 +861,10 @@ async def _quoted_post_render(
     html_tail = (
         f"<p>\U0001F501 {quoter_html} reposted {quoted_author_html}'s {post_pill_html}</p>{quote_block_html}"
     )
-    return plain_tail, html_tail, preview_image, preview_video
+    return QuotedPostRender(
+        plain_tail=plain_tail, html_tail=html_tail, preview_image=preview_image, preview_video=preview_video,
+        quoted_ref=quoted_ref, full_content=full_content,
+    )
 
 
 async def _handle_create(request: Request, username: str, activity: Activity, *, force: bool = False) -> None:
@@ -1001,6 +1053,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     quote_plain_tail = quote_html_tail = ""
     quote_preview_image: dict[str, object] | None = None
     quote_preview_video: dict[str, object] | None = None
+    quote_render: QuotedPostRender | None = None
     if quote_uri:
         # A genuine quote-post (Akkoma/Pleroma/Fedibird/Misskey-family --
         # see Note.quote_uri's own docstring) -- some of those append a
@@ -1013,9 +1066,13 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         plain = _strip_quote_tail(plain, quote_uri)
         if safe_html:
             safe_html = _strip_quote_tail_html(safe_html, quote_uri)
-        quote_plain_tail, quote_html_tail, quote_preview_image, quote_preview_video = await _quoted_post_render(
+        quote_render = await _quoted_post_render(
             request, activity.actor, quote_uri, quoter_has_own_attachment=bool(attachments)
         )
+        quote_plain_tail = quote_render.plain_tail
+        quote_html_tail = quote_render.html_tail
+        quote_preview_image = quote_render.preview_image
+        quote_preview_video = quote_render.preview_video
 
     message_content: dict = {"msgtype": "m.text", "body": plain}
     if quote_plain_tail:
@@ -1023,6 +1080,17 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     if (safe_html and safe_html != plain) or quote_html_tail:
         message_content["format"] = "org.matrix.custom.html"
         message_content["formatted_body"] = (safe_html or html.escape(plain)) + quote_html_tail
+    if (
+        request.app.state.config.bridge.set_msc4501_repost_of
+        and quote_render is not None
+        and quote_render.quoted_ref is not None
+    ):
+        quoted_room_id, quoted_event_id = quote_render.quoted_ref
+        message_content[SOCIAL_REPOST_OF_FIELD] = {
+            "event_id": quoted_event_id,
+            "room_id": quoted_room_id,
+            "content": quote_render.full_content,
+        }
     if mentions.mentioned_locals:
         # A pill alone (the <a href="matrix.to/..."> in formatted_body,
         # above) only makes the mention a clickable link -- an intentional
@@ -1048,6 +1116,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     try:
         event_id = await request.app.state.synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
+            event_type=mirrored_post_event_type(request.app.state.config),
             ts=resolve_event_ts(
                 obj, max_clock_skew=federation_config.max_clock_skew,
                 max_backdate_days=federation_config.max_backdate_days,
@@ -1206,6 +1275,7 @@ async def _mirror_note_as_reply(
     try:
         event_id = await synapse.send_message_event(
             parent.room_id, message_content, as_user_id=ghost_mxid_,
+            event_type=mirrored_post_event_type(request.app.state.config),
             ts=resolve_event_ts(
                 note, max_clock_skew=federation_config.max_clock_skew,
                 max_backdate_days=federation_config.max_backdate_days,
@@ -1305,6 +1375,7 @@ async def _echo_reply_in_own_room(
     try:
         event_id = await request.app.state.synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=profile.mxid,
+            event_type=mirrored_post_event_type(request.app.state.config),
             ts=resolve_event_ts(
                 note, max_clock_skew=federation_config.max_clock_skew,
                 max_backdate_days=federation_config.max_backdate_days,
@@ -1462,6 +1533,7 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     # repost summary card rather than re-uploaded, since it's the exact
     # same file.
     imported_link: str | None = None
+    imported_ref: tuple[str, str] | None = None
     imported_attachment_mxc: str | None = None
     if isinstance(original_author_id, str):
         local_actor = await repository.get_local_actor(username)
@@ -1472,9 +1544,10 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
         imported_attachment_mxc = imported.first_attachment_mxc
         if imported.federated_event is not None:
             imported_link = matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)
+            imported_ref = (imported.federated_event.room_id, imported.federated_event.event_id)
 
     message_content = await _build_repost_message(
-        request, remote_room, obj, original_author_id, original_actor_doc, imported_link,
+        request, remote_room, obj, original_author_id, original_actor_doc, imported_link, imported_ref,
     )
 
     # See _handle_create's identical reasoning: only the boosted post's
@@ -1491,6 +1564,7 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     try:
         event_id = await synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
+            event_type=mirrored_post_event_type(request.app.state.config),
             # The Announce's OWN published time (when the boost happened),
             # not the boosted post's -- this message represents "X boosted
             # this", so that's the moment it belongs at in the timeline,
@@ -1554,6 +1628,7 @@ async def _build_repost_message(
     original_author_id: str | None,
     original_actor_doc: dict,
     imported_link: str | None = None,
+    imported_ref: tuple[str, str] | None = None,
 ) -> dict:
     """Build the Matrix message content for a mirrored repost: an HTML body
     showing "\U0001F501 {booster} boosted {original author}'s post:" above
@@ -1567,7 +1642,22 @@ async def _build_repost_message(
     ``_handle_announce``'s use of ``bridge.note_mirroring.import_note``) --
     same as ``_quoted_post_render``/``_notify_post_owner``, that link is
     the word "post" itself (an event pill), not a separate "Full post:"
-    line -- one looks the same as another everywhere in this bridge."""
+    line -- one looks the same as another everywhere in this bridge.
+
+    ``imported_ref`` is that same boosted post's own ``(room_id,
+    event_id)``, used (when ``bridge.set_msc4501_repost_of`` is on) to
+    fetch that event's own real ``content`` dict and set
+    ``m.social.repost_of.content`` to it verbatim -- the actual event
+    content (``msgtype``, ``url``, ``info``, etc.), not just extracted
+    text, since a plain-text copy would be blank for an uncaptioned
+    image/video boost. Also, per the MSC's own definition of a boost (as
+    opposed to a quote-post with commentary), replaces the PLAIN ``body``
+    with nothing but ``imported_link`` itself, so a MSC4501-aware client
+    can recognize this as a boost by ``body`` being just a permalink
+    pointing at the same event ``m.social.repost_of`` names.
+    ``formatted_body`` is untouched either way -- that plain ``body``
+    swap only matters to a client parsing MSC4501 fields; an
+    ordinary client still renders the same rich HTML card as always."""
     _, booster_html = await actor_html_with_avatar(request, remote_room.actor_id)
     if original_author_id:
         original_handle, original_author_html = await actor_html_with_avatar(request, original_author_id)
@@ -1599,12 +1689,34 @@ async def _build_repost_message(
     header_html = f"<p>\U0001F501 {booster_html} boosted {original_author_html}'s {post_pill_html}:</p>"
     content_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
 
+    boosted_content: dict[str, object] | None = None
+    if request.app.state.config.bridge.set_msc4501_repost_of and imported_ref is not None:
+        config = request.app.state.config
+        bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+        try:
+            boosted_event = await request.app.state.synapse.get_event(*imported_ref, as_user_id=bot_mxid)
+            boosted_content = boosted_event.get("content") or {}
+        except SynapseError:
+            logger.info("Could not fetch boosted event %s in %s for repost_of", *imported_ref, exc_info=True)
+
+    use_repost_of = boosted_content is not None and imported_link
     message_content = {
         "msgtype": "m.text",
-        "body": plain_body,
+        # Per MSC4501, a boost's plain body MUST be nothing but a matrix.to
+        # permalink to the boosted event -- see this function's own
+        # docstring. formatted_body (below) keeps the full rich card
+        # regardless; only an MSC4501-aware client parses body at all.
+        "body": imported_link if use_repost_of else plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
     }
+    if use_repost_of:
+        quoted_room_id, quoted_event_id = imported_ref
+        message_content[SOCIAL_REPOST_OF_FIELD] = {
+            "event_id": quoted_event_id,
+            "room_id": quoted_room_id,
+            "content": boosted_content,
+        }
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url
@@ -1613,7 +1725,7 @@ async def _build_repost_message(
 
 async def _handle_update(request: Request, username: str, activity: Activity) -> None:
     """A followed remote actor changed their profile -- keep our mirror (the
-    ghost user and the Remote User Room's name/avatar) in sync."""
+    ghost user and the Remote User Room's name/avatar/banner) in sync."""
     obj = activity.object
     if isinstance(obj, str):
         try:
@@ -1630,15 +1742,22 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
 
     new_name = obj.get("name") or obj.get("preferredUsername") or remote_room.display_name
     new_icon_url = extract_icon_url(obj)
+    new_banner_url = extract_banner_url(obj)
     name_changed = new_name != remote_room.display_name
     icon_changed = new_icon_url != remote_room.icon_url
-    if not name_changed and not icon_changed:
+    banner_changed = new_banner_url != remote_room.banner_url
+    if not name_changed and not icon_changed and not banner_changed:
         return
 
     avatar_mxc = None
     if icon_changed and new_icon_url:
         avatar_mxc = await fetch_and_upload_media(
             request.app.state.http_client, request.app.state.synapse, new_icon_url
+        )
+    banner_mxc = None
+    if banner_changed and new_banner_url:
+        banner_mxc = await fetch_and_upload_media(
+            request.app.state.http_client, request.app.state.synapse, new_banner_url
         )
 
     synapse = request.app.state.synapse
@@ -1656,6 +1775,11 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     except SynapseError:
         logger.warning("Failed to sync profile changes for %s", activity.actor, exc_info=True)
 
+    if banner_changed and banner_mxc:
+        await _set_ghost_room_banner(
+            request, room_id=remote_room.room_id, ghost_user_id=remote_room.ghost_user_id, banner_mxc=banner_mxc
+        )
+
     await repository.register_remote_actor_room(
         RemoteActorRoom(
             actor_id=remote_room.actor_id,
@@ -1664,6 +1788,7 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
             inbox_url=remote_room.inbox_url,
             display_name=new_name,
             icon_url=new_icon_url,
+            banner_url=new_banner_url,
         )
     )
     # Keep _resolve_and_invite_ghost's separate sync-ghost-profile cache

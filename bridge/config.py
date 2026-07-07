@@ -57,6 +57,25 @@ class BridgeSection:
     # attempt there is a guaranteed-failing request otherwise -- harmless
     # (best-effort, logged and swallowed) but pure waste.
     set_msc4501_profile_room_id: bool = True
+    # Whether to set org.matrix.msc4501.social.repost_of on every mirrored
+    # boost (Announce) and quote-post -- see bridge.inbox_dispatch's
+    # _handle_announce/_handle_create. On by default: unlike
+    # use_msc4501_post_event_type below, this is purely additive content
+    # on an ordinary m.room.message event, so a client with no idea what
+    # MSC4501 is just ignores the extra field and renders the message
+    # exactly as it always has.
+    set_msc4501_repost_of: bool = True
+    # Whether to mirror a remote fediverse account's posts (their own new
+    # posts, replies, and boosts -- never DMs/Chats, which aren't "posts")
+    # using org.matrix.msc4501.social.post as the event TYPE, instead of
+    # the ordinary m.room.message every other client already understands.
+    # Off by default, and NOT recommended to turn on until Phase 2 of
+    # MSC4501's own message-interoperability rollout plan -- unlike
+    # set_msc4501_repost_of above, this changes the event's actual type,
+    # so a client that has never heard of MSC4501 won't render the event
+    # at all (not even as a blank bubble), rather than just ignoring a
+    # field it doesn't recognize.
+    use_msc4501_post_event_type: bool = False
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -201,6 +220,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         accept_federated_knocks=bool(bridge_raw.get("accept_federated_knocks", False)),
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
         set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", True)),
+        set_msc4501_repost_of=bool(bridge_raw.get("set_msc4501_repost_of", True)),
+        use_msc4501_post_event_type=bool(bridge_raw.get("use_msc4501_post_event_type", False)),
     )
 
     synapse_section = SynapseSection(

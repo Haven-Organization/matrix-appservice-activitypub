@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS remote_actor_rooms (
     inbox_url TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
     icon_url TEXT,
+    banner_url TEXT,
     pending_backfill INTEGER NOT NULL DEFAULT 0
 );
 
@@ -274,6 +275,9 @@ class SqliteActorRepository:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(remote_actor_rooms)")}
         if "icon_url" not in columns:
             self._conn.execute("ALTER TABLE remote_actor_rooms ADD COLUMN icon_url TEXT")
+            self._conn.commit()
+        if "banner_url" not in columns:
+            self._conn.execute("ALTER TABLE remote_actor_rooms ADD COLUMN banner_url TEXT")
             self._conn.commit()
         if "pending_backfill" not in columns:
             self._conn.execute(
@@ -760,18 +764,19 @@ class SqliteActorRepository:
         self._conn.execute(
             """
             INSERT INTO remote_actor_rooms
-                (actor_id, room_id, ghost_user_id, inbox_url, display_name, icon_url, pending_backfill)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (actor_id, room_id, ghost_user_id, inbox_url, display_name, icon_url, banner_url, pending_backfill)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(actor_id) DO UPDATE SET
                 room_id=excluded.room_id,
                 ghost_user_id=excluded.ghost_user_id,
                 inbox_url=excluded.inbox_url,
                 display_name=excluded.display_name,
-                icon_url=excluded.icon_url
+                icon_url=excluded.icon_url,
+                banner_url=excluded.banner_url
             """,
             (
                 record.actor_id, record.room_id, record.ghost_user_id,
-                record.inbox_url, record.display_name, record.icon_url, record.pending_backfill,
+                record.inbox_url, record.display_name, record.icon_url, record.banner_url, record.pending_backfill,
             ),
         )
         # Permanent history row -- see get_remote_actor_room_history_actor_id's
@@ -818,6 +823,7 @@ class SqliteActorRepository:
             inbox_url=row["inbox_url"],
             display_name=row["display_name"],
             icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
             pending_backfill=bool(row["pending_backfill"]),
         )
 

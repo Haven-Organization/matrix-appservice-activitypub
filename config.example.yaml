@@ -39,6 +39,22 @@ bridge:
   # request otherwise. Harmless either way (best-effort, logged and
   # swallowed on failure), just pure waste if you know it'll never work.
   # set_msc4501_profile_room_id: true
+  # Whether to set org.matrix.msc4501.social.repost_of on every mirrored
+  # boost and quote-post from the fediverse. On by default -- this is
+  # purely additive content on an ordinary m.room.message event, so a
+  # client with no idea what MSC4501 is just ignores the extra field and
+  # renders the message exactly as it always has.
+  # set_msc4501_repost_of: true
+  # Whether to mirror a remote fediverse account's posts (their own posts,
+  # replies, and boosts) using org.matrix.msc4501.social.post as the
+  # event TYPE, instead of the ordinary m.room.message every client
+  # already understands. Off by default. NOT RECOMMENDED to turn on until
+  # Phase 2 of MSC4501's own message-interoperability rollout plan --
+  # unlike set_msc4501_repost_of above, this changes the event's actual
+  # type, so a client that has never heard of MSC4501 won't render the
+  # event at all, not even as a blank bubble, rather than just ignoring a
+  # field it doesn't recognize.
+  # use_msc4501_post_event_type: false
 
 synapse:
   # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.

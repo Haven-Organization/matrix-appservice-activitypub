@@ -32,6 +32,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Actor, PublicKey
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_attachments,
+    extract_banner_url,
     extract_icon_url,
     fetch_actor,
     resolve_actor_inbox,
@@ -86,6 +87,78 @@ SOCIAL_PROFILE_ROOM_TYPE = "org.matrix.msc4501.social.profile"
 # a local user may deliberately want a different room entirely as their
 # general Matrix-wide social profile.
 SOCIAL_PROFILE_ROOM_ID_FIELD = "org.matrix.msc4501.social.profile_room_id"
+
+# The inverse of SOCIAL_PROFILE_ROOM_ID_FIELD: a room-level state event
+# (state_key "", content {"user_id": "@alice:example.org"}) asserting
+# which Matrix user a Profile Room actually belongs to -- added to
+# MSC4501 specifically for a case this bridge hits on every single
+# Profile Room it creates: m.room.create's own "creator" is the bridge's
+# bot, never the actual owner, so "creator" alone can never be trusted to
+# answer "whose profile is this". Set ONLY on local Profile Rooms
+# (bridge.commands._handle_create_profile/_handle_link_profile/
+# _replace_profile_room) -- never Remote User Rooms, where the ghost
+# already legitimately IS both the room's creator and the Matrix user it
+# represents, so there's no creator/owner mismatch to resolve. Per the
+# MSC, this event isn't one m.room.power_levels gives its own default
+# override for, so it falls back to state_default (50, "Moderator") if
+# nothing else is done -- meaning any Moderator, not just the room's
+# actual owner, could otherwise reassign a profile out from under them.
+# See SOCIAL_PROFILE_USER_ID_POWER_LEVEL below for the fix.
+SOCIAL_PROFILE_USER_ID_STATE_TYPE = "org.matrix.msc4501.social.profile_user_id"
+
+# The power level SOCIAL_PROFILE_USER_ID_STATE_TYPE should require to set,
+# per the MSC's own explicit guidance -- keyed under the SAME unstable
+# prefix actually being sent as the event type (not the future stable
+# m.social.profile_user_id name the MSC's own JSON example shows): Matrix
+# power-level enforcement matches on an event's literal type string, so a
+# power_levels override keyed by the stable name would protect nothing
+# while this bridge is still sending the unstable one, the same
+# "don't use the future stable name early" reasoning as everywhere else
+# in this file.
+SOCIAL_PROFILE_USER_ID_POWER_LEVEL = 100
+
+# Marks a mirrored boost/quote-post's content as reposting another event --
+# see bridge.inbox_dispatch's _handle_announce/_handle_create, and
+# bridge.config.BridgeSection.set_msc4501_repost_of (the toggle for
+# whether this gets set at all; on by default). Shape: {"event_id": ...,
+# "room_id": ..., "content": {<the reposted event's own full, untouched
+# Matrix content dict>}} -- the real event content (msgtype, url, info,
+# etc.), not just its extracted text, since a plain-text-only copy would
+# be blank for an uncaptioned image/video repost. Purely additive content
+# on an ordinary m.room.message event -- unlike SOCIAL_POST_EVENT_TYPE
+# below, a client with no idea what this is just ignores it.
+SOCIAL_REPOST_OF_FIELD = "org.matrix.msc4501.social.repost_of"
+
+# The event TYPE (not a content field) MSC4501 proposes in place of
+# m.room.message for a "real" social-media-style post -- see
+# bridge.config.BridgeSection.use_msc4501_post_event_type's own comment
+# for why this is off by default and not just recommended-off but
+# actually risky to turn on before MSC4501's own Phase 2: a client that
+# has never heard of this event type won't render the event at all.
+SOCIAL_POST_EVENT_TYPE = "org.matrix.msc4501.social.post"
+
+
+def mirrored_post_event_type(config) -> str:
+    """The event type to use when mirroring a remote fediverse account's
+    own posts, replies, and boosts into Matrix (never DMs/Chats, which
+    aren't "posts") -- SOCIAL_POST_EVENT_TYPE if
+    ``bridge.use_msc4501_post_event_type`` is on, otherwise the ordinary
+    ``m.room.message`` every client already understands."""
+    return SOCIAL_POST_EVENT_TYPE if config.bridge.use_msc4501_post_event_type else "m.room.message"
+
+
+# No stable Matrix state event exists yet for a room's "banner"/header image
+# (distinct from m.room.avatar) as of 2026-07 -- MSC4221 ("Room Banners":
+# https://github.com/matrix-org/matrix-spec-proposals/pull/4221) proposes
+# m.room.banner for exactly this, but per that MSC's own "Unstable prefix"
+# section, implementations should use page.codeberg.everypizza.room.banner
+# until it's actually merged, not m.room.banner itself (the same
+# "don't use the future stable name early" reasoning as SOCIAL_PROFILE_ROOM_TYPE
+# above). Content shape mirrors m.room.avatar's own: {"url": "mxc://..."}.
+# Used for both a local user's own Profile Room (bridge.commands._handle_banner)
+# and a ghost's Remote User Room, kept in sync with the remote actor's own
+# AP ``image`` field (see _handle_update in bridge.inbox_dispatch).
+PROFILE_BANNER_STATE_TYPE = "page.codeberg.everypizza.room.banner"
 
 # Explicit room version for the ``;replace`` family -- this server's own
 # configured default room version is v11, not v12, so leaving
@@ -509,6 +582,75 @@ async def set_ghost_profile_room_id(request: Request, *, mxid: str, room_id: str
         await synapse.set_profile_field(mxid, SOCIAL_PROFILE_ROOM_ID_FIELD, room_id)
     except SynapseError:
         logger.info("Could not set %s for %s", SOCIAL_PROFILE_ROOM_ID_FIELD, mxid, exc_info=True)
+
+
+async def set_ghost_room_banner(
+    request: Request, *, room_id: str, ghost_user_id: str, banner_mxc: str
+) -> None:
+    """Set PROFILE_BANNER_STATE_TYPE on a Remote User Room to mirror the
+    remote actor's own AP ``image`` (their profile banner/header) -- same
+    room-state-only mechanism as a local user's own ``;banner``, just
+    driven by what the remote actor's Actor document says rather than a
+    command. Best-effort, same as this room's own m.room.avatar handling
+    right next to every call site of this -- a failure here is cosmetic,
+    not worth blocking room creation or an Update sync over."""
+    synapse = request.app.state.synapse
+    try:
+        await synapse.send_state_event(
+            room_id, PROFILE_BANNER_STATE_TYPE, "", {"url": banner_mxc}, as_user_id=ghost_user_id
+        )
+    except SynapseError:
+        logger.info("Could not set %s in %s", PROFILE_BANNER_STATE_TYPE, room_id, exc_info=True)
+
+
+async def set_profile_user_id(
+    request: Request, *, room_id: str, matrix_user_id: str, as_user_id: str
+) -> None:
+    """Set SOCIAL_PROFILE_USER_ID_STATE_TYPE on a Profile Room, asserting
+    ``matrix_user_id`` as the room's true owner regardless of who actually
+    created it (always the bridge's bot, for a bridge-created room -- see
+    that constant's own comment). Best-effort, same as the rest of the
+    bridge's room bookkeeping. Call this every time a Profile Room is
+    created, linked, or replaced."""
+    synapse = request.app.state.synapse
+    try:
+        await synapse.send_state_event(
+            room_id, SOCIAL_PROFILE_USER_ID_STATE_TYPE, "", {"user_id": matrix_user_id}, as_user_id=as_user_id
+        )
+    except SynapseError:
+        logger.info("Could not set %s in %s", SOCIAL_PROFILE_USER_ID_STATE_TYPE, room_id, exc_info=True)
+
+
+async def protect_profile_user_id_power_level(request: Request, *, room_id: str) -> None:
+    """Best-effort read-modify-write of ``room_id``'s CURRENT
+    ``m.room.power_levels``, merging in an ``events`` override requiring
+    SOCIAL_PROFILE_USER_ID_POWER_LEVEL to set SOCIAL_PROFILE_USER_ID_STATE_TYPE
+    -- see that constant's own comment for why this matters (without it,
+    any Moderator could silently reassign a profile's ownership). Only
+    needed for ``;link profile`` (an already-existing room, whose power
+    levels weren't set by ``create_room``'s own ``power_level_content_override``
+    in the first place -- see ``_handle_create_profile``/``_replace_profile_room``,
+    which bake this in at creation time instead). Sent as the bot; if the
+    bot doesn't have high enough power in this room to touch
+    ``m.room.power_levels`` at all (routinely true for a room the user
+    made themselves, same caveat as this function's caller's own room
+    name/avatar attempt), this just silently does nothing, same as that."""
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(request.app.state.config)
+    try:
+        current = await synapse.get_room_state(room_id, "m.room.power_levels", as_user_id=bot_mxid)
+    except SynapseError:
+        logger.info("Could not read power levels in %s to protect profile_user_id", room_id, exc_info=True)
+        return
+    events = dict(current.get("events") or {})
+    if events.get(SOCIAL_PROFILE_USER_ID_STATE_TYPE) == SOCIAL_PROFILE_USER_ID_POWER_LEVEL:
+        return  # already protected -- e.g. a second `;link profile` re-run
+    events[SOCIAL_PROFILE_USER_ID_STATE_TYPE] = SOCIAL_PROFILE_USER_ID_POWER_LEVEL
+    new_content = {**current, "events": events}
+    try:
+        await synapse.send_state_event(room_id, "m.room.power_levels", "", new_content, as_user_id=bot_mxid)
+    except SynapseError:
+        logger.info("Could not protect profile_user_id power level in %s", room_id, exc_info=True)
 
 
 async def resolve_old_remote_actor_room(request: Request, room_id: str) -> RemoteActorRoom | None:
@@ -1602,6 +1744,8 @@ async def import_note(
         icon_url = extract_icon_url(author_doc)
         avatar_mxc = await fetch_and_upload_media(request.app.state.http_client, synapse, icon_url) if icon_url else None
         author_avatar_mxc = avatar_mxc
+        banner_url = extract_banner_url(author_doc)
+        banner_mxc = await fetch_and_upload_media(request.app.state.http_client, synapse, banner_url) if banner_url else None
 
         await ensure_ghost_user(
             synapse,
@@ -1632,8 +1776,13 @@ async def import_note(
             room_type=SOCIAL_PROFILE_ROOM_TYPE,
             join_rule=KNOCK_JOIN_RULE,
             # bot_mxid kept at the same level as the ghost creator -- see
-            # ensure_ghost_dm_room's identical reasoning.
+            # ensure_ghost_dm_room's identical reasoning. events'
+            # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches every
+            # other Remote User Room creation path's identical reasoning.
             additional_creators=[bot_mxid],
+            power_level_content_override={
+                "events": {SOCIAL_PROFILE_USER_ID_STATE_TYPE: SOCIAL_PROFILE_USER_ID_POWER_LEVEL},
+            },
         )
         remote_room = RemoteActorRoom(
             actor_id=author_actor_id,
@@ -1642,6 +1791,7 @@ async def import_note(
             inbox_url=author_doc.get("inbox") or "",
             display_name=display_name,
             icon_url=icon_url,
+            banner_url=banner_url,
         )
         await repository.register_remote_actor_room(remote_room)
         await send_bridge_info(
@@ -1650,6 +1800,9 @@ async def import_note(
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
+        if banner_mxc:
+            await set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
     elif inviter:
         try:
             await synapse.invite_user(remote_room.room_id, inviter, as_user_id=remote_room.ghost_user_id)
@@ -1689,6 +1842,7 @@ async def import_note(
     try:
         event_id = await synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
+            event_type=mirrored_post_event_type(config),
             ts=resolve_event_ts(note, max_clock_skew=max_clock_skew, max_backdate_days=max_backdate_days),
         )
     except SynapseError:

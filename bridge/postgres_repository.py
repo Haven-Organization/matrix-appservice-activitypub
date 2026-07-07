@@ -88,6 +88,7 @@ _SCHEMA_STATEMENTS = [
         inbox_url TEXT NOT NULL,
         display_name TEXT NOT NULL DEFAULT '',
         icon_url TEXT,
+        banner_url TEXT,
         pending_backfill BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
@@ -246,6 +247,7 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_followers BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_following BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS icon_url TEXT",
+    "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS banner_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS thread_root_event_id TEXT",
     "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS boosted_object_id TEXT",
@@ -578,17 +580,18 @@ class PostgresActorRepository:
                 await conn.execute(
                     """
                     INSERT INTO remote_actor_rooms
-                        (actor_id, room_id, ghost_user_id, inbox_url, display_name, icon_url, pending_backfill)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        (actor_id, room_id, ghost_user_id, inbox_url, display_name, icon_url, banner_url, pending_backfill)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (actor_id) DO UPDATE SET
                         room_id = EXCLUDED.room_id,
                         ghost_user_id = EXCLUDED.ghost_user_id,
                         inbox_url = EXCLUDED.inbox_url,
                         display_name = EXCLUDED.display_name,
-                        icon_url = EXCLUDED.icon_url
+                        icon_url = EXCLUDED.icon_url,
+                        banner_url = EXCLUDED.banner_url
                     """,
                     record.actor_id, record.room_id, record.ghost_user_id,
-                    record.inbox_url, record.display_name, record.icon_url, record.pending_backfill,
+                    record.inbox_url, record.display_name, record.icon_url, record.banner_url, record.pending_backfill,
                 )
                 # Permanent history row -- see
                 # get_remote_actor_room_history_actor_id's docstring. Clear
@@ -627,6 +630,7 @@ class PostgresActorRepository:
             inbox_url=row["inbox_url"],
             display_name=row["display_name"],
             icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
             pending_backfill=row["pending_backfill"],
         )
 

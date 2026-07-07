@@ -62,9 +62,10 @@ class ActorRecord:
 class RemoteActorRoom:
     """Maps a remote (fediverse) actor to the Matrix "Remote User Room" mirroring them.
 
-    ``display_name``/``icon_url`` mirror the actor's AP-side name and avatar
-    URL as of the last sync, so an inbound ``Update`` activity can tell
-    whether either actually changed before re-uploading/re-setting anything.
+    ``display_name``/``icon_url``/``banner_url`` mirror the actor's AP-side
+    name, avatar, and banner (``image``) as of the last sync, so an inbound
+    ``Update`` activity can tell whether any of them actually changed
+    before re-uploading/re-setting anything.
     """
 
     actor_id: str
@@ -73,6 +74,9 @@ class RemoteActorRoom:
     inbox_url: str
     display_name: str = ""
     icon_url: str | None = None
+    # Mirrors the actor's AP-side ``image`` (their profile banner/header),
+    # same "as of last sync" purpose as icon_url -- see set_ghost_room_banner.
+    banner_url: str | None = None
     # True only for the brief window between this room being freshly
     # created (the first-ever follow of this actor on this server -- see
     # bridge.commands._establish_remote_follow) and the follower actually

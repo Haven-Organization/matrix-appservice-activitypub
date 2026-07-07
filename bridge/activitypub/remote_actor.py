@@ -52,31 +52,40 @@ async def resolve_actor_inbox(request: Request, actor_id: str) -> str | None:
     return doc.get("inbox")
 
 
-def extract_icon_url(actor_doc: dict) -> str | None:
-    """Pull the avatar URL out of an Actor's ``icon`` field.
-
-    Handles the common shapes seen in the wild: a single Image object
-    (``{"type": "Image", "url": "..."}``), a bare URL string, or a list of
-    either (some implementations send multiple sizes/formats -- we just use
-    the first) -- and, within an Image object, ``url`` ITSELF being a list
-    of Link objects/strings rather than a single one (legal per the AS2
-    spec as multiple equivalent representations of the same resource; seen
-    in the wild on a Pleroma ``ChatMessage`` attachment -- see
-    ``extract_attachments`` -- so worth handling the same way here too).
-    """
-    icon = actor_doc.get("icon")
-    if isinstance(icon, dict):
-        url = icon.get("url")
+def _extract_image_field_url(image: object) -> str | None:
+    """Shared shape-handling for an Actor's ``icon``/``image`` field: a
+    single Image object (``{"type": "Image", "url": "..."}``), a bare URL
+    string, or a list of either (some implementations send multiple
+    sizes/formats -- we just use the first) -- and, within an Image
+    object, ``url`` ITSELF being a list of Link objects/strings rather
+    than a single one (legal per the AS2 spec as multiple equivalent
+    representations of the same resource; seen in the wild on a Pleroma
+    ``ChatMessage`` attachment -- see ``extract_attachments`` -- so worth
+    handling the same way here too)."""
+    if isinstance(image, dict):
+        url = image.get("url")
         if isinstance(url, list):
             url = url[0] if url else None
         if isinstance(url, dict):
             url = url.get("href") or url.get("url")
         return url if isinstance(url, str) else None
-    if isinstance(icon, str):
-        return icon
-    if isinstance(icon, list) and icon:
-        return extract_icon_url({"icon": icon[0]})
+    if isinstance(image, str):
+        return image
+    if isinstance(image, list) and image:
+        return _extract_image_field_url(image[0])
     return None
+
+
+def extract_icon_url(actor_doc: dict) -> str | None:
+    """Pull the avatar URL out of an Actor's ``icon`` field."""
+    return _extract_image_field_url(actor_doc.get("icon"))
+
+
+def extract_banner_url(actor_doc: dict) -> str | None:
+    """Pull the banner/header URL out of an Actor's ``image`` field (AS2's
+    convention for a profile's header/banner, as opposed to ``icon`` for
+    the avatar -- see bridge.activitypub.models' own comment on this)."""
+    return _extract_image_field_url(actor_doc.get("image"))
 
 
 def extract_attachments(obj: dict) -> list[dict]:
