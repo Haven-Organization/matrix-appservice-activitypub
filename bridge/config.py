@@ -51,12 +51,15 @@ class BridgeSection:
     backfill_default_count: int = 15
     # Whether to set org.matrix.msc4501.social.profile_room_id (MSC4133
     # Extensible Profiles) on every ghost, pointing at its Remote User
-    # Room -- see bridge.note_mirroring.set_ghost_profile_room_id. On by
-    # default; turn off for a homeserver that doesn't support MSC4133
-    # (e.g. Dendrite, or the original archived Conduit), since every set
-    # attempt there is a guaranteed-failing request otherwise -- harmless
-    # (best-effort, logged and swallowed) but pure waste.
-    set_msc4501_profile_room_id: bool = True
+    # Room -- see bridge.note_mirroring.set_ghost_profile_room_id. Off by
+    # default, matching Synapse's own default for MSC4133 itself: it
+    # requires experimental_features.msc4133_enabled: true in
+    # homeserver.yaml (confirmed against Synapse's own source, 2026-07-08)
+    # -- not set by default even there, so a fresh bridge deployment
+    # shouldn't eat a guaranteed-failing request on every ghost
+    # registration until the operator has actually opted into MSC4133 on
+    # the homeserver side too. Turn on once that's done.
+    set_msc4501_profile_room_id: bool = False
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
     # same convention as Matrix's own m.relates_to) on every mirrored boost
     # (Announce), quote-post, and cross-posted reply echo -- see
@@ -260,7 +263,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         internal_base_url=internal_base_url.rstrip("/") if internal_base_url else None,
         accept_federated_knocks=bool(bridge_raw.get("accept_federated_knocks", False)),
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
-        set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", True)),
+        set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", False)),
         set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,

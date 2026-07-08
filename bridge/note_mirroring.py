@@ -651,15 +651,17 @@ async def set_ghost_profile_room_id(request: Request, *, mxid: str, room_id: str
     SOCIAL_PROFILE_ROOM_ID_FIELD's docstring) at ``room_id`` as its
     MSC4501 ``social.profile_room_id`` profile field. Best-effort, same as
     the rest of the bridge's room bookkeeping -- silently does nothing
-    useful on a homeserver without MSC4133 support, which is expected on
-    some deployments (e.g. Dendrite, or the original archived Conduit)
-    and not this bridge's problem to work around -- see
+    useful on a homeserver without MSC4133 support enabled, which is NOT
+    the default even on this bridge's own target, Synapse (requires
+    experimental_features.msc4133_enabled: true in homeserver.yaml,
+    confirmed against Synapse's own source 2026-07-08) -- see
     ``bridge.config.BridgeSection.set_msc4501_profile_room_id``, which
     lets that be turned off entirely rather than eating a guaranteed-
-    failing request every time. Call this every time a ghost's Remote
-    User Room is registered or changes (a first follow, a
-    mention-triggered import, or a ``;replace room``), so the field
-    never points at a stale, already-superseded room."""
+    failing request every time on a deployment that hasn't opted in yet.
+    Call this every time a ghost's Remote User Room is registered or
+    changes (a first follow, a mention-triggered import, or a
+    ``;replace room``), so the field never points at a stale,
+    already-superseded room."""
     if not request.app.state.config.bridge.set_msc4501_profile_room_id:
         return
     synapse = request.app.state.synapse

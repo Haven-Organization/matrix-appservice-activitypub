@@ -30,10 +30,11 @@ bridge:
   # backfill_default_count: 15
 
   # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
-  # Profiles) on every ghost, pointing at its Remote User Room. On by
-  # default; turn off if your homeserver doesn't support MSC4133 (e.g.
-  # Dendrite, archived Conduit) -- harmless either way, just pure waste.
-  # set_msc4501_profile_room_id: true
+  # Profiles) on every ghost, pointing at its Remote User Room. Off by
+  # default -- Synapse doesn't enable MSC4133 by default either (needs
+  # experimental_features.msc4133_enabled: true in homeserver.yaml). Turn
+  # on once your homeserver actually supports it.
+  # set_msc4501_profile_room_id: false
 
   # Set org.matrix.msc4501.social.relates_to on every mirrored boost,
   # quote-post, and cross-posted reply echo. On by default -- purely
@@ -49,8 +50,6 @@ bridge:
 
   # Whether an untracked quote-post's TARGET gets imported into its own
   # Remote User Room (needed for relates_to to populate on it at all).
-  # Quotes are frequently adversarial ("quote-dunking"), unlike a reply's
-  # root, so this doesn't default to importing unconditionally:
   #   known  (default) - only if the quoted author already has a Remote
   #                       User Room for some other reason
   #   always            - import unconditionally
