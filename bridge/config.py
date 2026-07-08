@@ -57,21 +57,57 @@ class BridgeSection:
     # attempt there is a guaranteed-failing request otherwise -- harmless
     # (best-effort, logged and swallowed) but pure waste.
     set_msc4501_profile_room_id: bool = True
-    # Whether to set org.matrix.msc4501.social.repost_of on every mirrored
-    # boost (Announce) and quote-post -- see bridge.inbox_dispatch's
-    # _handle_announce/_handle_create. On by default: unlike
+    # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
+    # same convention as Matrix's own m.relates_to) on every mirrored boost
+    # (Announce), quote-post, and cross-posted reply echo -- see
+    # bridge.inbox_dispatch's _handle_announce/_handle_create/
+    # _echo_reply_in_own_room. On by default: unlike
     # use_msc4501_post_event_type below, this is purely additive content
     # on an ordinary m.room.message event, so a client with no idea what
     # MSC4501 is just ignores the extra field and renders the message
     # exactly as it always has.
-    set_msc4501_repost_of: bool = True
+    set_msc4501_relates_to: bool = True
+    # For a mirrored boost specifically (never a quote-post or reply, which
+    # always carry real commentary of their own -- see
+    # bridge.inbox_dispatch._build_repost_message's own docstring): whether
+    # relates_to asserts content_inline (the mirrored event's own content
+    # already IS the boosted post's content, so relates_to.content would
+    # just be a second copy of the same thing) instead of duplicating that
+    # content into relates_to.content a second time. On by default -- less
+    # redundant storage per event. Set to false to duplicate into
+    # relates_to.content instead (the original behavior, before
+    # content_inline existed), e.g. if some client you care about doesn't
+    # yet handle content_inline.
+    use_msc4501_content_inline: bool = True
+    # Whether a quote-post's TARGET (the post it quotes, when we don't
+    # already have a local mirror of it -- see
+    # bridge.inbox_dispatch._quoted_post_render) gets actually imported
+    # into its own Remote User Room, the same on-demand
+    # ghost/room-provisioning bridge.note_mirroring.import_note already
+    # does for an untracked reply's root. Doing so is what lets
+    # set_msc4501_relates_to above actually populate for a quote of a post
+    # nobody here already tracks -- MSC4501 requires a real room_id/event_id
+    # to point at, and there's nothing to reference without a local mirror.
+    # Unlike a reply's root (unambiguously wanted conversational context),
+    # a quote is frequently adversarial ("quote-dunking" someone to mock
+    # them, not to amplify them) -- importing it unconditionally means
+    # provisioning a room/ghost for a total stranger purely because someone
+    # we follow made fun of them.
+    #   - "known" (default): only import if the quoted post's author
+    #     already has a Remote User Room for some other reason (followed,
+    #     replied to, previously imported, ...) -- never provisions a
+    #     brand-new room/ghost purely from being quoted.
+    #   - "always": import unconditionally, maximizing relates_to coverage.
+    #   - "never": the old read-only behavior -- fetch a preview over AP,
+    #     never mirror the quoted post, relates_to stays unset.
+    quote_import_policy: str = "known"
     # Whether to mirror a remote fediverse account's posts (their own new
     # posts, replies, and boosts -- never DMs/Chats, which aren't "posts")
     # using org.matrix.msc4501.social.post as the event TYPE, instead of
     # the ordinary m.room.message every other client already understands.
     # Off by default, and NOT recommended to turn on until Phase 2 of
     # MSC4501's own message-interoperability rollout plan -- unlike
-    # set_msc4501_repost_of above, this changes the event's actual type,
+    # set_msc4501_relates_to above, this changes the event's actual type,
     # so a client that has never heard of MSC4501 won't render the event
     # at all (not even as a blank bubble), rather than just ignoring a
     # field it doesn't recognize.
@@ -211,6 +247,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         raise ConfigError(f"Missing required top-level config section: {exc}") from exc
 
     internal_base_url = bridge_raw.get("internal_base_url")
+    quote_import_policy = bridge_raw.get("quote_import_policy", "known")
+    if quote_import_policy not in ("always", "known", "never"):
+        raise ConfigError(
+            f"bridge.quote_import_policy must be 'always', 'known', or 'never', got {quote_import_policy!r}"
+        )
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -220,7 +261,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         accept_federated_knocks=bool(bridge_raw.get("accept_federated_knocks", False)),
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
         set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", True)),
-        set_msc4501_repost_of=bool(bridge_raw.get("set_msc4501_repost_of", True)),
+        set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
+        use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
+        quote_import_policy=quote_import_policy,
         use_msc4501_post_event_type=bool(bridge_raw.get("use_msc4501_post_event_type", False)),
     )
 

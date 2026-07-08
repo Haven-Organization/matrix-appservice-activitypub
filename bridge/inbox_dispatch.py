@@ -80,7 +80,9 @@ from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
-    SOCIAL_REPOST_OF_FIELD,
+    SOCIAL_REL_TYPE_REPLY,
+    SOCIAL_REL_TYPE_REPOST,
+    SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
     import_note,
     is_silenced,
@@ -90,8 +92,10 @@ from bridge.note_mirroring import (
     note_is_direct_message,
     note_mentions_local_actor,
     notify_mentioned_locals,
+    resolve_actor_matrix_identity,
     resolve_event_ts,
     resolve_mention_pills,
+    social_relates_to,
     thread_reply_relates_to,
 )
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
@@ -275,12 +279,12 @@ async def _fetch_post_preview(
     compact notification preview (``truncated_text``) plus, separately,
     the event's complete, untouched ``content`` dict (``full_content``)
     for a caller that needs the real thing instead of a text-only
-    preview -- e.g. ``m.social.repost_of.content`` (see
+    preview -- e.g. ``m.social.relates_to.content`` (see
     ``_quoted_post_render``), which MSC4501 wants as a genuine full copy
     of whatever the reposted post's own event content actually was
     (``msgtype``, ``url``, ``info``, and all -- not just its ``body``,
     which is blank for an uncaptioned image/video and would otherwise
-    make ``repost_of`` look broken for exactly the posts a snippet can't
+    make ``relates_to`` look broken for exactly the posts a snippet can't
     represent anyway). Needed because the notification itself is sent
     into a different room entirely (the bot's DM with the post's owner)
     than the one the actual post event lives in, so it can't just be
@@ -646,10 +650,21 @@ async def _handle_undo(request: Request, username: str, activity: Activity) -> N
         # An Undo(Announce) references the Announce activity's own id -- if
         # we mirrored it as a repost message (_handle_announce), reuse the
         # same lookup+redact helper as Delete, since "remove our mirror of
-        # this AP object" is exactly the same operation either way.
-        if await repository.get_federated_event_by_ap_object(inner_id) is not None:
+        # this AP object" is exactly the same operation either way. That
+        # same repost-card record also names the boosted post itself
+        # (boosted_object_id), letting _undo_boost_reaction find and
+        # retract _react_boost's own 🔁 reaction there too.
+        card = await repository.get_federated_event_by_ap_object(inner_id)
+        if card is not None:
+            await _undo_boost_reaction(request, card.boosted_object_id, activity.actor)
             await _redact_for_ap_object(request, inner_id, reason="Undo Announce", actor_id=activity.actor)
             return
+        # No repost card exists at all (the booster isn't someone whose
+        # boosts get mirrored into their own room) -- _react_boost may
+        # still have reacted directly to a tracked boosted post regardless
+        # (see _handle_announce), so fall back to whatever boosted-object
+        # id the Undo's own embedded Announce names, if any.
+        await _undo_boost_reaction(request, _embedded_announce_object_id(activity), activity.actor)
 
     inner = activity.object
     inner_type = inner.get("type") if isinstance(inner, dict) else None
@@ -726,33 +741,80 @@ def _strip_quote_tail_html(safe_html: str, quote_uri: str) -> str:
     immediately-surrounding whitespace/``<br>``/``<span>`` wrapper -- a
     no-op if the markup doesn't actually end in one (this is inherently a
     best-effort heuristic against one observed real-world shape, not a full
-    HTML parse, so a differently-structured fallback just won't match)."""
+    HTML parse, so a differently-structured fallback just won't match). The
+    fallback is usually the tail of the note's own single wrapping ``<p>``
+    (Akkoma appends it inside the same paragraph as the caption), so the
+    match is allowed to land right before a trailing ``</p>`` rather than
+    only at the very end of the string -- otherwise that closing tag alone
+    stops the anchor from ever being recognized as "trailing" and the whole
+    strip silently no-ops."""
     escaped_uri = re.escape(html.escape(quote_uri, quote=True))
     pattern = re.compile(
         rf"(?:<span>)?\s*(?:<br\s*/?>\s*)*(?:RT|QT)?:?\s*"
-        rf'<a[^>]*?href="{escaped_uri}"[^>]*>.*?</a>\s*(?:</span>)?\s*$',
+        rf'<a[^>]*?href="{escaped_uri}"[^>]*>.*?</a>\s*(?:</span>)?\s*(?=(?:</p>)?\s*$)',
         re.IGNORECASE | re.DOTALL,
     )
     return pattern.sub("", safe_html).rstrip()
+
+
+async def _maybe_import_quoted_note(
+    request: Request, quoted_obj: dict, quoted_author_id: str | None
+) -> FederatedEvent | None:
+    """Decides whether ``_quoted_post_render`` should actually mirror an
+    untracked quote-post's target into a Remote User Room (rather than just
+    a read-only preview fetch), per
+    ``bridge.config.BridgeSection.quote_import_policy``:
+    ``"never"`` never imports (the original read-only behavior);
+    ``"known"`` (default) only imports if ``quoted_author_id`` already has a
+    Remote User Room for some other reason (followed, replied to,
+    previously imported, ...) -- so this never provisions a brand-new
+    room/ghost purely because someone quoted a stranger, since a quote is
+    often adversarial ("quote-dunking") rather than genuine engagement;
+    ``"always"`` imports unconditionally, matching how a reply's untracked
+    root is already handled. Returns ``None`` on policy-declined, a missing
+    author, or an import failure -- the caller falls back to its old
+    read-only preview either way."""
+    if quoted_author_id is None:
+        return None
+    policy = request.app.state.config.bridge.quote_import_policy
+    if policy == "never":
+        return None
+    repository = request.app.state.repository
+    if policy == "known" and await repository.get_remote_actor_room(quoted_author_id) is None:
+        return None
+    try:
+        author_doc = await fetch_actor(request.app.state.http_client, quoted_author_id)
+    except RemoteActorFetchError:
+        author_doc = {}
+    imported = await import_note(request, note=quoted_obj, author_actor_id=quoted_author_id, author_doc=author_doc)
+    return imported.federated_event
 
 
 @dataclass
 class QuotedPostRender:
     """Result of ``_quoted_post_render``. ``quoted_ref`` is
     ``(room_id, event_id)`` for the quoted post's own Matrix mirror, if it
-    has one -- used for ``m.social.repost_of``'s required ``room_id``/
+    has one -- used for ``m.social.relates_to``'s required ``room_id``/
     ``event_id`` fields, ``None`` when the quoted post was only ever
     fetched fresh over ActivityPub (so there's no Matrix event to point
-    at, and ``m.social.repost_of`` can't be attached at all -- in that
+    at, and ``m.social.relates_to`` can't be attached at all -- in that
     case ``full_content`` is also ``None``, for the same reason).
     ``full_content`` is the quoted post's own complete, untouched Matrix
     event ``content`` dict -- unlike the other fields here, which are all
     deliberately truncated/condensed for the quote-card rendering,
-    MSC4501 wants a genuine full copy in ``m.social.repost_of.content``,
+    MSC4501 wants a genuine full copy in ``m.social.relates_to.content``,
     not a preview snippet, and specifically the real event content
     (``msgtype``, ``url``, ``info``, etc.) rather than just extracted
     text, since a plain-text-only copy would be blank for an uncaptioned
-    image/video post."""
+    image/video post. ``quoted_sender``/``quoted_displayname`` are the
+    quoted post's own author's mxid/display name (via
+    ``resolve_actor_matrix_identity``) -- ``m.social.relates_to``'s
+    mandatory ``sender``/RECOMMENDED ``displayname`` fields; ``quoted_sender``
+    is ``None`` whenever ``quoted_author_id`` couldn't be resolved to a real
+    mxid at all (an unimported quote target, or one whose author has no
+    ghost/local-actor record for some other reason), same as ``quoted_ref``
+    being ``None`` -- ``m.social.relates_to`` can't be attached without
+    either."""
 
     plain_tail: str
     html_tail: str
@@ -760,6 +822,8 @@ class QuotedPostRender:
     preview_video: dict[str, object] | None
     quoted_ref: tuple[str, str] | None
     full_content: dict[str, object] | None
+    quoted_sender: str | None
+    quoted_displayname: str | None
 
 
 async def _quoted_post_render(
@@ -788,11 +852,23 @@ async def _quoted_post_render(
     real attachment, since that slot's already taken.
 
     Prefers an already-tracked local Matrix copy of the quoted post (real
-    preview text/image, a matrix.to link to it) over a fresh fetch; never
-    provisions a ghost/room for its author just because someone else quoted
-    them, unlike a genuine reply/mention -- this is read-only, best-effort
-    (a network hiccup just means a plainer rendering, never a dropped
-    post)."""
+    preview text/image, a matrix.to link to it) over a fresh fetch. Whether
+    an untracked quote target gets actually imported (rather than just
+    read-only previewed) is gated on
+    ``bridge.config.BridgeSection.quote_import_policy`` -- see that
+    setting's own docstring for why this doesn't default to importing
+    unconditionally the way a reply's untracked root already does (quote
+    reposts are frequently adversarial "quote-dunking", not amplification).
+    Either way this stays best-effort (a network hiccup just means a
+    plainer rendering, never a dropped post).
+
+    Always duplicates the full quoted content into ``relates_to.content``
+    (never ``content_inline`` -- see ``bridge.note_mirroring.
+    social_relates_to``'s own docstring): unlike a pure boost
+    (``_build_repost_message``), a quote-post's outer content is the
+    QUOTER's own caption, not a copy of the quoted post, so
+    ``content_inline``'s "the outer content already IS the referenced
+    post" premise never holds here."""
     repository = request.app.state.repository
     existing = await repository.get_federated_event_by_ap_object(quote_uri)
     preview_text = ""
@@ -813,18 +889,31 @@ async def _quoted_post_render(
         except RemoteActorFetchError:
             quoted_obj = None
         if quoted_obj is not None and quoted_obj.get("type") == "Note":
-            # No local Matrix mirror exists for this quoted post at all
-            # (quoted_ref stays None below), so there's no real event
-            # ``content`` to hand back either -- m.social.repost_of won't
-            # be attached regardless, per its own required room_id/event_id.
-            preview_text, _ = strip_to_matrix_message(quoted_obj.get("content") or "")
-            if len(preview_text) > _PREVIEW_TEXT_LIMIT:
-                preview_text = preview_text[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
             quoted_author_id = _note_author(quoted_obj)
+            imported_event = await _maybe_import_quoted_note(request, quoted_obj, quoted_author_id)
+            if imported_event is not None:
+                preview_text, full_content, preview_image, preview_video = await _fetch_post_preview(
+                    request, imported_event
+                )
+                post_link = matrix_to_link(imported_event.room_id, imported_event.event_id)
+                quoted_ref = (imported_event.room_id, imported_event.event_id)
+            else:
+                # Not imported (policy said no, or the import itself
+                # failed) -- no local mirror exists for this quoted post
+                # (quoted_ref stays None below), so there's no real event
+                # ``content`` to hand back either -- m.social.relates_to
+                # won't be attached regardless, per its own required
+                # room_id/event_id.
+                preview_text, _ = strip_to_matrix_message(quoted_obj.get("content") or "")
+                if len(preview_text) > _PREVIEW_TEXT_LIMIT:
+                    preview_text = preview_text[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
 
     quoter_handle, quoter_html = await actor_html_with_avatar(request, quoter_actor_id)
+    quoted_sender: str | None = None
+    quoted_displayname: str | None = None
     if quoted_author_id:
         quoted_handle, quoted_author_html = await actor_html_with_avatar(request, quoted_author_id)
+        _, quoted_displayname, quoted_sender = await resolve_actor_matrix_identity(request, quoted_author_id)
     else:
         quoted_handle, quoted_author_html = quote_uri, html.escape(quote_uri)
 
@@ -864,6 +953,7 @@ async def _quoted_post_render(
     return QuotedPostRender(
         plain_tail=plain_tail, html_tail=html_tail, preview_image=preview_image, preview_video=preview_video,
         quoted_ref=quoted_ref, full_content=full_content,
+        quoted_sender=quoted_sender, quoted_displayname=quoted_displayname,
     )
 
 
@@ -958,40 +1048,16 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                 # reply into a conversation we already mirror is relevant
                 # because the conversation is.
                 pass
-            elif parent is None:
-                # The chain reached the conversation's true root without
-                # touching anything we track -- historically this whole
-                # branch was skipped and the reply landed as a STANDALONE
-                # post in the replier's own room, silently severed from
-                # its conversation. Instead (user-requested, 2026-07-04):
-                # import the root, creating a ghost + Remote User Room for
-                # its author on demand exactly like the `import` command
-                # does, so the reply has a real thread to land in. If the
-                # import fails, fall through to the old standalone
-                # behavior rather than dropping the reply.
-                root_note = missing_ancestors[0]
-                root_author = _note_author(root_note)
-                if root_author is not None:
-                    try:
-                        root_author_doc = await fetch_actor(request.app.state.http_client, root_author)
-                    except RemoteActorFetchError:
-                        root_author_doc = {}
-                    imported = await import_note(
-                        request, note=root_note, author_actor_id=root_author, author_doc=root_author_doc
-                    )
-                    parent = imported.federated_event
-                    if parent is not None:
-                        imported_root = True
-                        missing_ancestors = missing_ancestors[1:]
+            else:
+                # Either a tracked ancestor was already found, or the chain
+                # reached the conversation's true root untracked --
+                # _backfill_ancestor_chain imports/mirrors whatever's
+                # missing either way (user-requested, 2026-07-04: a reply
+                # into a wholly untracked conversation used to land as a
+                # STANDALONE post, silently severed from it -- see that
+                # helper's own docstring).
+                parent, imported_root = await _backfill_ancestor_chain(request, parent, missing_ancestors)
             if parent is not None:
-                for ancestor_note in missing_ancestors:
-                    ancestor_author = _note_author(ancestor_note)
-                    if ancestor_author is None:
-                        break  # can't attribute it to anyone -- stop backfilling, but still try the real reply below
-                    mirrored = await _mirror_note_as_reply(request, ancestor_note, parent, ancestor_author)
-                    if mirrored is None:
-                        break  # couldn't mirror this ancestor -- attach directly to whichever parent we did reach
-                    parent = mirrored
                 reply_event = await _mirror_note_as_reply(request, obj, parent, activity.actor)
                 if imported_root and reply_event is not None:
                     # The reply's author previously had this post show up in
@@ -1081,16 +1147,20 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         message_content["format"] = "org.matrix.custom.html"
         message_content["formatted_body"] = (safe_html or html.escape(plain)) + quote_html_tail
     if (
-        request.app.state.config.bridge.set_msc4501_repost_of
+        request.app.state.config.bridge.set_msc4501_relates_to
         and quote_render is not None
         and quote_render.quoted_ref is not None
+        and quote_render.quoted_sender is not None
     ):
         quoted_room_id, quoted_event_id = quote_render.quoted_ref
-        message_content[SOCIAL_REPOST_OF_FIELD] = {
-            "event_id": quoted_event_id,
-            "room_id": quoted_room_id,
-            "content": quote_render.full_content,
-        }
+        message_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+            SOCIAL_REL_TYPE_REPOST,
+            event_id=quoted_event_id,
+            room_id=quoted_room_id,
+            sender=quote_render.quoted_sender,
+            displayname=quote_render.quoted_displayname,
+            content=quote_render.full_content,
+        )
     if mentions.mentioned_locals:
         # A pill alone (the <a href="matrix.to/..."> in formatted_body,
         # above) only makes the mention a clickable link -- an intentional
@@ -1146,7 +1216,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
 
 
 async def _resolve_ancestor_chain(
-    request: Request, in_reply_to_id: str, *, max_depth: int = 10
+    request: Request, in_reply_to_id: str, *, max_depth: int = 25
 ) -> tuple[FederatedEvent | None, list[dict]] | None:
     """Walk *up* an AP reply chain starting from ``in_reply_to_id``, fetching
     any ancestor Note we don't already track, until reaching one we do --
@@ -1176,7 +1246,23 @@ async def _resolve_ancestor_chain(
     ``None`` -- the chain is unusable: an inaccessible/deleted/non-Note
     ancestor, or deeper than ``max_depth``. Nothing to thread against and
     nothing importable either.
-    """
+
+    ``max_depth`` only matters on a genuinely cold walk -- once ANYTHING in
+    a conversation is tracked (including a post that itself only fell
+    through to a bare, unthreaded mirror because IT hit this same ceiling
+    first -- see ``_handle_create``'s reply branch), a later reply into the
+    same conversation resolves in one cheap DB lookup regardless of how
+    deep the full chain actually is, since the walk stops there rather
+    than continuing to the true root. Raised from 10 to 25 on 2026-07-08
+    after a real 13-hop multi-actor conversation (no deleted/inaccessible
+    ancestor, just a long thread) exceeded the old ceiling on its first,
+    coldest reply and permanently missed being threaded -- nothing
+    retroactively re-threads a post already mirrored bare once a later
+    reply's own walk backfills the rest of the conversation around it.
+    Each extra hop of headroom costs one more live AP fetch in the worst
+    case (a chain that's actually unusable -- deleted/inaccessible/beyond
+    even this), so this is a tradeoff, not a fix for arbitrarily long
+    conversations; a still-deeper one can still exceed it."""
     repository = request.app.state.repository
     missing: list[dict] = []
     current_id = in_reply_to_id
@@ -1195,6 +1281,66 @@ async def _resolve_ancestor_chain(
             return None, list(reversed(missing))  # untracked root -- importable anchor candidate
         current_id = next_id
     return None  # gave up -- chain deeper than we're willing to fetch
+
+
+async def _backfill_ancestor_chain(
+    request: Request, parent: FederatedEvent | None, missing_ancestors: list[dict]
+) -> tuple[FederatedEvent | None, bool]:
+    """Given one outcome of ``_resolve_ancestor_chain`` -- an already-tracked
+    ``parent`` if the chain reached one, or ``None`` if it reached the
+    conversation's untracked TRUE ROOT instead (with ``missing_ancestors``
+    the previously-unknown notes either way, oldest-first) -- actually
+    mirror whatever's missing and return the ``(parent, imported_root)`` a
+    caller's own reply should thread onto.
+
+    If ``parent`` came in ``None``, imports ``missing_ancestors[0]`` (the
+    root) as a fresh post -- creating a Remote User Room/ghost for its
+    author on demand, exactly like the ``import`` command does for a single
+    post -- unconditionally: no "does anyone follow this account" gate,
+    since a caller only reaches this at all once it's already decided the
+    chain is worth walking (``_handle_create`` checks that itself first;
+    ``bridge.commands``' ``import`` command doesn't need to, since running
+    it IS the relevance signal, same reasoning as that command's own
+    single-post case). Every remaining ancestor is then threaded onto that
+    in turn, each becoming the parent of the next.
+
+    ``imported_root`` is ``True`` only when the untracked-root import above
+    actually ran (vs. an already-tracked ancestor being found) -- used by
+    ``_handle_create`` to decide whether an echo-in-own-room is needed
+    afterward.
+
+    Returns ``(None, False)`` if the root's author can't be determined or
+    the import itself fails outright. If a LATER ancestor can't be
+    attributed to anyone, or fails to mirror, backfilling stops there but
+    whatever ancestor WAS reached is still returned as ``parent`` -- a
+    partial backfill beats none."""
+    imported_root = False
+    if parent is None:
+        root_note = missing_ancestors[0]
+        root_author = _note_author(root_note)
+        if root_author is None:
+            return None, False
+        try:
+            root_author_doc = await fetch_actor(request.app.state.http_client, root_author)
+        except RemoteActorFetchError:
+            root_author_doc = {}
+        imported = await import_note(
+            request, note=root_note, author_actor_id=root_author, author_doc=root_author_doc
+        )
+        parent = imported.federated_event
+        if parent is None:
+            return None, False
+        imported_root = True
+        missing_ancestors = missing_ancestors[1:]
+    for ancestor_note in missing_ancestors:
+        ancestor_author = _note_author(ancestor_note)
+        if ancestor_author is None:
+            break  # can't attribute it to anyone -- stop backfilling, but still thread onto whichever parent we reached
+        mirrored = await _mirror_note_as_reply(request, ancestor_note, parent, ancestor_author)
+        if mirrored is None:
+            break  # couldn't mirror this ancestor -- attach directly to whichever parent we did reach
+        parent = mirrored
+    return parent, imported_root
 
 
 async def _mirror_note_as_reply(
@@ -1331,6 +1477,16 @@ async def _echo_reply_in_own_room(
     the same AP object (the partial-unique index only constrains primary
     rows -- verified live), so a Matrix reaction or reply to the echo
     resolves to the same underlying post as one on the threaded copy.
+
+    Also carries ``m.social.relates_to`` (``rel_type``
+    ``SOCIAL_REL_TYPE_REPLY``, gated on
+    ``bridge.config.BridgeSection.set_msc4501_relates_to`` same as a
+    boost/quote-post's own repost relation) pointing at ``parent`` -- the
+    specific post this reply is actually replying to, matching the "Reply
+    to <author>'s post" header text above -- so an MSC4501-aware client
+    can recognize this echo as a cross-posted reply rather than an
+    ordinary top-level post, without needing to resolve ``thread_link``
+    into the OTHER room this event isn't even in.
     """
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room(author_actor_id)
@@ -1343,6 +1499,32 @@ async def _echo_reply_in_own_room(
     root_event_id = reply_event.thread_root_event_id or parent.event_id
     thread_link = matrix_to_link(reply_event.room_id, root_event_id)
     parent_handle, parent_author_html = await actor_html_with_avatar(request, parent.author_actor_id)
+
+    reply_relates_to: dict | None = None
+    if request.app.state.config.bridge.set_msc4501_relates_to:
+        config = request.app.state.config
+        bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+        _, parent_displayname, parent_sender = await resolve_actor_matrix_identity(
+            request, parent.author_actor_id
+        )
+        if parent_sender is not None:
+            try:
+                parent_event = await request.app.state.synapse.get_event(
+                    parent.room_id, parent.event_id, as_user_id=bot_mxid
+                )
+                reply_relates_to = social_relates_to(
+                    SOCIAL_REL_TYPE_REPLY,
+                    event_id=parent.event_id,
+                    room_id=parent.room_id,
+                    sender=parent_sender,
+                    displayname=parent_displayname,
+                    content=parent_event.get("content") or {},
+                )
+            except SynapseError:
+                logger.info(
+                    "Could not fetch parent event %s in %s for relates_to", parent.event_id, parent.room_id,
+                    exc_info=True,
+                )
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=note)
     plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
@@ -1365,6 +1547,8 @@ async def _echo_reply_in_own_room(
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
     }
+    if reply_relates_to is not None:
+        message_content[SOCIAL_RELATES_TO_FIELD] = reply_relates_to
     source_url = _source_post_url(note)
     if source_url:
         message_content["external_url"] = source_url
@@ -1401,6 +1585,14 @@ async def _echo_reply_in_own_room(
 
 
 _DEFAULT_LIKE_EMOJI = "👍"
+
+# The reaction key _react_boost sends for an inbound Announce, and
+# _redact_boost_reaction looks for on undo -- MSC4501's own boost/repost
+# emoji (see _build_repost_message/_quoted_post_render's identical choice),
+# reused here as a real m.reaction so a repost/boost count can be computed
+# via ordinary reaction-aggregation, per the MSC's "Repost/boost counts"
+# recommendation.
+_BOOST_REACTION_KEY = "\U0001F501"
 
 
 async def _handle_like_or_emoji_react(request: Request, username: str, activity: Activity) -> None:
@@ -1474,6 +1666,51 @@ async def _handle_like_or_emoji_react(request: Request, username: str, activity:
     )
 
 
+async def _react_boost(request: Request, target: FederatedEvent, booster_actor_id: str) -> None:
+    """Mirrors an inbound boost as an ordinary 🔁 ``m.reaction`` on
+    ``target`` (the boosted post's own Matrix mirror) -- MSC4501's
+    RECOMMENDED (not mandatory) "Repost/boost counts" mechanism, letting
+    any client compute a repost/boost count via the same
+    reaction-aggregation it already needs for likes. Reuses the exact same
+    reactor-ghost-provisioning path ``_handle_like_or_emoji_react`` does,
+    including its refusal to fake-react on behalf of a LOCAL actor's own
+    boost (see ``resolve_and_invite_ghost``'s docstring) -- this simply
+    drops the reaction rather than erroring in that case, same as that
+    function.
+
+    Called for EVERY tracked boosted post (see ``_handle_announce``'s own
+    ``boosted_target is not None`` gate: a local user's own post, or any
+    remote post we already mirror), regardless of whether the booster
+    itself is someone we follow/mirror -- unlike the repost card
+    (``_build_repost_message``), which only exists for a followed booster.
+
+    Deliberately NOT recorded via ``ReactionRecord``: undoing it
+    (``_redact_boost_reaction``) crawls ``target``'s own live reactions
+    instead of tracked bookkeeping -- recording this under the Announce's
+    own activity id would collide with ``_handle_undo``'s existing
+    Like/EmojiReact-vs-repost-card lookup chain (whichever matches first
+    wins and returns), silently breaking retraction of the OTHER thing
+    (the repost card itself, for a followed booster)."""
+    resolved = await _resolve_and_invite_ghost(request, booster_actor_id, target.room_id)
+    if resolved is None:
+        return
+    ghost_mxid_, _ = resolved
+    synapse = request.app.state.synapse
+    try:
+        await synapse.join_room(target.room_id, as_user_id=ghost_mxid_)
+        await synapse.send_message_event(
+            target.room_id,
+            {"m.relates_to": {"rel_type": "m.annotation", "event_id": target.event_id, "key": _BOOST_REACTION_KEY}},
+            event_type="m.reaction",
+            as_user_id=ghost_mxid_,
+        )
+    except SynapseError:
+        logger.info(
+            "Could not mirror boost reaction from %s onto %s in %s",
+            booster_actor_id, target.event_id, target.room_id, exc_info=True,
+        )
+
+
 async def _handle_announce(request: Request, username: str, activity: Activity) -> None:
     """A followed account reposted/boosted someone else's post -- mirror it
     into their own Remote User Room as a nicely-formatted repost (not just a
@@ -1482,10 +1719,13 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     original poster usually isn't.
 
     Separately -- and regardless of whether the booster is themselves
-    followed/mirrored at all -- if the boosted post is one we track that
-    lives in a local user's own Profile Room, notify them there. Anyone on
-    the fediverse can boost a public post, not just people the poster
-    follows back, so this check can't be gated on ``remote_room`` existing.
+    followed/mirrored at all -- if the boosted post is one we track (a
+    local user's own post, in their Profile Room, or any remote post we
+    already mirror), notify its owner (local posts only -- see
+    ``_notify_post_owner``) and mirror the boost as a real 🔁 reaction on
+    it (see ``_react_boost``). Anyone on the fediverse can boost a public
+    post, not just people the poster follows back, so neither of those can
+    be gated on ``remote_room`` existing.
     """
     repository = request.app.state.repository
 
@@ -1504,6 +1744,7 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
             request, target=boosted_target, actor_id=activity.actor, actor_doc=booster_actor_doc,
             verb_phrase="boosted your post",
         )
+        await _react_boost(request, boosted_target, activity.actor)
 
     remote_room = await repository.get_remote_actor_room(activity.actor)
     if remote_room is None:
@@ -1645,25 +1886,39 @@ async def _build_repost_message(
     line -- one looks the same as another everywhere in this bridge.
 
     ``imported_ref`` is that same boosted post's own ``(room_id,
-    event_id)``, used (when ``bridge.set_msc4501_repost_of`` is on) to
-    fetch that event's own real ``content`` dict and set
-    ``m.social.repost_of.content`` to it verbatim -- the actual event
-    content (``msgtype``, ``url``, ``info``, etc.), not just extracted
-    text, since a plain-text copy would be blank for an uncaptioned
-    image/video boost. Also, per the MSC's own definition of a boost (as
-    opposed to a quote-post with commentary), replaces the PLAIN ``body``
-    with nothing but ``imported_link`` itself, so a MSC4501-aware client
-    can recognize this as a boost by ``body`` being just a permalink
-    pointing at the same event ``m.social.repost_of`` names.
+    event_id)``, used (when ``bridge.set_msc4501_relates_to`` is on) to set
+    ``m.social.relates_to`` (``rel_type`` ``SOCIAL_REL_TYPE_REPOST``).
+    Since this function's own ``content_html`` below already renders the
+    boosted post's real content (not a truncated preview -- unlike, say,
+    ``send_boost``'s summary card), it qualifies for the MSC's
+    ``content_inline`` shorthand (``bridge.config.BridgeSection.
+    use_msc4501_content_inline``, on by default): asserting the outer
+    event's own content already IS a full copy of the boosted post, rather
+    than fetching and duplicating that same content a second time into
+    ``relates_to.content``. Turning that setting off restores the original
+    behavior instead -- fetching the boosted event's own real ``content``
+    dict (``msgtype``, ``url``, ``info``, etc., not just extracted text,
+    since a plain-text copy would be blank for an uncaptioned image/video
+    boost) and duplicating it into ``relates_to.content`` explicitly.
+    Also, per the MSC's own definition of a boost (as opposed to a
+    quote-post with commentary), replaces the PLAIN ``body`` with nothing
+    but ``imported_link`` itself, so a MSC4501-aware client can recognize
+    this as a boost by ``body`` being just a permalink pointing at the
+    same event ``m.social.relates_to`` names.
     ``formatted_body`` is untouched either way -- that plain ``body``
     swap only matters to a client parsing MSC4501 fields; an
     ordinary client still renders the same rich HTML card as always."""
     _, booster_html = await actor_html_with_avatar(request, remote_room.actor_id)
+    original_sender: str | None = None
+    original_displayname: str | None = None
     if original_author_id:
         original_handle, original_author_html = await actor_html_with_avatar(request, original_author_id)
+        _, original_displayname, original_sender = await resolve_actor_matrix_identity(request, original_author_id)
     else:
         # No real actor id to resolve a pill for at all -- fall back to
-        # whatever the fetched actor document itself offered.
+        # whatever the fetched actor document itself offered. No mxid
+        # exists to attribute a relates_to ``sender`` to either, hence
+        # original_sender staying None -- guarded below.
         original_handle = original_actor_doc.get("name") or original_actor_doc.get("preferredUsername") or "someone"
         original_author_html = html.escape(original_handle)
 
@@ -1689,34 +1944,45 @@ async def _build_repost_message(
     header_html = f"<p>\U0001F501 {booster_html} boosted {original_author_html}'s {post_pill_html}:</p>"
     content_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
 
+    config = request.app.state.config
+    content_inline = config.bridge.use_msc4501_content_inline
     boosted_content: dict[str, object] | None = None
-    if request.app.state.config.bridge.set_msc4501_repost_of and imported_ref is not None:
-        config = request.app.state.config
+    if config.bridge.set_msc4501_relates_to and imported_ref is not None and not content_inline:
+        # Only needed for the relates_to.content duplication path -- when
+        # content_inline is on, the outer content_html above already IS the
+        # boosted post's content, so there's nothing else to fetch.
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
         try:
             boosted_event = await request.app.state.synapse.get_event(*imported_ref, as_user_id=bot_mxid)
             boosted_content = boosted_event.get("content") or {}
         except SynapseError:
-            logger.info("Could not fetch boosted event %s in %s for repost_of", *imported_ref, exc_info=True)
+            logger.info("Could not fetch boosted event %s in %s for relates_to", *imported_ref, exc_info=True)
 
-    use_repost_of = boosted_content is not None and imported_link
+    use_relates_to = (
+        config.bridge.set_msc4501_relates_to
+        and imported_ref is not None
+        and bool(imported_link)
+        and original_sender is not None
+        and (content_inline or boosted_content is not None)
+    )
     message_content = {
         "msgtype": "m.text",
         # Per MSC4501, a boost's plain body MUST be nothing but a matrix.to
         # permalink to the boosted event -- see this function's own
         # docstring. formatted_body (below) keeps the full rich card
         # regardless; only an MSC4501-aware client parses body at all.
-        "body": imported_link if use_repost_of else plain_body,
+        "body": imported_link if use_relates_to else plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
     }
-    if use_repost_of:
+    if use_relates_to:
         quoted_room_id, quoted_event_id = imported_ref
-        message_content[SOCIAL_REPOST_OF_FIELD] = {
-            "event_id": quoted_event_id,
-            "room_id": quoted_room_id,
-            "content": boosted_content,
-        }
+        message_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+            SOCIAL_REL_TYPE_REPOST,
+            event_id=quoted_event_id, room_id=quoted_room_id,
+            sender=original_sender, displayname=original_displayname,
+            content_inline=content_inline, content=None if content_inline else boosted_content,
+        )
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url
@@ -1919,6 +2185,93 @@ async def _redact_reaction(request: Request, reaction: ReactionRecord) -> None:
     except SynapseError:
         logger.warning("Failed to redact reaction %s in %s", reaction.event_id, reaction.room_id, exc_info=True)
     await repository.remove_reaction(reaction.activity_id)
+
+
+async def _redact_boost_reaction(request: Request, target: FederatedEvent, ghost_mxid: str) -> None:
+    """Crawls ``target``'s own reactions for the 🔁 ``ghost_mxid`` previously
+    sent (``_react_boost``) and redacts it, for an inbound ``Undo(Announce)``.
+
+    A live lookup rather than tracked bookkeeping: ``SynapseClient.
+    get_relations`` is a cheap indexed query keyed off ``target`` itself
+    (see its own docstring -- this bridge already relies on it being cheap
+    enough to call on every public post/profile page view), not a room
+    timeline crawl. Recording this reaction via ``ReactionRecord`` instead
+    would collide with ``_handle_undo``'s existing reaction-vs-repost-card
+    lookup chain if both were keyed off the same Announce activity id
+    (whichever matches first wins and returns, silently skipping
+    retraction of the other one) -- see ``_react_boost``'s own docstring.
+
+    Best-effort throughout: a network hiccup here just leaves a stale
+    reaction behind, never a dropped Undo."""
+    synapse = request.app.state.synapse
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        relations = await synapse.get_relations(
+            target.room_id, target.event_id, rel_type="m.annotation", event_type="m.reaction", as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        logger.info(
+            "Could not read reactions on %s in %s to undo a boost", target.event_id, target.room_id, exc_info=True
+        )
+        return
+    for reaction_event in relations:
+        if reaction_event.get("sender") != ghost_mxid:
+            continue
+        key = ((reaction_event.get("content") or {}).get("m.relates_to") or {}).get("key")
+        if key != _BOOST_REACTION_KEY:
+            continue
+        reaction_event_id = reaction_event.get("event_id")
+        if not reaction_event_id:
+            continue
+        try:
+            await synapse.redact_event(
+                target.room_id, reaction_event_id, reason="Undo Announce", as_user_id=ghost_mxid
+            )
+        except SynapseError:
+            logger.info("Failed to redact boost reaction %s in %s", reaction_event_id, target.room_id, exc_info=True)
+
+
+async def _undo_boost_reaction(request: Request, boosted_object_id: str | None, booster_actor_id: str) -> None:
+    """Resolves the boosted post's own Matrix mirror and the booster's own
+    ghost mxid, then hands off to ``_redact_boost_reaction`` -- shared by
+    both ways ``_handle_undo`` can learn ``boosted_object_id`` (a tracked
+    repost card's own ``boosted_object_id``, or ``_embedded_announce_object_id``
+    parsing the Undo's own embedded Announce). No-ops (nothing to undo, or
+    no ghost to attribute/authorize the redaction as) rather than erroring,
+    same as every other best-effort path in this module."""
+    if not boosted_object_id:
+        return
+    repository = request.app.state.repository
+    target = await repository.get_federated_event_by_ap_object(boosted_object_id)
+    if target is None:
+        return
+    _, _, ghost_mxid_ = await resolve_actor_matrix_identity(request, booster_actor_id)
+    if ghost_mxid_ is None:
+        return
+    await _redact_boost_reaction(request, target, ghost_mxid_)
+
+
+def _embedded_announce_object_id(activity: Activity) -> str | None:
+    """The boosted post's own id from an inbound ``Undo(Announce)`` that
+    embeds the full original ``Announce`` (rather than referencing it by
+    bare id alone) -- e.g. Mastodon does this. Only reached when there's no
+    repost-card ``FederatedEvent`` to pull ``boosted_object_id`` from
+    instead (see ``_handle_undo``), i.e. the booster isn't someone whose
+    boosts get mirrored into their own room -- our only other way to learn
+    what was boosted, short of not handling this Undo's reaction cleanup at
+    all. Returns ``None`` (silently skipped by ``_undo_boost_reaction``) if
+    the sender only referenced the Announce by bare id, since there's
+    nothing to parse in that case."""
+    inner = activity.object
+    if not isinstance(inner, dict):
+        return None
+    inner_object = inner.get("object")
+    if isinstance(inner_object, str):
+        return inner_object
+    if isinstance(inner_object, dict):
+        return inner_object.get("id")
+    return None
 
 
 async def _resolve_inbox(request: Request, actor_id: str) -> str:

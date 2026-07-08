@@ -32,7 +32,6 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;import follows`](#import-follows-or-import-following)
 - [`;replace room`](#replace-room)
 - [`;rejoin`](#rejoin-room_id-othermatrixid)
-- [`;boost`](#boost-reply-to-a-mirrored-fediverse-post)
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
 - [`;widget`](#widget)
@@ -44,7 +43,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `boost`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -281,21 +280,11 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ---
 
-## `;boost` (reply to a mirrored fediverse post)
-
-**Syntax:** Sent as a reply to a Matrix message the bridge is tracking as a mirrored post. No other argument.
-
-**What it does:** Sends a signed `Announce` of that post as your own actor, equivalent to reacting with 🔁. Also posts a "you boosted" card into your own Profile Room regardless of where the command was run. Boosting a repost card boosts the original post/author underneath it, not the repost itself. Redacting either the command or the Profile Room card later undoes it.
-
-**Who can run it:** Requires a linked profile; must be a reply to a tracked post.
-
----
-
 ## `;repost <caption>` (reply to a mirrored fediverse post)
 
 **Syntax:** Sent as a reply to a tracked post, with a required, non-empty caption.
 
-**What it does:** Unlike `;boost`, creates a brand-new post of your own with the caption as its text, marked as quoting the original (for receivers that render real quote cards) with a plain link appended for those that don't. Delivered like an ordinary post: to your followers, the original author, and anyone mentioned in the caption. Always rendered into your own Profile Room, never wherever the command was actually run.
+**What it does:** Unlike reacting to a post with 🔁 (which sends a signed `Announce` -- a bare boost/repost with no commentary of your own), this creates a brand-new post of your own with the caption as its text, marked as quoting the original (for receivers that render real quote cards) with a plain link appended for those that don't. Delivered like an ordinary post: to your followers, the original author, and anyone mentioned in the caption. Always rendered into your own Profile Room, never wherever the command was actually run.
 
 **Who can run it:** Requires a linked profile.
 
@@ -329,4 +318,4 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the `hide`/`show` toggle, and a read-only following list.
 
-It deliberately omits `;boost`, `;repost`, and `;rejoin`. None fit a simple button: boost/repost need a specific post to reply to, and rejoin is a rare recovery tool. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.
+It deliberately omits `;repost` and `;rejoin`. Neither fits a simple button: repost needs a specific post to reply to, and rejoin is a rare recovery tool. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.

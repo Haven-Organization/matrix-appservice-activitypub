@@ -215,10 +215,12 @@ from bridge.activitypub.webfinger import (
 from bridge.crypto import generate_keypair
 from bridge.ghosts import ensure_ghost_user, ghost_localpart, ghost_mxid, sanitize_localpart_component
 from bridge.inbox_dispatch import (
+    _backfill_ancestor_chain,
     _fetch_post_preview,
     _handle_create,
     _mirror_note_as_reply,
     _note_author,
+    _resolve_ancestor_chain,
     build_preview_media_content,
 )
 from bridge.matrix_links import matrix_to_link, matrix_to_room_link
@@ -233,6 +235,8 @@ from bridge.note_mirroring import SOCIAL_PROFILE_ROOM_TYPE as _SOCIAL_PROFILE_RO
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
 from bridge.note_mirroring import resolve_old_remote_actor_room as _resolve_old_remote_actor_room
 from bridge.note_mirroring import (
+    SOCIAL_REL_TYPE_REPOST,
+    SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
     build_repost_note_content,
     deliver_to_actor_or_followers,
@@ -241,8 +245,10 @@ from bridge.note_mirroring import (
     notify_mentioned_locals,
     provision_ghost,
     push_profile_update,
+    resolve_actor_matrix_identity,
     resolve_event_ts,
     resolve_mention_pills,
+    social_relates_to,
     thread_reply_relates_to,
     unfollow_remote_actor,
 )
@@ -253,7 +259,6 @@ from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
 from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
 from bridge.note_mirroring import SOCIAL_PROFILE_USER_ID_STATE_TYPE, SOCIAL_PROFILE_USER_ID_POWER_LEVEL
 from bridge.note_mirroring import source_post_url as _source_post_url
-from bridge.reaction_bridge import send_boost
 from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, RemoteActorRoom
 from bridge.room_widget import add_bridge_widget
 from bridge.spaces import add_room_to_space
@@ -709,10 +714,6 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
         (
             f"{_COMMAND_PREFIX}import <url>",
             "Fetch and mirror a single fediverse post by its URL.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}boost",
-            "Reply to a fediverse post with this to boost it (same as reacting with 🔁).",
         ),
         (
             f"{_COMMAND_PREFIX}repost <caption>",
@@ -2533,11 +2534,26 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     """Fetch a single post by its source URL and force-mirror it, regardless
     of whether anyone follows its author -- for pulling in one specific post
     someone links you to, without committing to following the account.
-    Creates/reuses a Remote User Room for the author exactly like ``follow``
-    (minus actually following), invites the sender into it, and never
-    duplicates a post that's already been mirrored by this or any other
-    path (a follow, another import, ...). Replies with a matrix.to link so
-    the sender can jump straight to the resulting event."""
+    Never duplicates a post that's already been mirrored by this or any
+    other path (a follow, another import, ...). Replies with a matrix.to
+    link so the sender can jump straight to the resulting event.
+
+    If the post is a reply, its AP ancestor chain is walked UP to wherever
+    we already track one -- importing/mirroring any untracked ancestor
+    along the way, all the way to the conversation's true root if nothing
+    in between is tracked either (see ``bridge.inbox_dispatch``'s
+    ``_backfill_ancestor_chain``, the same machinery a live inbound reply
+    into an untracked conversation already uses) -- and threads the
+    requested post onto whatever that resolves to, in THAT parent's own
+    room. Deliberately does not walk back DOWN to pull in the rest of that
+    thread -- ``;backfill``, run inside the resulting room, covers that.
+
+    Only when there's no ``inReplyTo`` at all, or the chain can't be
+    resolved (a deleted/inaccessible ancestor, or one deeper than
+    ``_resolve_ancestor_chain`` is willing to fetch), does this fall back
+    to the original behavior: creating/reusing a Remote User Room for the
+    post's own author exactly like ``follow`` does (minus actually
+    following), and inviting the sender into it."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     if not url:
@@ -2609,6 +2625,47 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         )
         return
 
+    # If this is a reply, walk its AP ancestor chain up to wherever we
+    # already track one, importing/mirroring any untracked ancestor along
+    # the way -- all the way up to the conversation's true root if nothing
+    # in between is tracked either (same machinery _handle_create already
+    # uses for a live inbound reply into an untracked conversation; see
+    # _backfill_ancestor_chain's own docstring). Deliberately does NOT walk
+    # back down again to pull in the rest of that thread -- ";backfill"
+    # covers that, given a room in that thread to run it from. If this
+    # resolves to a real parent, the requested post is threaded onto it (in
+    # THAT parent's room, not necessarily a room of its own -- a reply
+    # belongs in the conversation it's part of, same convention as every
+    # other reply this bridge mirrors) instead of getting its own Remote
+    # User Room at all.
+    in_reply_to = obj.get("inReplyTo")
+    parent: FederatedEvent | None = None
+    if in_reply_to:
+        chain = await _resolve_ancestor_chain(request, in_reply_to)
+        if chain is not None:
+            chain_parent, missing_ancestors = chain
+            parent, _imported_root = await _backfill_ancestor_chain(request, chain_parent, missing_ancestors)
+
+    if parent is not None:
+        new_federated_event = await _mirror_note_as_reply(request, obj, parent, author_actor_id)
+        if new_federated_event is None:
+            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
+            return
+        try:
+            await synapse.invite_user(new_federated_event.room_id, sender, as_user_id=bot_mxid)
+        except SynapseError as exc:
+            if exc.errcode != "M_FORBIDDEN":
+                logger.warning("Could not invite %s to %s: %s", sender, new_federated_event.room_id, exc)
+        await _notice(
+            request, room_id,
+            f"Imported: {matrix_to_link(new_federated_event.room_id, new_federated_event.event_id)}",
+        )
+        return
+
+    # Not a reply, or its ancestor chain couldn't be resolved/imported at
+    # all (deleted/inaccessible ancestor, or too deep) -- the original
+    # standalone behavior: mirror into a Remote User Room dedicated to THIS
+    # post's own author, creating one on demand.
     try:
         author_doc = await fetch_actor(http_client, author_actor_id)
     except RemoteActorFetchError as exc:
@@ -2690,74 +2747,62 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             if exc.errcode != "M_FORBIDDEN":
                 logger.warning("Could not invite %s to %s: %s", sender, remote_room.room_id, exc)
 
-    # If this is a reply whose immediate parent is already tracked IN THIS
-    # SAME ROOM, mirror it as a proper threaded reply -- a Matrix thread
-    # relation can only reference an event in the same room, so a parent
-    # tracked elsewhere can't be used regardless (e.g. a reply to someone
-    # else entirely still just imports as a plain top-level post here).
-    in_reply_to = obj.get("inReplyTo")
-    parent = await repository.get_federated_event_by_ap_object(in_reply_to) if in_reply_to else None
-    if parent is not None and parent.room_id == remote_room.room_id:
-        new_federated_event = await _mirror_note_as_reply(request, obj, parent, author_actor_id)
-        if new_federated_event is None:
-            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
-            return
-        event_id = new_federated_event.event_id
-    else:
-        mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
-        plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
-        message_content: dict = {"msgtype": "m.text", "body": plain}
-        if safe_html and safe_html != plain:
-            message_content["format"] = "org.matrix.custom.html"
-            message_content["formatted_body"] = safe_html
-        if mentions.mentioned_locals:
-            # A pill alone (the <a href="matrix.to/..."> above) only makes
-            # the mention a clickable link -- an intentional mention
-            # (MSC3952) is what actually highlights/notifies the tagged
-            # user's client.
-            message_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
-        source_url = _source_post_url(obj)
-        if source_url:
-            message_content["external_url"] = source_url
+    # Plain top-level post (no inReplyTo at all, or the reply-chain handling
+    # above couldn't resolve/import a parent to thread onto).
+    mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
+    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    message_content: dict = {"msgtype": "m.text", "body": plain}
+    if safe_html and safe_html != plain:
+        message_content["format"] = "org.matrix.custom.html"
+        message_content["formatted_body"] = safe_html
+    if mentions.mentioned_locals:
+        # A pill alone (the <a href="matrix.to/..."> above) only makes
+        # the mention a clickable link -- an intentional mention
+        # (MSC3952) is what actually highlights/notifies the tagged
+        # user's client.
+        message_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
+    source_url = _source_post_url(obj)
+    if source_url:
+        message_content["external_url"] = source_url
 
-        # Only the first attachment (if any) is embedded as real Matrix
-        # media -- see attach_media_to_content's docstring for why the rest
-        # are appended as plain links: an ActivityPub post always maps to
-        # exactly one Matrix event.
-        attachments = extract_attachments(obj)
-        message_content, _ = await _attach_media_to_content(request, message_content, attachments)
+    # Only the first attachment (if any) is embedded as real Matrix
+    # media -- see attach_media_to_content's docstring for why the rest
+    # are appended as plain links: an ActivityPub post always maps to
+    # exactly one Matrix event.
+    attachments = extract_attachments(obj)
+    message_content, _ = await _attach_media_to_content(request, message_content, attachments)
 
-        federation_config = request.app.state.config.federation
-        try:
-            event_id = await synapse.send_message_event(
-                remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
-                ts=resolve_event_ts(
-                    obj, max_clock_skew=federation_config.max_clock_skew,
-                    max_backdate_days=federation_config.max_backdate_days,
-                ),
-            )
-        except SynapseError:
-            logger.warning("Failed to import post from %s", author_actor_id, exc_info=True)
-            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
-            return
-
-        if ap_object_id:
-            await repository.record_federated_event(
-                FederatedEvent(
-                    event_id=event_id,
-                    room_id=remote_room.room_id,
-                    ap_object_id=ap_object_id,
-                    author_actor_id=author_actor_id,
-                )
-            )
-
-        await notify_mentioned_locals(
-            request,
-            mentioned=mentions.mentioned_locals,
-            room_id=remote_room.room_id,
-            event_id=event_id,
-            author_actor_id=author_actor_id,
+    federation_config = request.app.state.config.federation
+    try:
+        event_id = await synapse.send_message_event(
+            remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
+            ts=resolve_event_ts(
+                obj, max_clock_skew=federation_config.max_clock_skew,
+                max_backdate_days=federation_config.max_backdate_days,
+            ),
         )
+    except SynapseError:
+        logger.warning("Failed to import post from %s", author_actor_id, exc_info=True)
+        await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
+        return
+
+    if ap_object_id:
+        await repository.record_federated_event(
+            FederatedEvent(
+                event_id=event_id,
+                room_id=remote_room.room_id,
+                ap_object_id=ap_object_id,
+                author_actor_id=author_actor_id,
+            )
+        )
+
+    await notify_mentioned_locals(
+        request,
+        mentioned=mentions.mentioned_locals,
+        room_id=remote_room.room_id,
+        event_id=event_id,
+        author_actor_id=author_actor_id,
+    )
 
     await _notice(request, room_id, f"Imported: {matrix_to_link(remote_room.room_id, event_id)}")
 
@@ -2777,59 +2822,26 @@ def _reply_target_event_id(content: dict) -> str | None:
 
 
 async def _handle_boost(request: Request, *, sender: str, room_id: str, content: dict, event_id: str | None) -> None:
-    """Boost (``Announce``) the fediverse post ``;boost`` was sent as a reply
-    to -- the command counterpart of reacting to it with 🔁 (see
-    ``bridge.reaction_bridge.send_boost``, shared by both).
-
-    Recorded (like the emoji-reaction path) as a ``ReactionRecord`` keyed to
-    THIS command message's own ``event_id`` -- redacting it later works the
-    same as removing the reaction would, since ``maybe_federate_reaction_removal``
-    undoes any tracked reaction purely by matrix event id.
-
-    Every notice this sends (including the usage/error ones) replies to
-    the command message itself, in the same thread if it was sent as a
-    thread reply (see ``_command_reply_relates_to``) -- otherwise it'd land
-    as a bare, seemingly-unrelated message outside whatever thread the
-    command was actually run in."""
-    repository = request.app.state.repository
+    """Retired 2026-07-08: ``;boost`` used to send a signed ``Announce`` of
+    whatever fediverse post it was sent as a reply to, equivalent to
+    reacting with 🔁 (see ``bridge.reaction_bridge.send_boost``, still the
+    live path for the emoji reaction). Kept around as a hidden fallback --
+    deliberately dropped from ``_handle_help`` and ``COMMANDS.md`` -- purely
+    so a new user's muscle memory or a stuck-and-guessing reply doesn't hit
+    "unknown command" instead of a pointer to the real way to do it. Every
+    other Matrix client capable of running this bridge at all can also react
+    with an emoji at this point, making the command genuinely redundant, not
+    just less convenient. A reaction-triggered boost also has a real Matrix
+    user actually sending it, which a bot-issued command reply never could
+    (nothing else in this bridge sends anything AS a real local user, only
+    ever as the bot) -- one more reason to just point people at the
+    reaction instead of trying to preserve feature parity here."""
     relates_to = _command_reply_relates_to(content, event_id)
-
-    target_event_id = _reply_target_event_id(content)
-    if not target_event_id:
-        await _notice(
-            request, room_id, f'Reply to a fediverse post with "{_COMMAND_PREFIX}boost" (or tag me) to boost it.',
-            relates_to=relates_to,
-        )
-        return
-
-    parent = await repository.get_federated_event_by_matrix_event(target_event_id)
-    if parent is None:
-        await _notice(
-            request, room_id, "That message isn't a fediverse post I'm tracking, so there's nothing to boost.",
-            relates_to=relates_to,
-        )
-        return
-
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
-    if actor_record is None:
-        await _notice(
-            request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".', relates_to=relates_to,
-        )
-        return
-
-    await send_boost(
-        request,
-        actor_record=actor_record,
-        parent=parent,
-        matrix_event_id=event_id,
-        room_id=room_id,
-        reactor_matrix_user_id=sender,
+    await _notice(
+        request, room_id,
+        f'"{_COMMAND_PREFIX}boost" isn\'t needed -- react to a fediverse post with 🔁 to boost it.',
+        relates_to=relates_to,
     )
-    # send_boost already posts the real "X boosted Y's post" record into the
-    # booster's own Profile Room -- this is just an ack for wherever the
-    # command itself was run, when that's somewhere else.
-    if room_id != actor_record.room_id:
-        await _notice(request, room_id, "Boosted.", relates_to=relates_to)
 
 
 async def _handle_repost(
@@ -2956,7 +2968,9 @@ async def _handle_repost(
     # the original post. Falls back to `parent` in the (shouldn't-happen)
     # case that lookup somehow misses.
     preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
-    preview_text, preview_image, preview_video = await _fetch_post_preview(request, preview_target)
+    preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+        request, preview_target
+    )
     post_link = matrix_to_link(preview_target.room_id, preview_target.event_id)
 
     # preview_text alongside preview media means the post had BOTH media
@@ -2967,6 +2981,9 @@ async def _handle_repost(
 
     _, reposter_html = await actor_html_with_avatar(request, own_actor_id)
     original_handle, original_author_html = await actor_html_with_avatar(request, target_author_actor_id)
+    _, original_displayname, original_sender = await resolve_actor_matrix_identity(
+        request, target_author_actor_id
+    )
 
     plain_body = f"\U0001F501 reposted {original_handle}'s post:"
     if preview_text:
@@ -2983,6 +3000,12 @@ async def _handle_repost(
         plain_body=plain_body, formatted_caption=formatted_caption,
         preview_image=preview_image, preview_video=preview_video,
     )
+    if config.bridge.set_msc4501_relates_to and preview_full_content and original_sender is not None:
+        echo_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+            SOCIAL_REL_TYPE_REPOST,
+            event_id=preview_target.event_id, room_id=preview_target.room_id,
+            sender=original_sender, displayname=original_displayname, content=preview_full_content,
+        )
     # Always lands in the reposter's OWN Profile Room -- never wherever the
     # command happened to be run from (e.g. a reply inside the ORIGINAL
     # author's Remote User Room, replying to their own mirrored post there),

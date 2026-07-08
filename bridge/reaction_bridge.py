@@ -52,7 +52,14 @@ from bridge.activitypub.models import AS_PUBLIC, Activity
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
-from bridge.note_mirroring import actor_html_with_avatar, deliver_to_actor_or_followers
+from bridge.note_mirroring import (
+    SOCIAL_REL_TYPE_REPOST,
+    SOCIAL_RELATES_TO_FIELD,
+    actor_html_with_avatar,
+    deliver_to_actor_or_followers,
+    resolve_actor_matrix_identity,
+    social_relates_to,
+)
 from bridge.repository import ActorRecord, FederatedEvent, ReactionRecord
 from bridge.synapse_client import SynapseError
 
@@ -197,7 +204,9 @@ async def send_boost(
     notice_event_id: str | None = None
     if actor_record.room_id:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
-        preview_text, preview_image, preview_video = await _fetch_post_preview(request, preview_target)
+        preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+            request, preview_target
+        )
         post_link = matrix_to_link(preview_target.room_id, preview_target.event_id)
 
         # preview_text alongside preview media means the post had BOTH
@@ -210,6 +219,9 @@ async def send_boost(
 
         _, booster_html = await actor_html_with_avatar(request, own_actor_id)
         original_handle, original_author_html = await actor_html_with_avatar(request, target_author_actor_id)
+        _, original_displayname, original_sender = await resolve_actor_matrix_identity(
+            request, target_author_actor_id
+        )
 
         plain_body = f"\U0001F501 boosted {original_handle}'s post:"
         if preview_text:
@@ -220,15 +232,33 @@ async def send_boost(
         formatted_caption = (
             f"<p>\U0001F501 {booster_html} boosted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
         )
+        use_relates_to = (
+            config.bridge.set_msc4501_relates_to and bool(preview_full_content) and original_sender is not None
+        )
+        notice_content = build_preview_media_content(
+            # Per MSC4501, a boost (this is always one -- send_boost never
+            # carries reposting-user commentary, unlike
+            # bridge.commands._handle_repost's quote-post) has a plain
+            # ``body`` that's nothing but a permalink to the boosted event,
+            # so a compliant client's boost-vs-quote-post detection doesn't
+            # mistake this notice's own auto-generated attribution text for
+            # genuine commentary -- same convention as
+            # bridge.inbox_dispatch._build_repost_message's mirrored-boost
+            # card. ``formatted_caption`` (the rich card) is unaffected.
+            plain_body=post_link if use_relates_to else plain_body,
+            formatted_caption=formatted_caption,
+            preview_image=preview_image, preview_video=preview_video,
+        )
+        if use_relates_to:
+            notice_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+                SOCIAL_REL_TYPE_REPOST,
+                event_id=preview_target.event_id, room_id=preview_target.room_id,
+                sender=original_sender, displayname=original_displayname, content=preview_full_content,
+            )
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
         try:
             notice_event_id = await request.app.state.synapse.send_message_event(
-                actor_record.room_id,
-                build_preview_media_content(
-                    plain_body=plain_body, formatted_caption=formatted_caption,
-                    preview_image=preview_image, preview_video=preview_video,
-                ),
-                as_user_id=bot_mxid,
+                actor_record.room_id, notice_content, as_user_id=bot_mxid,
             )
         except SynapseError:
             logger.warning("Failed to post boost notice in %s", actor_record.room_id, exc_info=True)

@@ -18,9 +18,11 @@ import cycle.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -117,17 +119,88 @@ SOCIAL_PROFILE_USER_ID_STATE_TYPE = "org.matrix.msc4501.social.profile_user_id"
 # in this file.
 SOCIAL_PROFILE_USER_ID_POWER_LEVEL = 100
 
-# Marks a mirrored boost/quote-post's content as reposting another event --
-# see bridge.inbox_dispatch's _handle_announce/_handle_create, and
-# bridge.config.BridgeSection.set_msc4501_repost_of (the toggle for
-# whether this gets set at all; on by default). Shape: {"event_id": ...,
-# "room_id": ..., "content": {<the reposted event's own full, untouched
-# Matrix content dict>}} -- the real event content (msgtype, url, info,
-# etc.), not just its extracted text, since a plain-text-only copy would
-# be blank for an uncaptioned image/video repost. Purely additive content
-# on an ordinary m.room.message event -- unlike SOCIAL_POST_EVENT_TYPE
-# below, a client with no idea what this is just ignores it.
-SOCIAL_REPOST_OF_FIELD = "org.matrix.msc4501.social.repost_of"
+# Marks a mirrored event's content as relating to another event via some
+# social-media-shaped relation -- MSC4501's own replacement for the earlier,
+# repost-only ``social.repost_of`` field, generalized (same "rel_type"
+# discriminator convention as Matrix's own ``m.relates_to``) to also cover
+# SOCIAL_REL_TYPE_REPLY below. See bridge.inbox_dispatch's
+# _handle_announce/_handle_create/_echo_reply_in_own_room, and
+# bridge.config.BridgeSection.set_msc4501_relates_to (the toggle for
+# whether this gets set at all; on by default). Shape per the MSC's own
+# "Cross-room post references" section: {"rel_type": ..., "event_id": ...,
+# "room_id": ..., "sender": "<referenced post's author's mxid>",
+# "displayname": ... (optional), "content": {<the related event's own
+# full, untouched Matrix content dict>}} -- the real event content
+# (msgtype, url, info, etc.), not just its extracted text, since a
+# plain-text-only copy would be blank for an uncaptioned image/video
+# repost. ``sender`` is MANDATORY per the MSC (a viewer may not share a
+# room with the referenced post's author at all, so there's no other way
+# to attribute it) -- every call site skips setting this field entirely
+# if the referenced author's mxid can't be resolved (see
+# resolve_actor_matrix_identity), same as it already does when there's no
+# local Matrix mirror to reference at all. Purely additive content on an
+# ordinary m.room.message event -- unlike SOCIAL_POST_EVENT_TYPE below, a
+# client with no idea what this is just ignores it.
+SOCIAL_RELATES_TO_FIELD = "org.matrix.msc4501.social.relates_to"
+
+# SOCIAL_RELATES_TO_FIELD's "rel_type" for a boost (Announce) or quote-post:
+# the related event is the thing being reposted.
+SOCIAL_REL_TYPE_REPOST = "org.matrix.msc4501.social.repost"
+
+# SOCIAL_RELATES_TO_FIELD's "rel_type" for a followed account's reply
+# echoed into their OWN Remote User Room (see _echo_reply_in_own_room) --
+# the related event is the post being replied to. Distinct from the real
+# Matrix thread relation (``rel_type: "m.thread"``, see
+# thread_reply_relates_to below) that the CANONICAL threaded copy of the
+# same reply carries in the conversation's own room: this one lives on a
+# second, non-primary copy in a different room entirely, which isn't
+# itself part of that Matrix thread.
+SOCIAL_REL_TYPE_REPLY = "org.matrix.msc4501.social.reply"
+
+
+def social_relates_to(
+    rel_type: str,
+    *,
+    event_id: str,
+    room_id: str,
+    sender: str,
+    content: dict | None = None,
+    content_inline: bool = False,
+    displayname: str | None = None,
+) -> dict:
+    """Builds a ``SOCIAL_RELATES_TO_FIELD`` value -- shared by every mirrored
+    event that relates to another one this way (a repost/boost, a quote-post,
+    or a cross-posted reply's echo). ``sender`` (the referenced post's own
+    author's mxid) is mandatory per the MSC; callers are responsible for not
+    calling this at all when it can't be resolved (see
+    ``resolve_actor_matrix_identity``) -- there's no meaningful placeholder
+    for a required field. ``displayname`` is the MSC's RECOMMENDED (not
+    mandatory) snapshot of the referenced author's display name, included
+    when the caller already has one on hand.
+
+    ``content_inline`` and ``content`` are mutually exclusive:
+    ``content_inline=True`` takes precedence and omits ``content`` entirely,
+    asserting the caller's own outer event ``content`` already IS a full
+    copy of the referenced post rather than duplicating it a second time
+    inside this block. Per the MSC's own text, this is ONLY valid for a
+    genuine repost/boost with no reposting-user commentary of its own
+    (``SOCIAL_REL_TYPE_REPOST``'s pure-boost case -- see
+    ``bridge.inbox_dispatch._build_repost_message``'s own docstring, the
+    only caller that passes it) -- never a quote-post (whose outer content
+    is the quoter's own caption, not a copy of the quoted post) and never
+    ``SOCIAL_REL_TYPE_REPLY`` (whose outer content is always the replier's
+    own text). A compliant reader has no way to separate genuine
+    commentary from duplicated original text once ``content_inline`` is
+    set, so callers with any commentary of their own MUST use ``content``
+    instead."""
+    value = {"rel_type": rel_type, "event_id": event_id, "room_id": room_id, "sender": sender}
+    if displayname:
+        value["displayname"] = displayname
+    if content_inline:
+        value["content_inline"] = True
+    elif content is not None:
+        value["content"] = content
+    return value
 
 # The event TYPE (not a content field) MSC4501 proposes in place of
 # m.room.message for a "real" social-media-style post -- see
@@ -327,6 +400,44 @@ def split_repost_caption(echo_body: str) -> str:
     return echo_body.split(REPOST_CAPTION_MARKER, 1)[0]
 
 
+async def resolve_actor_matrix_identity(request: Request, actor_id: str) -> tuple[str, str, str | None]:
+    """``(handle, display_name, mxid_or_None)`` for ``actor_id`` -- the
+    shared lookup ``actor_html_with_avatar`` builds its pill from, factored
+    out so a caller that needs the raw mxid/display_name themselves (rather
+    than an HTML snippet) doesn't have to re-derive this same
+    local-actor-vs-ghost-profile-vs-unknown-remote resolution by hand. Used
+    by ``bridge.inbox_dispatch``/``bridge.commands``/``bridge.reaction_bridge``
+    to populate ``m.social.relates_to``'s mandatory ``sender`` (and
+    RECOMMENDED ``displayname``) fields per MSC4501 -- see
+    ``SOCIAL_RELATES_TO_FIELD``'s own docstring."""
+    config = request.app.state.config
+    repository = request.app.state.repository
+    base = config.bridge.public_base_url
+
+    username = username_from_actor_url(base, actor_id)
+    display_name: str
+    handle: str
+    mxid: str | None
+    if username is not None:
+        local_actor = await repository.get_local_actor(username)
+        if local_actor is None:
+            return actor_id, actor_id, None
+        handle = f"@{username}@{config.bridge.domain}"
+        display_name = local_actor.display_name or username
+        mxid = local_actor.matrix_user_id
+    else:
+        profile = await repository.get_ghost_profile(actor_id)
+        if profile is None:
+            domain = urlsplit(actor_id).hostname or ""
+            localpart = actor_id.rstrip("/").rsplit("/", 1)[-1]
+            handle = f"@{localpart}@{domain}" if domain else localpart
+            return handle, handle, None
+        handle = profile.handle or actor_id
+        display_name = profile.display_name or handle
+        mxid = profile.mxid
+    return handle, display_name, mxid
+
+
 async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, str]:
     """``(plain_handle, html_snippet)`` for ``actor_id`` -- a Matrix pill if
     there's a real mxid for them (a ghost, or a local actor's own account),
@@ -355,33 +466,7 @@ async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, 
     regardless of whether X and Y are local, remote, or which side of the
     bridge made the repost.
     """
-    config = request.app.state.config
-    repository = request.app.state.repository
-    base = config.bridge.public_base_url
-
-    username = username_from_actor_url(base, actor_id)
-    display_name: str
-    handle: str
-    mxid: str | None
-    if username is not None:
-        local_actor = await repository.get_local_actor(username)
-        if local_actor is None:
-            escaped = html.escape(actor_id)
-            return actor_id, f"<strong>{escaped}</strong>"
-        handle = f"@{username}@{config.bridge.domain}"
-        display_name = local_actor.display_name or username
-        mxid = local_actor.matrix_user_id
-    else:
-        profile = await repository.get_ghost_profile(actor_id)
-        if profile is None:
-            domain = urlsplit(actor_id).hostname or ""
-            localpart = actor_id.rstrip("/").rsplit("/", 1)[-1]
-            handle = f"@{localpart}@{domain}" if domain else localpart
-            return handle, f"<strong>{html.escape(handle)}</strong>"
-        handle = profile.handle or actor_id
-        display_name = profile.display_name or handle
-        mxid = profile.mxid
-
+    handle, display_name, mxid = await resolve_actor_matrix_identity(request, actor_id)
     if mxid:
         pill_href = html.escape(f"https://matrix.to/#/{mxid}", quote=True)
         name_html = f'<a href="{pill_href}">{html.escape(display_name)}</a>'
@@ -1681,6 +1766,37 @@ class ImportedNote:
     author_avatar_mxc: str | None = None
 
 
+# Per-``ap_object_id`` locks so two concurrent ``import_note`` calls for the
+# SAME post (observed live 2026-07-08: a followed account's own post arriving
+# as its own top-level Create at the same time someone else's quote-post of
+# it triggers _maybe_import_quoted_note to import that exact same post as
+# the quote target) don't both pass the "not tracked yet" check before
+# either has recorded it, each upload their own copy of any attachment, and
+# both send a duplicate Matrix event. Self-cleaning (refcounted, popped once
+# nothing's waiting on a given id) rather than left to grow forever -- entries
+# only live as long as an import for that specific post is actually in
+# flight. Only closes the race within this one process; record_federated_event
+# still has a real partial-unique DB index as a backstop (see import_note's
+# own handling of a lost race there) for the case this doesn't cover, e.g. a
+# future multi-process deployment sharing one Postgres database.
+_import_locks: dict[str, asyncio.Lock] = {}
+_import_lock_waiters: dict[str, int] = {}
+
+
+@asynccontextmanager
+async def _import_lock(ap_object_id: str):
+    _import_lock_waiters[ap_object_id] = _import_lock_waiters.get(ap_object_id, 0) + 1
+    lock = _import_locks.setdefault(ap_object_id, asyncio.Lock())
+    try:
+        async with lock:
+            yield
+    finally:
+        _import_lock_waiters[ap_object_id] -= 1
+        if _import_lock_waiters[ap_object_id] <= 0:
+            _import_lock_waiters.pop(ap_object_id, None)
+            _import_locks.pop(ap_object_id, None)
+
+
 async def import_note(
     request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
 ) -> ImportedNote:
@@ -1695,13 +1811,39 @@ async def import_note(
     Matrix failed outright.
 
     Shared by ``bridge.commands``'s ``import`` command and
-    ``bridge.inbox_dispatch``'s ``Announce`` handling (automatically
-    importing whatever a followed account boosts/reposts). Doesn't handle
-    reply-threading the way ``import`` does for its own case -- a caller
-    that cares should check for a trackable parent first and only fall back
-    to this for the plain-top-level-post case, same as ``import`` itself
-    does.
-    """
+    ``bridge.inbox_dispatch``'s ``Announce``/quote-post handling
+    (automatically importing whatever a followed account boosts/reposts, or
+    whatever an inbound quote-post's own target turns out to be). Doesn't
+    handle reply-threading the way ``import`` does for its own case -- a
+    caller that cares should check for a trackable parent first and only
+    fall back to this for the plain-top-level-post case, same as ``import``
+    itself does.
+
+    Serializes concurrent calls for the SAME ``note`` (see ``_import_lock``)
+    -- two different inbound deliveries can legitimately both want to
+    import the exact same post at the same time (e.g. it arrives as its
+    own top-level ``Create`` right as someone else's quote-post of it is
+    ALSO independently resolving it as their quote target), and without
+    this, both would pass the "not tracked yet" check before either
+    finishes, each upload their own copy of any attachment, and both send
+    a duplicate Matrix event for the same post -- confirmed live 2026-07-08."""
+    ap_object_id = note.get("id")
+    if not ap_object_id:
+        # Nothing to key a lock (or future dedup lookups) on regardless.
+        return await _import_note_locked(
+            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+        )
+    async with _import_lock(ap_object_id):
+        return await _import_note_locked(
+            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+        )
+
+
+async def _import_note_locked(
+    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+) -> ImportedNote:
+    """``import_note``'s actual body, run while holding that post's own
+    ``_import_lock`` -- see ``import_note``'s own docstring for why."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
@@ -1856,7 +1998,36 @@ async def import_note(
         new_event = FederatedEvent(
             event_id=event_id, room_id=remote_room.room_id, ap_object_id=ap_object_id, author_actor_id=author_actor_id,
         )
-        await repository.record_federated_event(new_event)
+        try:
+            await repository.record_federated_event(new_event)
+        except Exception:
+            # Lost a race _import_lock (see import_note's own docstring)
+            # didn't catch -- e.g. a future multi-process deployment
+            # sharing one Postgres database, where the real partial-unique
+            # index on ap_object_id is the actual backstop. event_id above
+            # has already been sent as a genuine duplicate of whatever won
+            # that race; redact it and hand back the winner's own record
+            # instead of leaving two live copies of the same post around.
+            existing = await repository.get_federated_event_by_ap_object(ap_object_id)
+            if existing is None:
+                # Not actually a duplicate -- some other failure recording
+                # this (a transient DB hiccup, say). The Matrix event
+                # itself is real and otherwise fine; leave it unrecorded
+                # rather than redact a message that isn't a duplicate of
+                # anything.
+                logger.warning("Failed to record federated event for %s", ap_object_id, exc_info=True)
+            else:
+                try:
+                    await synapse.redact_event(
+                        remote_room.room_id, event_id, reason="Duplicate import",
+                        as_user_id=remote_room.ghost_user_id,
+                    )
+                except SynapseError:
+                    logger.warning(
+                        "Lost an import race for %s but could not redact the duplicate %s",
+                        ap_object_id, event_id, exc_info=True,
+                    )
+                new_event = existing
 
     await notify_mentioned_locals(
         request,

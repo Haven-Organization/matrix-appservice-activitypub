@@ -6,54 +6,62 @@
 bridge:
   # Public domain used to mint ActivityPub actor IDs, e.g. https://<domain>/actor/<user>
   domain: bridge.example.org
+
   # Base URL this bridge is publicly reachable at (may sit behind a reverse proxy
   # doing TLS termination, in which case this differs from listen_host/listen_port).
   public_base_url: https://bridge.example.org
+
   # Host/port the bridge's own HTTP server binds to.
   listen_host: 127.0.0.1
   listen_port: 8090
-  # Address Synapse should push AppService transactions (room events) to.
-  # Defaults to http://{listen_host}:{listen_port} -- i.e. directly, bypassing
-  # the public internet/reverse proxy, since Synapse and the bridge normally
-  # run on the same host. Only set this if they're on different hosts and
-  # need an explicit reachable address instead.
+
+  # Address Synapse should push AppService transactions to. Defaults to
+  # http://{listen_host}:{listen_port}; only set this if Synapse and the
+  # bridge are on different hosts.
   # internal_base_url: http://127.0.0.1:8090
-  # Whether Matrix users from OTHER homeservers who knock on a remote
-  # account's mirrored room get auto-accepted like local users do. Off by
-  # default: mirrored posts are public fediverse content, but who gets
-  # auto-admitted into this server's rooms is this server's call. Someone
-  # already in the room can always invite a federated user manually.
+
+  # Auto-accept knocks from OTHER homeservers' users the same as local ones.
+  # Off by default -- who gets auto-admitted into this server's rooms is
+  # this server's call; anyone already in a room can still invite one manually.
   # accept_federated_knocks: false
-  # Default number of posts ";backfill" pulls from a remote actor's outbox
-  # (or, run in a Matrix thread mirroring an AP conversation, from that
-  # post's own replies) when no explicit count is given. A Matrix server
-  # admin can override this per-use with an explicit argument; anyone else
-  # always gets this default.
+
+  # Default post count for ";backfill" with no explicit argument. A Matrix
+  # server admin can override this per-use; everyone else always gets this default.
   # backfill_default_count: 15
-  # Whether to set org.matrix.msc4501.social.profile_room_id (MSC4133
-  # Extensible Profiles) on every ghost (a Remote User Room mirroring a
-  # fediverse account), pointing at that room. Never set on local users'
-  # own profiles either way, only ghosts. On by default; turn off if your
-  # homeserver doesn't support MSC4133 (e.g. Dendrite, or the original
-  # archived Conduit), since every attempt there is a guaranteed-failing
-  # request otherwise. Harmless either way (best-effort, logged and
-  # swallowed on failure), just pure waste if you know it'll never work.
+
+  # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
+  # Profiles) on every ghost, pointing at its Remote User Room. On by
+  # default; turn off if your homeserver doesn't support MSC4133 (e.g.
+  # Dendrite, archived Conduit) -- harmless either way, just pure waste.
   # set_msc4501_profile_room_id: true
-  # Whether to set org.matrix.msc4501.social.repost_of on every mirrored
-  # boost and quote-post from the fediverse. On by default -- this is
-  # purely additive content on an ordinary m.room.message event, so a
-  # client with no idea what MSC4501 is just ignores the extra field and
-  # renders the message exactly as it always has.
-  # set_msc4501_repost_of: true
-  # Whether to mirror a remote fediverse account's posts (their own posts,
-  # replies, and boosts) using org.matrix.msc4501.social.post as the
-  # event TYPE, instead of the ordinary m.room.message every client
-  # already understands. Off by default. NOT RECOMMENDED to turn on until
-  # Phase 2 of MSC4501's own message-interoperability rollout plan --
-  # unlike set_msc4501_repost_of above, this changes the event's actual
-  # type, so a client that has never heard of MSC4501 won't render the
-  # event at all, not even as a blank bubble, rather than just ignoring a
-  # field it doesn't recognize.
+
+  # Set org.matrix.msc4501.social.relates_to on every mirrored boost,
+  # quote-post, and cross-posted reply echo. On by default -- purely
+  # additive content a non-MSC4501 client just ignores.
+  # set_msc4501_relates_to: true
+
+  # For a mirrored boost, assert content_inline (the event's own content
+  # already IS the boosted post's content) instead of duplicating that
+  # content a second time into relates_to.content. On by default. Turn off
+  # to restore the old duplicate-into-relates_to.content behavior, e.g. if
+  # a client you care about doesn't handle content_inline yet.
+  # use_msc4501_content_inline: true
+
+  # Whether an untracked quote-post's TARGET gets imported into its own
+  # Remote User Room (needed for relates_to to populate on it at all).
+  # Quotes are frequently adversarial ("quote-dunking"), unlike a reply's
+  # root, so this doesn't default to importing unconditionally:
+  #   known  (default) - only if the quoted author already has a Remote
+  #                       User Room for some other reason
+  #   always            - import unconditionally
+  #   never             - read-only preview only, relates_to stays unset
+  # quote_import_policy: known
+
+  # Mirror a remote account's posts using org.matrix.msc4501.social.post as
+  # the event TYPE instead of m.room.message. Off by default, and NOT
+  # RECOMMENDED until Phase 2 of MSC4501's rollout plan -- unlike the
+  # relates_to/content_inline options above, this changes the event's
+  # actual type, so a non-MSC4501 client won't render it at all.
   # use_msc4501_post_event_type: false
 
 synapse:
