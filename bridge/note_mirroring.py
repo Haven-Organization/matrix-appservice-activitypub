@@ -204,17 +204,21 @@ def social_relates_to(
 
 # Set (bool, always ``True`` when present) on a mirrored event whose body/
 # formatted_body starts with a bridge-generated attribution line -- "🔁 X
-# boosted Y's post:" (_build_repost_message), "⤵️ Reply to X's post:"
-# (_echo_reply_in_own_room), or send_boost's own reaction-triggered notice
-# -- ahead of the actual mirrored content, rather than the mirrored
-# content being the entire body verbatim. Haven's own field (not part of
-# MSC4501 or any other spec), requested 2026-07-08, so it can strip/render
-# that header specially instead of treating it as part of the post's own
-# text. Deliberately NOT set on a quote-post's own tail (_quoted_post_render)
-# or an outbound ;repost's own echo (bridge.commands._handle_repost) --
-# both put a REAL caption first, with any bridge-generated attribution
-# coming after, not a header "at the top" in the sense this field means.
-HAVEN_INCLUDES_HEADER_FIELD = "software.haven.includes_header"
+# boosted Y's post:" (_build_repost_message) or "⤵️ Reply to X's post:"
+# (_echo_reply_in_own_room) -- ahead of the actual mirrored content, rather
+# than the mirrored content being the entire body verbatim. Haven's own
+# field (not part of MSC4501 or any other spec), requested 2026-07-08, so
+# it can strip that header off entirely when rendering instead of treating
+# it as part of the post's own text. Deliberately NOT set on a quote-post's
+# own tail (_quoted_post_render) or an outbound ;repost's own echo
+# (bridge.commands._handle_repost) -- both put a REAL caption first, with
+# any bridge-generated attribution coming after, not a header "at the top"
+# in the sense this field means. Also deliberately NOT set on anything sent
+# as the bridge BOT itself (e.g. send_boost's own reaction-triggered
+# notice, posted into the booster's Profile Room as the bot rather than a
+# ghost) -- Haven only ever needs to strip a header from a mirrored
+# fediverse-authored post, never from the bridge's own first-party notices.
+HAVEN_REMOVE_HEADER_FIELD = "software.haven.remove_header"
 
 # The event TYPE (not a content field) MSC4501 proposes in place of
 # m.room.message for a "real" social-media-style post -- see

@@ -80,7 +80,7 @@ from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
-    HAVEN_INCLUDES_HEADER_FIELD,
+    HAVEN_REMOVE_HEADER_FIELD,
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
@@ -1548,7 +1548,7 @@ async def _echo_reply_in_own_room(
         "body": plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
-        HAVEN_INCLUDES_HEADER_FIELD: True,
+        HAVEN_REMOVE_HEADER_FIELD: True,
     }
     if reply_relates_to is not None:
         message_content[SOCIAL_RELATES_TO_FIELD] = reply_relates_to
@@ -1993,7 +1993,7 @@ async def _build_repost_message(
         "body": imported_link if use_relates_to else plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
-        HAVEN_INCLUDES_HEADER_FIELD: True,
+        HAVEN_REMOVE_HEADER_FIELD: True,
     }
     if use_relates_to:
         quoted_room_id, quoted_event_id = imported_ref
