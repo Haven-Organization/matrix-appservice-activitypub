@@ -1,5 +1,7 @@
 # matrix-appservice-activitypub
 
+![A Matrix room mirroring the Free Software Foundation's Mastodon account side-by-side with the actual Mastodon profile, showing matching posts](screenshots/screenshot1.png)
+
 A Matrix Application Service that bridges Matrix to ActivityPub (Mastodon, Pleroma, Akkoma, Misskey, and friends), so a Matrix homeserver's users can post, follow, reply, react, and DM across the fediverse using ordinary Matrix rooms and clients. No separate fediverse account needed.
 
 Runs natively as a single Python process, no containers required. It talks to Synapse exclusively through the Client-Server and Admin APIs (plus the Application Service push API for inbound events), never by touching Synapse's database directly. It also stores no post content or media of its own; that all lives in Matrix rooms. The only local state is bookkeeping (linked identities, follow relationships, keys, and the Matrix-event/ActivityPub-object map), kept in a SQLite file or a Postgres database.
