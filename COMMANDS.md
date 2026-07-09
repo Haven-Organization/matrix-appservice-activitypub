@@ -4,7 +4,8 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 - A command is only recognized on the **first line** of a message. Tagging the bot somewhere in a longer message won't misfire on a command word later in the text.
 - Keyword matching is case-insensitive.
-- Every command **except `;help`** only works for users on the bridge's own homeserver. A user on another Matrix server tagging the bot gets told commands aren't available to them. This stops someone from squatting usernames on your domain or riding your bridge's reputation to follow arbitrary fediverse accounts from outside it.
+- Every command **except `;help` and `;delete profile`** only works for users on the bridge's own homeserver, unless a Matrix server admin has explicitly allowlisted them -- an exact MXID, a room's membership, or a whole homeserver (see [`;allow`](#allow-mxidroomhomeserver-value)). A user on another Matrix server tagging the bot gets told commands aren't available to them unless allowlisted. This stops someone from squatting usernames on your domain or riding your bridge's reputation to follow arbitrary fediverse accounts from outside it, while still letting an admin selectively open the bridge up to trusted outsiders.
+- An allowlisted third-party user gets one of two modes, set once for the whole bridge (`bridge.third_party_access_mode`, default `follow_only`): **Follow Only** (default) -- `;follow` and interact only, no Profile Room, no `;dm`/`;chat`/`;banner`/`;replace room`/`;backfill`/`;repost`, their fediverse identity is minted automatically on first `;follow` and always mirrors their live Matrix name/avatar -- or **Full** -- identical to a local user, including self-service `;create profile`/`;link profile`.
 - The bridge's own bot and ghost accounts never trigger commands, so a mirrored post that happens to start with `;` is never misread as one.
 - Tagging the bot with no recognized keyword shows the full help message (if nothing else was said) or a short pointer to `;help` (if something else was said that just wasn't recognized).
 - If a command was sent as a thread reply, the bot's response(s) stay in that same thread.
@@ -36,6 +37,9 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
 - [`;widget`](#widget)
+- [`;allow`](#allow-mxidroomhomeserver-value)
+- [`;disallow`](#disallow-mxidroomhomeserver-value)
+- [`;allowed`](#allowed)
 - [Widget vs. commands](#widget-vs-commands)
 
 ---
@@ -44,7 +48,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`, `allow`/`disallow`/`allowed`.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -325,8 +329,40 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ---
 
+## `;allow mxid|room|homeserver <value>`
+
+**Syntax:** `;allow mxid @user:example.org`, `;allow room !roomid:example.org`, or `;allow homeserver example.org`.
+
+**What it does:** Grants third-party access to whoever `<value>` names -- an exact Matrix user, anyone whose command arrives from a specific room (checked purely by "did this event come from that room," no separate live membership lookup), or every user on a whole homeserver. Every grant gets whatever mode `bridge.third_party_access_mode` currently configures (`follow_only` by default -- `;follow` and interact only, no self-service Profile Room) -- it's a single deployment-wide setting, not chosen per-grant. `mxid` and `room` grants take effect immediately; `homeserver` (trusting an entire remote server's user base) asks for confirmation first, the same "reply confirm" flow as `;delete profile`. A `room` grant also warns if the bot isn't currently a member of that room, since the grant only does anything once it is.
+
+**Who can run it:** Matrix server admins only.
+
+**Notes:** Flipping `bridge.third_party_access_mode` later is always safe and instant for everyone currently allowed -- nothing about an already-provisioned identity is ever deleted or reassigned by a config change alone (see the option's own comment in `config.example.yaml`).
+
+---
+
+## `;disallow mxid|room|homeserver <value>`
+
+**Syntax:** Same shape as `;allow` -- `;disallow mxid @user:example.org`, `;disallow room !roomid:example.org`, `;disallow homeserver example.org`.
+
+**What it does:** Removes that grant, immediately, no confirmation needed. Never tears down any identity already provisioned under it -- everything (keys, followers, following, any Profile Room from a past Full period) stays exactly as-is, just no longer reachable/authoritative. Use `;delete profile` (still available to anyone who's ever linked one, allowlisted or not) to actually remove an identity.
+
+**Who can run it:** Matrix server admins only.
+
+---
+
+## `;allowed`
+
+**Syntax:** `;allowed`, no argument.
+
+**What it does:** Lists every current third-party access grant, grouped by kind, plus the current global mode they'd all get.
+
+**Who can run it:** Matrix server admins only.
+
+---
+
 ## Widget vs. commands
 
 The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the `hide`/`show` toggle, and a read-only following list.
 
-It deliberately omits `;repost`, `;rejoin`, and `;leave unfollowed`. None fit a simple button: repost needs a specific post to reply to, rejoin is a rare recovery tool, and leave-unfollowed is a rare cleanup one, both of which also need a confirmation step the widget doesn't have a flow for. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.
+It deliberately omits `;repost`, `;rejoin`, `;leave unfollowed`, and `;allow`/`;disallow`/`;allowed`. None fit a simple button: repost needs a specific post to reply to, rejoin is a rare recovery tool, leave-unfollowed is a rare cleanup one, and the allowlist commands are admin-only bridge-wide configuration, not something to expose in an ordinary room widget -- several of these also need a confirmation step the widget doesn't have a flow for. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.

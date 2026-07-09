@@ -115,6 +115,44 @@ class BridgeSection:
     # at all (not even as a blank bubble), rather than just ignoring a
     # field it doesn't recognize.
     use_msc4501_post_event_type: bool = False
+    # Default join_rule for a Remote User Room (a ghost's mirror of a
+    # remote fediverse account) -- "knock" (default) lets anyone locked
+    # out (e.g. after a `;replace room`) ask their way back in without an
+    # admin, see bridge.membership.maybe_handle_knock. "invite"/"public"
+    # are the only other values this bridge actually supports without
+    # further plumbing -- "restricted"/"knock_restricted" need a space
+    # membership condition this bridge never sets up.
+    ghost_room_join_rule: str = "knock"
+    # Same as ghost_room_join_rule, but for a local user's own Profile
+    # Room (`;create profile`/`;link profile`/`;replace room`). Separate
+    # setting since a local user's own room and a ghost's mirror of a
+    # stranger's account are different trust situations -- e.g. an
+    # operator might want their own users' profiles knockable but a
+    # remote account's mirror invite-only, or vice versa.
+    local_profile_room_join_rule: str = "knock"
+    # Whether an admin-allowlisted user on a DIFFERENT Matrix homeserver
+    # (see the `;allow`/`;disallow`/`;allowed` commands) gets treated as a
+    # full local user ("full": self-service `;create profile`/`;link
+    # profile`, their own Profile Room, DM, Chat, everything) or as
+    # follow-and-interact-only ("follow_only", default: no Profile Room, no
+    # `;dm`/`;chat`/`;banner`/`;replace room`/`;backfill`/`;repost` -- their
+    # AP identity is minted automatically on first `;follow`, with a
+    # bridge-held keypair and a profile that always mirrors their live
+    # Matrix display name/avatar, never self-controlled).
+    #
+    # This is a single deployment-wide setting, not per-grant -- every
+    # currently-allowed third party gets whichever mode this says, live,
+    # not whatever mode was in effect when they were first allowed or first
+    # interacted. An allowlisted user with no linked identity yet who was
+    # previously blocked from `;create profile`/`;link profile` under
+    # follow_only immediately gets access to those the moment this flips to
+    # full, with no migration step; someone who already has a Profile Room
+    # from a past "full" period keeps it if this flips back to follow_only,
+    # it just stops being used to represent them on the fediverse (stops
+    # sending posts out, their AP profile reverts to mirroring Matrix)
+    # until this flips to full again -- nothing about an existing identity
+    # is ever deleted or reassigned by changing this alone.
+    third_party_access_mode: str = "follow_only"
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -255,6 +293,23 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         raise ConfigError(
             f"bridge.quote_import_policy must be 'always', 'known', or 'never', got {quote_import_policy!r}"
         )
+    _valid_join_rules = ("public", "invite", "knock")
+    ghost_room_join_rule = bridge_raw.get("ghost_room_join_rule", "knock")
+    if ghost_room_join_rule not in _valid_join_rules:
+        raise ConfigError(
+            f"bridge.ghost_room_join_rule must be one of {_valid_join_rules}, got {ghost_room_join_rule!r}"
+        )
+    local_profile_room_join_rule = bridge_raw.get("local_profile_room_join_rule", "knock")
+    if local_profile_room_join_rule not in _valid_join_rules:
+        raise ConfigError(
+            f"bridge.local_profile_room_join_rule must be one of {_valid_join_rules}, "
+            f"got {local_profile_room_join_rule!r}"
+        )
+    third_party_access_mode = bridge_raw.get("third_party_access_mode", "follow_only")
+    if third_party_access_mode not in ("follow_only", "full"):
+        raise ConfigError(
+            f"bridge.third_party_access_mode must be 'follow_only' or 'full', got {third_party_access_mode!r}"
+        )
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -268,6 +323,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,
         use_msc4501_post_event_type=bool(bridge_raw.get("use_msc4501_post_event_type", False)),
+        ghost_room_join_rule=ghost_room_join_rule,
+        local_profile_room_join_rule=local_profile_room_join_rule,
+        third_party_access_mode=third_party_access_mode,
     )
 
     synapse_section = SynapseSection(

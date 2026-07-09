@@ -29,6 +29,36 @@ bridge:
   # server admin can override this per-use; everyone else always gets this default.
   # backfill_default_count: 15
 
+  # Join rule for a Remote User Room (a ghost's mirror of a remote fediverse
+  # account). "knock" (default) lets anyone locked out ask their way back in
+  # without an admin. "invite" or "public" also work; "restricted"/
+  # "knock_restricted" aren't supported (need a space membership condition
+  # this bridge doesn't set up).
+  # ghost_room_join_rule: knock
+
+  # Same as ghost_room_join_rule, but for a local user's own Profile Room
+  # (";create profile"/";link profile"/";replace room"). Separate setting
+  # since a local user's own room and a ghost's mirror of a stranger's
+  # account are different trust situations.
+  # local_profile_room_join_rule: knock
+
+  # What an admin-allowlisted user on a DIFFERENT homeserver (see the
+  # ";allow"/";disallow"/";allowed" commands) gets, once allowed:
+  #   follow_only (default) - ";follow" and interact only. No Profile Room;
+  #                            their AP identity is minted automatically on
+  #                            first ";follow" with a bridge-held keypair,
+  #                            and always mirrors their live Matrix display
+  #                            name/avatar. No ";dm"/";chat"/";banner"/
+  #                            ";replace room"/";backfill"/";repost".
+  #   full                    - identical to a local user: self-service
+  #                             ";create profile"/";link profile", full
+  #                             control of their own Profile Room, DM, Chat.
+  # A single deployment-wide setting, live and reversible -- flipping it
+  # doesn't touch any already-provisioned identity, it just changes what's
+  # reachable going forward (see this option's own docstring in
+  # bridge/config.py for the exact rules).
+  # third_party_access_mode: follow_only
+
   # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
   # Profiles) on every ghost, pointing at its Remote User Room. Off by
   # default -- Synapse doesn't enable MSC4133 by default either (needs

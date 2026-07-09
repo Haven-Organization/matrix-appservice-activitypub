@@ -25,7 +25,14 @@ import time
 
 import asyncpg
 
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, ReactionRecord, RemoteActorRoom
+from bridge.repository import (
+    ActorRecord,
+    FederatedEvent,
+    GhostProfile,
+    ReactionRecord,
+    RemoteActorRoom,
+    ThirdPartyAllowRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +49,21 @@ _SCHEMA_STATEMENTS = [
         icon_url TEXT,
         banner_url TEXT,
         hide_followers BOOLEAN NOT NULL DEFAULT FALSE,
-        hide_following BOOLEAN NOT NULL DEFAULT FALSE
+        hide_following BOOLEAN NOT NULL DEFAULT FALSE,
+        is_third_party BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+    # Admin-granted third-party access (see ActorRecord.is_third_party and
+    # the ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid',
+    # 'room', or 'homeserver'; value is the corresponding exact MXID/room
+    # ID/domain.
+    """
+    CREATE TABLE IF NOT EXISTS third_party_allowlist (
+        rule_type TEXT NOT NULL,
+        value TEXT NOT NULL,
+        granted_by TEXT NOT NULL,
+        granted_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (rule_type, value)
     )
     """,
     """
@@ -246,6 +267,7 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS banner_url TEXT",
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_followers BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_following BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS icon_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS banner_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
@@ -399,8 +421,9 @@ class PostgresActorRepository:
                     """
                     INSERT INTO local_actors
                         (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
-                         display_name, summary, icon_url, banner_url, hide_followers, hide_following)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         display_name, summary, icon_url, banner_url, hide_followers, hide_following,
+                         is_third_party)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                     ON CONFLICT (username) DO UPDATE SET
                         matrix_user_id = EXCLUDED.matrix_user_id,
                         room_id = EXCLUDED.room_id,
@@ -411,12 +434,13 @@ class PostgresActorRepository:
                         icon_url = EXCLUDED.icon_url,
                         banner_url = EXCLUDED.banner_url,
                         hide_followers = EXCLUDED.hide_followers,
-                        hide_following = EXCLUDED.hide_following
+                        hide_following = EXCLUDED.hide_following,
+                        is_third_party = EXCLUDED.is_third_party
                     """,
                     record.username, record.matrix_user_id, record.room_id,
                     record.public_key_pem, record.private_key_pem,
                     record.display_name, record.summary, record.icon_url, record.banner_url,
-                    record.hide_followers, record.hide_following,
+                    record.hide_followers, record.hide_following, record.is_third_party,
                 )
                 if record.room_id:
                     # Permanent, unlike local_actors.room_id itself -- see
@@ -462,6 +486,7 @@ class PostgresActorRepository:
             banner_url=row["banner_url"],
             hide_followers=row["hide_followers"],
             hide_following=row["hide_following"],
+            is_third_party=row["is_third_party"],
         )
 
     # -- followers / following ----------------------------------------------
@@ -522,6 +547,12 @@ class PostgresActorRepository:
             "UPDATE local_actors SET hide_following = $1 WHERE username = $2", hidden, username
         )
 
+    async def list_third_party_records(self) -> list[ActorRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM local_actors WHERE is_third_party AND room_id = ''"
+        )
+        return [self._row_to_actor(row) for row in rows]
+
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
         row = await self._pool.fetchrow(
             "SELECT 1 FROM blocked_actors WHERE username = $1 AND remote_actor_id = $2", username, remote_actor_id
@@ -555,6 +586,62 @@ class PostgresActorRepository:
         await self._pool.execute(
             "DELETE FROM muted_actors WHERE username = $1 AND remote_actor_id = $2", username, remote_actor_id
         )
+
+    # -- third-party allowlist -----------------------------------------------
+
+    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO third_party_allowlist (rule_type, value, granted_by, granted_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (rule_type, value) DO UPDATE SET
+                granted_by = EXCLUDED.granted_by,
+                granted_at = EXCLUDED.granted_at
+            """,
+            rule_type, value, granted_by,
+        )
+
+    async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
+        await self._pool.execute(
+            "DELETE FROM third_party_allowlist WHERE rule_type = $1 AND value = $2", rule_type, value
+        )
+
+    async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
+        if rule_type is not None:
+            rows = await self._pool.fetch(
+                "SELECT * FROM third_party_allowlist WHERE rule_type = $1 ORDER BY rule_type, value", rule_type
+            )
+        else:
+            rows = await self._pool.fetch("SELECT * FROM third_party_allowlist ORDER BY rule_type, value")
+        return [
+            ThirdPartyAllowRecord(
+                rule_type=row["rule_type"],
+                value=row["value"],
+                granted_by=row["granted_by"],
+                granted_at=row["granted_at"].isoformat(),
+            )
+            for row in rows
+        ]
+
+    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
+        row = await self._pool.fetchrow(
+            "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = $1", mxid
+        )
+        if row is not None:
+            return True
+        if room_id:
+            row = await self._pool.fetchrow(
+                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'room' AND value = $1", room_id
+            )
+            if row is not None:
+                return True
+        if homeserver:
+            row = await self._pool.fetchrow(
+                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = $1", homeserver
+            )
+            if row is not None:
+                return True
+        return False
 
     # -- remote actor rooms --------------------------------------------------
 

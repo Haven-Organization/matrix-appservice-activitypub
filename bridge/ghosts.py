@@ -39,6 +39,26 @@ def ghost_mxid(user_prefix: str, actor_username: str, actor_domain: str, server_
     return f"@{ghost_localpart(user_prefix, actor_username, actor_domain)}:{server_name}"
 
 
+def third_party_username_from_mxid(mxid: str) -> str:
+    """The AP ``username`` (see ``bridge.repository.ActorRecord.username``)
+    minted for a third-party (different-homeserver) user's auto-provisioned
+    identity -- see ``bridge.commands``'s allowlist/auto-provisioning logic.
+
+    Unlike ``ghost_localpart`` (which just replaces any unsafe char with a
+    single ``_``, fine there since a ghost's localpart is never parsed back
+    apart), this must keep two DIFFERENT MXIDs from ever mangling to the
+    SAME username -- ``:`` is the field separator, so any literal ``_``
+    already present in either half is first escaped to ``__`` before joining
+    with a single un-escaped ``_``, making the join collision-proof:
+    ``@forgot_password:matrix.org`` -> ``forgot__password_matrix.org`` vs.
+    ``@forgot:password_matrix.org`` -> ``forgot_password__matrix.org``.
+    """
+    localpart, domain = mxid.lstrip("@").split(":", 1)
+    escaped_localpart = sanitize_localpart_component(localpart).replace("_", "__")
+    escaped_domain = sanitize_localpart_component(domain).replace("_", "__")
+    return f"{escaped_localpart}_{escaped_domain}"
+
+
 async def ensure_ghost_user(
     synapse: SynapseClient,
     *,

@@ -43,7 +43,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
-from bridge.commands import message_addresses_bot
+from bridge.commands import _effective_third_party_mode, message_addresses_bot
 from bridge.media import build_ap_attachment, media_caption
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import deliver_to_actor_or_followers, push_profile_update
@@ -174,6 +174,16 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         # Matrix-only, so the owner's later on-Matrix replies to it
         # federated as fresh context-free posts instead of replies.
         actor_record = guest_record
+
+    # A leftover Profile Room from a past Full period (the room owner's own
+    # post) or a Follow-Only third party posting as a GUEST in someone
+    # else's room (the guest_record reassignment just above) must not
+    # distribute while the poster is currently effective-Follow-Only --
+    # per this feature's truth table, the room stays exactly as-is on the
+    # Matrix side, it just stops being cross-posted to the fediverse. See
+    # _effective_third_party_mode's docstring.
+    if await _effective_third_party_mode(request, actor_record) == "follow_only":
+        return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
         return True  # already distributed (e.g. a redelivered transaction) -- nothing to do

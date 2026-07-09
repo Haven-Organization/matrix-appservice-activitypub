@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Protocol
 
 
@@ -56,6 +57,37 @@ class ActorRecord:
     # either way, same as Mastodon's own "hide network" setting.
     hide_followers: bool = False
     hide_following: bool = False
+    # True for an actor provisioned for a Matrix user on a DIFFERENT
+    # homeserver, admin-allowlisted via the ";allow"/";disallow"/";allowed"
+    # commands (see bridge.commands's _effective_third_party_mode). Never
+    # set for a local user or the bridge's own service actor. This is the
+    # ONLY per-identity state this feature stores -- deliberately NOT a
+    # "current mode" (full/follow_only), which is always computed live from
+    # this flag + the CURRENT config.bridge.third_party_access_mode +
+    # whether room_id is set, never cached, so flipping that config back and
+    # forth never requires migrating or mutating any existing record.
+    is_third_party: bool = False
+
+
+@dataclass(frozen=True)
+class ThirdPartyAllowRecord:
+    """One admin-granted allowlist entry letting a user/room/homeserver on a
+    DIFFERENT Matrix homeserver use the bridge (see the ";allow"/";disallow"/
+    ";allowed" commands and ``ActorRecord.is_third_party``).
+
+    ``rule_type`` is ``"mxid"`` (an exact ``@user:server``), ``"room"`` (any
+    sender whose command arrives from this room -- membership is never
+    separately queried, "the bot received this event from an allowlisted
+    room" IS the check), or ``"homeserver"`` (any user on this domain).
+    Checked in that precedence order (most to least specific) by
+    ``ActorRepository.is_third_party_allowed``. ``granted_by``/``granted_at``
+    are audit-trail only, never read for any permission decision.
+    """
+
+    rule_type: str
+    value: str
+    granted_by: str
+    granted_at: str
 
 
 @dataclass(frozen=True)
@@ -269,6 +301,47 @@ class ActorRepository(Protocol):
 
     async def set_following_hidden(self, username: str, hidden: bool) -> None:
         """Same as ``set_followers_hidden``, for the following collection."""
+        ...
+
+    async def list_third_party_records(self) -> list[ActorRecord]:
+        """Every ``ActorRecord`` with ``is_third_party=True`` and an empty
+        ``room_id`` -- i.e. every identity currently eligible for the
+        periodic Follow-Only profile-mirroring sync (see
+        ``bridge.third_party_sync``). A record that's graduated to a real
+        Profile Room (``room_id`` set) is deliberately excluded -- that room
+        is authoritative for their profile now, current config permitting
+        (see ``ActorRecord.is_third_party``'s docstring)."""
+        ...
+
+    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+        """Grant third-party access to ``value`` (an MXID, room ID, or
+        homeserver domain depending on ``rule_type``). Idempotent -- granting
+        the same ``(rule_type, value)`` again just refreshes ``granted_by``/
+        ``granted_at``."""
+        ...
+
+    async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
+        """Revoke a grant. No-op if it doesn't exist. Never tears down any
+        ``ActorRecord`` already provisioned under this grant -- see this
+        feature's design note in ``bridge.commands`` for why revocation is
+        deliberately non-destructive."""
+        ...
+
+    async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
+        """Every current grant, optionally filtered to one ``rule_type`` --
+        used by the ";allowed" command."""
+        ...
+
+    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
+        """Whether ``mxid`` currently has third-party access, checking all
+        three grant kinds in precedence order (exact ``mxid``, then
+        ``room_id`` membership, then ``homeserver``) -- ``True`` as soon as
+        any one matches. This is the single source of truth both the
+        command-dispatch gate AND every outbound-federation re-validation
+        point (reactions, replies, DM, Chat, post distribution -- see
+        ``bridge.commands.is_third_party_still_allowed``) call, so a
+        revoked grant takes effect everywhere at once, live, with nothing
+        cached."""
         ...
 
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
@@ -620,6 +693,7 @@ class InMemoryActorRepository:
         self._ghost_chat_rooms: dict[tuple[str, str], str] = {}
         self._ghost_chat_room_ids: set[str] = set()
         self._ghost_chat_room_history: dict[str, tuple[str, str]] = {}  # room_id -> (actor_id, matrix_user_id)
+        self._third_party_allows: dict[tuple[str, str], ThirdPartyAllowRecord] = {}
 
     async def get_local_actor(self, username: str) -> ActorRecord | None:
         state = self._actors.get(username)
@@ -709,6 +783,39 @@ class InMemoryActorRepository:
         state = self._actors.get(username)
         if state is not None:
             state.record = replace(state.record, hide_following=hidden)
+
+    async def list_third_party_records(self) -> list[ActorRecord]:
+        return [
+            state.record
+            for state in self._actors.values()
+            if state.record.is_third_party and not state.record.room_id
+        ]
+
+    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+        self._third_party_allows[(rule_type, value)] = ThirdPartyAllowRecord(
+            rule_type=rule_type,
+            value=value,
+            granted_by=granted_by,
+            granted_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
+        self._third_party_allows.pop((rule_type, value), None)
+
+    async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
+        records = self._third_party_allows.values()
+        if rule_type is not None:
+            records = [r for r in records if r.rule_type == rule_type]
+        return sorted(records, key=lambda r: (r.rule_type, r.value))
+
+    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
+        if ("mxid", mxid) in self._third_party_allows:
+            return True
+        if room_id and ("room", room_id) in self._third_party_allows:
+            return True
+        if homeserver and ("homeserver", homeserver) in self._third_party_allows:
+            return True
+        return False
 
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
         state = self._actors.get(username)

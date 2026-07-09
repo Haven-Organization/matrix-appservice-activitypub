@@ -51,7 +51,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
-from bridge.commands import message_addresses_bot
+from bridge.commands import is_third_party_still_allowed, message_addresses_bot
 from bridge.media import build_ap_attachment, media_caption
 from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import deliver_to_actor_or_followers
@@ -341,6 +341,9 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
                 logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
             return True
 
+        if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
+            return True
+
         await _send_outbound_dm(
             request,
             event=event,
@@ -403,6 +406,9 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             )
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
+        return True
+
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True
 
     recipient = await _resolve_remote_recipient(request, parent, sender_username=actor_record.username)

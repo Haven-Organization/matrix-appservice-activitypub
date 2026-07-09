@@ -213,7 +213,13 @@ from bridge.activitypub.webfinger import (
     resolve_remote_actor_id,
 )
 from bridge.crypto import generate_keypair
-from bridge.ghosts import ensure_ghost_user, ghost_localpart, ghost_mxid, sanitize_localpart_component
+from bridge.ghosts import (
+    ensure_ghost_user,
+    ghost_localpart,
+    ghost_mxid,
+    sanitize_localpart_component,
+    third_party_username_from_mxid,
+)
 from bridge.inbox_dispatch import (
     _backfill_ancestor_chain,
     _fetch_post_preview,
@@ -278,7 +284,8 @@ _COMMAND_PREFIX = ";"
 
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
-    r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help"
+    r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help|"
+    r"disallow|allowed|allow"
 )
 
 
@@ -368,6 +375,61 @@ def message_addresses_bot(content: dict, config) -> bool:
     return _extract_prefixed_command(body) is not None
 
 
+# Single-word commands blocked outright for a third-party sender currently
+# effective-Follow-Only, regardless of argument (see _effective_third_party_mode).
+_FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost"}
+
+# (subcommand, lowercased argument) pairs blocked the same way -- these
+# subcommands only actually dispatch to anything when paired with this
+# exact argument (see maybe_handle_command's own dispatch chain), so this
+# mirrors that shape rather than blocking the subcommand word outright.
+_FOLLOW_ONLY_BLOCKED_EXACT = {
+    ("create", "profile"),
+    ("link", "profile"),
+    ("unlink", "profile"),
+    ("replace", "room"),
+}
+
+
+async def _effective_third_party_mode(request: Request, record: ActorRecord) -> str:
+    """"full" or "follow_only" -- computed FRESH on every call from three
+    live inputs (``record.is_third_party``, the CURRENT
+    ``config.bridge.third_party_access_mode``, and whether ``record.room_id``
+    is currently set), never cached anywhere. A local user's record always
+    resolves to "full" here regardless of config.
+
+    This is deliberately re-derived at every call site rather than stored,
+    so an admin flipping ``third_party_access_mode`` back and forth is
+    always safe and takes effect everywhere at once -- see
+    ``ActorRecord.is_third_party``'s docstring for the full reasoning."""
+    if not record.is_third_party:
+        return "full"
+    mode = request.app.state.config.bridge.third_party_access_mode
+    if mode == "full" and record.room_id:
+        return "full"
+    return "follow_only"
+
+
+async def is_third_party_still_allowed(request: Request, record: ActorRecord, *, room_id: str) -> bool:
+    """Whether ``record`` is still allowed to federate AT ALL right now --
+    not just run commands. A local user's ``ActorRecord`` existing is
+    always sufficient (it could only have been created via an
+    already-gated ``;create profile``/``;link profile``), but a
+    third-party identity's continued right to federate ANYTHING --
+    reactions, replies, DMs, Chat, post distribution, not just new
+    commands -- depends on still being allowlisted, since revoking a grant
+    deliberately never tears down an already-provisioned identity (see
+    this feature's design notes). Call this at every point one of those
+    paths resolves the acting ``ActorRecord``, using the room the
+    triggering Matrix event itself arrived in; treat ``False`` the same as
+    "no linked profile" (drop the action silently)."""
+    if not record.is_third_party:
+        return True
+    repository = request.app.state.repository
+    homeserver = record.matrix_user_id.split(":", 1)[1] if ":" in record.matrix_user_id else ""
+    return await repository.is_third_party_allowed(mxid=record.matrix_user_id, homeserver=homeserver, room_id=room_id)
+
+
 async def maybe_handle_command(request: Request, event: dict) -> bool:
     """Handle a bot-tagged command event.
 
@@ -446,14 +508,63 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         # own homeserver -- anyone can invite the bot into a room they control
         # from any Matrix server, and without this check they could otherwise
         # squat usernames on our domain or use our bridge's reputation to follow
-        # arbitrary fediverse accounts.
+        # arbitrary fediverse accounts. An admin can lift this for specific
+        # outside users/rooms/homeservers via ";allow" -- see
+        # is_third_party_allowed and _effective_third_party_mode.
+        repository = request.app.state.repository
         sender_server = sender.split(":", 1)[1] if ":" in sender else ""
-        if sender_server != config.synapse.server_name:
-            logger.info("Ignoring tagged command from non-local user %s", sender)
-            await _notice(
-                request, room_id, f"Commands are only available to users on {config.synapse.server_name}."
+        is_third_party_sender = sender_server != config.synapse.server_name
+        is_delete_profile_command = subcommand == "delete" and argument.lower() == "profile"
+        # ";delete profile" is exempt from the allowlist check itself (not
+        # just the Follow-Only block below) -- it's their own identity to
+        # walk away from, and revoking a grant deliberately never tears one
+        # down on its own (see this feature's design notes), so someone
+        # already removed from the allowlist must still be able to trigger
+        # their own signed Delete/cleanup rather than being stuck as an
+        # orphaned identity with no way to remove themselves.
+        if is_third_party_sender and not is_delete_profile_command:
+            allowed = await repository.is_third_party_allowed(
+                mxid=sender, homeserver=sender_server, room_id=room_id
             )
-            return True
+            if not allowed:
+                logger.info("Ignoring tagged command from non-local, non-allowlisted user %s", sender)
+                await _notice(
+                    request, room_id, f"Commands are only available to users on {config.synapse.server_name}."
+                )
+                return True
+
+        # Any allowed third-party sender is effective-Follow-Only whenever
+        # the CURRENT global mode isn't "full" -- this is deliberately
+        # decided from the live config alone, not from whether an
+        # ActorRecord exists yet or what its room_id is: per this feature's
+        # truth table, Follow Only always wins for a third party regardless
+        # of a leftover room_id from a past Full period, and a sender with
+        # NO record yet must be stopped from self-service-provisioning a
+        # full Profile Room via ";create profile"/";link profile" just as
+        # much as one who already has an identity -- only ";follow" is
+        # allowed to auto-mint one for them in that case (see
+        # _handle_follow). ";delete profile" is deliberately exempt --
+        # it's the one thing a third-party user should always be able to do
+        # to their own identity regardless of current allowlist/mode state.
+        if is_third_party_sender and config.bridge.third_party_access_mode != "full":
+            if not is_delete_profile_command:
+                normalized_argument = argument.strip().lower()
+                if subcommand in _FOLLOW_ONLY_BLOCKED_ANY_ARG:
+                    if subcommand == "chat":
+                        await _notice(request, room_id, "Chat is disabled for third-party accounts in Follow Only mode.")
+                    else:
+                        await _notice(
+                            request, room_id,
+                            f'"{_COMMAND_PREFIX}{subcommand}" is disabled for third-party accounts in Follow Only mode.',
+                        )
+                    return True
+                if (subcommand, normalized_argument) in _FOLLOW_ONLY_BLOCKED_EXACT:
+                    await _notice(
+                        request, room_id,
+                        f'"{_COMMAND_PREFIX}{subcommand} {normalized_argument}" is disabled for '
+                        "third-party accounts in Follow Only mode.",
+                    )
+                    return True
 
         if subcommand == "follow":
             await _handle_follow(request, sender=sender, room_id=room_id, handle=argument, content=content)
@@ -510,6 +621,12 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_backfill(request, sender=sender, room_id=room_id, argument=argument, content=content)
         elif subcommand == "widget":
             await _handle_widget(request, room_id=room_id)
+        elif subcommand == "allow":
+            await _handle_allow(request, sender=sender, room_id=room_id, argument=argument)
+        elif subcommand == "disallow":
+            await _handle_disallow(request, sender=sender, room_id=room_id, argument=argument)
+        elif subcommand == "allowed":
+            await _handle_allowed(request, sender=sender, room_id=room_id)
         else:
             await _notice(
                 request, room_id, f'Unknown command -- try "{_COMMAND_PREFIX}help" to see what I can do.'
@@ -791,6 +908,17 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
             "Add a room widget with buttons for most of these commands, for clients that support "
             "Matrix widgets.",
         ),
+        (
+            f"{_COMMAND_PREFIX}allow mxid|room|homeserver <value>",
+            "Matrix server admin only: let a user on a DIFFERENT homeserver (an exact MXID, anyone in a "
+            "room, or a whole homeserver's users) use this bridge -- in whatever mode "
+            "bridge.third_party_access_mode currently configures. Whitelisting a homeserver asks for "
+            f'confirmation first. "{_COMMAND_PREFIX}disallow" undoes any of these.',
+        ),
+        (
+            f"{_COMMAND_PREFIX}allowed",
+            "Matrix server admin only: list every current third-party access grant.",
+        ),
     ]
     if show_all:
         commands = commands + advanced_commands
@@ -929,6 +1057,70 @@ async def _resolve_target_actor(
     return None
 
 
+async def _auto_provision_third_party_actor(request: Request, *, matrix_user_id: str) -> ActorRecord:
+    """Mint a fresh Follow-Only identity for ``matrix_user_id`` (a user on a
+    DIFFERENT homeserver, already confirmed allowlisted by the caller) the
+    first time they ever ``;follow`` anyone -- see this feature's design
+    notes and ``ActorRecord.is_third_party``'s docstring. Mirrors
+    ``bridge.service_actor.load_or_create_service_actor``'s own
+    keypair-minting shape, and the profile-mapping ``_handle_create_profile``
+    uses -- but with ``is_third_party=True`` and an empty ``room_id``: this
+    actor's AP profile always live-mirrors their current Matrix profile from
+    here on (see ``_effective_third_party_mode``/the profile-sync timer)
+    rather than being self-controlled via a Profile Room.
+
+    Usernames are derived via ``third_party_username_from_mxid`` -- since
+    ``register_local_actor`` is a pure upsert keyed on ``username`` with NO
+    uniqueness check, a collision with an already-registered DIFFERENT
+    ``matrix_user_id`` (astronomically unlikely given that encoding, but not
+    impossible) falls back to a numeric-suffixed username rather than
+    silently hijacking the existing identity."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+
+    base_username = third_party_username_from_mxid(matrix_user_id)
+    username = base_username
+    suffix = 2
+    while True:
+        existing_username_owner = await repository.get_local_actor(username)
+        if existing_username_owner is None or existing_username_owner.matrix_user_id == matrix_user_id:
+            break
+        username = f"{base_username}_{suffix}"
+        suffix += 1
+
+    try:
+        profile = await synapse.get_profile(matrix_user_id)
+    except SynapseError:
+        profile = {}
+    matrix_display_name = profile.get("displayname")
+    matrix_avatar_mxc = profile.get("avatar_url")
+    display_name = matrix_display_name or matrix_user_id
+    icon_url = None
+    if matrix_avatar_mxc:
+        try:
+            icon_url = media_url(config.bridge.public_base_url, matrix_avatar_mxc)
+        except ValueError:
+            icon_url = None
+        else:
+            await repository.mark_media_published(matrix_avatar_mxc)
+
+    private_key_pem, public_key_pem = generate_keypair()
+    record = ActorRecord(
+        username=username,
+        matrix_user_id=matrix_user_id,
+        room_id="",
+        public_key_pem=public_key_pem,
+        private_key_pem=private_key_pem,
+        display_name=display_name,
+        summary=f"{matrix_user_id} is a Matrix user.",
+        icon_url=icon_url,
+        is_third_party=True,
+    )
+    await repository.register_local_actor(record)
+    return record
+
+
 async def _handle_follow(request: Request, *, sender: str, room_id: str, handle: str, content: dict) -> None:
     """Follow ``handle`` (``@user@instance.org``) as the sender's own linked
     actor. ``handle`` may be omitted entirely if this is run from inside
@@ -1013,13 +1205,26 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:
-        await _notice(
-            request, room_id,
-            f'You need a linked profile before following anyone -- run "{_COMMAND_PREFIX}link profile" '
-            "in your own room first. (Without one, a reply you send to a followed account "
-            "would come from an identity the remote server has never seen.)",
-        )
-        return
+        sender_server = sender.split(":", 1)[1] if ":" in sender else ""
+        is_third_party_sender = sender_server != config.synapse.server_name
+        # Reaching here at all already means an allowed third party (the
+        # dispatch gate in maybe_handle_command rejected anyone else before
+        # ever calling this handler) -- Follow Only mints their identity
+        # right here, on first follow, instead of requiring the self-service
+        # ";create profile"/";link profile" flow local users (and Full-mode
+        # third parties) go through. Full mode with no room_id yet falls
+        # through to the same "link a profile first" rejection a local user
+        # with no profile gets, unchanged.
+        if is_third_party_sender and config.bridge.third_party_access_mode != "full":
+            actor_record = await _auto_provision_third_party_actor(request, matrix_user_id=sender)
+        else:
+            await _notice(
+                request, room_id,
+                f'You need a linked profile before following anyone -- run "{_COMMAND_PREFIX}link profile" '
+                "in your own room first. (Without one, a reply you send to a followed account "
+                "would come from an identity the remote server has never seen.)",
+            )
+            return
 
     if await repository.is_following(actor_record.username, remote_actor_id):
         await _notice(request, room_id, f"You're already following {handle}.")
@@ -1842,6 +2047,12 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
         )
         return
 
+    # Belt-and-suspenders alongside maybe_handle_command's own gate (which
+    # already keeps a Follow-Only third party from ever reaching this
+    # handler at all) -- see is_third_party_still_allowed's docstring.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
+        return
+
     provisioned = await provision_ghost(request, remote_actor_id)
     if provisioned is None:
         await _notice(request, room_id, f"Could not resolve {handle or remote_actor_id}.")
@@ -1925,6 +2136,12 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
             f'You need a linked profile before starting a chat -- run "{_COMMAND_PREFIX}link profile" '
             "in your own room first.",
         )
+        return
+
+    # Belt-and-suspenders alongside maybe_handle_command's own gate (which
+    # already keeps a Follow-Only third party from ever reaching this
+    # handler at all) -- see is_third_party_still_allowed's docstring.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return
 
     provisioned = await provision_ghost(request, remote_actor_id)
@@ -3528,7 +3745,13 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
     # 6. Actually erase the identity: keys, followers, following, all of it.
     await repository.unregister_local_actor(record.username)
 
-    # 7. Let them know, in the room itself -- it's still theirs to leave
+    # 7. Let them know. A roomless identity (a third-party Follow-Only
+    # actor, or -- in principle -- our own service actor, though that one
+    # is never reachable via this command) has no profile_room_id to post
+    # the notice into -- fall back to wherever "confirm" was actually sent
+    # (this function's own room_id parameter), which is guaranteed to be
+    # a room both the bot and sender are already in. Otherwise, same as
+    # before: post in the profile room itself, still theirs to leave
     # whenever they like, just no longer tied to anything on the fediverse.
     if profile_room_id:
         deletion_notice_content: dict = {
@@ -3537,13 +3760,21 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
             "deleted, and this room is no longer associated with ActivityPub. You can safely leave "
             "it whenever you like.",
         }
-        relates_to = _command_relates_to_var.get()
-        if relates_to:
-            deletion_notice_content["m.relates_to"] = relates_to
+        notice_room_id = profile_room_id
+    else:
+        deletion_notice_content = {
+            "msgtype": "m.text",
+            "body": f"Your fediverse identity ({record.username}@{config.bridge.domain}) has been deleted.",
+        }
+        notice_room_id = room_id
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        deletion_notice_content["m.relates_to"] = relates_to
+    if notice_room_id:
         try:
-            await synapse.send_message_event(profile_room_id, deletion_notice_content, as_user_id=bot_mxid)
+            await synapse.send_message_event(notice_room_id, deletion_notice_content, as_user_id=bot_mxid)
         except SynapseError:
-            logger.info("Could not send deletion notice to %s", profile_room_id, exc_info=True)
+            logger.info("Could not send deletion notice to %s", notice_room_id, exc_info=True)
 
 
 async def _list_unfollowed_ghost_rooms(
@@ -4334,3 +4565,224 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
         await _notice(request, room_id, f"Could not invite {target_mxid} to {target_room_id}: {exc}")
         return
     await _notice(request, room_id, f"Invited {target_mxid} to {target_room_id}.")
+
+
+# Matrix server_name shape: a domain (optionally with a port) -- deliberately
+# permissive rather than a strict RFC952/1123 hostname grammar, same spirit
+# as _ROOM_ID_RE/_MXID_RE above not fully validating Matrix ID grammar
+# either. Just needs to reject obvious garbage (spaces, a stray "@"/"!"/
+# extra ":") before it's stored as an allowlist value.
+_HOMESERVER_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.\-]+(?::\d+)?$")
+
+_ALLOW_RULE_TYPES = ("mxid", "room", "homeserver")
+
+_ALLOW_USAGE = (
+    f"Usage: {_COMMAND_PREFIX}allow mxid @user:example.org | "
+    f"{_COMMAND_PREFIX}allow room !roomid:example.org | "
+    f"{_COMMAND_PREFIX}allow homeserver example.org"
+)
+_DISALLOW_USAGE = (
+    f"Usage: {_COMMAND_PREFIX}disallow mxid @user:example.org | "
+    f"{_COMMAND_PREFIX}disallow room !roomid:example.org | "
+    f"{_COMMAND_PREFIX}disallow homeserver example.org"
+)
+
+# Whitelisting an entire homeserver means trusting every account on a server
+# this bridge's admin doesn't control -- confirmation-gated the same
+# stateless, marker-based way as ;delete profile/;leave unfollowed (see
+# maybe_handle_delete_confirmation's own docstring for why stateless: no DB
+# row for "a grant is pending", just this substring checked on the replied-to
+# event). mxid/room grants are immediate -- narrow enough in scope not to
+# warrant the extra step.
+_ALLOW_HOMESERVER_WARNING_MARKER = "This will let EVERY user on"
+_ALLOW_HOMESERVER_DOMAIN_FROM_MARKER_RE = re.compile(
+    re.escape(_ALLOW_HOMESERVER_WARNING_MARKER) + r" (\S+) use this bridge"
+)
+
+
+async def _handle_allow(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """Admin-only: grant third-party access to an exact MXID, a room's
+    membership, or a whole homeserver -- see this feature's design notes
+    (``ActorRecord.is_third_party``, ``_effective_third_party_mode``) for
+    what that access actually means, which is controlled once, globally,
+    by ``bridge.third_party_access_mode`` -- not per-grant."""
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can manage third-party access.")
+        return
+
+    parts = argument.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() not in _ALLOW_RULE_TYPES:
+        await _notice(request, room_id, _ALLOW_USAGE)
+        return
+    rule_type, value = parts[0].lower(), parts[1].strip()
+    repository = request.app.state.repository
+
+    if rule_type == "mxid":
+        if not _MXID_RE.match(value):
+            await _notice(request, room_id, f"{value} doesn't look like a valid MXID (e.g. @user:example.org).")
+            return
+        await repository.add_third_party_allow("mxid", value, granted_by=sender)
+        await _notice(request, room_id, f"Allowed {value} to use this bridge.")
+        return
+
+    if rule_type == "room":
+        if not _ROOM_ID_RE.match(value):
+            await _notice(request, room_id, f"{value} doesn't look like a valid room ID (e.g. !roomid:example.org).")
+            return
+        # A room grant only does anything once the bot is actually present
+        # to receive events from it (the allowlist check at the command
+        # dispatch gate, and every outbound-federation re-validation point,
+        # both work purely off "did this event arrive from an allowlisted
+        # room" -- there's no separate live membership query). Doesn't block
+        # the grant either way, just informs -- the bot might be invited
+        # into it moments later.
+        bot_mxid = _bot_mxid(request.app.state.config)
+        try:
+            bot_rooms = await request.app.state.synapse.admin_list_joined_rooms(bot_mxid)
+        except SynapseError:
+            bot_rooms = []
+        await repository.add_third_party_allow("room", value, granted_by=sender)
+        note = (
+            "" if value in bot_rooms
+            else " Note: the bot isn't currently in this room, so this won't take effect until it is."
+        )
+        await _notice(request, room_id, f"Allowed members of {value} to use this bridge.{note}")
+        return
+
+    # homeserver -- confirmation-gated, see _ALLOW_HOMESERVER_WARNING_MARKER.
+    if not _HOMESERVER_DOMAIN_RE.match(value):
+        await _notice(request, room_id, f"{value} doesn't look like a valid homeserver domain.")
+        return
+    mode = request.app.state.config.bridge.third_party_access_mode
+    warning = (
+        f"⚠️ {_ALLOW_HOMESERVER_WARNING_MARKER} {value} use this bridge, in whatever mode is "
+        f'currently configured (currently "{mode}") -- that\'s every account on a server you '
+        "don't control, not just people you already trust. This can be undone later with "
+        f'"{_COMMAND_PREFIX}disallow homeserver {value}" (though any identity already '
+        f'provisioned under it stays around until deleted -- see "{_COMMAND_PREFIX}delete profile").\n\n'
+        'Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {html.escape(_ALLOW_HOMESERVER_WARNING_MARKER)} <strong>{html.escape(value)}</strong> "
+        f'use this bridge, in whatever mode is currently configured (currently "{html.escape(mode)}") -- '
+        "that's every account on a server you don't control, not just people you already trust. "
+        f"This can be undone later with \"{_COMMAND_PREFIX}disallow homeserver {html.escape(value)}\" "
+        "(though any identity already provisioned under it stays around until deleted).</p>"
+        '<p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text",
+        "body": warning,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    config = request.app.state.config
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send allow-homeserver warning to %s", room_id, exc_info=True)
+
+
+async def maybe_handle_allow_homeserver_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``;allow homeserver`` warnings (handled, whether or not it actually
+    matched one) -- same stateless pattern as ``maybe_handle_delete_confirmation``,
+    with one addition: unlike a delete/leave-unfollowed confirmation (which
+    only ever act on the CONFIRMER's own identity, so it's safe regardless of
+    who sends "confirm"), granting a whole homeserver access is a
+    bridge-wide admin action -- so the confirmer's OWN admin status is
+    re-checked here too, not just whoever originally ran ``;allow
+    homeserver``. Otherwise any non-admin in the same room could confirm
+    someone else's pending admin action just by replying "confirm" to it."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    warning_body = (target_event.get("content") or {}).get("body") or ""
+    if _ALLOW_HOMESERVER_WARNING_MARKER not in warning_body:
+        return False
+    domain_match = _ALLOW_HOMESERVER_DOMAIN_FROM_MARKER_RE.search(warning_body)
+    if domain_match is None:
+        return False
+    homeserver = domain_match.group(1)
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        if not await _is_matrix_admin(request, sender):
+            await _notice(request, room_id, "Only a Matrix server admin can confirm this.")
+            return True
+        repository = request.app.state.repository
+        await repository.add_third_party_allow("homeserver", homeserver, granted_by=sender)
+        await _notice(request, room_id, f"Allowed every user on {homeserver} to use this bridge.")
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
+async def _handle_disallow(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """Admin-only: revoke a third-party access grant. Immediate for all
+    three rule types, no confirmation needed -- unlike granting, revoking
+    can only narrow access. Never tears down any identity already
+    provisioned under the grant (see this feature's design notes) -- it
+    just stops being reachable/authoritative going forward."""
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can manage third-party access.")
+        return
+
+    parts = argument.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() not in _ALLOW_RULE_TYPES:
+        await _notice(request, room_id, _DISALLOW_USAGE)
+        return
+    rule_type, value = parts[0].lower(), parts[1].strip()
+    repository = request.app.state.repository
+    await repository.remove_third_party_allow(rule_type, value)
+    await _notice(
+        request, room_id,
+        f"Removed the {rule_type} grant for {value}. Any identity already provisioned under it stays "
+        f'around until deleted (see "{_COMMAND_PREFIX}allowed" to see current grants).',
+    )
+
+
+async def _handle_allowed(request: Request, *, sender: str, room_id: str) -> None:
+    """Admin-only: list every current third-party access grant, grouped by
+    rule type, plus the current global mode they'd all get."""
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can view third-party access grants.")
+        return
+
+    repository = request.app.state.repository
+    grants = await repository.list_third_party_allows()
+    mode = request.app.state.config.bridge.third_party_access_mode
+    if not grants:
+        await _notice(request, room_id, f'No third-party access grants (mode: "{mode}") -- everyone stays local-only.')
+        return
+
+    lines = [f'Third-party access mode: "{mode}".', ""]
+    for rule_type in _ALLOW_RULE_TYPES:
+        matching = [grant for grant in grants if grant.rule_type == rule_type]
+        if not matching:
+            continue
+        lines.append(f"{rule_type}:")
+        lines.extend(f"- {grant.value} (by {grant.granted_by})" for grant in matching)
+    await _notice(request, room_id, "\n".join(lines))

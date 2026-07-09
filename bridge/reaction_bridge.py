@@ -50,9 +50,11 @@ from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
+from bridge.commands import is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
 from bridge.note_mirroring import (
+    HAVEN_INCLUDES_HEADER_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
@@ -249,6 +251,7 @@ async def send_boost(
             formatted_caption=formatted_caption,
             preview_image=preview_image, preview_video=preview_video,
         )
+        notice_content[HAVEN_INCLUDES_HEADER_FIELD] = True
         if use_relates_to:
             notice_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
                 SOCIAL_REL_TYPE_REPOST,
@@ -318,6 +321,15 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
             )
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
+        return True
+
+    # A local user's ActorRecord existing is enough (it could only have
+    # come from an already-gated ;create/;link profile) -- but a
+    # third-party identity's continued right to federate depends on still
+    # being allowlisted RIGHT NOW, since revocation deliberately never
+    # tears down an already-provisioned identity. Drop silently, same as
+    # the "no linked profile" case, rather than erroring.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True
 
     if _is_boost_emoji(key):
@@ -406,6 +418,13 @@ async def maybe_federate_reaction_removal(request: Request, event: dict) -> bool
 
     actor_record = await repository.get_local_actor_by_matrix_id(reaction.reactor_matrix_user_id)
     if actor_record is None:
+        await repository.remove_reaction(reaction.activity_id)
+        return True
+
+    # Same live re-validation as maybe_federate_reaction -- a revoked
+    # third-party sender's Undo doesn't go out either, just drop the local
+    # record same as the "no linked profile" case above.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=reaction.room_id):
         await repository.remove_reaction(reaction.activity_id)
         return True
 

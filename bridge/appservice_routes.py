@@ -44,6 +44,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
 from bridge.chat_bridge import maybe_federate_chat_message
 from bridge.commands import (
+    maybe_handle_allow_homeserver_confirmation,
     maybe_handle_command,
     maybe_handle_delete_confirmation,
     maybe_handle_leave_unfollowed_confirmation,
@@ -140,6 +141,11 @@ async def _handle_transaction(
                 request, event
             )
             if handled_as_leave_unfollowed_confirmation:
+                continue
+            handled_as_allow_homeserver_confirmation = await maybe_handle_allow_homeserver_confirmation(
+                request, event
+            )
+            if handled_as_allow_homeserver_confirmation:
                 continue
             handled_as_command = await maybe_handle_command(request, event)
             if not handled_as_command:

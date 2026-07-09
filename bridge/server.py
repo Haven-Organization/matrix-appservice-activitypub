@@ -29,6 +29,7 @@ from bridge.repository import ActorRepository
 from bridge.service_actor import load_or_create_service_actor
 from bridge.sqlite_repository import SqliteActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
+from bridge.third_party_sync import third_party_profile_sync_loop
 from bridge.widget import router as widget_router
 
 logger = logging.getLogger(__name__)
@@ -175,9 +176,15 @@ def create_app(
                     avatar_mxc=desired_avatar,
                 )
 
+        sync_task = asyncio.create_task(third_party_profile_sync_loop(app))
         try:
             yield
         finally:
+            sync_task.cancel()
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
             await http_client.aclose()
             await app.state.synapse.aclose()
             if owns_repository:

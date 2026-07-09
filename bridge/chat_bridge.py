@@ -31,7 +31,7 @@ from fastapi import Request
 from bridge.activitypub.models import Activity, ChatMessage
 from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.activitypub.urls import actor_url, main_key_id
-from bridge.commands import message_addresses_bot
+from bridge.commands import is_third_party_still_allowed, message_addresses_bot
 from bridge.media import build_ap_attachment
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
@@ -83,6 +83,14 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
             )
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
+        return True
+
+    # A chat room established during a past Full/allowed period keeps
+    # existing and receiving Matrix-side messages after a downgrade or
+    # revocation, but must stop actually federating them out -- see
+    # is_third_party_still_allowed's docstring. Drop silently, matching
+    # the "no linked profile" case above.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True
 
     base = config.bridge.public_base_url

@@ -65,6 +65,7 @@ from bridge.activitypub.urls import (
     username_from_actor_url,
 )
 from bridge.activitypub.webfinger import build_local_webfinger_document, parse_acct
+from bridge.commands import _effective_third_party_mode
 from bridge.inbox_dispatch import handle_activity
 from bridge.media import build_ap_attachment, media_caption
 from bridge.reply_bridge import derive_in_reply_to
@@ -122,25 +123,62 @@ async def _get_actor_record(request: Request, username: str):
     return record
 
 
-def _build_actor(request: Request, record) -> Actor:
+async def _build_actor(request: Request, record) -> Actor:
+    """Build the served Actor document for ``record``.
+
+    A Follow-Only third-party identity (see ``_effective_third_party_mode``)
+    is deliberately never self-controlled -- its served name/avatar/bio
+    always live-mirror its CURRENT Matrix profile (fetched fresh here, not
+    the possibly-stale ``record.display_name``/``icon_url`` columns the
+    periodic sync timer only refreshes every so often) rather than anything
+    it or a past Full period might have set, and it never advertises Chat
+    (independently, ``;chat`` is already blocked outbound -- see
+    ``bridge.commands``'s ``_FOLLOW_ONLY_BLOCKED_ANY_ARG``). A local user
+    (or a Full-mode third party with a real Profile Room) is unchanged from
+    before this feature existed: everything read straight from the stored
+    ``ActorRecord``."""
     base = request.app.state.config.bridge.public_base_url
+    mode = await _effective_third_party_mode(request, record)
+    if mode == "follow_only":
+        synapse = request.app.state.synapse
+        try:
+            profile = await synapse.get_profile(record.matrix_user_id)
+        except SynapseError:
+            profile = {}
+        display_name = profile.get("displayname") or record.display_name or record.username
+        matrix_avatar_mxc = profile.get("avatar_url")
+        icon_url = None
+        if matrix_avatar_mxc:
+            try:
+                icon_url = media_url(base, matrix_avatar_mxc)
+            except ValueError:
+                icon_url = None
+        summary = f"{record.matrix_user_id} is a Matrix user."
+        banner_url = None
+        accepts_chat_messages = False
+    else:
+        display_name = record.display_name or record.username
+        icon_url = record.icon_url
+        summary = record.summary
+        banner_url = record.banner_url
+        # Advertises the "Chat" option (see bridge.chat_bridge) on software
+        # that checks for it -- every local actor accepts them, same as
+        # every local actor already implicitly accepts ordinary DMs.
+        accepts_chat_messages = True
     return Actor(
         id=actor_url(base, record.username),
         preferred_username=record.username,
-        name=record.display_name or record.username,
-        summary=record.summary,
+        name=display_name,
+        summary=summary,
         url=actor_url(base, record.username),
         inbox=inbox_url(base, record.username),
         outbox=outbox_url(base, record.username),
         followers=followers_url(base, record.username),
         following=following_url(base, record.username),
-        icon_url=record.icon_url,
-        image_url=record.banner_url,
+        icon_url=icon_url,
+        image_url=banner_url,
         shared_inbox=shared_inbox_url(base),
-        # Advertises the "Chat" option (see bridge.chat_bridge) on software
-        # that checks for it -- every local actor accepts them, same as
-        # every local actor already implicitly accepts ordinary DMs.
-        accepts_chat_messages=True,
+        accepts_chat_messages=accepts_chat_messages,
         public_key=PublicKey(
             id=main_key_id(base, record.username),
             owner=actor_url(base, record.username),
@@ -215,7 +253,8 @@ async def get_actor(request: Request, username: str) -> Response:
             following=following,
         )
         return HTMLResponse(html_doc)
-    return _activity_json(_build_actor(request, record).to_dict())
+    actor = await _build_actor(request, record)
+    return _activity_json(actor.to_dict())
 
 
 def _matrix_ts_to_iso(origin_server_ts: int | None) -> str:

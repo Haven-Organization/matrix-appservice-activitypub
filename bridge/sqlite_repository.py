@@ -22,9 +22,17 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, ReactionRecord, RemoteActorRoom
+from bridge.repository import (
+    ActorRecord,
+    FederatedEvent,
+    GhostProfile,
+    ReactionRecord,
+    RemoteActorRoom,
+    ThirdPartyAllowRecord,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS local_actors (
@@ -38,7 +46,19 @@ CREATE TABLE IF NOT EXISTS local_actors (
     icon_url TEXT,
     banner_url TEXT,
     hide_followers INTEGER NOT NULL DEFAULT 0,
-    hide_following INTEGER NOT NULL DEFAULT 0
+    hide_following INTEGER NOT NULL DEFAULT 0,
+    is_third_party INTEGER NOT NULL DEFAULT 0
+);
+
+-- Admin-granted third-party access (see ActorRecord.is_third_party and the
+-- ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid', 'room', or
+-- 'homeserver'; value is the corresponding exact MXID/room ID/domain.
+CREATE TABLE IF NOT EXISTS third_party_allowlist (
+    rule_type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    PRIMARY KEY (rule_type, value)
 );
 
 CREATE TABLE IF NOT EXISTS profile_room_history (
@@ -242,6 +262,9 @@ class SqliteActorRepository:
         if "hide_followers" not in columns:
             self._conn.execute("ALTER TABLE local_actors ADD COLUMN hide_followers INTEGER NOT NULL DEFAULT 0")
             self._conn.execute("ALTER TABLE local_actors ADD COLUMN hide_following INTEGER NOT NULL DEFAULT 0")
+            self._conn.commit()
+        if "is_third_party" not in columns:
+            self._conn.execute("ALTER TABLE local_actors ADD COLUMN is_third_party INTEGER NOT NULL DEFAULT 0")
             self._conn.commit()
 
         # is_current gives profile_room_history the same DB-enforced "only
@@ -503,8 +526,9 @@ class SqliteActorRepository:
             """
             INSERT INTO local_actors
                 (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
-                 display_name, summary, icon_url, banner_url, hide_followers, hide_following)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 display_name, summary, icon_url, banner_url, hide_followers, hide_following,
+                 is_third_party)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(username) DO UPDATE SET
                 matrix_user_id=excluded.matrix_user_id,
                 room_id=excluded.room_id,
@@ -515,13 +539,14 @@ class SqliteActorRepository:
                 icon_url=excluded.icon_url,
                 banner_url=excluded.banner_url,
                 hide_followers=excluded.hide_followers,
-                hide_following=excluded.hide_following
+                hide_following=excluded.hide_following,
+                is_third_party=excluded.is_third_party
             """,
             (
                 record.username, record.matrix_user_id, record.room_id,
                 record.public_key_pem, record.private_key_pem,
                 record.display_name, record.summary, record.icon_url, record.banner_url,
-                int(record.hide_followers), int(record.hide_following),
+                int(record.hide_followers), int(record.hide_following), int(record.is_third_party),
             ),
         )
         if record.room_id:
@@ -576,6 +601,7 @@ class SqliteActorRepository:
             banner_url=row["banner_url"],
             hide_followers=bool(row["hide_followers"]),
             hide_following=bool(row["hide_following"]),
+            is_third_party=bool(row["is_third_party"]),
         )
 
     # -- followers / following ----------------------------------------------
@@ -677,6 +703,15 @@ class SqliteActorRepository:
     async def set_following_hidden(self, username: str, hidden: bool) -> None:
         await self._run(self._set_following_hidden, username, hidden)
 
+    def _list_third_party_records(self) -> list[ActorRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM local_actors WHERE is_third_party = 1 AND room_id = ''"
+        ).fetchall()
+        return [self._row_to_actor(row) for row in rows]
+
+    async def list_third_party_records(self) -> list[ActorRecord]:
+        return await self._run(self._list_third_party_records)
+
     def _is_blocked(self, username: str, remote_actor_id: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM blocked_actors WHERE username = ? AND remote_actor_id = ?",
@@ -736,6 +771,80 @@ class SqliteActorRepository:
 
     async def remove_muted(self, username: str, remote_actor_id: str) -> None:
         await self._run(self._remove_muted, username, remote_actor_id)
+
+    # -- third-party allowlist -----------------------------------------------
+
+    def _add_third_party_allow(self, rule_type: str, value: str, granted_by: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO third_party_allowlist (rule_type, value, granted_by, granted_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(rule_type, value) DO UPDATE SET
+                granted_by=excluded.granted_by,
+                granted_at=excluded.granted_at
+            """,
+            (rule_type, value, granted_by, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+
+    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+        await self._run(self._add_third_party_allow, rule_type, value, granted_by)
+
+    def _remove_third_party_allow(self, rule_type: str, value: str) -> None:
+        self._conn.execute(
+            "DELETE FROM third_party_allowlist WHERE rule_type = ? AND value = ?", (rule_type, value)
+        )
+        self._conn.commit()
+
+    async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
+        await self._run(self._remove_third_party_allow, rule_type, value)
+
+    def _list_third_party_allows(self, rule_type: str | None) -> list[ThirdPartyAllowRecord]:
+        if rule_type is not None:
+            rows = self._conn.execute(
+                "SELECT * FROM third_party_allowlist WHERE rule_type = ? ORDER BY rule_type, value",
+                (rule_type,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM third_party_allowlist ORDER BY rule_type, value"
+            ).fetchall()
+        return [
+            ThirdPartyAllowRecord(
+                rule_type=row["rule_type"],
+                value=row["value"],
+                granted_by=row["granted_by"],
+                granted_at=row["granted_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
+        return await self._run(self._list_third_party_allows, rule_type)
+
+    def _is_third_party_allowed(self, mxid: str, homeserver: str, room_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = ?", (mxid,)
+        ).fetchone()
+        if row is not None:
+            return True
+        if room_id:
+            row = self._conn.execute(
+                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'room' AND value = ?", (room_id,)
+            ).fetchone()
+            if row is not None:
+                return True
+        if homeserver:
+            row = self._conn.execute(
+                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = ?",
+                (homeserver,),
+            ).fetchone()
+            if row is not None:
+                return True
+        return False
+
+    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
+        return await self._run(self._is_third_party_allowed, mxid, homeserver, room_id)
 
     # -- remote actor rooms --------------------------------------------------
 
