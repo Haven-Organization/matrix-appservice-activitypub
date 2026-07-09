@@ -32,6 +32,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;import follows`](#import-follows-or-import-following)
 - [`;replace room`](#replace-room)
 - [`;rejoin`](#rejoin-room_id-othermatrixid)
+- [`;leave unfollowed`](#leave-unfollowed)
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
 - [`;widget`](#widget)
@@ -43,7 +44,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -280,6 +281,16 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ---
 
+## `;leave unfollowed`
+
+**Syntax:** `;leave unfollowed`, no argument.
+
+**What it does:** Finds every Remote User Room you're currently a member of for an account you don't (or no longer) follow -- room membership and following are tracked independently, so this can happen via an old unfollow that never kicked you out, or various on-demand imports (a mention, a reply's ancestor chain, someone else's boost) landing you in a room you never actually ran `;follow` in. Shows the count and a list first and asks you to reply "confirm" before removing anything -- nothing happens just from running the command. Removes you (kicks, via the bot) from each one; your own Profile Room, DMs, and Chats are never touched, only Remote User Rooms.
+
+**Who can run it:** Requires a linked profile.
+
+---
+
 ## `;repost <caption>` (reply to a mirrored fediverse post)
 
 **Syntax:** Sent as a reply to a tracked post, with a required, non-empty caption.
@@ -318,4 +329,4 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the `hide`/`show` toggle, and a read-only following list.
 
-It deliberately omits `;repost` and `;rejoin`. Neither fits a simple button: repost needs a specific post to reply to, and rejoin is a rare recovery tool. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.
+It deliberately omits `;repost`, `;rejoin`, and `;leave unfollowed`. None fit a simple button: repost needs a specific post to reply to, rejoin is a rare recovery tool, and leave-unfollowed is a rare cleanup one, both of which also need a confirmation step the widget doesn't have a flow for. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.

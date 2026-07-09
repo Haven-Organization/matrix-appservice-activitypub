@@ -43,7 +43,11 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
 from bridge.chat_bridge import maybe_federate_chat_message
-from bridge.commands import maybe_handle_command, maybe_handle_delete_confirmation
+from bridge.commands import (
+    maybe_handle_command,
+    maybe_handle_delete_confirmation,
+    maybe_handle_leave_unfollowed_confirmation,
+)
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
@@ -131,6 +135,11 @@ async def _handle_transaction(
                 continue
             handled_as_delete_confirmation = await maybe_handle_delete_confirmation(request, event)
             if handled_as_delete_confirmation:
+                continue
+            handled_as_leave_unfollowed_confirmation = await maybe_handle_leave_unfollowed_confirmation(
+                request, event
+            )
+            if handled_as_leave_unfollowed_confirmation:
                 continue
             handled_as_command = await maybe_handle_command(request, event)
             if not handled_as_command:

@@ -278,7 +278,7 @@ _COMMAND_PREFIX = ";"
 
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
-    r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|help"
+    r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help"
 )
 
 
@@ -473,6 +473,8 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_create_profile(request, sender=sender, room_id=room_id)
         elif subcommand == "replace" and argument.lower() == "room":
             await _handle_replace_room(request, sender=sender, room_id=room_id)
+        elif subcommand == "leave" and argument.lower() == "unfollowed":
+            await _handle_leave_unfollowed(request, sender=sender, room_id=room_id)
         elif subcommand == "rejoin":
             await _handle_rejoin(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "following":
@@ -748,6 +750,11 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
         (
             f"{_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id]",
             "Force an invite into a room the bridge manages, e.g. to recover from a lockout.",
+        ),
+        (
+            f"{_COMMAND_PREFIX}leave unfollowed",
+            "Leave every Remote User Room you're a member of but no longer (or never actually) follow. "
+            "Shows a count and asks for confirmation first.",
         ),
         (
             f"{_COMMAND_PREFIX}hide followers",
@@ -3537,6 +3544,200 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
             await synapse.send_message_event(profile_room_id, deletion_notice_content, as_user_id=bot_mxid)
         except SynapseError:
             logger.info("Could not send deletion notice to %s", profile_room_id, exc_info=True)
+
+
+async def _list_unfollowed_ghost_rooms(
+    request: Request, *, sender: str, username: str
+) -> list[tuple[str, str, str]]:
+    """Every Remote User Room ``sender`` currently belongs to that they do
+    NOT (or no longer) follow -- ``(room_id, actor_id, handle)`` tuples.
+    Membership (``SynapseClient.admin_list_joined_rooms``, the same Admin
+    API call ``_execute_delete_profile`` already uses to enumerate a user's
+    rooms) and following (``ActorRepository.is_following``) are two
+    genuinely independent things in this bridge: a room invite can outlive
+    an unfollow (there's no code path that kicks someone out just because
+    they unfollowed), and various on-demand imports (a mention, a reply's
+    ancestor chain, someone else's boost) can land a user in a Remote User
+    Room's membership without them ever having run ``;follow`` there at
+    all. Best-effort against listing itself failing; a room this can't
+    even enumerate just doesn't show up rather than erroring the whole
+    command out."""
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+    try:
+        joined_rooms = await synapse.admin_list_joined_rooms(sender)
+    except SynapseError:
+        logger.warning("Could not list rooms for %s for ;leave unfollowed", sender, exc_info=True)
+        return []
+
+    unfollowed: list[tuple[str, str, str]] = []
+    for candidate_room_id in joined_rooms:
+        remote_room = await repository.get_remote_actor_room_by_room_id(candidate_room_id)
+        if remote_room is None:
+            continue  # not a Remote User Room at all (own profile room, a DM/Chat, ...)
+        if await repository.is_following(username, remote_room.actor_id):
+            continue
+        handle = remote_room.display_name or remote_room.actor_id
+        unfollowed.append((candidate_room_id, remote_room.actor_id, handle))
+    return unfollowed
+
+
+_LEAVE_UNFOLLOWED_WARNING_MARKER = "This will remove you from every Remote User Room you don't follow"
+_LEAVE_UNFOLLOWED_LIST_LIMIT = 25
+
+
+async def _handle_leave_unfollowed(request: Request, *, sender: str, room_id: str) -> None:
+    """First half of a two-step, confirmation-gated cleanup: shows how many
+    Remote User Rooms ``sender`` would be removed from (see
+    ``_list_unfollowed_ghost_rooms``) and, only if there's at least one,
+    asks them to reply "confirm" to actually go through -- nothing is left
+    yet just from running this command. See
+    ``maybe_handle_leave_unfollowed_confirmation`` for how that reply is
+    recognized, and ``_execute_leave_unfollowed`` for what actually runs
+    once confirmed."""
+    repository = request.app.state.repository
+    relates_to = _command_relates_to_var.get()
+
+    record = await repository.get_local_actor_by_matrix_id(sender)
+    if record is None:
+        await _notice(
+            request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".', relates_to=relates_to,
+        )
+        return
+
+    unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+    if not unfollowed:
+        await _notice(
+            request, room_id,
+            "You're not in any Remote User Rooms for accounts you don't follow -- nothing to leave.",
+            relates_to=relates_to,
+        )
+        return
+
+    shown = unfollowed[:_LEAVE_UNFOLLOWED_LIST_LIMIT]
+    handle_list = "\n".join(f"- {handle}" for _room_id, _actor_id, handle in shown)
+    remaining = len(unfollowed) - len(shown)
+    if remaining > 0:
+        handle_list += f"\n...and {remaining} more"
+
+    warning = (
+        f"⚠️ {_LEAVE_UNFOLLOWED_WARNING_MARKER} -- {len(unfollowed)} room"
+        f"{'s' if len(unfollowed) != 1 else ''}:\n{handle_list}"
+        '\n\nReply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_list = "".join(f"<li>{html.escape(handle)}</li>" for _room_id, _actor_id, handle in shown)
+    formatted_warning = (
+        f"<p>⚠️ {html.escape(_LEAVE_UNFOLLOWED_WARNING_MARKER)} -- "
+        f"<strong>{len(unfollowed)}</strong> room{'s' if len(unfollowed) != 1 else ''}:</p><ul>{formatted_list}</ul>"
+        + (f"<p>...and {remaining} more</p>" if remaining > 0 else "")
+        + '<p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text",
+        "body": warning,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_warning,
+    }
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    config = request.app.state.config
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send leave-unfollowed warning to %s", room_id, exc_info=True)
+
+
+async def maybe_handle_leave_unfollowed_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``;leave unfollowed`` warnings (handled, whether or not it actually
+    matched one) -- same pattern as ``maybe_handle_delete_confirmation``
+    (checked independent of ``message_addresses_bot``/the ``;`` prefix,
+    since the reply is just the bare word "confirm"; deliberately stateless
+    -- the replied-to event is checked for ``_LEAVE_UNFOLLOWED_WARNING_MARKER``
+    instead of any DB-tracked "pending confirmation" row). Must run before
+    ``maybe_federate_reply``/``maybe_distribute_profile_post`` in the
+    dispatch chain, same reasoning as that function."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    if _LEAVE_UNFOLLOWED_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+        return False
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_leave_unfollowed(request, sender=sender, room_id=room_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
+async def _execute_leave_unfollowed(request: Request, *, sender: str, room_id: str) -> None:
+    """The actual room-kicking, only ever reached via a confirmed
+    ``maybe_handle_leave_unfollowed_confirmation``. Recomputes the
+    unfollowed-room list fresh rather than trusting whatever
+    ``_handle_leave_unfollowed`` found earlier -- room membership/follow
+    state could have changed in between (e.g. they re-followed one before
+    confirming), same reasoning as ``_execute_delete_profile`` recomputing
+    from scratch rather than trusting anything from its own warning step.
+
+    Kicks (never just a Matrix-side leave) as the bot -- the bridge has no
+    puppeting rights over a real local user's own account to make them
+    literally "leave" it themselves (see
+    ``bridge.note_mirroring.resolve_and_invite_ghost``'s docstring for why
+    that's true everywhere else in this bridge too); the bot has power in
+    every Remote User Room it created (or that has invited it), so kicking
+    from there is always possible without needing the room owner/creator
+    to intervene."""
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+
+    record = await repository.get_local_actor_by_matrix_id(sender)
+    if record is None:
+        await _notice(request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".')
+        return
+
+    unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+    if not unfollowed:
+        await _notice(
+            request, room_id, "Nothing to leave anymore -- looks like this already changed since you asked.",
+        )
+        return
+
+    left = 0
+    for other_room_id, _actor_id, _handle in unfollowed:
+        try:
+            await synapse.kick_user(other_room_id, sender, as_user_id=bot_mxid, reason="Not followed")
+        except SynapseError:
+            logger.warning("Could not remove %s from %s for ;leave unfollowed", sender, other_room_id, exc_info=True)
+            continue
+        left += 1
+
+    await _notice(
+        request, room_id,
+        f"Done -- left {left} of {len(unfollowed)} room{'s' if len(unfollowed) != 1 else ''}"
+        + ("." if left == len(unfollowed) else f" ({len(unfollowed) - left} failed, see the logs)."),
+    )
 
 
 async def _handle_replace_room(request: Request, *, sender: str, room_id: str) -> None:

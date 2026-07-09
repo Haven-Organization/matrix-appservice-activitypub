@@ -80,6 +80,7 @@ from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
+    HAVEN_INCLUDES_HEADER_FIELD,
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
@@ -827,14 +828,18 @@ class QuotedPostRender:
 
 
 async def _quoted_post_render(
-    request: Request, quoter_actor_id: str, quote_uri: str, *, quoter_has_own_attachment: bool
+    request: Request, quote_uri: str, *, quoter_has_own_attachment: bool
 ) -> QuotedPostRender:
-    """Renders a quote-post's "X reposted Y's post" line plus a preview of
+    """Renders a quote-post's "reposted Y's post" line plus a preview of
     the quoted post -- for appending after the quoter's own (already
     stripped of any "RT: <link>" fallback, see ``_strip_quote_tail``)
     caption text. Mirrors ``bridge.commands._handle_repost``'s identical
     outbound rendering, so a quote reads the same regardless of which side
-    of the bridge made it.
+    of the bridge made it. Deliberately doesn't name the quoter themselves
+    in this line -- the mirrored event's own ``sender`` (a Matrix pill
+    naming them the ordinary way) already does that; repeating it here
+    would just be redundant, same reasoning as ``_build_repost_message``'s
+    identical omission for a boost's header.
 
     ``preview_image``/``preview_video`` are ALSO returned separately for
     ``merge_quote_preview_attachment`` to turn into the event's own real
@@ -908,7 +913,6 @@ async def _quoted_post_render(
                 if len(preview_text) > _PREVIEW_TEXT_LIMIT:
                     preview_text = preview_text[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
 
-    quoter_handle, quoter_html = await actor_html_with_avatar(request, quoter_actor_id)
     quoted_sender: str | None = None
     quoted_displayname: str | None = None
     if quoted_author_id:
@@ -939,7 +943,7 @@ async def _quoted_post_render(
         quote_block_parts.append(f"{img_html}<br>{html.escape(media_filename)}")
     quote_block_html = f"<blockquote>{'<br>'.join(quote_block_parts)}</blockquote>" if quote_block_parts else ""
 
-    plain_tail = f"\U0001F501 {quoter_handle} reposted {quoted_handle}'s post:"
+    plain_tail = f"\U0001F501 reposted {quoted_handle}'s post:"
     if has_real_caption:
         plain_tail += f"\n> {preview_text}"
     if show_media_inline:
@@ -947,9 +951,7 @@ async def _quoted_post_render(
     plain_tail += f"\n{post_link}"
 
     post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
-    html_tail = (
-        f"<p>\U0001F501 {quoter_html} reposted {quoted_author_html}'s {post_pill_html}</p>{quote_block_html}"
-    )
+    html_tail = f"<p>\U0001F501 reposted {quoted_author_html}'s {post_pill_html}</p>{quote_block_html}"
     return QuotedPostRender(
         plain_tail=plain_tail, html_tail=html_tail, preview_image=preview_image, preview_video=preview_video,
         quoted_ref=quoted_ref, full_content=full_content,
@@ -1126,14 +1128,14 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # plain-text "RT: <link>"-shaped fallback to their OWN content for
         # receivers that don't understand the quote fields, which is
         # exactly what we'd otherwise just mirror verbatim. Strip that tail
-        # and render our own explicit "X reposted Y's post" line plus a
+        # and render our own explicit "reposted Y's post" line plus a
         # preview instead, same convention as our own outbound ;repost (see
         # bridge.commands._handle_repost).
         plain = _strip_quote_tail(plain, quote_uri)
         if safe_html:
             safe_html = _strip_quote_tail_html(safe_html, quote_uri)
         quote_render = await _quoted_post_render(
-            request, activity.actor, quote_uri, quoter_has_own_attachment=bool(attachments)
+            request, quote_uri, quoter_has_own_attachment=bool(attachments)
         )
         quote_plain_tail = quote_render.plain_tail
         quote_html_tail = quote_render.html_tail
@@ -1546,6 +1548,7 @@ async def _echo_reply_in_own_room(
         "body": plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
+        HAVEN_INCLUDES_HEADER_FIELD: True,
     }
     if reply_relates_to is not None:
         message_content[SOCIAL_RELATES_TO_FIELD] = reply_relates_to
@@ -1719,14 +1722,22 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     original poster usually isn't.
 
     Separately -- and regardless of whether the booster is themselves
-    followed/mirrored at all -- if the boosted post is one we track (a
-    local user's own post, in their Profile Room, or any remote post we
-    already mirror), notify its owner (local posts only -- see
-    ``_notify_post_owner``) and mirror the boost as a real 🔁 reaction on
-    it (see ``_react_boost``). Anyone on the fediverse can boost a public
-    post, not just people the poster follows back, so neither of those can
-    be gated on ``remote_room`` existing.
-    """
+    followed/mirrored at all -- if the boosted post is one we ALREADY track
+    (a local user's own post, in their Profile Room, or any remote post we
+    already mirror) before this Announce even arrives, notify its owner
+    (local posts only -- see ``_notify_post_owner``) and mirror the boost
+    as a real 🔁 reaction on it right away (see ``_react_boost``). Anyone on
+    the fediverse can boost a public post, not just people the poster
+    follows back, so neither of those can be gated on ``remote_room``
+    existing.
+
+    If it ISN'T already tracked (the common case for a followed booster --
+    the whole point of following someone is seeing posts from accounts we
+    otherwise know nothing about), the 🔁 reaction still happens, just
+    later in this same function, once the boosted post actually gets
+    mirrored for the first time below (see the ``boosted_target is None``
+    check right after that import) -- not at the top, since there's
+    nothing to react to yet at that point."""
     repository = request.app.state.repository
 
     announce_id = activity.id
@@ -1786,6 +1797,15 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
         if imported.federated_event is not None:
             imported_link = matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)
             imported_ref = (imported.federated_event.room_id, imported.federated_event.event_id)
+            if boosted_target is None:
+                # Wasn't already tracked at the top of this function (the
+                # `_react_boost` call there never ran) -- this is the FIRST
+                # time we've mirrored it, via this exact Announce, so react
+                # now instead. If it WAS already tracked, import_note's own
+                # dedup just returned that same existing record without
+                # sending anything new, and _react_boost already ran once,
+                # above -- reacting again here would be a duplicate.
+                await _react_boost(request, imported.federated_event, activity.actor)
 
     message_content = await _build_repost_message(
         request, remote_room, obj, original_author_id, original_actor_doc, imported_link, imported_ref,
@@ -1908,7 +1928,6 @@ async def _build_repost_message(
     ``formatted_body`` is untouched either way -- that plain ``body``
     swap only matters to a client parsing MSC4501 fields; an
     ordinary client still renders the same rich HTML card as always."""
-    _, booster_html = await actor_html_with_avatar(request, remote_room.actor_id)
     original_sender: str | None = None
     original_displayname: str | None = None
     if original_author_id:
@@ -1941,7 +1960,7 @@ async def _build_repost_message(
         plain_body += f"\n\n{imported_link}"
 
     post_pill_html = f'<a href="{html.escape(imported_link, quote=True)}">post</a>' if imported_link else "post"
-    header_html = f"<p>\U0001F501 {booster_html} boosted {original_author_html}'s {post_pill_html}:</p>"
+    header_html = f"<p>\U0001F501 boosted {original_author_html}'s {post_pill_html}:</p>"
     content_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
 
     config = request.app.state.config
@@ -1974,6 +1993,7 @@ async def _build_repost_message(
         "body": imported_link if use_relates_to else plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
+        HAVEN_INCLUDES_HEADER_FIELD: True,
     }
     if use_relates_to:
         quoted_room_id, quoted_event_id = imported_ref

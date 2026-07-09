@@ -202,6 +202,20 @@ def social_relates_to(
         value["content"] = content
     return value
 
+# Set (bool, always ``True`` when present) on a mirrored event whose body/
+# formatted_body starts with a bridge-generated attribution line -- "🔁 X
+# boosted Y's post:" (_build_repost_message), "⤵️ Reply to X's post:"
+# (_echo_reply_in_own_room), or send_boost's own reaction-triggered notice
+# -- ahead of the actual mirrored content, rather than the mirrored
+# content being the entire body verbatim. Haven's own field (not part of
+# MSC4501 or any other spec), requested 2026-07-08, so it can strip/render
+# that header specially instead of treating it as part of the post's own
+# text. Deliberately NOT set on a quote-post's own tail (_quoted_post_render)
+# or an outbound ;repost's own echo (bridge.commands._handle_repost) --
+# both put a REAL caption first, with any bridge-generated attribution
+# coming after, not a header "at the top" in the sense this field means.
+HAVEN_INCLUDES_HEADER_FIELD = "software.haven.includes_header"
+
 # The event TYPE (not a content field) MSC4501 proposes in place of
 # m.room.message for a "real" social-media-style post -- see
 # bridge.config.BridgeSection.use_msc4501_post_event_type's own comment
@@ -241,12 +255,18 @@ PROFILE_BANNER_STATE_TYPE = "page.codeberg.everypizza.room.banner"
 # creator implicit power, letting the override omit them safely).
 REPLACE_ROOM_VERSION = "12"
 
-# Every fediverse-bridged room the bot creates (a Remote User Room, or a
-# local user's own Profile Room) is knock-only rather than invite-only, so
-# someone locked out of one (an old room they've moved on from, or one they
-# were never invited to but should have access to) can ask their way back in
-# without needing an admin -- see bridge.membership.maybe_handle_knock, which
-# auto-accepts a knock using the same rules as the `rejoin` command.
+# A Remote User Room's and a local Profile Room's own join_rule are each
+# separately configurable (bridge.config.BridgeSection.ghost_room_join_rule /
+# local_profile_room_join_rule) -- this constant is now just the fixed
+# default for a ghost's DM/Chat room specifically (ensure_ghost_dm_room/
+# ensure_ghost_chat_room and their `;replace room` equivalents), which stays
+# knock-only unconditionally: it's how the intended local user lets
+# themselves back into a private 1:1 room they already know the ID of (e.g.
+# after a `;replace room`) without needing an admin -- see
+# bridge.membership.maybe_handle_knock, which auto-accepts a knock using the
+# same rules as the `rejoin` command. Not exposed as its own setting since a
+# DM/Chat's privacy concern (letting the ONE intended person back in) is
+# different from a profile room's (who can discover/follow it at all).
 KNOCK_JOIN_RULE = "knock"
 
 
@@ -1918,7 +1938,7 @@ async def _import_note_locked(
             invite=[inviter, bot_mxid] if inviter else [bot_mxid],
             avatar_mxc=avatar_mxc,
             room_type=SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=KNOCK_JOIN_RULE,
+            join_rule=config.bridge.ghost_room_join_rule,
             # bot_mxid kept at the same level as the ghost creator -- see
             # ensure_ghost_dm_room's identical reasoning. events'
             # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches every
