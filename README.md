@@ -36,6 +36,13 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 - **Boosts**: reacting with 🔁, or running `;boost` as a reply, sends a real `Announce` (not a Like) to both your followers and the original author, plus a "🔁 you boosted" card in your own Profile Room. An incoming `Announce` renders the same card and independently imports the boosted post into its original author's own room, so it's reply/react-able there too. Un-boosting (redacting the reaction, the command, or the card, all three are linked) sends `Undo(Announce)`.
 - **Custom emoji**: Pleroma/Misskey/Akkoma image-emoji shortcodes (in post text, reactions, or display names) are resolved against the object's own metadata to an uploaded `mxc://` image and inlined next to the shortcode text, in both directions.
 
+### Polls
+
+- Polls are bridged bidirectionally, as real Matrix poll widgets (MSC3381), not text. A Profile Room poll becomes a `Create{Question}`; an incoming poll from a followed account is mirrored the same way a post is, but as an actual interactive poll.
+- Voting either direction works: a local vote on a mirrored (remote-owned) poll federates out as a private vote to the poll's author; a remote vote on your own poll makes that voter's ghost cast a real Matrix poll response, so Matrix's own widget tallies it alongside everyone else's.
+- A mirrored poll's results are shown as a "Fediverse Tallies" thread reply, seeded from whatever the poll already shows at import time and actively refreshed after a vote or via `;poll refresh` -- some remote servers (confirmed for Pleroma/Akkoma) never push a live tally update over federation at all, so this doesn't rely solely on one arriving.
+- An incoming poll closing is mirrored as a real poll-end event in the same thread.
+
 ### Direct messages and chats
 
 - **DMs** (`;dm`): a private, non-public `Create{Note}` addressed only to the recipient, in a dedicated ghost DM room. Threaded if replying within that same room.
