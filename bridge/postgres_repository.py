@@ -29,6 +29,7 @@ from bridge.repository import (
     ActorRecord,
     FederatedEvent,
     GhostProfile,
+    PollVoteRecord,
     ReactionRecord,
     RemoteActorRoom,
     ThirdPartyAllowRecord,
@@ -155,6 +156,20 @@ _SCHEMA_STATEMENTS = [
         secondary_event_id TEXT UNIQUE
     )
     """,
+    # Idempotency bookkeeping for poll votes, both directions -- see
+    # PollVoteRecord's own docstring for why this table exists and what it
+    # deliberately does NOT store (which option was chosen).
+    """
+    CREATE TABLE IF NOT EXISTS poll_votes (
+        vote_activity_id TEXT PRIMARY KEY,
+        question_ap_object_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        voter_actor_id TEXT,
+        matrix_user_id TEXT,
+        matrix_event_id TEXT UNIQUE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_poll_votes_question_user ON poll_votes (question_ap_object_id, matrix_user_id)",
     """
     CREATE TABLE IF NOT EXISTS ghost_profiles (
         actor_id TEXT PRIMARY KEY,
@@ -839,6 +854,41 @@ class PostgresActorRepository:
     async def remove_reaction(self, activity_id: str) -> None:
         await self._pool.execute("DELETE FROM reactions WHERE activity_id = $1", activity_id)
 
+    # -- poll votes -----------------------------------------------------------
+
+    async def record_poll_vote(self, record: PollVoteRecord) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO poll_votes
+                (vote_activity_id, question_ap_object_id, room_id,
+                 voter_actor_id, matrix_user_id, matrix_event_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (vote_activity_id) DO UPDATE SET
+                question_ap_object_id = EXCLUDED.question_ap_object_id,
+                room_id = EXCLUDED.room_id,
+                voter_actor_id = EXCLUDED.voter_actor_id,
+                matrix_user_id = EXCLUDED.matrix_user_id,
+                matrix_event_id = EXCLUDED.matrix_event_id
+            """,
+            record.vote_activity_id, record.question_ap_object_id, record.room_id,
+            record.voter_actor_id, record.matrix_user_id, record.matrix_event_id,
+        )
+
+    async def get_poll_vote_by_activity_id(self, vote_activity_id: str) -> PollVoteRecord | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM poll_votes WHERE vote_activity_id = $1", vote_activity_id
+        )
+        return self._row_to_poll_vote(row) if row else None
+
+    async def get_poll_vote_by_matrix_user(
+        self, question_ap_object_id: str, matrix_user_id: str
+    ) -> PollVoteRecord | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM poll_votes WHERE question_ap_object_id = $1 AND matrix_user_id = $2",
+            question_ap_object_id, matrix_user_id,
+        )
+        return self._row_to_poll_vote(row) if row else None
+
     async def get_custom_emoji_mxc(self, source_url: str) -> str | None:
         row = await self._pool.fetchrow("SELECT mxc_url FROM custom_emoji WHERE source_url = $1", source_url)
         return row["mxc_url"] if row else None
@@ -883,6 +933,17 @@ class PostgresActorRepository:
             reactor_matrix_user_id=row["reactor_matrix_user_id"],
             secondary_event_id=row["secondary_event_id"],
             custom_emoji_mxc=row["custom_emoji_mxc"],
+        )
+
+    @staticmethod
+    def _row_to_poll_vote(row: asyncpg.Record) -> PollVoteRecord:
+        return PollVoteRecord(
+            vote_activity_id=row["vote_activity_id"],
+            question_ap_object_id=row["question_ap_object_id"],
+            room_id=row["room_id"],
+            voter_actor_id=row["voter_actor_id"],
+            matrix_user_id=row["matrix_user_id"],
+            matrix_event_id=row["matrix_event_id"],
         )
 
     # -- ghost profile sync cache -------------------------------------------

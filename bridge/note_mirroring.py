@@ -228,6 +228,222 @@ HAVEN_REMOVE_HEADER_FIELD = "software.haven.remove_header"
 # has never heard of this event type won't render the event at all.
 SOCIAL_POST_EVENT_TYPE = "org.matrix.msc4501.social.post"
 
+# Bare boolean marker (not part of any spec -- a Haven-specific convention,
+# same category as HAVEN_REMOVE_HEADER_FIELD above) on the bridge's own
+# poll-tallies thread reply (see ``upsert_poll_tally_reply`` below), so a
+# later refresh can reliably find and edit THIS message again via
+# SynapseClient.get_relations rather than creating a duplicate one --
+# deliberately not stored in any DB table (this project's "read live state
+# back out of Synapse instead" convention), since a thread can also contain
+# genuine human replies this marker needs to be distinguishable from.
+HAVEN_POLL_TALLY_REPLY_FIELD = "software.haven.poll.tally_reply"
+
+POLL_END_EVENT_TYPE = "org.matrix.msc3381.poll.end"
+
+
+def extract_poll_tallies(obj: dict) -> dict[str, int] | None:
+    """Pulls current per-option vote counts out of a Question object's
+    ``oneOf``/``anyOf``, per Mastodon's own actual wire shape (confirmed
+    against ``ActivityPub::Parser::PollParser#cached_tallies`` in its
+    source: each option is ``{"name": ..., "replies": {"totalItems": N}}``).
+    Returns None if there's nothing usable (no options, or none with a
+    name) rather than an empty dict, so callers can tell "nothing to show"
+    apart from "all options have flatly zero votes"."""
+    options = obj.get("oneOf") or obj.get("anyOf") or []
+    tallies: dict[str, int] = {}
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        name = (opt.get("name") or "").strip()
+        if not name:
+            continue
+        count = (opt.get("replies") or {}).get("totalItems")
+        tallies[name] = count if isinstance(count, int) else 0
+    return tallies or None
+
+
+def render_poll_tallies(tallies: dict[str, int]) -> tuple[str, str]:
+    """Builds the plain/HTML content for a poll's fediverse-tallies thread
+    reply -- see this feature's own design/testing (numbers-and-percentage
+    FIRST so a long option name just wraps away on its own instead of
+    dragging the numeric columns out of alignment; a real ``<pre><code>``
+    block for the HTML rendering, confirmed live to be the only tested
+    approach that keeps the columns aligned regardless of label length)."""
+    header = "\U0001F4CA Fediverse Tallies"
+    total = sum(tallies.values()) or 1
+    counts = list(tallies.values())
+    count_width = max(len(str(c)) for c in counts)
+    pct_strs = [f"{c / total * 100:.1f}" for c in counts]
+    pct_width = max(len(s) for s in pct_strs)
+
+    lines = []
+    for i, ((label, count), pct_str) in enumerate(zip(tallies.items(), pct_strs), start=1):
+        count_padded = str(count).rjust(count_width)
+        pct_padded = pct_str.rjust(pct_width)
+        lines.append(f"{i}. {count_padded} ({pct_padded}%)  {label}")
+    plain = header + "\n" + "\n".join(lines)
+    formatted = (
+        f"<p><strong>{html.escape(header)}</strong></p>"
+        "<pre><code>" + "\n".join(html.escape(line) for line in lines) + "</code></pre>"
+    )
+    return plain, formatted
+
+
+async def find_poll_thread_children(request: Request, target: FederatedEvent) -> list[dict]:
+    """One ``get_relations`` fetch of every reply in the poll's own thread,
+    shared by the tally-reply lookup and the already-closed check -- a
+    single round trip covers both rather than two."""
+    try:
+        return await request.app.state.synapse.get_relations(
+            target.room_id, target.event_id, rel_type="m.thread"
+        )
+    except SynapseError:
+        return []
+
+
+async def upsert_poll_tally_reply(
+    request: Request, *, target: FederatedEvent, tallies: dict[str, int],
+    thread_children: list[dict],
+) -> None:
+    """Finds this poll's own fediverse-tallies reply (tagged with
+    ``HAVEN_POLL_TALLY_REPLY_FIELD``, since a poll's thread can also
+    contain genuine human replies this has to be distinguished from) among
+    ``thread_children`` and edits it with the current numbers, or sends a
+    fresh one -- which becomes the anchor every later update edits -- if
+    none exists yet. No DB state at all; ``thread_children`` is read live
+    from Synapse by the caller (shared with the already-closed check; pass
+    ``[]`` for a poll that was JUST created, since it can't have a thread
+    yet -- avoids a wasted fetch at import time).
+
+    Sent as the bridge BOT, not the ghost -- unlike the poll itself and its
+    eventual ``poll.end`` (both real mirrored copies of the remote account's
+    own activity), this specific message is bridge-GENERATED informational
+    content the remote account never actually said, same category as
+    ``send_boost``'s own "you boosted" card (see its docstring for that
+    distinction). The bot is always already a member of a Remote User Room
+    with equal standing to the ghost (``additional_creators=[bot_mxid]`` at
+    room-creation time -- see ``_ensure_remote_actor_room``), so no extra
+    join/invite step is needed here either."""
+    synapse = request.app.state.synapse
+    plain, formatted = render_poll_tallies(tallies)
+    existing_id = next(
+        (
+            e.get("event_id") for e in thread_children
+            if e.get("type") == "m.room.message" and (e.get("content") or {}).get(HAVEN_POLL_TALLY_REPLY_FIELD)
+        ),
+        None,
+    )
+    if existing_id is not None:
+        new_content = {
+            "msgtype": "m.text", "body": plain,
+            "format": "org.matrix.custom.html", "formatted_body": formatted,
+            HAVEN_POLL_TALLY_REPLY_FIELD: True,
+        }
+        content = {
+            "msgtype": "m.text",
+            "body": f"* {plain}",
+            "format": "org.matrix.custom.html",
+            "formatted_body": f"* {formatted}",
+            "m.new_content": new_content,
+            "m.relates_to": {"rel_type": "m.replace", "event_id": existing_id},
+        }
+    else:
+        content = {
+            "msgtype": "m.text", "body": plain,
+            "format": "org.matrix.custom.html", "formatted_body": formatted,
+            HAVEN_POLL_TALLY_REPLY_FIELD: True,
+            "m.relates_to": thread_reply_relates_to(event_id=target.event_id, thread_root_event_id=None),
+        }
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        await synapse.send_message_event(target.room_id, content, as_user_id=bot_mxid)
+    except SynapseError:
+        logger.warning("Failed to update poll tally reply for %s", target.ap_object_id, exc_info=True)
+
+
+async def maybe_send_poll_end(
+    request: Request, *, target: FederatedEvent, ghost_user_id: str, thread_children: list[dict],
+) -> bool:
+    """Sends ``org.matrix.msc3381.poll.end`` for a poll confirmed closed --
+    as the GHOST (not the bot), since this is the poll author's own real
+    act, exactly like every other mirrored copy of their activity, not
+    bridge-generated commentary (see ``bridge.reaction_bridge.send_boost``'s
+    docstring for that distinction). The ghost is already guaranteed a room
+    member (it created the room), so no extra join step is needed.
+
+    Idempotent -- checked live (no new DB state) against whether a
+    ``poll.end`` has already been posted in this thread, so calling this
+    repeatedly (a redelivered/repeated Update, or a user re-running
+    ``;poll refresh`` after it's already closed) costs one cheap read each
+    time after the first, never a repeat write. Returns True once the poll
+    is known-closed in Matrix, whether this call is what sent it or it was
+    already there."""
+    if any(e.get("type") == POLL_END_EVENT_TYPE for e in thread_children):
+        return True
+    try:
+        await request.app.state.synapse.send_message_event(
+            target.room_id,
+            {
+                POLL_END_EVENT_TYPE: {},
+                "org.matrix.msc1767.text": "The poll has closed.",
+                "m.relates_to": {"rel_type": "m.reference", "event_id": target.event_id},
+            },
+            event_type=POLL_END_EVENT_TYPE,
+            as_user_id=ghost_user_id,
+        )
+        return True
+    except SynapseError:
+        logger.warning("Failed to mirror poll close for %s", target.ap_object_id, exc_info=True)
+        return False
+
+
+async def refresh_poll_tallies(request: Request, *, target: FederatedEvent) -> bool:
+    """Actively re-fetches a mirrored poll's own live AP object, rather
+    than only ever waiting for a push ``Update`` -- confirmed some remote
+    implementations (Pleroma/Akkoma, verified directly against their
+    source) never send one at all, live or at close, so relying solely on
+    inbound delivery leaves a poll's tallies permanently stuck wherever
+    they were at import time. Reflects whatever the live fetch finds:
+    refreshed tallies via the same thread-reply upsert an inbound Update
+    would trigger, and the poll's closed state via the same idempotent
+    ``poll.end`` logic.
+
+    Shared by a local vote on a mirrored poll
+    (``bridge.poll_bridge.maybe_federate_poll_vote``, right after
+    delivering the vote itself) and the ``;poll refresh`` command
+    (``bridge.commands``) -- both are user-triggered, not remote-triggered,
+    so neither needs the inbound Update handler's own spam-guard cooldown
+    (see ``bridge.inbox_dispatch._TALLY_REFRESH_COOLDOWN_SECONDS`` --
+    that one exists specifically because a hostile/buggy remote server can
+    push as often as it likes; nothing here is remote-triggered the same
+    way).
+
+    Returns False if the poll's live object couldn't be fetched at all
+    (network error, deleted, no longer a Question, or ``target`` isn't a
+    tracked Remote User Room's poll) -- True otherwise, whether or not
+    anything about it had actually changed."""
+    repository = request.app.state.repository
+    remote_room = await repository.get_remote_actor_room_by_room_id(target.room_id)
+    if remote_room is None:
+        return False
+    try:
+        question = await fetch_actor(request.app.state.http_client, target.ap_object_id)
+    except RemoteActorFetchError:
+        return False
+    if question.get("type") != "Question":
+        return False
+
+    thread_children = await find_poll_thread_children(request, target)
+    tallies = extract_poll_tallies(question)
+    if tallies is not None:
+        await upsert_poll_tally_reply(request, target=target, tallies=tallies, thread_children=thread_children)
+    if question.get("closed"):
+        await maybe_send_poll_end(
+            request, target=target, ghost_user_id=remote_room.ghost_user_id, thread_children=thread_children,
+        )
+    return True
+
 
 def mirrored_post_event_type(config) -> str:
     """The event type to use when mirroring a remote fediverse account's
@@ -1865,43 +2081,50 @@ async def import_note(
         )
 
 
-async def _import_note_locked(
-    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
-) -> ImportedNote:
-    """``import_note``'s actual body, run while holding that post's own
-    ``_import_lock`` -- see ``import_note``'s own docstring for why."""
+async def _ensure_remote_actor_room(
+    request: Request, *, author_actor_id: str, author_doc: dict, inviter: str | None
+) -> tuple[RemoteActorRoom | None, str | None]:
+    """Resolve (or provision, if this is the first-ever import from
+    ``author_actor_id``) their Remote User Room -- ghost user, room, bridge
+    info/widget, MSC4501 profile-room state, banner. Returns
+    ``(None, None)`` only when ``author_actor_id`` turns out to be one of
+    this bridge's own local actors (never ghosted -- see the refusal
+    branch's own reasoning) or its domain can't be determined. Best-effort
+    invites ``inviter`` either way (folded into a brand-new room's own
+    creation, or via ``synapse.invite_user`` for an existing one).
+
+    The second tuple element is the ghost's own freshly-uploaded avatar
+    mxc://, but ONLY when this call is the one that actually created the
+    room (``None`` if it already existed) -- callers that render an
+    author's avatar (e.g. a boost/repost card) need this because
+    ``RemoteActorRoom.icon_url`` alone is a remote https:// URL, not yet
+    uploaded to this homeserver's own media repo.
+
+    Shared by ``_import_note_locked`` and ``_import_question_locked`` --
+    identical provisioning regardless of whether the post being imported
+    turns out to be a Note or a Question."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
     bot_mxid = _bot_mxid(config)
 
-    ap_object_id = note.get("id")
-    existing = await repository.get_federated_event_by_ap_object(ap_object_id) if ap_object_id else None
-    if existing is not None:
-        if inviter:
-            try:
-                await synapse.invite_user(existing.room_id, inviter, as_user_id=bot_mxid)
-            except SynapseError as exc:
-                if exc.errcode != "M_FORBIDDEN":
-                    logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
-        return ImportedNote(federated_event=existing)
-
     if username_from_actor_url(config.bridge.public_base_url, author_actor_id) is not None:
         # A local actor's own post always gets a FederatedEvent recorded the
         # moment it's actually posted (see bridge.profile_posts), so the
-        # dedup check above should already have caught this -- reaching here
-        # means we somehow have no record of a post that claims to be ours.
-        # Ghosting a local actor is never right regardless (see
-        # resolve_and_invite_ghost's docstring for why); refuse rather than
-        # minting a fake identity for someone who already has a real one.
+        # caller's own dedup check should already have caught this --
+        # reaching here means we somehow have no record of a post that
+        # claims to be ours. Ghosting a local actor is never right
+        # regardless (see resolve_and_invite_ghost's docstring for why);
+        # refuse rather than minting a fake identity for someone who
+        # already has a real one.
         logger.info("Refusing to import %s as a Remote User Room -- it looks like a local actor", author_actor_id)
-        return ImportedNote(federated_event=None)
+        return None, None
 
     username = author_doc.get("preferredUsername") or author_actor_id.rstrip("/").rsplit("/", 1)[-1]
     domain = urlsplit(author_actor_id).hostname or ""
     if not domain:
         logger.info("Could not determine a domain for %s; dropping import", author_actor_id)
-        return ImportedNote(federated_event=None)
+        return None, None
     localpart = ghost_localpart(config.appservice.user_prefix, username, domain)
     mxid = ghost_mxid(config.appservice.user_prefix, username, domain, config.synapse.server_name)
 
@@ -1977,6 +2200,36 @@ async def _import_note_locked(
         except SynapseError as exc:
             if exc.errcode != "M_FORBIDDEN":
                 logger.warning("Could not invite %s to %s: %s", inviter, remote_room.room_id, exc)
+
+    return remote_room, author_avatar_mxc
+
+
+async def _import_note_locked(
+    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+) -> ImportedNote:
+    """``import_note``'s actual body, run while holding that post's own
+    ``_import_lock`` -- see ``import_note``'s own docstring for why."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+
+    ap_object_id = note.get("id")
+    existing = await repository.get_federated_event_by_ap_object(ap_object_id) if ap_object_id else None
+    if existing is not None:
+        if inviter:
+            try:
+                await synapse.invite_user(existing.room_id, inviter, as_user_id=bot_mxid)
+            except SynapseError as exc:
+                if exc.errcode != "M_FORBIDDEN":
+                    logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
+        return ImportedNote(federated_event=existing)
+
+    remote_room, author_avatar_mxc = await _ensure_remote_actor_room(
+        request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+    )
+    if remote_room is None:
+        return ImportedNote(federated_event=None)
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=note)
     plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
@@ -2066,3 +2319,138 @@ async def _import_note_locked(
     return ImportedNote(
         federated_event=new_event, first_attachment_mxc=first_attachment_mxc, author_avatar_mxc=author_avatar_mxc
     )
+
+
+async def import_question(
+    request: Request, *, question: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+) -> ImportedNote:
+    """Mirror ``question`` (an already-fetched, already-type-checked
+    ActivityStreams ``Question`` -- a poll) into a Remote User Room for
+    ``author_actor_id``, as a REAL Matrix ``org.matrix.msc3381.poll.start``
+    event (not a text message) so Matrix clients render an actual
+    interactive poll widget, ghost-authored exactly like an ordinary
+    mirrored post. Otherwise follows ``import_note``'s exact shape -- see
+    its own docstring for the dedup/locking/room-provisioning reasoning,
+    all of which is identical here (including sharing its ``_import_lock``
+    keyspace -- a poll and a Note never collide on ``id``)."""
+    ap_object_id = question.get("id")
+    if not ap_object_id:
+        return await _import_question_locked(
+            request, question=question, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+        )
+    async with _import_lock(ap_object_id):
+        return await _import_question_locked(
+            request, question=question, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+        )
+
+
+async def _import_question_locked(
+    request: Request, *, question: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+) -> ImportedNote:
+    """``import_question``'s actual body, run while holding that poll's own
+    ``_import_lock`` -- see ``import_note``'s docstring for why that's
+    needed."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+
+    ap_object_id = question.get("id")
+    existing = await repository.get_federated_event_by_ap_object(ap_object_id) if ap_object_id else None
+    if existing is not None:
+        if inviter:
+            try:
+                await synapse.invite_user(existing.room_id, inviter, as_user_id=bot_mxid)
+            except SynapseError as exc:
+                if exc.errcode != "M_FORBIDDEN":
+                    logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
+        return ImportedNote(federated_event=existing)
+
+    remote_room, author_avatar_mxc = await _ensure_remote_actor_room(
+        request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+    )
+    if remote_room is None:
+        return ImportedNote(federated_event=None)
+
+    question_text, _ = strip_to_matrix_message(question.get("content") or "")
+    options_raw = question.get("oneOf") or question.get("anyOf") or []
+    multi = bool(question.get("anyOf"))
+    answers = [
+        {"id": f"option-{i}", "org.matrix.msc1767.text": (opt.get("name") or "").strip()}
+        for i, opt in enumerate(options_raw)
+        if isinstance(opt, dict) and (opt.get("name") or "").strip()
+    ]
+    if not answers:
+        logger.info("Question %s has no usable options; dropping import", ap_object_id)
+        return ImportedNote(federated_event=None, author_avatar_mxc=author_avatar_mxc)
+
+    fallback_lines = "\n".join(f"- {a['org.matrix.msc1767.text']}" for a in answers)
+    poll_content: dict = {
+        "org.matrix.msc1767.text": f"{question_text}\n{fallback_lines}" if question_text else fallback_lines,
+        "org.matrix.msc3381.poll.start": {
+            # Mastodon's own AP wire format has no reliable "hide results"
+            # signal on a Question object to map to "undisclosed" -- always
+            # disclosed until a real signal turns up to key off of.
+            "kind": "org.matrix.msc3381.poll.disclosed",
+            "max_selections": len(answers) if multi else 1,
+            "question": {"org.matrix.msc1767.text": question_text},
+            "answers": answers,
+        },
+    }
+    src = source_post_url(question)
+    if src:
+        poll_content["external_url"] = src
+
+    config = request.app.state.config
+    max_clock_skew = config.federation.max_clock_skew
+    max_backdate_days = config.federation.max_backdate_days
+    try:
+        event_id = await synapse.send_message_event(
+            remote_room.room_id, poll_content, as_user_id=remote_room.ghost_user_id,
+            event_type="org.matrix.msc3381.poll.start",
+            ts=resolve_event_ts(question, max_clock_skew=max_clock_skew, max_backdate_days=max_backdate_days),
+        )
+    except SynapseError:
+        logger.warning("Failed to import poll from %s", author_actor_id, exc_info=True)
+        return ImportedNote(federated_event=None, author_avatar_mxc=author_avatar_mxc)
+
+    new_event: FederatedEvent | None = None
+    if ap_object_id:
+        new_event = FederatedEvent(
+            event_id=event_id, room_id=remote_room.room_id, ap_object_id=ap_object_id, author_actor_id=author_actor_id,
+        )
+        try:
+            await repository.record_federated_event(new_event)
+        except Exception:
+            # Same lost-race handling as _import_note_locked -- see its own
+            # comment on this exact block for why.
+            existing = await repository.get_federated_event_by_ap_object(ap_object_id)
+            if existing is None:
+                logger.warning("Failed to record federated event for %s", ap_object_id, exc_info=True)
+            else:
+                try:
+                    await synapse.redact_event(
+                        remote_room.room_id, event_id, reason="Duplicate import",
+                        as_user_id=remote_room.ghost_user_id,
+                    )
+                except SynapseError:
+                    logger.warning(
+                        "Lost an import race for %s but could not redact the duplicate %s",
+                        ap_object_id, event_id, exc_info=True,
+                    )
+                new_event = existing
+        else:
+            # Seed an initial tallies snapshot from whatever the just-fetched
+            # Question already shows -- some remote implementations
+            # (confirmed for Pleroma/Akkoma) never push a live Update at
+            # all, so this one-time snapshot may be the ONLY tally data
+            # this poll ever gets without someone running
+            # ";poll refresh"/voting (see refresh_poll_tallies). thread_children=[]
+            # since a poll that was JUST created can't have a thread yet.
+            initial_tallies = extract_poll_tallies(question)
+            if initial_tallies is not None:
+                await upsert_poll_tally_reply(
+                    request, target=new_event, tallies=initial_tallies, thread_children=[],
+                )
+
+    return ImportedNote(federated_event=new_event, author_avatar_mxc=author_avatar_mxc)

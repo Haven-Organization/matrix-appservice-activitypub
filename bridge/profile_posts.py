@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -46,11 +47,26 @@ from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media
 from bridge.commands import _effective_third_party_mode, message_addresses_bot
 from bridge.media import build_ap_attachment, media_caption
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
-from bridge.note_mirroring import deliver_to_actor_or_followers, push_profile_update
-from bridge.reaction_bridge import send_boost
+from bridge.note_mirroring import (
+    SOCIAL_REL_TYPE_REPOST,
+    SOCIAL_RELATES_TO_FIELD,
+    deliver_to_actor_or_followers,
+    push_profile_update,
+)
+from bridge.reaction_bridge import note_msc4501_native_repost, send_boost
 from bridge.repository import FederatedEvent
 
 logger = logging.getLogger(__name__)
+
+# Matches a body that's ENTIRELY a matrix.to permalink or a matrix: URI
+# (MSC2312) and nothing else -- per MSC4501, a repost with no added
+# caption (i.e. a plain boost) always has its body reduced to just this,
+# with the real content living in org.matrix.msc4501.social.relates_to
+# instead. A genuine caption (real added commentary) fails this match, so
+# _maybe_boost_msc4501_repost's caller only ever treats a caption-less
+# repost as a boost -- one WITH a caption falls through to the ordinary
+# post path, same as ";repost" already does for the outbound direction.
+_BARE_MATRIX_LINK_BODY_RE = re.compile(r"^(https://matrix\.to/#/\S+|matrix:\S+)$")
 
 
 async def _maybe_boost_forwarded_post(
@@ -121,6 +137,54 @@ async def _maybe_boost_forwarded_post(
     return True
 
 
+async def _maybe_suppress_msc4501_repost_record(
+    request: Request, *, relates_to: dict, body: str, booster_matrix_user_id: str,
+) -> bool:
+    """Recognizes -- and consumes, WITHOUT itself boosting anything -- the
+    ``org.matrix.msc4501.social.relates_to`` record an MSC4501-aware client
+    (e.g. Haven) posts into the booster's own Profile Room for a
+    caption-less repost (a boost): ``rel_type:
+    "org.matrix.msc4501.social.repost"`` with the body reduced to nothing
+    but a matrix.to/matrix: permalink, per the spec's own convention.
+
+    Per MSC4501, a caption-less repost is the 🔁 reaction on the original
+    post TOGETHER WITH this record -- two Matrix events for one logical
+    repost, not two independent ones. The reaction ALONE already triggers
+    a real AP ``Announce`` on its own (``maybe_federate_reaction`` ->
+    ``send_boost``, pre-existing, unrelated to this function). This
+    function's only job is stopping THIS record from falling through to
+    the ordinary fresh-post path and being published as a new post
+    containing nothing but the bare permalink text (confirmed live
+    2026-07-09: that's exactly what happened before this existed) --
+    deliberately does NOT also call ``send_boost`` itself: doing so
+    double-boosted (two "you boosted" cards, two Announces) for the exact
+    same repost, confirmed live the same day this was first added, since
+    the reaction was already independently doing it.
+
+    Also tells ``send_boost`` (via ``note_msc4501_native_repost``) that a
+    native record for this exact boost now exists, so its own "you
+    boosted" card -- redundant with this native record when both land in
+    the SAME Profile Room, e.g. Haven's own social page and this bridge's
+    Profile Room being the same room -- gets skipped (or retroactively
+    redacted if the reaction happened to arrive first and already posted
+    it). See that function's own docstring for the arrival-order handling.
+
+    A repost WITH a real added caption is a genuine quote-post, not a
+    boost -- MSC4501 doesn't pair those with a reaction, so it must fall
+    through to the ordinary post path instead (matching ``;repost``'s own
+    outbound distinction) -- the caller only invokes this once the body's
+    already been confirmed to be nothing but a bare link (see
+    ``_BARE_MATRIX_LINK_BODY_RE``), which is what keeps this from
+    misfiring on one."""
+    boosted_event_id = relates_to.get("event_id")
+    if not boosted_event_id or not _BARE_MATRIX_LINK_BODY_RE.match(body):
+        return False
+    await note_msc4501_native_repost(
+        request, booster_matrix_user_id=booster_matrix_user_id, boosted_event_id=boosted_event_id,
+    )
+    return True
+
+
 async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     """Returns True if this event belonged to a linked Profile Room (handled,
     successfully distributed or not) -- callers shouldn't process it further."""
@@ -187,6 +251,20 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
         return True  # already distributed (e.g. a redelivered transaction) -- nothing to do
+
+    # A genuine MSC4501-native caption-less repost (a real MSC4501 client,
+    # e.g. Haven, not Element's own "forward message") is ALREADY boosted
+    # via its paired 🔁 reaction (see maybe_federate_reaction) -- this just
+    # keeps this accompanying record from also publishing the bare
+    # permalink text as a new post in the owner's name -- see
+    # _maybe_suppress_msc4501_repost_record for the full reasoning.
+    relates_to = content.get(SOCIAL_RELATES_TO_FIELD)
+    if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
+        if await _maybe_suppress_msc4501_repost_record(
+            request, relates_to=relates_to, body=(content.get("body") or "").strip(),
+            booster_matrix_user_id=actor_record.matrix_user_id,
+        ):
+            return True
 
     # A forwarded mirrored post becomes a boost of the original, not a new
     # post published in the owner's name -- see _maybe_boost_forwarded_post.

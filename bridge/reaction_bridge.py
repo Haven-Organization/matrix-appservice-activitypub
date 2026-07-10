@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import html
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -95,6 +96,53 @@ def _is_boost_emoji(key: str) -> bool:
     reaction shorthand for boosting a post instead of merely reacting to
     it."""
     return key.replace(_VARIATION_SELECTOR_16, "") in _BOOST_EMOJIS
+
+
+# Per MSC4501, a caption-less repost is TWO Matrix events for one logical
+# action: the 🔁 reaction (which alone already triggers send_boost below)
+# and a separate org.matrix.msc4501.social.relates_to record an MSC4501
+# client posts into the booster's OWN Profile Room (see
+# bridge.profile_posts._maybe_suppress_msc4501_repost_record). When that
+# record lands in the SAME room send_boost would post its own "you
+# boosted" card into, the two are redundant -- Haven's own native record
+# already shows the boosted content there. Arrival order between the two
+# isn't guaranteed, so this coordinates both directions with a short-lived
+# in-process dict (not persisted -- losing it across a restart just means
+# one redundant card slips through right after, harmless): keyed by
+# (booster's own matrix user id, the BOOSTED post's own matrix event id --
+# available as ``parent.event_id`` in send_boost, and directly as
+# ``relates_to["event_id"]`` on the native record, so no extra lookup is
+# needed on either side to agree on the same key).
+_BOOST_CARD_DEDUP_WINDOW_SECONDS = 15.0
+_native_repost_record_seen_at: dict[tuple[str, str], float] = {}
+_pending_boost_card: dict[tuple[str, str], tuple[str, str, float]] = {}  # -> (room_id, card_event_id, posted_at)
+
+
+async def note_msc4501_native_repost(request: Request, *, booster_matrix_user_id: str, boosted_event_id: str) -> None:
+    """Called by ``bridge.profile_posts`` when an MSC4501-native repost
+    record lands in the booster's own Profile Room. Records that this
+    exact boost now has a native record covering it (for the case
+    send_boost's own reaction-triggered call hasn't run yet), and
+    retroactively redacts send_boost's own "you boosted" card if it
+    already got posted moments earlier (the reaction having arrived
+    first) -- either way, only one of the two ever ends up visible."""
+    key = (booster_matrix_user_id, boosted_event_id)
+    now = time.monotonic()
+    _native_repost_record_seen_at[key] = now
+    pending = _pending_boost_card.pop(key, None)
+    if pending is None:
+        return
+    room_id, card_event_id, posted_at = pending
+    if now - posted_at > _BOOST_CARD_DEDUP_WINDOW_SECONDS:
+        return  # too long ago to safely assume it's the SAME boost action
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        await request.app.state.synapse.redact_event(
+            room_id, card_event_id, reason="Redundant with MSC4501 native repost record", as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        logger.warning("Failed to redact redundant boost card %s", card_event_id, exc_info=True)
 
 
 async def send_boost(
@@ -196,7 +244,11 @@ async def send_boost(
     # the boost exactly like redacting the original reaction/;boost command
     # message would.
     notice_event_id: str | None = None
-    if actor_record.room_id:
+    boost_dedup_key = (reactor_matrix_user_id, parent.event_id)
+    already_has_native_record = (
+        time.monotonic() - _native_repost_record_seen_at.get(boost_dedup_key, 0.0) < _BOOST_CARD_DEDUP_WINDOW_SECONDS
+    )
+    if actor_record.room_id and not already_has_native_record:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
         preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
             request, preview_target
@@ -252,6 +304,11 @@ async def send_boost(
             notice_event_id = await request.app.state.synapse.send_message_event(
                 actor_record.room_id, notice_content, as_user_id=bot_mxid,
             )
+            # If the MSC4501 native record for this SAME boost shows up in
+            # the next few seconds (see this module's own dedup-window
+            # comment above), note_msc4501_native_repost finds this and
+            # redacts it as redundant.
+            _pending_boost_card[boost_dedup_key] = (actor_record.room_id, notice_event_id, time.monotonic())
         except SynapseError:
             logger.warning("Failed to post boost notice in %s", actor_record.room_id, exc_info=True)
 

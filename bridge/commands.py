@@ -248,9 +248,11 @@ from bridge.note_mirroring import (
     deliver_to_actor_or_followers,
     ensure_ghost_chat_room,
     ensure_ghost_dm_room,
+    import_question,
     notify_mentioned_locals,
     provision_ghost,
     push_profile_update,
+    refresh_poll_tallies,
     resolve_actor_matrix_identity,
     resolve_event_ts,
     resolve_mention_pills,
@@ -500,7 +502,10 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
     try:
         if subcommand == "help":
-            await _handle_help(request, room_id=room_id, show_all=argument.strip().lower() == "all")
+            help_arg = argument.strip().lower()
+            await _handle_help(
+                request, room_id=room_id, show_all=help_arg == "all", show_admin=help_arg == "admin",
+            )
             return True
 
         # Every other command mints identities or triggers signed federation
@@ -617,6 +622,8 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
                 request, sender=sender, room_id=room_id, content=content, caption=argument,
                 event_id=event.get("event_id"),
             )
+        elif subcommand == "poll" and argument.strip().lower() == "refresh":
+            await _handle_poll_refresh(request, room_id=room_id, content=content)
         elif subcommand == "backfill":
             await _handle_backfill(request, sender=sender, room_id=room_id, argument=argument, content=content)
         elif subcommand == "widget":
@@ -786,7 +793,9 @@ async def _mark_room_replaced(request: Request, *, old_room_id: str, as_user_id:
         logger.info("Could not rename replaced room %s", old_room_id, exc_info=True)
 
 
-async def _handle_help(request: Request, *, room_id: str, show_all: bool = False) -> None:
+async def _handle_help(
+    request: Request, *, room_id: str, show_all: bool = False, show_admin: bool = False,
+) -> None:
     """Sent as an ordinary ``m.text`` message, not ``m.notice`` -- someone
     asking what the bot can do should get an answer that stands out, not
     one muted into whatever quieter styling (or, per
@@ -796,11 +805,18 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
     "command\\n  description" pairs is hard to scan for the one command
     you're actually looking for.
 
-    ``show_all`` (``;help all``) additionally lists the room-maintenance
-    commands (link/unlink/delete/replace/rejoin) -- hidden from the
-    ordinary ``;help`` since they're one-off account/room-recovery
-    operations almost nobody needs day to day, not things a new user
-    scanning "how do I follow someone" should have to scroll past."""
+    Three tiers, each hidden from the ones "below" it: ``show_all``
+    (``;help all``) additionally lists the room-maintenance/advanced
+    commands -- hidden from the ordinary ``;help`` since they're one-off
+    account/room-recovery operations (or things like ``;poll refresh``)
+    almost nobody needs day to day, not things a new user scanning "how do
+    I follow someone" should have to scroll past. ``show_admin``
+    (``;help admin``) instead lists ONLY the commands that are actually
+    gated to a Matrix server admin (``;allow``/``;disallow``/``;allowed``)
+    -- kept out of ``;help all`` entirely, since they're not "advanced
+    user" features, they're admin-only and irrelevant to (can't even be
+    run by) everyone else. Deliberately no combined "all + admin" view --
+    each tier answers one specific "what can I do" question."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     intro = (
@@ -874,6 +890,12 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
             "Shows a count and asks for confirmation first.",
         ),
         (
+            f"{_COMMAND_PREFIX}poll refresh",
+            "Reply to a poll (or anything in its thread) to actively re-fetch its current tallies/closed "
+            "state right now, rather than waiting for the remote server to push an update (some, like "
+            "Pleroma/Akkoma, never do).",
+        ),
+        (
             f"{_COMMAND_PREFIX}hide followers",
             'Hide your followers list from remote viewers (also works with "following"; your counts stay '
             f'public either way). Undo it with "{_COMMAND_PREFIX}show" (visible by default).',
@@ -908,20 +930,28 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
             "Add a room widget with buttons for most of these commands, for clients that support "
             "Matrix widgets.",
         ),
+    ]
+    # Commands actually GATED to a Matrix server admin -- nobody else can
+    # run these at all, as opposed to advanced_commands above (one-off
+    # account/room-recovery operations any user can run for their own
+    # stuff). Its own tier ("help admin"), never folded into "help all".
+    admin_commands = [
         (
             f"{_COMMAND_PREFIX}allow mxid|room|homeserver <value>",
-            "Matrix server admin only: let a user on a DIFFERENT homeserver (an exact MXID, anyone in a "
-            "room, or a whole homeserver's users) use this bridge -- in whatever mode "
-            "bridge.third_party_access_mode currently configures. Whitelisting a homeserver asks for "
-            f'confirmation first. "{_COMMAND_PREFIX}disallow" undoes any of these.',
+            "Let a user on a DIFFERENT homeserver (an exact MXID, anyone in a room, or a whole homeserver's "
+            "users) use this bridge -- in whatever mode bridge.third_party_access_mode currently configures. "
+            f'Whitelisting a homeserver asks for confirmation first. "{_COMMAND_PREFIX}disallow" undoes any '
+            "of these.",
         ),
         (
             f"{_COMMAND_PREFIX}allowed",
-            "Matrix server admin only: list every current third-party access grant.",
+            "List every current third-party access grant.",
         ),
     ]
     if show_all:
         commands = commands + advanced_commands
+    elif show_admin:
+        commands = commands + admin_commands
 
     body = intro + "\n\n" + "\n\n".join(f"{cmd}\n  - {desc}" for cmd, desc in commands)
     formatted_body = (
@@ -931,6 +961,10 @@ async def _handle_help(request: Request, *, room_id: str, show_all: bool = False
     )
     if not show_all:
         outro = f'Advanced/maintenance commands are hidden here -- use "{_COMMAND_PREFIX}help all" to see them too.'
+        body += f"\n\n{outro}"
+        formatted_body += f"<p>{html.escape(outro)}</p>"
+    if not show_admin:
+        outro = f'Matrix server admin commands are hidden here -- use "{_COMMAND_PREFIX}help admin" to see them.'
         body += f"\n\n{outro}"
         formatted_body += f"<p>{html.escape(outro)}</p>"
     help_content: dict = {
@@ -2804,7 +2838,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             await _notice(request, room_id, f"Could not fetch {url}: {exc}")
             return
 
-    if obj.get("type") != "Note":
+    if obj.get("type") not in ("Note", "Question"):
         await _notice(request, room_id, f"{url} doesn't look like a fediverse post (got {obj.get('type')!r}).")
         return
 
@@ -2846,6 +2880,28 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         await _notice(
             request, room_id,
             f"Already imported: {matrix_to_link(existing.room_id, existing.event_id)}",
+        )
+        return
+
+    if obj.get("type") == "Question":
+        # Polls have no reply-chain-walk path (Mastodon's poll UI doesn't
+        # offer replying to the poll object itself) -- straight to
+        # import_question, which does its own ghost/room provisioning
+        # (shared with live inbound poll mirroring; see its own docstring).
+        try:
+            author_doc = await fetch_actor(http_client, author_actor_id)
+        except RemoteActorFetchError as exc:
+            await _notice(request, room_id, f"Could not fetch the poll's author ({author_actor_id}): {exc}")
+            return
+        imported = await import_question(
+            request, question=obj, author_actor_id=author_actor_id, author_doc=author_doc, inviter=sender
+        )
+        if imported.federated_event is None:
+            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
+            return
+        await _notice(
+            request, room_id,
+            f"Imported: {matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)}",
         )
         return
 
@@ -3043,6 +3099,55 @@ def _reply_target_event_id(content: dict) -> str | None:
         return in_reply_to.get("event_id") or relates_to.get("event_id")
     in_reply_to = relates_to.get("m.in_reply_to") or {}
     return in_reply_to.get("event_id")
+
+
+async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict) -> None:
+    """";poll refresh" -- actively re-fetches a mirrored poll's own live AP
+    object and refreshes its tallies reply / closed state right now,
+    rather than only ever waiting for a push ``Update`` some remote
+    implementations (confirmed for Pleroma/Akkoma) never send at all --
+    see ``bridge.note_mirroring.refresh_poll_tallies``'s own docstring for
+    the shared mechanism (the same one that already runs automatically
+    right after a local vote).
+
+    Resolves the poll from whatever this command was sent as a reply to --
+    either directly to the poll's own event, or to anything else inside
+    its thread (most naturally the tallies reply itself, or a human
+    reply), trying the specific reply target first and falling back to the
+    thread's own root event id, since only the poll's own root event has a
+    tracked ``FederatedEvent`` to resolve at all."""
+    repository = request.app.state.repository
+    relates_to = content.get("m.relates_to") or {}
+    candidate_ids: list[str] = []
+    direct = (relates_to.get("m.in_reply_to") or {}).get("event_id")
+    if direct:
+        candidate_ids.append(direct)
+    if relates_to.get("rel_type") == "m.thread":
+        root = relates_to.get("event_id")
+        if root and root not in candidate_ids:
+            candidate_ids.append(root)
+
+    if not candidate_ids:
+        await _notice(
+            request, room_id,
+            f'Reply to a poll (or anything in its thread) with "{_COMMAND_PREFIX}poll refresh" '
+            "to refresh its tallies.",
+        )
+        return
+
+    target = None
+    for candidate_id in candidate_ids:
+        target = await repository.get_federated_event_by_matrix_event(candidate_id)
+        if target is not None:
+            break
+    if target is None:
+        await _notice(request, room_id, "Couldn't find a tracked poll to refresh there.")
+        return
+
+    if await refresh_poll_tallies(request, target=target):
+        await _notice(request, room_id, "Refreshed.")
+    else:
+        await _notice(request, room_id, "Couldn't refresh that poll -- it may no longer be reachable.")
 
 
 async def _handle_boost(request: Request, *, sender: str, room_id: str, content: dict, event_id: str | None) -> None:

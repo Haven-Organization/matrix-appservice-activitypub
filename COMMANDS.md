@@ -13,7 +13,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ## Contents
 
-- [`;help` / `;help all`](#help--help-all)
+- [`;help` / `;help all` / `;help admin`](#help--help-all--help-admin)
 - [`;create profile`](#create-profile)
 - [`;link profile`](#link-profile)
 - [`;unlink profile`](#unlink-profile)
@@ -36,6 +36,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;leave unfollowed`](#leave-unfollowed)
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
+- [`;poll refresh`](#poll-refresh-reply-to-a-poll-or-anything-in-its-thread)
 - [`;widget`](#widget)
 - [`;allow`](#allow-mxidroomhomeserver-value)
 - [`;disallow`](#disallow-mxidroomhomeserver-value)
@@ -44,11 +45,11 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ---
 
-## `;help` / `;help all`
+## `;help` / `;help all` / `;help admin`
 
-**Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list.
+**Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list of advanced/maintenance commands anyone can use for their own stuff. `;help admin` instead shows the commands actually gated to a Matrix server admin (`;allow`/`;disallow`/`;allowed`) -- its own separate tier, never combined with `;help all`.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`, `allow`/`disallow`/`allowed`.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `poll refresh`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`. `;help admin` instead appends just `allow`/`disallow`/`allowed` -- those aren't shown under `;help all` at all, since they can't be run by anyone but a Matrix server admin regardless.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -314,6 +315,18 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 **Who can run it:** Any local user, with the default count. Only a Matrix server admin can specify a custom N, since an arbitrarily large one means unbounded outbound fetches against a remote server.
 
 **Notes:** A brand-new follow's first room-join already triggers one automatic backfill on its own. This is for topping that up or pulling in a specific thread.
+
+---
+
+## `;poll refresh` (reply to a poll, or anything in its thread)
+
+**Syntax:** `;poll refresh`, sent as a reply to a mirrored poll's own event, or to anything else inside its thread (e.g. its tallies message, or a human reply).
+
+**What it does:** Actively re-fetches the poll's current live state from its own ActivityPub id and reflects it: refreshed vote tallies (posted/edited as a thread reply under the poll) and closed state, if it's ended. Exists because some remote implementations -- confirmed for Pleroma/Akkoma -- never push a live update over federation at all, live or at close, so a mirrored poll's tallies can otherwise sit stale forever. The same refresh already runs automatically right after you vote on a mirrored poll; this command is for anyone who wants to check again without voting again (which most polls don't allow anyway).
+
+**Who can run it:** Any local user.
+
+**Notes:** Best-effort -- if the poll is no longer reachable (deleted, network error), you'll get a notice saying so instead of a silent no-op.
 
 ---
 

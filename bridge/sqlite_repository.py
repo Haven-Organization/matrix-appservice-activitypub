@@ -29,6 +29,7 @@ from bridge.repository import (
     ActorRecord,
     FederatedEvent,
     GhostProfile,
+    PollVoteRecord,
     ReactionRecord,
     RemoteActorRoom,
     ThirdPartyAllowRecord,
@@ -141,6 +142,21 @@ CREATE TABLE IF NOT EXISTS reactions (
     reactor_matrix_user_id TEXT,
     secondary_event_id TEXT UNIQUE
 );
+
+-- Idempotency bookkeeping for poll votes, both directions -- see
+-- PollVoteRecord's own docstring for why this table exists and what it
+-- deliberately does NOT store (which option was chosen).
+CREATE TABLE IF NOT EXISTS poll_votes (
+    vote_activity_id TEXT PRIMARY KEY,
+    question_ap_object_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    voter_actor_id TEXT,
+    matrix_user_id TEXT,
+    matrix_event_id TEXT UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_poll_votes_question_user
+    ON poll_votes (question_ap_object_id, matrix_user_id);
 
 CREATE TABLE IF NOT EXISTS ghost_profiles (
     actor_id TEXT PRIMARY KEY,
@@ -1098,6 +1114,55 @@ class SqliteActorRepository:
     async def remove_reaction(self, activity_id: str) -> None:
         await self._run(self._remove_reaction, activity_id)
 
+    # -- poll votes ------------------------------------------------------
+
+    def _record_poll_vote(self, record: PollVoteRecord) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO poll_votes
+                (vote_activity_id, question_ap_object_id, room_id,
+                 voter_actor_id, matrix_user_id, matrix_event_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vote_activity_id) DO UPDATE SET
+                question_ap_object_id=excluded.question_ap_object_id,
+                room_id=excluded.room_id,
+                voter_actor_id=excluded.voter_actor_id,
+                matrix_user_id=excluded.matrix_user_id,
+                matrix_event_id=excluded.matrix_event_id
+            """,
+            (
+                record.vote_activity_id, record.question_ap_object_id, record.room_id,
+                record.voter_actor_id, record.matrix_user_id, record.matrix_event_id,
+            ),
+        )
+        self._conn.commit()
+
+    async def record_poll_vote(self, record: PollVoteRecord) -> None:
+        await self._run(self._record_poll_vote, record)
+
+    def _get_poll_vote_by_activity_id(self, vote_activity_id: str) -> PollVoteRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM poll_votes WHERE vote_activity_id = ?", (vote_activity_id,)
+        ).fetchone()
+        return self._row_to_poll_vote(row) if row else None
+
+    async def get_poll_vote_by_activity_id(self, vote_activity_id: str) -> PollVoteRecord | None:
+        return await self._run(self._get_poll_vote_by_activity_id, vote_activity_id)
+
+    def _get_poll_vote_by_matrix_user(
+        self, question_ap_object_id: str, matrix_user_id: str
+    ) -> PollVoteRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM poll_votes WHERE question_ap_object_id = ? AND matrix_user_id = ?",
+            (question_ap_object_id, matrix_user_id),
+        ).fetchone()
+        return self._row_to_poll_vote(row) if row else None
+
+    async def get_poll_vote_by_matrix_user(
+        self, question_ap_object_id: str, matrix_user_id: str
+    ) -> PollVoteRecord | None:
+        return await self._run(self._get_poll_vote_by_matrix_user, question_ap_object_id, matrix_user_id)
+
     def _get_custom_emoji_mxc(self, source_url: str) -> str | None:
         row = self._conn.execute(
             "SELECT mxc_url FROM custom_emoji WHERE source_url = ?", (source_url,)
@@ -1160,6 +1225,17 @@ class SqliteActorRepository:
             reactor_matrix_user_id=row["reactor_matrix_user_id"],
             secondary_event_id=row["secondary_event_id"],
             custom_emoji_mxc=row["custom_emoji_mxc"],
+        )
+
+    @staticmethod
+    def _row_to_poll_vote(row: sqlite3.Row) -> PollVoteRecord:
+        return PollVoteRecord(
+            vote_activity_id=row["vote_activity_id"],
+            question_ap_object_id=row["question_ap_object_id"],
+            room_id=row["room_id"],
+            voter_actor_id=row["voter_actor_id"],
+            matrix_user_id=row["matrix_user_id"],
+            matrix_event_id=row["matrix_event_id"],
         )
 
     # -- ghost profile sync cache -------------------------------------------

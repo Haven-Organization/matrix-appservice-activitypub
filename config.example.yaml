@@ -59,6 +59,11 @@ bridge:
   # bridge/config.py for the exact rules).
   # third_party_access_mode: follow_only
 
+  # Matrix polls have no expiry; some fediverse receivers (Mastodon-family)
+  # refuse a poll with none at all. This many days from creation is sent as
+  # the poll's endTime instead of omitting it.
+  # poll_default_duration_days: 7
+
   # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
   # Profiles) on every ghost, pointing at its Remote User Room. Off by
   # default -- Synapse doesn't enable MSC4133 by default either (needs

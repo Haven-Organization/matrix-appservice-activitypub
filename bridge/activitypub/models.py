@@ -3,9 +3,9 @@
 Minimal dataclasses for the subset of ActivityStreams 2.0 this bridge speaks:
 ``Actor`` (Person), ``Note`` (an ordinary federated post), ``ChatMessage``
 (Pleroma/Akkoma's "Chats" -- a distinct instant-messaging object type from a
-Note-based direct message), the generic ``Activity`` envelope
-(Create/Follow/Accept/Like/Announce/Undo/Delete), and ``OrderedCollection``
-for outbox/followers/following.
+Note-based direct message), ``Question`` (a poll), the generic ``Activity``
+envelope (Create/Follow/Accept/Like/Announce/Undo/Delete), and
+``OrderedCollection`` for outbox/followers/following.
 
 These are intentionally not a full ActivityStreams implementation -- only the
 fields Mastodon/Pleroma actually require to interoperate are modeled.
@@ -174,6 +174,15 @@ class Note:
     # three field names real implementations check (see JSON_LD_CONTEXT's
     # own comment on why), rather than one specific one.
     quote_uri: str | None = None
+    # Set only for a poll vote (see ``bridge.poll_bridge.maybe_federate_poll_vote``):
+    # a poll vote's *entire* payload is ``name`` (the chosen option's exact
+    # text) + ``inReplyTo`` (the Question's id), privately addressed to just
+    # the poll's author -- no ``content``. Sent with ``type="Answer"``, NOT
+    # the default "Note" -- Pleroma/Akkoma only count a vote at all if the
+    # object's own type is literally "Answer" (confirmed in their
+    # side_effects.ex); Mastodon doesn't gate on type here, so "Answer" is
+    # correct for both. Absent for every ordinary post.
+    name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _without_none(
@@ -192,6 +201,7 @@ class Note:
                 "inReplyTo": self.in_reply_to,
                 "tag": self.tag,
                 "attachment": self.attachment,
+                "name": self.name,
             }
         )
 
@@ -238,6 +248,60 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
+class Question:
+    """An ActivityStreams ``Question`` -- the object type Mastodon/Pleroma
+    use for a poll. ``one_of``/``any_of`` mirror AS2's own single-choice vs.
+    multi-choice idiom (mutually exclusive; whichever the poll actually is
+    gets populated, the other stays empty). Each option is
+    ``{"type": "Note", "name": "<option text>"}``.
+
+    Deliberately never carries a live ``replies.totalItems`` tally on an
+    OUTBOUND option: per-option counts here would only ever reflect this
+    bridge's own partial view (Matrix voters plus any votes personally
+    received as the poll's author -- a structural ceiling of how
+    Mastodon-style private voting works, not a bug -- see
+    ``bridge.poll_bridge``'s module docstring), and publishing a
+    provably-incomplete count is worse than omitting it entirely.
+    """
+
+    id: str
+    attributed_to: str
+    content: str
+    published: str
+    to: list[str] = field(default_factory=lambda: [AS_PUBLIC])
+    cc: list[str] = field(default_factory=list)
+    one_of: list[dict[str, Any]] = field(default_factory=list)
+    any_of: list[dict[str, Any]] = field(default_factory=list)
+    # Some Mastodon-family receivers refuse a Question with no expiry at
+    # all -- Matrix's own poll model has no such concept, so this bridge
+    # synthesizes one (see bridge.config.BridgeSection.poll_default_duration_days)
+    # rather than omitting it outright.
+    end_time: str | None = None
+    # Set only on the ``Update`` sent when the poll is closed (see
+    # bridge.poll_bridge.maybe_federate_poll_close) -- always absent on the
+    # original Create.
+    closed: str | None = None
+    type: str = "Question"
+
+    def to_dict(self) -> dict[str, Any]:
+        return _without_none(
+            {
+                "id": self.id,
+                "type": self.type,
+                "attributedTo": self.attributed_to,
+                "content": self.content,
+                "published": self.published,
+                "to": self.to,
+                "cc": self.cc,
+                "oneOf": self.one_of,
+                "anyOf": self.any_of,
+                "endTime": self.end_time,
+                "closed": self.closed,
+            }
+        )
+
+
+@dataclass(frozen=True)
 class Activity:
     """A generic ActivityStreams Activity envelope.
 
@@ -252,7 +316,7 @@ class Activity:
     id: str
     type: str
     actor: str
-    object: Union[str, dict[str, Any], "Activity", Note, ChatMessage, None] = None
+    object: Union[str, dict[str, Any], "Activity", Note, ChatMessage, Question, None] = None
     published: str | None = None
     to: list[str] = field(default_factory=list)
     cc: list[str] = field(default_factory=list)
@@ -266,7 +330,7 @@ class Activity:
 
     def to_dict(self) -> dict[str, Any]:
         obj: Any
-        if isinstance(self.object, (Activity, Note, ChatMessage)):
+        if isinstance(self.object, (Activity, Note, ChatMessage, Question)):
             obj = self.object.to_dict()
         else:
             obj = self.object
@@ -319,7 +383,7 @@ class Activity:
             return self.object
         if isinstance(self.object, dict):
             return self.object.get("id")
-        if isinstance(self.object, (Activity, Note, ChatMessage)):
+        if isinstance(self.object, (Activity, Note, ChatMessage, Question)):
             return self.object.id
         return None
 

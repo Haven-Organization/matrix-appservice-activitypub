@@ -22,7 +22,9 @@ followers so an already-cached copy on their server refreshes too -- see
 ``bridge.profile_posts.maybe_handle_topic_change``/
 ``maybe_handle_room_name_change``/``maybe_handle_room_avatar_change``);
 federating a reaction (or its removal) on a previously-mirrored post;
-federating a redaction of one of our own distributed posts as a signed
+federating a vote cast on a mirrored (externally-owned) poll, or that poll
+being closed (see ``bridge.poll_bridge``); federating a redaction of one of
+our own distributed posts as a signed
 ``Delete`` (see ``bridge.delete_bridge``); a bare "confirm" reply to one of
 our own ``delete profile`` warnings (see
 ``bridge.commands.maybe_handle_delete_confirmation`` -- deliberately
@@ -30,9 +32,9 @@ checked before bot-tagged commands below, since it's recognized by reply
 target/content rather than being tagged/prefixed at all); bot-tagged
 command handling (see ``bridge.commands``); federating it as a chat
 message (see ``bridge.chat_bridge``) if the room is a ghost chat room;
-federating it as a reply to one; and finally, if it's a fresh post in a
-linked Profile Room, converting and distributing it to followers as a new
-ActivityPub ``Create``.
+federating it as a reply to one; and finally, if it's a fresh post (or a new
+poll) in a linked Profile Room, converting and distributing it to followers
+as a new ActivityPub ``Create``.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from bridge.commands import (
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
+from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
 from bridge.profile_posts import (
     maybe_distribute_profile_post,
     maybe_handle_room_avatar_change,
@@ -131,6 +134,12 @@ async def _handle_transaction(
             handled_as_reaction_removal = await maybe_federate_reaction_removal(request, event)
             if handled_as_reaction_removal:
                 continue
+            handled_as_poll_vote = await maybe_federate_poll_vote(request, event)
+            if handled_as_poll_vote:
+                continue
+            handled_as_poll_close = await maybe_federate_poll_close(request, event)
+            if handled_as_poll_close:
+                continue
             handled_as_delete = await maybe_federate_delete(request, event)
             if handled_as_delete:
                 continue
@@ -159,7 +168,9 @@ async def _handle_transaction(
                     if not handled_as_chat:
                         handled_as_reply = await maybe_federate_reply(request, event)
                         if not handled_as_reply:
-                            await maybe_distribute_profile_post(request, event)
+                            handled_as_poll_start = await maybe_distribute_profile_poll(request, event)
+                            if not handled_as_poll_start:
+                                await maybe_distribute_profile_post(request, event)
         except Exception:
             logger.exception(
                 "Error handling event %s (%s) in %s",

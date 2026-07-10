@@ -153,6 +153,12 @@ class BridgeSection:
     # until this flips to full again -- nothing about an existing identity
     # is ever deleted or reassigned by changing this alone.
     third_party_access_mode: str = "follow_only"
+    # Matrix polls (MSC3381) have no expiry concept, but Mastodon-family
+    # receivers are known to refuse a Question with no endTime at all -- see
+    # bridge.activitypub.models.Question.end_time. This bridge synthesizes
+    # one at creation time (poll's own published time + this many days)
+    # rather than omit the field outright.
+    poll_default_duration_days: int = 7
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -326,6 +332,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         ghost_room_join_rule=ghost_room_join_rule,
         local_profile_room_join_rule=local_profile_room_join_rule,
         third_party_access_mode=third_party_access_mode,
+        poll_default_duration_days=int(bridge_raw.get("poll_default_duration_days", 7)),
     )
 
     synapse_section = SynapseSection(

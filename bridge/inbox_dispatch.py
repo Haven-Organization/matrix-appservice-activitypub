@@ -56,6 +56,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -81,12 +82,17 @@ from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
     HAVEN_REMOVE_HEADER_FIELD,
+    POLL_END_EVENT_TYPE,
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
+    extract_poll_tallies,
+    find_poll_thread_children,
     import_note,
+    import_question,
     is_silenced,
+    maybe_send_poll_end,
     mirror_chat_message,
     mirror_direct_message,
     mirrored_post_event_type,
@@ -98,12 +104,13 @@ from bridge.note_mirroring import (
     resolve_mention_pills,
     social_relates_to,
     thread_reply_relates_to,
+    upsert_poll_tally_reply,
 )
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
 from bridge.note_mirroring import resolve_and_invite_ghost as _resolve_and_invite_ghost
 from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
 from bridge.note_mirroring import source_post_url as _source_post_url
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, ReactionRecord, RemoteActorRoom
+from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, PollVoteRecord, ReactionRecord, RemoteActorRoom
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -959,6 +966,163 @@ async def _quoted_post_render(
     )
 
 
+async def _maybe_handle_poll_vote(request: Request, obj: dict, activity: Activity) -> bool:
+    """Called from ``_handle_create`` for any inbound ``Note`` shaped like a
+    poll vote (``name`` + ``inReplyTo`` both set -- see that call site's own
+    comment on why this has to run before the DM check). Returns ``True``
+    only once this is POSITIVELY confirmed to be a vote -- by checking the
+    resolved ``inReplyTo`` target's own live Matrix event type is actually
+    ``org.matrix.msc3381.poll.start`` -- so an ordinary post that happens to
+    set AS2's ``name`` (a legitimate, if rare, "subject line" field some
+    non-Mastodon software uses) isn't misrouted here and silently dropped.
+
+    Mirrors the vote as the voter's own ghost casting an
+    ``org.matrix.msc3381.poll.response`` -- same resolve-ghost/join/send
+    shape as ``_handle_like_or_emoji_react``/``_react_boost``. No local vote
+    tallying happens here at all: Matrix's own poll widget already tallies
+    only the LATEST response per sender, so this function's entire job is
+    idempotent per-AP-vote-activity delivery of one ghost event each --
+    letting Matrix do the counting, per this feature's own "same rules we
+    use now" design (reuse the existing idempotency-by-source-id pattern
+    already established for ``federated_events``/``reactions``, invent no
+    new tallying logic)."""
+    repository = request.app.state.repository
+    target = await repository.get_federated_event_by_ap_object(obj["inReplyTo"])
+    if target is None:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    synapse = request.app.state.synapse
+    try:
+        poll_event = await synapse.get_event(target.room_id, target.event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if poll_event.get("type") != "org.matrix.msc3381.poll.start":
+        return False  # The tracked target isn't a poll -- an ordinary reply; let it fall through.
+
+    vote_ap_id = activity.id or obj.get("id")
+    if vote_ap_id and await repository.get_poll_vote_by_activity_id(vote_ap_id) is not None:
+        return True  # Redelivered transaction -- already mirrored this exact vote.
+
+    poll_start = (poll_event.get("content") or {}).get("org.matrix.msc3381.poll.start") or {}
+    answer_id = next(
+        (a["id"] for a in poll_start.get("answers", []) if a.get("org.matrix.msc1767.text") == obj["name"]), None
+    )
+    if answer_id is None:
+        logger.info("Vote for an unrecognized option on %s; dropping", target.ap_object_id)
+        return True
+
+    resolved = await _resolve_and_invite_ghost(request, activity.actor, target.room_id)
+    if resolved is None:
+        return True
+    ghost_mxid_, _actor_doc = resolved
+    try:
+        await synapse.join_room(target.room_id, as_user_id=ghost_mxid_)
+        event_id = await synapse.send_message_event(
+            target.room_id,
+            {
+                "org.matrix.msc3381.poll.response": {"answers": [answer_id]},
+                "m.relates_to": {"rel_type": "m.reference", "event_id": target.event_id},
+            },
+            event_type="org.matrix.msc3381.poll.response",
+            as_user_id=ghost_mxid_,
+        )
+    except SynapseError:
+        logger.warning("Failed to mirror a poll vote from %s", activity.actor, exc_info=True)
+        return True
+
+    if vote_ap_id:
+        await repository.record_poll_vote(
+            PollVoteRecord(
+                vote_activity_id=vote_ap_id,
+                question_ap_object_id=target.ap_object_id,
+                room_id=target.room_id,
+                voter_actor_id=activity.actor,
+                matrix_event_id=event_id,
+            )
+        )
+    return True
+
+
+# Minimum time between two live (non-closing) tally-reply refreshes for the
+# SAME poll -- an in-process debounce, not persisted (losing it across a
+# restart just means one extra refresh is allowed through right after,
+# which is harmless). This is the actual spam guard: a remote instance
+# (malicious or just buggy) could in principle re-send Update{Question}
+# arbitrarily often while a poll stays open, and without this, EVERY one
+# would cost a full get_relations fetch plus a Matrix edit/send. The check
+# below runs before any Synapse call at all, so anything arriving inside
+# the cooldown window costs nothing but a dict lookup. The final "closed"
+# Update always bypasses this (see _handle_question_update) since it's a
+# one-time terminal event, not something a burst of votes could trigger
+# repeatedly -- it has its OWN separate spam guard (maybe_send_poll_end's
+# own idempotency check), since a malicious server could otherwise still
+# re-send a "closed" Update forever. This cooldown is specific to INBOUND,
+# remote-triggered refreshes -- the user-triggered paths (a local vote, or
+# ";poll refresh") go through refresh_poll_tallies instead, which doesn't
+# need it (see that function's own docstring for why)."""
+_TALLY_REFRESH_COOLDOWN_SECONDS = 60.0
+_last_tally_refresh_at: dict[str, float] = {}
+
+
+async def _handle_question_update(request: Request, obj: dict) -> None:
+    """Mirrors a remote poll's own author updating it: a live tally
+    refresh (Mastodon periodically re-sends the Question with updated vote
+    counts while it's still open) gets reflected as an edited thread reply
+    under the poll (see ``bridge.note_mirroring.upsert_poll_tally_reply``);
+    the terminal ``closed`` update ADDITIONALLY sends a real
+    ``org.matrix.msc3381.poll.end`` event (see
+    ``bridge.note_mirroring.maybe_send_poll_end``).
+
+    Live refreshes are debounced in-process per poll (see
+    ``_TALLY_REFRESH_COOLDOWN_SECONDS``, checked before any Synapse call at
+    all) -- the actual spam guard, since this is entirely remote-triggered
+    and this bridge doesn't get to decide how often a hostile or just
+    buggy remote instance re-sends these. A ``closed`` update's own spam
+    guard lives in ``maybe_send_poll_end`` instead (idempotent, no new DB
+    state)."""
+    ap_object_id = obj.get("id")
+    if not ap_object_id:
+        return
+    repository = request.app.state.repository
+    target = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if target is None:
+        return
+    remote_room = await repository.get_remote_actor_room_by_room_id(target.room_id)
+    if remote_room is None:
+        return
+
+    if not obj.get("closed"):
+        now = time.monotonic()
+        if now - _last_tally_refresh_at.get(ap_object_id, 0.0) < _TALLY_REFRESH_COOLDOWN_SECONDS:
+            return
+        _last_tally_refresh_at[ap_object_id] = now
+        tallies = extract_poll_tallies(obj)
+        if tallies is None:
+            return
+        thread_children = await find_poll_thread_children(request, target)
+        await upsert_poll_tally_reply(
+            request, target=target, tallies=tallies, thread_children=thread_children,
+        )
+        return
+
+    # Terminal "closed" update.
+    _last_tally_refresh_at.pop(ap_object_id, None)
+    thread_children = await find_poll_thread_children(request, target)
+    if any(e.get("type") == POLL_END_EVENT_TYPE for e in thread_children):
+        return  # already processed this poll's close -- a redelivered/repeated Update
+
+    tallies = extract_poll_tallies(obj)
+    if tallies is not None:
+        await upsert_poll_tally_reply(
+            request, target=target, tallies=tallies, thread_children=thread_children,
+        )
+    await maybe_send_poll_end(
+        request, target=target, ghost_user_id=remote_room.ghost_user_id, thread_children=thread_children,
+    )
+
+
 async def _handle_create(request: Request, username: str, activity: Activity, *, force: bool = False) -> None:
     """Mirror an inbound ``Create(Note)`` into the author's Remote User
     Room -- but only if someone here actually follows them, UNLESS the
@@ -1009,6 +1173,40 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             recipient_matrix_user_id=actor_record.matrix_user_id,
         )
         return
+
+    if obj.get("type") == "Question":
+        # A poll -- mirrored as a real Matrix poll (see import_question),
+        # not text. Same relevance gate as an ordinary Note below, just
+        # applied here since a Question never reaches that check (it isn't
+        # "Note", so it would otherwise just be silently dropped at the
+        # gate right below this branch).
+        if not force and not await repository.is_anyone_following(activity.actor):
+            logger.info("Dropping Question from an actor nobody here follows: %s", activity.actor)
+            return
+        try:
+            author_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+        except RemoteActorFetchError:
+            author_doc = {}
+        await import_question(request, question=obj, author_actor_id=activity.actor, author_doc=author_doc)
+        return
+
+    # A poll vote is wire-identical to a DM in shape (privately addressed to
+    # just one recipient -- the poll's author) EXCEPT it also carries `name`
+    # (the chosen option's exact text) and `inReplyTo` (the Question's own
+    # id) -- checked, and positively confirmed by resolving the target and
+    # checking ITS live Matrix event type is actually a poll (not just any
+    # tracked post -- some non-Mastodon software sets `name` as an ordinary
+    # "subject line" on unrelated posts), before the DM check below, since
+    # it WOULD otherwise be misclassified as a DM. Accepts either "Note" or
+    # "Answer" as the object type -- Mastodon doesn't care/sends "Note";
+    # Pleroma/Akkoma REQUIRE "Answer" to count a vote at all on their own
+    # end (confirmed in their side_effects.ex), and their own voters send
+    # it that way too, so both must be recognized here.
+    if obj.get("type") in ("Note", "Answer") and obj.get("name") and obj.get("inReplyTo"):
+        if await _maybe_handle_poll_vote(request, obj, activity):
+            return
+        # Not actually a vote (target isn't tracked, or isn't a poll) --
+        # fall through to ordinary Note handling below.
 
     if obj.get("type") != "Note":
         return
@@ -2018,6 +2216,10 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
             obj = await fetch_actor(request.app.state.http_client, obj)
         except RemoteActorFetchError:
             return
+    if isinstance(obj, dict) and obj.get("type") == "Question":
+        await _handle_question_update(request, obj)
+        return
+
     if not isinstance(obj, dict) or obj.get("type") not in _ACTOR_TYPES:
         return  # not a profile update we care about (e.g. an edited Note)
 

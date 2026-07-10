@@ -226,6 +226,36 @@ class ReactionRecord:
     custom_emoji_mxc: str | None = None
 
 
+@dataclass(frozen=True)
+class PollVoteRecord:
+    """Bidirectional idempotency record for one poll vote -- either an
+    inbound remote vote mirrored as a ghost's ``org.matrix.msc3381.poll.response``
+    (``voter_actor_id``/``matrix_event_id`` set, ``matrix_user_id`` None), or
+    an outbound local vote federated as a private ``Create{Note}`` to a
+    mirrored poll's real author (``matrix_user_id`` set, ``voter_actor_id``/
+    ``matrix_event_id`` None).
+
+    Deliberately never stores WHICH option was chosen -- matching this
+    module's own data-sovereignty rule (see its docstring below): the choice
+    always lives in Matrix's own poll.response/poll.start event content,
+    re-read live wherever it's needed (see
+    ``bridge.inbox_dispatch._maybe_handle_poll_vote`` /
+    ``bridge.poll_bridge.maybe_federate_poll_vote``), never duplicated here.
+
+    ``vote_activity_id`` is the vote's own AP id (the inbound Create's own
+    id for a mirrored remote vote, or a freshly minted one for an outbound
+    vote) -- same "key off the source-side id" idempotency convention as
+    ``federated_events``/``processed_transactions``/``reactions``.
+    """
+
+    vote_activity_id: str
+    question_ap_object_id: str
+    room_id: str
+    voter_actor_id: str | None = None
+    matrix_user_id: str | None = None
+    matrix_event_id: str | None = None
+
+
 class ActorRepository(Protocol):
     """Read/write access to local actors, remote actor rooms, and the post/event map."""
 
@@ -433,6 +463,20 @@ class ActorRepository(Protocol):
         ...
 
     async def remove_reaction(self, activity_id: str) -> None: ...
+
+    async def record_poll_vote(self, record: PollVoteRecord) -> None: ...
+
+    async def get_poll_vote_by_activity_id(self, vote_activity_id: str) -> PollVoteRecord | None:
+        """Inbound redelivery dedup -- have we already mirrored this exact vote?"""
+        ...
+
+    async def get_poll_vote_by_matrix_user(
+        self, question_ap_object_id: str, matrix_user_id: str
+    ) -> PollVoteRecord | None:
+        """Outbound no-revote check -- has this local user already sent a
+        vote out for this externally-owned poll? (Mastodon-family software
+        doesn't support changing a vote once cast.)"""
+        ...
 
     async def get_custom_emoji_mxc(self, source_url: str) -> str | None:
         """The ``mxc://`` a custom emoji's remote image ``source_url`` was
@@ -682,6 +726,7 @@ class InMemoryActorRepository:
         self._published_media: set[str] = set()
         self._reactions_by_activity: dict[str, ReactionRecord] = {}
         self._reactions_by_matrix_event: dict[str, ReactionRecord] = {}
+        self._poll_votes_by_activity: dict[str, PollVoteRecord] = {}
         self._custom_emoji: dict[str, str] = {}  # source_url -> mxc_url
         self._resolved_emoji: dict[str, dict[str, str]] = {}  # subject_id -> {shortcode: mxc_url}
         self._ghost_profiles: dict[str, GhostProfile] = {}
@@ -925,6 +970,20 @@ class InMemoryActorRepository:
             self._reactions_by_matrix_event.pop(record.event_id, None)
             if record.secondary_event_id:
                 self._reactions_by_matrix_event.pop(record.secondary_event_id, None)
+
+    async def record_poll_vote(self, record: PollVoteRecord) -> None:
+        self._poll_votes_by_activity[record.vote_activity_id] = record
+
+    async def get_poll_vote_by_activity_id(self, vote_activity_id: str) -> PollVoteRecord | None:
+        return self._poll_votes_by_activity.get(vote_activity_id)
+
+    async def get_poll_vote_by_matrix_user(
+        self, question_ap_object_id: str, matrix_user_id: str
+    ) -> PollVoteRecord | None:
+        for record in self._poll_votes_by_activity.values():
+            if record.question_ap_object_id == question_ap_object_id and record.matrix_user_id == matrix_user_id:
+                return record
+        return None
 
     async def get_custom_emoji_mxc(self, source_url: str) -> str | None:
         return self._custom_emoji.get(source_url)
