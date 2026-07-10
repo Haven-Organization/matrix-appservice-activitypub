@@ -488,6 +488,8 @@ a:hover { text-decoration: underline; }
 img.reaction-icon { width: 16px; height: 16px; object-fit: contain; }
 .empty-state { padding: 32px 16px; text-align: center; color: var(--text-dim); }
 .page-footer { padding: 16px; text-align: center; color: var(--text-dim); font-size: 13px; }
+.page-footer a { color: inherit; text-decoration: none; }
+.page-footer a:hover { text-decoration: underline; }
 .pagination { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 16px; }
 .pagination-link { padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg-elevated); font-size: 14px; font-weight: 600; }
 .pagination-link:hover { text-decoration: none; background: var(--border); }
@@ -615,7 +617,7 @@ def render_profile_page(
 
     body = (
         f"{header}\n{dialogs}\n{timeline}\n{pagination}"
-        + '<div class="page-footer">matrix-appservice-activitypub</div>'
+        + '<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     )
     return _page_shell(title=f"{display_name} ({handle})", body=body)
 
@@ -657,5 +659,5 @@ def render_thread_page(
             "</div>"
         )
 
-    body = f'<div class="timeline">{cards}</div>\n{pagination}\n<div class="page-footer">matrix-appservice-activitypub</div>'
+    body = f'<div class="timeline">{cards}</div>\n{pagination}\n<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     return _page_shell(title=title, body=body)
