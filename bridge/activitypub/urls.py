@@ -60,3 +60,27 @@ def media_url(base_url: str, mxc_uri: str) -> str:
         raise ValueError(f"Not an mxc:// URI: {mxc_uri}")
     server_and_id = mxc_uri.removeprefix("mxc://")
     return f"{base_url}/media/{server_and_id}"
+
+
+def resolve_own_media_proxy_mxc(base_url: str, url: str) -> str | None:
+    """Reverse of ``media_url`` -- if ``url`` is our OWN media proxy link
+    (i.e. we minted it ourselves for some earlier post's attachment, see
+    ``build_ap_attachment``), returns the exact ``mxc://`` URI it encodes;
+    ``None`` for anything else (a genuinely-remote URL).
+
+    Used to recognize a boosted/quoted post's attachment as media we
+    ALREADY have on this homeserver -- e.g. a local user's own post,
+    boosted by a remote follower, carries an attachment URL pointing right
+    back at this same proxy -- so it can be reused as-is instead of being
+    downloaded through our own public endpoint and re-uploaded to Synapse
+    as a brand new, wasteful, un-deduplicated copy (confirmed live
+    2026-07-10: boosting the same local post from N different remote
+    accounts produced N distinct mxc:// copies of the identical file).
+    """
+    prefix = f"{base_url}/media/"
+    if not url.startswith(prefix):
+        return None
+    server_and_id = url.removeprefix(prefix)
+    if server_and_id.count("/") != 1 or not all(server_and_id.split("/")):
+        return None
+    return f"mxc://{server_and_id}"

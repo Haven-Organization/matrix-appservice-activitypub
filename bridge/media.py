@@ -19,7 +19,7 @@ import mimetypes
 
 import httpx
 
-from bridge.activitypub.urls import media_url
+from bridge.activitypub.urls import media_url, resolve_own_media_proxy_mxc
 from bridge.synapse_client import SynapseClient, SynapseError
 
 logger = logging.getLogger(__name__)
@@ -101,22 +101,57 @@ async def fetch_and_upload_media(
     return await _upload_media(synapse, response, url, content_type)
 
 
+_DIMENSIONS_PARSER_BY_CONTENT_TYPE = {}  # populated below, once the parsers themselves are defined
+
+
 async def fetch_and_upload_media_with_dimensions(
-    http_client: httpx.AsyncClient, synapse: SynapseClient, url: str
+    http_client: httpx.AsyncClient, synapse: SynapseClient, url: str, *, public_base_url: str | None = None
 ) -> tuple[str, int | None, int | None] | None:
     """Like ``fetch_and_upload_media``, but also returns ``(width, height)``
-    for a video file it can determine them for -- ``(None, None)`` for
-    anything else, or if they couldn't be determined. Pleroma's federated
-    attachment objects don't carry a video's dimensions at all (confirmed
-    against a real one), so a Matrix client has nothing to size a player
-    with unless we work them out ourselves -- done here, from the same
-    bytes already being uploaded, rather than a second fetch.
+    for an image or video file it can determine them for -- ``(None,
+    None)`` for anything else, or if they couldn't be determined.
+    Pleroma's federated attachment objects don't carry a video's (or an
+    image's) dimensions at all (confirmed against real ones), so a Matrix
+    client has nothing to size a player/image with unless we work them out
+    ourselves -- done here, from the same bytes already being uploaded,
+    rather than a second fetch. Hand-rolled per-format header parsing
+    (like the rest of this module's media handling) rather than a new
+    image-processing dependency, since only the fixed-size dimension
+    fields are needed, not real decoding.
+
+    ``public_base_url``, if given, lets this recognize ``url`` as our OWN
+    media proxy link (see ``resolve_own_media_proxy_mxc``) -- e.g. boosting
+    a LOCAL user's post carries an attachment URL pointing right back at
+    this bridge -- and reuse that already-uploaded ``mxc://`` directly
+    (pulling bytes straight from Synapse's own authenticated media API,
+    via ``SynapseClient.download_media``, just to determine dimensions)
+    instead of round-tripping through our own public endpoint and
+    re-uploading a brand new, wasteful, un-deduplicated copy of a file
+    already on this homeserver (confirmed live 2026-07-10: boosting the
+    same local post from N different remote accounts produced N distinct
+    mxc:// copies of the identical video).
 
     Returns None (not a 3-tuple) if the fetch/upload itself failed --
     ``fetch_and_upload_media``'s simpler ``str | None`` isn't reused for
     this because most callers (avatars, banners) never need dimensions and
     shouldn't have to unpack a tuple to get the one thing they want.
     """
+    own_mxc = resolve_own_media_proxy_mxc(public_base_url, url) if public_base_url else None
+    if own_mxc:
+        server_name, media_id = own_mxc.removeprefix("mxc://").split("/", 1)
+        try:
+            download = await synapse.download_media(server_name, media_id)
+        except SynapseError:
+            # Still worth reusing the mxc even if we couldn't re-fetch it
+            # ourselves just now to work out dimensions -- better than
+            # falling through to an unnecessary, un-deduplicated re-upload.
+            logger.warning("Could not re-fetch own media %s for dimensions", own_mxc, exc_info=True)
+            return own_mxc, None, None
+        parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(download.content_type)
+        dimensions = parser(download.content) if parser else None
+        width, height = dimensions if dimensions is not None else (None, None)
+        return own_mxc, width, height
+
     response = await _download_media(http_client, url)
     if response is None:
         return None
@@ -126,12 +161,8 @@ async def fetch_and_upload_media_with_dimensions(
         return None
 
     width = height = None
-    if content_type == "video/mp4":
-        dimensions = _mp4_video_dimensions(response.content)
-    elif content_type == "video/webm":
-        dimensions = _webm_video_dimensions(response.content)
-    else:
-        dimensions = None
+    parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(content_type)
+    dimensions = parser(response.content) if parser else None
     if dimensions is not None:
         width, height = dimensions
     return mxc_uri, width, height
@@ -300,6 +331,109 @@ def _webm_video_dimensions(data: bytes) -> tuple[int, int] | None:
                         return width, height
         pos = content_end
     return None
+
+
+def _png_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width/height from a PNG's mandatory-first IHDR chunk -- a fixed
+    offset right after the 8-byte signature, no scanning needed."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return (width, height) if width and height else None
+
+
+def _gif_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width/height from a GIF's fixed-layout logical screen descriptor,
+    right after the 6-byte "GIF87a"/"GIF89a" signature."""
+    if len(data) < 10 or data[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    width = int.from_bytes(data[6:8], "little")
+    height = int.from_bytes(data[8:10], "little")
+    return (width, height) if width and height else None
+
+
+def _jpeg_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width/height from a JPEG's first SOFn (start-of-frame) marker.
+    Unlike PNG/GIF this needs to scan the marker segments (each
+    self-describes its own length) rather than read a fixed offset, since
+    JPEG allows an arbitrary run of other segments (APPn/EXIF,
+    quantization/Huffman tables, ...) before the SOFn that carries the
+    actual dimensions."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    # Marker range 0xC0-0xCF is "start of frame or similar", but only
+    # these are genuine SOFn frame headers -- 0xC4/0xC8/0xCC (DHT/JPG/DAC)
+    # share the range without carrying dimensions the same way.
+    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    pos = 2
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        marker = data[pos + 1]
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            pos += 2  # markers with no length field (TEM, SOI, RSTn)
+            continue
+        if marker == 0xD9:  # EOI -- ran off the end without finding a SOFn
+            return None
+        if pos + 4 > len(data):
+            return None
+        segment_length = int.from_bytes(data[pos + 2 : pos + 4], "big")
+        if marker in sof_markers:
+            if pos + 9 > len(data):
+                return None
+            height = int.from_bytes(data[pos + 5 : pos + 7], "big")
+            width = int.from_bytes(data[pos + 7 : pos + 9], "big")
+            return (width, height) if width and height else None
+        pos += 2 + segment_length
+    return None
+
+
+def _webp_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width/height from a WebP file -- the encoding differs by which of
+    the three chunk types (simple lossy VP8, simple lossless VP8L, or
+    extended VP8X) it actually is."""
+    if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk_type = data[12:16]
+    if chunk_type == b"VP8 ":
+        # Lossy: each dimension is a 14-bit value in its own 16-bit
+        # little-endian field (top 2 bits are an unrelated scaling flag).
+        if len(data) < 30:
+            return None
+        width = int.from_bytes(data[26:28], "little") & 0x3FFF
+        height = int.from_bytes(data[28:30], "little") & 0x3FFF
+        return (width, height) if width and height else None
+    if chunk_type == b"VP8L":
+        # Lossless: width-minus-1 and height-minus-1, 14 bits each, packed
+        # into a 32-bit little-endian field right after a fixed signature byte.
+        if len(data) < 25 or data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], "little")
+        width = (bits & 0x3FFF) + 1
+        height = ((bits >> 14) & 0x3FFF) + 1
+        return (width, height) if width and height else None
+    if chunk_type == b"VP8X":
+        # Extended: width-minus-1/height-minus-1, 24 bits each, little-endian.
+        if len(data) < 30:
+            return None
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return (width, height) if width and height else None
+    return None
+
+
+_DIMENSIONS_PARSER_BY_CONTENT_TYPE.update(
+    {
+        "video/mp4": _mp4_video_dimensions,
+        "video/webm": _webm_video_dimensions,
+        "image/png": _png_image_dimensions,
+        "image/jpeg": _jpeg_image_dimensions,
+        "image/gif": _gif_image_dimensions,
+        "image/webp": _webp_image_dimensions,
+    }
+)
 
 
 def filename_with_extension(filename: str, media_type: str) -> str:

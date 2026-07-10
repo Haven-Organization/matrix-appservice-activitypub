@@ -86,7 +86,9 @@ from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
+    activity_lock,
     actor_html_with_avatar,
+    ensure_remote_actor_room,
     extract_poll_tallies,
     find_poll_thread_children,
     import_note,
@@ -1269,7 +1271,14 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                     )
                 return
 
-    if not force and not await repository.is_anyone_following(activity.actor):
+    # Extracted early (not just where it's used for rendering, below) since
+    # a quote of a post we already track is itself a relevance signal --
+    # see the "followed" branch right after this.
+    quote_uri = _extract_quote_uri(obj)
+    quoted_target = await repository.get_federated_event_by_ap_object(quote_uri) if quote_uri else None
+
+    followed = force or await repository.is_anyone_following(activity.actor)
+    if not followed and quoted_target is None:
         if not note_mentions_local_actor(request, obj):
             logger.info("Dropping Create from an actor nobody here follows: %s", activity.actor)
             return
@@ -1287,10 +1296,35 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         await import_note(request, note=obj, author_actor_id=activity.actor, author_doc=author_doc)
         return
 
-    remote_room = await repository.get_remote_actor_room(activity.actor)
-    if remote_room is None:
-        logger.info("No Remote User Room mapped for %s; dropping Create", activity.actor)
-        return
+    if followed:
+        remote_room = await repository.get_remote_actor_room(activity.actor)
+        if remote_room is None:
+            logger.info("No Remote User Room mapped for %s; dropping Create", activity.actor)
+            return
+    else:
+        # Not followed, but quotes a post we already track -- just as
+        # relevant regardless of follow status, same reasoning as
+        # _handle_announce's own boosted_target carve-out ("anyone on the
+        # fediverse can boost a public post, not just people the poster
+        # follows back"). Misskey in particular sends a plain renote (no
+        # comment at all) this way -- a quoting Create, never an Announce --
+        # so without this carve-out one from an account nobody here follows
+        # was silently dropped with zero acknowledgment on the original
+        # post at all (confirmed live 2026-07-10). Provisions a Remote User
+        # Room for the quoter on demand, same as the mention carve-out
+        # above -- just without diverting into import_note's simpler,
+        # non-quote-rendering pipeline, so it still gets a real "reposted
+        # Y's post" card below instead of just its own (often blank, for a
+        # commentless renote) content.
+        try:
+            author_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+        except RemoteActorFetchError:
+            author_doc = {}
+        remote_room, _ = await ensure_remote_actor_room(
+            request, author_actor_id=activity.actor, author_doc=author_doc, inviter=None,
+        )
+        if remote_room is None:
+            return
 
     ap_object_id = obj.get("id")
     if ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None:
@@ -1300,6 +1334,31 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # inbox/shared-inbox recipient); only the first delivery should
         # actually create anything.
         return
+
+    if quoted_target is not None:
+        # A quote-post targeting something we already track is functionally
+        # a boost, even though the wire shape is an ordinary Create rather
+        # than an Announce -- give it the exact same "notify + 🔁 react on
+        # the original" treatment _handle_announce gives a real Announce
+        # boost (see its own identical boosted_target handling), so the
+        # post's owner finds out regardless of which shape their booster's
+        # software happens to use. Placed AFTER the redelivery dedup check
+        # right above (not up in the relevance gate, where quoted_target is
+        # first computed) specifically so a redelivered/re-processed copy
+        # of the SAME quote note can't double-notify -- confirmed live
+        # 2026-07-10: a quote-post from an unfollowed Misskey account
+        # created its author's Remote User Room and repost card exactly as
+        # intended, but produced no notification at all, since nothing
+        # here previously called _notify_post_owner for a quote.
+        try:
+            quoter_actor_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+        except RemoteActorFetchError:
+            quoter_actor_doc = {}
+        await _notify_post_owner(
+            request, target=quoted_target, actor_id=activity.actor, actor_doc=quoter_actor_doc,
+            verb_phrase="reposted your post",
+        )
+        await _react_boost(request, quoted_target, activity.actor)
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
     plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
@@ -1315,7 +1374,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     # post's -- see its docstring.
     attachments = extract_attachments(obj)
 
-    quote_uri = _extract_quote_uri(obj)
+    # quote_uri itself was already extracted above, for the relevance gate.
     quote_plain_tail = quote_html_tail = ""
     quote_preview_image: dict[str, object] | None = None
     quote_preview_video: dict[str, object] | None = None
@@ -1935,7 +1994,27 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     later in this same function, once the boosted post actually gets
     mirrored for the first time below (see the ``boosted_target is None``
     check right after that import) -- not at the top, since there's
-    nothing to react to yet at that point."""
+    nothing to react to yet at that point.
+
+    Serializes concurrent calls for the SAME Announce (see
+    ``bridge.note_mirroring.activity_lock``) -- two near-simultaneous
+    inbox deliveries of the exact same Announce (e.g. a redelivered
+    transaction) would otherwise both pass the "already handled?" dedup
+    check below before either had recorded it, each re-upload their own
+    copy of the boosted attachment under its own fresh ``mxc://``, and
+    both send a duplicate repost card -- confirmed live 2026-07-10."""
+    announce_id = activity.id
+    if not announce_id:
+        # Nothing to key a lock (or the dedup check below) on regardless.
+        return await _handle_announce_locked(request, username, activity)
+    async with activity_lock(announce_id):
+        return await _handle_announce_locked(request, username, activity)
+
+
+async def _handle_announce_locked(request: Request, username: str, activity: Activity) -> None:
+    """``_handle_announce``'s actual body, run while holding that Announce's
+    own ``activity_lock`` -- see ``_handle_announce``'s own docstring for
+    why."""
     repository = request.app.state.repository
 
     announce_id = activity.id
@@ -1985,6 +2064,8 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     imported_link: str | None = None
     imported_ref: tuple[str, str] | None = None
     imported_attachment_mxc: str | None = None
+    imported_attachment_width: int | None = None
+    imported_attachment_height: int | None = None
     if isinstance(original_author_id, str):
         local_actor = await repository.get_local_actor(username)
         inviter = local_actor.matrix_user_id if local_actor is not None else None
@@ -1992,6 +2073,8 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
             request, note=obj, author_actor_id=original_author_id, author_doc=original_actor_doc, inviter=inviter,
         )
         imported_attachment_mxc = imported.first_attachment_mxc
+        imported_attachment_width = imported.first_attachment_width
+        imported_attachment_height = imported.first_attachment_height
         if imported.federated_event is not None:
             imported_link = matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)
             imported_ref = (imported.federated_event.room_id, imported.federated_event.event_id)
@@ -2015,7 +2098,8 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     # or not.
     attachments = extract_attachments(obj)
     message_content, _ = await _attach_media_to_content(
-        request, message_content, attachments, mxc_uri=imported_attachment_mxc
+        request, message_content, attachments, mxc_uri=imported_attachment_mxc,
+        width=imported_attachment_width, height=imported_attachment_height,
     )
 
     synapse = request.app.state.synapse

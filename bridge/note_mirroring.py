@@ -322,7 +322,7 @@ async def upsert_poll_tally_reply(
     ``send_boost``'s own "you boosted" card (see its docstring for that
     distinction). The bot is always already a member of a Remote User Room
     with equal standing to the ghost (``additional_creators=[bot_mxid]`` at
-    room-creation time -- see ``_ensure_remote_actor_room``), so no extra
+    room-creation time -- see ``ensure_remote_actor_room``), so no extra
     join/invite step is needed here either."""
     synapse = request.app.state.synapse
     plain, formatted = render_poll_tallies(tallies)
@@ -716,7 +716,8 @@ async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, 
 
 
 async def merge_attachment_into_content(
-    request: Request, message_content: dict, attachment: dict, *, mxc_uri: str | None = None
+    request: Request, message_content: dict, attachment: dict, *,
+    mxc_uri: str | None = None, width: int | None = None, height: int | None = None,
 ) -> tuple[dict, str | None]:
     """Fold ``attachment`` into ``message_content`` -- switching its
     ``msgtype`` to the media type and adding ``url``/``info``/``filename`` --
@@ -730,7 +731,20 @@ async def merge_attachment_into_content(
 
     ``mxc_uri``, if given, is reused as-is rather than fetching/re-uploading
     the attachment's source URL again -- same reasoning as
-    ``mirror_attachment``'s identical parameter.
+    ``mirror_attachment``'s identical parameter. Since that path never
+    (re-)fetches the file, it has no way to work out ``width``/``height``
+    itself -- pass them in too (read back from the FIRST call's own
+    returned ``info.w``/``info.h``, e.g. via ``ImportedNote.first_attachment_width``/
+    ``_height``) if the caller has them, or they're silently dropped for
+    this copy (confirmed live 2026-07-10: a boosted video's confirmation
+    card was missing its dimensions entirely -- cut off in Element's
+    timeline -- because the reuse path here had no way to carry them over
+    before this parameter existed).
+
+    When no ``mxc_uri`` is given, a fresh fetch still recognizes -- and
+    reuses without re-uploading -- an attachment URL that turns out to be
+    this bridge's OWN media proxy (e.g. boosting a local user's post; see
+    ``fetch_and_upload_media_with_dimensions``'s ``public_base_url``).
 
     Returns ``(content, mxc_uri)`` -- ``message_content`` unchanged and
     ``mxc_uri`` None if the attachment couldn't actually be fetched/
@@ -738,21 +752,19 @@ async def merge_attachment_into_content(
     used (freshly uploaded, or the given one), so a caller can pass it on
     to mirror the same attachment elsewhere without re-uploading it.
     """
-    width = height = None
     if mxc_uri is None:
-        # A video's dimensions aren't reused across the "mxc_uri already
-        # given" path below since that path never fetched the file at all
-        # -- only the primary attachment (the one actually fetched here)
-        # ever gets them.
-        if matrix_msgtype_for_mimetype(attachment["media_type"]) == "m.video":
-            result = await fetch_and_upload_media_with_dimensions(
-                request.app.state.http_client, request.app.state.synapse, attachment["url"]
-            )
-            if result is None:
-                return message_content, None
-            mxc_uri, width, height = result
-        else:
-            mxc_uri = await fetch_and_upload_media(request.app.state.http_client, request.app.state.synapse, attachment["url"])
+        # Any given width/height are meaningless for a fresh fetch of a
+        # DIFFERENT mxc_uri -- ignored in favor of whatever this fetch
+        # itself determines (image formats too, not just video -- see
+        # fetch_and_upload_media_with_dimensions).
+        width = height = None
+        result = await fetch_and_upload_media_with_dimensions(
+            request.app.state.http_client, request.app.state.synapse, attachment["url"],
+            public_base_url=request.app.state.config.bridge.public_base_url,
+        )
+        if result is None:
+            return message_content, None
+        mxc_uri, width, height = result
     if not mxc_uri:
         return message_content, None
     merged = dict(message_content)
@@ -769,7 +781,8 @@ async def merge_attachment_into_content(
 
 
 async def attach_media_to_content(
-    request: Request, message_content: dict, attachments: list[dict], *, mxc_uri: str | None = None
+    request: Request, message_content: dict, attachments: list[dict], *,
+    mxc_uri: str | None = None, width: int | None = None, height: int | None = None,
 ) -> tuple[dict, str | None]:
     """Attach ``attachments`` to ``message_content`` -- embedding only the
     FIRST as real Matrix media (see ``merge_attachment_into_content``) so an
@@ -791,7 +804,10 @@ async def attach_media_to_content(
 
     ``mxc_uri``, if given, is reused for the first attachment as-is rather
     than fetching/re-uploading it again -- same reasoning as
-    ``merge_attachment_into_content``'s identical parameter.
+    ``merge_attachment_into_content``'s identical parameter, including
+    ``width``/``height`` needing to be passed in alongside it (see that
+    function's own docstring) since the reuse path can't work them out
+    itself.
 
     Returns ``(content, mxc_uri)`` matching ``merge_attachment_into_content``'s
     own shape: the second element is the mxc:// URI the FIRST attachment
@@ -804,7 +820,7 @@ async def attach_media_to_content(
     if not attachments:
         return message_content, None
     merged, used_mxc_uri = await merge_attachment_into_content(
-        request, message_content, attachments[0], mxc_uri=mxc_uri
+        request, message_content, attachments[0], mxc_uri=mxc_uri, width=width, height=height,
     )
     extra = attachments[1:] if used_mxc_uri else attachments
     if not extra:
@@ -1996,47 +2012,60 @@ async def mirror_chat_message(
 class ImportedNote:
     """Result of ``import_note``. ``first_attachment_mxc`` is the ``mxc://``
     URI the note's first (only embedded -- see ``attach_media_to_content``)
-    attachment ended up uploaded as, if it had one, and ``author_avatar_mxc``
+    attachment ended up uploaded as, if it had one (``first_attachment_width``/
+    ``_height`` alongside it, if they could be determined -- needed so a
+    caller reusing ``first_attachment_mxc`` can pass them straight through
+    to ``attach_media_to_content`` too, since THAT reuse path has no way to
+    work them out itself; see its own docstring), and ``author_avatar_mxc``
     is the author's ghost/room avatar (if a new Remote User Room had to be
-    created for them) -- both exposed so a caller that separately builds its
+    created for them) -- all exposed so a caller that separately builds its
     own message referencing the same attachment/avatar (e.g.
     ``_handle_announce``'s repost summary card) can reuse them instead of
     re-uploading the same files to the homeserver."""
 
     federated_event: FederatedEvent | None
     first_attachment_mxc: str | None = None
+    first_attachment_width: int | None = None
+    first_attachment_height: int | None = None
     author_avatar_mxc: str | None = None
 
 
-# Per-``ap_object_id`` locks so two concurrent ``import_note`` calls for the
-# SAME post (observed live 2026-07-08: a followed account's own post arriving
-# as its own top-level Create at the same time someone else's quote-post of
-# it triggers _maybe_import_quoted_note to import that exact same post as
-# the quote target) don't both pass the "not tracked yet" check before
+# Per-key locks so two concurrent handlers for the SAME activity (observed
+# live 2026-07-08: a followed account's own post arriving as its own
+# top-level Create at the same time someone else's quote-post of it
+# triggers _maybe_import_quoted_note to import that exact same post as
+# the quote target) don't both pass a "not tracked yet" check before
 # either has recorded it, each upload their own copy of any attachment, and
 # both send a duplicate Matrix event. Self-cleaning (refcounted, popped once
 # nothing's waiting on a given id) rather than left to grow forever -- entries
-# only live as long as an import for that specific post is actually in
+# only live as long as a handler for that specific key is actually in
 # flight. Only closes the race within this one process; record_federated_event
 # still has a real partial-unique DB index as a backstop (see import_note's
 # own handling of a lost race there) for the case this doesn't cover, e.g. a
-# future multi-process deployment sharing one Postgres database.
-_import_locks: dict[str, asyncio.Lock] = {}
-_import_lock_waiters: dict[str, int] = {}
+# future multi-process deployment sharing one Postgres database. Generic
+# over any string key (not just an imported post's own AP object id) --
+# reused by bridge.inbox_dispatch._handle_announce, keyed by the Announce
+# activity's own id, to close the identical race for a redelivered boost
+# (confirmed live 2026-07-10: two near-simultaneous deliveries of the same
+# Announce both passed its own top-level "already handled?" dedup check
+# before either had recorded it, each re-uploading the boosted attachment
+# under its own fresh mxc:// and sending its own duplicate repost card).
+_activity_locks: dict[str, asyncio.Lock] = {}
+_activity_lock_waiters: dict[str, int] = {}
 
 
 @asynccontextmanager
-async def _import_lock(ap_object_id: str):
-    _import_lock_waiters[ap_object_id] = _import_lock_waiters.get(ap_object_id, 0) + 1
-    lock = _import_locks.setdefault(ap_object_id, asyncio.Lock())
+async def activity_lock(key: str):
+    _activity_lock_waiters[key] = _activity_lock_waiters.get(key, 0) + 1
+    lock = _activity_locks.setdefault(key, asyncio.Lock())
     try:
         async with lock:
             yield
     finally:
-        _import_lock_waiters[ap_object_id] -= 1
-        if _import_lock_waiters[ap_object_id] <= 0:
-            _import_lock_waiters.pop(ap_object_id, None)
-            _import_locks.pop(ap_object_id, None)
+        _activity_lock_waiters[key] -= 1
+        if _activity_lock_waiters[key] <= 0:
+            _activity_lock_waiters.pop(key, None)
+            _activity_locks.pop(key, None)
 
 
 async def import_note(
@@ -2061,7 +2090,7 @@ async def import_note(
     fall back to this for the plain-top-level-post case, same as ``import``
     itself does.
 
-    Serializes concurrent calls for the SAME ``note`` (see ``_import_lock``)
+    Serializes concurrent calls for the SAME ``note`` (see ``activity_lock``)
     -- two different inbound deliveries can legitimately both want to
     import the exact same post at the same time (e.g. it arrives as its
     own top-level ``Create`` right as someone else's quote-post of it is
@@ -2075,13 +2104,13 @@ async def import_note(
         return await _import_note_locked(
             request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
         )
-    async with _import_lock(ap_object_id):
+    async with activity_lock(ap_object_id):
         return await _import_note_locked(
             request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
         )
 
 
-async def _ensure_remote_actor_room(
+async def ensure_remote_actor_room(
     request: Request, *, author_actor_id: str, author_doc: dict, inviter: str | None
 ) -> tuple[RemoteActorRoom | None, str | None]:
     """Resolve (or provision, if this is the first-ever import from
@@ -2208,7 +2237,7 @@ async def _import_note_locked(
     request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
 ) -> ImportedNote:
     """``import_note``'s actual body, run while holding that post's own
-    ``_import_lock`` -- see ``import_note``'s own docstring for why."""
+    ``activity_lock`` -- see ``import_note``'s own docstring for why."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
@@ -2225,7 +2254,7 @@ async def _import_note_locked(
                     logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
         return ImportedNote(federated_event=existing)
 
-    remote_room, author_avatar_mxc = await _ensure_remote_actor_room(
+    remote_room, author_avatar_mxc = await ensure_remote_actor_room(
         request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
     )
     if remote_room is None:
@@ -2256,6 +2285,9 @@ async def _import_note_locked(
     # ActivityPub post always maps to exactly one Matrix event now.
     attachments = extract_attachments(note)
     message_content, first_attachment_mxc = await attach_media_to_content(request, message_content, attachments)
+    first_attachment_info = message_content.get("info") or {}
+    first_attachment_width = first_attachment_info.get("w")
+    first_attachment_height = first_attachment_info.get("h")
 
     config = request.app.state.config
     max_clock_skew = config.federation.max_clock_skew
@@ -2269,7 +2301,9 @@ async def _import_note_locked(
     except SynapseError:
         logger.warning("Failed to import post from %s", author_actor_id, exc_info=True)
         return ImportedNote(
-            federated_event=None, first_attachment_mxc=first_attachment_mxc, author_avatar_mxc=author_avatar_mxc
+            federated_event=None, first_attachment_mxc=first_attachment_mxc,
+            first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
+            author_avatar_mxc=author_avatar_mxc,
         )
 
     new_event: FederatedEvent | None = None
@@ -2280,7 +2314,7 @@ async def _import_note_locked(
         try:
             await repository.record_federated_event(new_event)
         except Exception:
-            # Lost a race _import_lock (see import_note's own docstring)
+            # Lost a race activity_lock (see import_note's own docstring)
             # didn't catch -- e.g. a future multi-process deployment
             # sharing one Postgres database, where the real partial-unique
             # index on ap_object_id is the actual backstop. event_id above
@@ -2317,7 +2351,9 @@ async def _import_note_locked(
     )
 
     return ImportedNote(
-        federated_event=new_event, first_attachment_mxc=first_attachment_mxc, author_avatar_mxc=author_avatar_mxc
+        federated_event=new_event, first_attachment_mxc=first_attachment_mxc,
+        first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
+        author_avatar_mxc=author_avatar_mxc,
     )
 
 
@@ -2331,14 +2367,14 @@ async def import_question(
     interactive poll widget, ghost-authored exactly like an ordinary
     mirrored post. Otherwise follows ``import_note``'s exact shape -- see
     its own docstring for the dedup/locking/room-provisioning reasoning,
-    all of which is identical here (including sharing its ``_import_lock``
+    all of which is identical here (including sharing its ``activity_lock``
     keyspace -- a poll and a Note never collide on ``id``)."""
     ap_object_id = question.get("id")
     if not ap_object_id:
         return await _import_question_locked(
             request, question=question, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
         )
-    async with _import_lock(ap_object_id):
+    async with activity_lock(ap_object_id):
         return await _import_question_locked(
             request, question=question, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
         )
@@ -2348,7 +2384,7 @@ async def _import_question_locked(
     request: Request, *, question: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
 ) -> ImportedNote:
     """``import_question``'s actual body, run while holding that poll's own
-    ``_import_lock`` -- see ``import_note``'s docstring for why that's
+    ``activity_lock`` -- see ``import_note``'s docstring for why that's
     needed."""
     repository = request.app.state.repository
     config = request.app.state.config
@@ -2366,7 +2402,7 @@ async def _import_question_locked(
                     logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
         return ImportedNote(federated_event=existing)
 
-    remote_room, author_avatar_mxc = await _ensure_remote_actor_room(
+    remote_room, author_avatar_mxc = await ensure_remote_actor_room(
         request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
     )
     if remote_room is None:
