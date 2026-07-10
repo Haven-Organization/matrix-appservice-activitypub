@@ -4287,11 +4287,19 @@ async def _replace_remote_actor_room(
     domain = urlsplit(remote_room.actor_id).hostname or ""
     username = actor_doc.get("preferredUsername") or remote_room.actor_id.rstrip("/").rsplit("/", 1)[-1]
     display_name = actor_doc.get("name") or username
-    icon_url = extract_icon_url(actor_doc) if actor_doc else None
+    # Same fallback-to-what-we-already-had convention as inbox_url below --
+    # a failed re-fetch (actor_doc == {}) must NOT be read as "this actor has
+    # no icon/banner now", or a transient fetch failure during ;replace room
+    # silently wipes a previously-known-good avatar from both the new room
+    # and the cache, even though the ghost's own live Matrix avatar is left
+    # untouched (ensure_ghost_user only ever sets, never clears, an avatar)
+    # -- confirmed live 2026-07-10 as the cause of a room/ghost avatar
+    # mismatch after a replace whose actor fetch happened to fail.
+    icon_url = extract_icon_url(actor_doc) if actor_doc else remote_room.icon_url
     localpart = ghost_localpart(config.appservice.user_prefix, username, domain)
     mxid = ghost_mxid(config.appservice.user_prefix, username, domain, config.synapse.server_name)
     avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
-    banner_url = extract_banner_url(actor_doc) if actor_doc else None
+    banner_url = extract_banner_url(actor_doc) if actor_doc else remote_room.banner_url
     banner_mxc = await fetch_and_upload_media(http_client, synapse, banner_url) if banner_url else None
 
     await ensure_ghost_user(
