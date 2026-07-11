@@ -41,15 +41,16 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;allow`](#allow-mxidroomhomeserver-value)
 - [`;disallow`](#disallow-mxidroomhomeserver-value)
 - [`;allowed`](#allowed)
+- [`;refresh`](#refresh-userinstanceorg)
 - [Widget vs. commands](#widget-vs-commands)
 
 ---
 
 ## `;help` / `;help all` / `;help admin`
 
-**Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list of advanced/maintenance commands anyone can use for their own stuff. `;help admin` instead shows the commands actually gated to a Matrix server admin (`;allow`/`;disallow`/`;allowed`) -- its own separate tier, never combined with `;help all`.
+**Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list of advanced/maintenance commands anyone can use for their own stuff. `;help admin` instead shows the commands actually gated to a Matrix server admin (`;allow`/`;disallow`/`;allowed`/`;refresh`) -- its own separate tier, never combined with `;help all`.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `poll refresh`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`. `;help admin` instead appends just `allow`/`disallow`/`allowed` -- those aren't shown under `;help all` at all, since they can't be run by anyone but a Matrix server admin regardless.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `poll refresh`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`. `;help admin` instead appends just `allow`/`disallow`/`allowed`/`refresh` -- those aren't shown under `;help all` at all, since they can't be run by anyone but a Matrix server admin regardless.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -371,6 +372,22 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 **What it does:** Lists every current third-party access grant, grouped by kind, plus the current global mode they'd all get.
 
 **Who can run it:** Matrix server admins only.
+
+---
+
+## `;refresh [@user@instance.org]`
+
+**Syntax:** `;refresh @user@instance.org`, or bare `;refresh` run inside that account's own Remote User Room (same "argument or implied by the room" convention as `;follow`).
+
+**What it does:** Re-fetches the ghost's live ActivityPub actor document right now and brings everything this bridge keeps in sync with it up to date immediately, rather than waiting for whatever would normally trigger it (a reply/reaction, or an inbound `Update` some remote servers may never actually send):
+
+- The ghost's own Matrix display name and avatar.
+- The Remote User Room's name, avatar, and banner.
+- The MSC4503 `m.external_handle` profile field -- brought into line with whatever `bridge.msc4503_external_handle` currently allows either way: set/refreshed if it's `profile` or `both`, actively removed if it's `off` or `events`, rather than leaving a stale value in place after a config change.
+
+**Who can run it:** Matrix server admins only.
+
+**Notes:** Best-effort per piece -- a failure updating one part (say, the room avatar) doesn't stop the rest from refreshing.
 
 ---
 

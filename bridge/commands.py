@@ -198,6 +198,7 @@ from bridge.activitypub.delivery import DeliveryError, deliver_activity
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
+    extract_actor_url,
     extract_attachments,
     extract_banner_url,
     extract_icon_url,
@@ -241,13 +242,16 @@ from bridge.note_mirroring import SOCIAL_PROFILE_ROOM_TYPE as _SOCIAL_PROFILE_RO
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
 from bridge.note_mirroring import resolve_old_remote_actor_room as _resolve_old_remote_actor_room
 from bridge.note_mirroring import (
+    EXTERNAL_HANDLE_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
     build_repost_note_content,
+    clear_ghost_external_handle,
     deliver_to_actor_or_followers,
     ensure_ghost_chat_room,
     ensure_ghost_dm_room,
+    event_external_handle_content,
     import_question,
     notify_mentioned_locals,
     provision_ghost,
@@ -256,6 +260,7 @@ from bridge.note_mirroring import (
     resolve_actor_matrix_identity,
     resolve_event_ts,
     resolve_mention_pills,
+    set_ghost_external_handle,
     social_relates_to,
     thread_reply_relates_to,
     unfollow_remote_actor,
@@ -287,7 +292,7 @@ _COMMAND_PREFIX = ";"
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
     r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help|"
-    r"disallow|allowed|allow"
+    r"disallow|allowed|allow|refresh"
 )
 
 
@@ -634,6 +639,8 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_disallow(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "allowed":
             await _handle_allowed(request, sender=sender, room_id=room_id)
+        elif subcommand == "refresh":
+            await _handle_refresh(request, sender=sender, room_id=room_id, argument=argument)
         else:
             await _notice(
                 request, room_id, f'Unknown command -- try "{_COMMAND_PREFIX}help" to see what I can do.'
@@ -946,6 +953,13 @@ async def _handle_help(
         (
             f"{_COMMAND_PREFIX}allowed",
             "List every current third-party access grant.",
+        ),
+        (
+            f"{_COMMAND_PREFIX}refresh [@user@instance.org]",
+            "Re-fetch a ghost's live profile right now and bring their display name/avatar, their room's "
+            "name/avatar/banner, and their MSC4503 external-handle profile field (set or removed, matching "
+            "whatever bridge.msc4503_external_handle currently allows) all up to date immediately. The handle "
+            "can be omitted when run inside that account's own room.",
         ),
     ]
     if show_all:
@@ -1392,6 +1406,7 @@ async def _establish_remote_follow(
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await set_ghost_external_handle(request, mxid=mxid, handle=handle, profile_url=extract_actor_url(actor_doc))
         await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
         if banner_mxc:
             await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
@@ -3017,6 +3032,9 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await set_ghost_external_handle(
+            request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc),
+        )
         await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
         if banner_mxc:
             await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
@@ -3044,6 +3062,9 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # Only the first attachment (if any) is embedded as real Matrix
     # media -- see attach_media_to_content's docstring for why the rest
@@ -3148,6 +3169,151 @@ async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict)
         await _notice(request, room_id, "Refreshed.")
     else:
         await _notice(request, room_id, "Couldn't refresh that poll -- it may no longer be reachable.")
+
+
+async def _handle_refresh(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """Admin-only: ``;refresh @user@instance.org`` (or bare ``;refresh`` run
+    inside that account's own Remote User Room, same "argument or implied
+    by the room" convention as ``;follow`` -- see its own docstring)
+    re-fetches a ghost's live ActivityPub actor document right now and
+    brings everything this bridge keeps in sync with it up to date
+    immediately, rather than waiting for whatever next triggers it
+    naturally (a reply/reaction re-running ``sync_ghost_profile``, or an
+    inbound ``Update`` the remote server may not even send -- Pleroma/Akkoma
+    confirmed to never send one for a poll's own Question, and there's no
+    reason to assume every implementation is better about a profile
+    Update either):
+
+    - The ghost's own Matrix display name/avatar -- only actually touched
+      when the live document's value differs from what's already on
+      record, same change-detection convention as sync_ghost_profile, so
+      a repeat ;refresh with nothing genuinely changed doesn't re-upload
+      the same avatar and show a spurious "changed their avatar" event.
+    - The Remote User Room's name/avatar/banner (same change detection).
+    - The MSC4503 ``m.external_handle`` profile field, brought into line
+      with the CURRENT ``bridge.msc4503_external_handle`` setting either
+      way -- set/refreshed if it now allows profile data ("profile"/
+      "both"), actively removed if it doesn't (e.g. the operator just
+      turned this off, or switched to "events" only), rather than leaving
+      a stale value in place forever either way.
+    """
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can refresh a ghost's profile.")
+        return
+
+    config = request.app.state.config
+    http_client = request.app.state.http_client
+    synapse = request.app.state.synapse
+    repository = request.app.state.repository
+
+    handle = argument.strip()
+    if handle:
+        try:
+            remote_actor_id = await resolve_remote_actor_id(http_client, handle)
+        except WebfingerNotFoundError:
+            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+            return
+        except WebfingerUnreachableError:
+            await _notice(request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit.")
+            return
+        except WebfingerError as exc:
+            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+            return
+        remote_room = await repository.get_remote_actor_room(remote_actor_id)
+        if remote_room is None:
+            await _notice(request, room_id, f"{handle} isn't a ghost on this bridge yet.")
+            return
+    else:
+        remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
+        if remote_room is None:
+            await _notice(
+                request, room_id,
+                f"Usage: {_COMMAND_PREFIX}refresh @user@instance.org (or run this with no argument inside "
+                "that account's own room)",
+            )
+            return
+        remote_actor_id = remote_room.actor_id
+
+    try:
+        actor_doc = await fetch_actor(http_client, remote_actor_id)
+    except RemoteActorFetchError as exc:
+        await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
+        return
+
+    mxid = remote_room.ghost_user_id
+    username = actor_doc.get("preferredUsername") or remote_actor_id.rstrip("/").rsplit("/", 1)[-1]
+    domain = urlsplit(remote_actor_id).hostname or ""
+    display_name = actor_doc.get("name") or username
+    icon_url = extract_icon_url(actor_doc)
+    banner_url = extract_banner_url(actor_doc)
+
+    # Compared against what's already on record (same convention as
+    # sync_ghost_profile) rather than unconditionally re-fetching/
+    # re-uploading/re-setting every single time -- Synapse mints a brand
+    # new mxc:// for every upload even of byte-identical content, so
+    # skipping this check would re-upload the SAME avatar on every
+    # ;refresh and show it as a spurious "changed their avatar" event in
+    # the room and the ghost's own membership, even when nothing on the
+    # ActivityPub side actually changed (confirmed live 2026-07-10).
+    name_changed = display_name != remote_room.display_name
+    icon_changed = icon_url != remote_room.icon_url
+    banner_changed = banner_url != remote_room.banner_url
+
+    avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_changed and icon_url else None
+    banner_mxc = (
+        await fetch_and_upload_media(http_client, synapse, banner_url) if banner_changed and banner_url else None
+    )
+
+    # Ghost's own Matrix profile.
+    if name_changed:
+        try:
+            await synapse.set_display_name(mxid, display_name)
+        except SynapseError:
+            logger.info("Could not refresh display name for %s", mxid, exc_info=True)
+    if avatar_mxc:
+        try:
+            await synapse.set_avatar_url(mxid, avatar_mxc)
+        except SynapseError:
+            logger.info("Could not refresh avatar for %s", mxid, exc_info=True)
+
+    # The Remote User Room's own name/avatar/banner.
+    if name_changed:
+        try:
+            await synapse.send_state_event(
+                remote_room.room_id, "m.room.name", "", {"name": display_name}, as_user_id=mxid
+            )
+        except SynapseError:
+            logger.info("Could not refresh room name for %s", remote_room.room_id, exc_info=True)
+    if avatar_mxc:
+        try:
+            await synapse.send_state_event(
+                remote_room.room_id, "m.room.avatar", "", {"url": avatar_mxc}, as_user_id=mxid
+            )
+        except SynapseError:
+            logger.info("Could not refresh room avatar for %s", remote_room.room_id, exc_info=True)
+    if banner_mxc:
+        await _set_ghost_room_banner(request, room_id=remote_room.room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
+
+    # MSC4503 -- brought into line with the CURRENT setting either way.
+    handle_str = f"@{username}@{domain}"
+    if config.bridge.msc4503_external_handle in ("profile", "both"):
+        await set_ghost_external_handle(
+            request, mxid=mxid, handle=handle_str, profile_url=extract_actor_url(actor_doc)
+        )
+    else:
+        await clear_ghost_external_handle(request, mxid=mxid)
+
+    # Keep this bridge's own cached bookkeeping (used by sync_ghost_profile
+    # and every other reply/reaction-driven sync) from immediately treating
+    # this as "changed again" the next time one of those runs.
+    await repository.record_ghost_profile(
+        GhostProfile(actor_id=remote_actor_id, display_name=display_name, icon_url=icon_url, mxid=mxid, handle=handle_str)
+    )
+    await repository.register_remote_actor_room(
+        dataclasses.replace(remote_room, display_name=display_name, icon_url=icon_url, banner_url=banner_url)
+    )
+
+    await _notice(request, room_id, f"Refreshed {handle_str}.")
 
 
 async def _handle_boost(request: Request, *, sender: str, room_id: str, content: dict, event_id: str | None) -> None:
@@ -4380,6 +4546,9 @@ async def _replace_remote_actor_room(
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+    await set_ghost_external_handle(
+        request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(actor_doc)
+    )
     await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
     if banner_mxc:
         await _set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
