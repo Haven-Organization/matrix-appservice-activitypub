@@ -281,7 +281,7 @@ async def maybe_federate_poll_vote(request: Request, event: dict) -> bool:
     # Some remote implementations (confirmed for Pleroma/Akkoma) never push
     # a live Update at all, live or at close -- so rather than only ever
     # waiting for one, actively pull the poll's current state right after
-    # voting, same mechanism as ";poll refresh" (see
+    # voting, same mechanism as ";refresh poll" (see
     # bridge.note_mirroring.refresh_poll_tallies's own docstring).
     # Best-effort: the vote itself already succeeded above regardless.
     await refresh_poll_tallies(request, target=target)

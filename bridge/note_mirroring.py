@@ -463,7 +463,7 @@ async def maybe_send_poll_end(
     Idempotent -- checked live (no new DB state) against whether a
     ``poll.end`` has already been posted in this thread, so calling this
     repeatedly (a redelivered/repeated Update, or a user re-running
-    ``;poll refresh`` after it's already closed) costs one cheap read each
+    ``;refresh poll`` after it's already closed) costs one cheap read each
     time after the first, never a repeat write. Returns True once the poll
     is known-closed in Matrix, whether this call is what sent it or it was
     already there."""
@@ -499,7 +499,7 @@ async def refresh_poll_tallies(request: Request, *, target: FederatedEvent) -> b
 
     Shared by a local vote on a mirrored poll
     (``bridge.poll_bridge.maybe_federate_poll_vote``, right after
-    delivering the vote itself) and the ``;poll refresh`` command
+    delivering the vote itself) and the ``;refresh poll`` command
     (``bridge.commands``) -- both are user-triggered, not remote-triggered,
     so neither needs the inbound Update handler's own spam-guard cooldown
     (see ``bridge.inbox_dispatch._TALLY_REFRESH_COOLDOWN_SECONDS`` --
@@ -2581,7 +2581,7 @@ async def _import_question_locked(
             # (confirmed for Pleroma/Akkoma) never push a live Update at
             # all, so this one-time snapshot may be the ONLY tally data
             # this poll ever gets without someone running
-            # ";poll refresh"/voting (see refresh_poll_tallies). thread_children=[]
+            # ";refresh poll"/voting (see refresh_poll_tallies). thread_children=[]
             # since a poll that was JUST created can't have a thread yet.
             initial_tallies = extract_poll_tallies(question)
             if initial_tallies is not None:

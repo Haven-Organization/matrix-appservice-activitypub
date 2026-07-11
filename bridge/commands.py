@@ -185,6 +185,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import html
+import inspect
 import logging
 import re
 import uuid
@@ -627,8 +628,6 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
                 request, sender=sender, room_id=room_id, content=content, caption=argument,
                 event_id=event.get("event_id"),
             )
-        elif subcommand == "poll" and argument.strip().lower() == "refresh":
-            await _handle_poll_refresh(request, room_id=room_id, content=content)
         elif subcommand == "backfill":
             await _handle_backfill(request, sender=sender, room_id=room_id, argument=argument, content=content)
         elif subcommand == "widget":
@@ -639,8 +638,10 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_disallow(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "allowed":
             await _handle_allowed(request, sender=sender, room_id=room_id)
+        elif subcommand == "refresh" and argument.strip().lower() == "poll":
+            await _handle_poll_refresh(request, room_id=room_id, content=content)
         elif subcommand == "refresh":
-            await _handle_refresh(request, sender=sender, room_id=room_id, argument=argument)
+            await _handle_refresh(request, sender=sender, room_id=room_id, argument=argument, content=content)
         else:
             await _notice(
                 request, room_id, f'Unknown command -- try "{_COMMAND_PREFIX}help" to see what I can do.'
@@ -648,6 +649,41 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         return True
     finally:
         _command_relates_to_var.reset(token)
+
+
+def _check_command_keywords_cover_dispatch() -> None:
+    """Fails loudly, at import time, if ``_COMMAND_KEYWORDS`` is missing a
+    subcommand this function's own ``elif subcommand == "..."``/``subcommand
+    in (...)`` dispatch chain actually recognizes -- confirmed live
+    2026-07-11, TWICE (``;poll refresh`` and, moments earlier, ``;refresh``
+    itself): a subcommand added to the dispatch chain without also adding
+    it here is never recognized as addressing the bot at all (see
+    ``message_addresses_bot``'s own ``;``-prefix check, which requires a
+    keyword match specifically so an ordinary message that merely starts
+    with ``;`` for unrelated reasons isn't swallowed) -- so the message
+    falls through this function entirely and gets federated to the
+    fediverse as if it were an ordinary post/reply, silently leaking a
+    bot command onto the network instead of running it. Parses the
+    keywords straight out of THIS function's own source (the actual
+    dispatch, the only real source of truth) rather than a second
+    hand-maintained list, so the two can never silently drift apart again
+    -- a missing keyword now crashes the bridge on startup instead of
+    leaking a future command over ActivityPub in production."""
+    source = inspect.getsource(maybe_handle_command)
+    dispatched = set(re.findall(r'subcommand == "([a-z_]+)"', source))
+    for group in re.findall(r'subcommand in \(([^)]+)\)', source):
+        dispatched.update(re.findall(r'"([a-z_]+)"', group))
+    recognized = set(_COMMAND_KEYWORDS.split("|"))
+    missing = dispatched - recognized
+    if missing:
+        raise AssertionError(
+            f"_COMMAND_KEYWORDS is missing {sorted(missing)} -- present in maybe_handle_command's own dispatch "
+            "chain but not recognized by the ;prefix command detector, so a message using it would silently "
+            "fall through to federation instead of running the command. Add it to _COMMAND_KEYWORDS."
+        )
+
+
+_check_command_keywords_cover_dispatch()
 
 
 # The bot response(s) to whichever command is currently being dispatched,
@@ -815,11 +851,12 @@ async def _handle_help(
     Three tiers, each hidden from the ones "below" it: ``show_all``
     (``;help all``) additionally lists the room-maintenance/advanced
     commands -- hidden from the ordinary ``;help`` since they're one-off
-    account/room-recovery operations (or things like ``;poll refresh``)
+    account/room-recovery operations (or things like ``;refresh poll``)
     almost nobody needs day to day, not things a new user scanning "how do
     I follow someone" should have to scroll past. ``show_admin``
     (``;help admin``) instead lists ONLY the commands that are actually
-    gated to a Matrix server admin (``;allow``/``;disallow``/``;allowed``)
+    gated to a Matrix server admin (``;allow``/``;disallow``/``;allowed``/
+    ``;refresh``)
     -- kept out of ``;help all`` entirely, since they're not "advanced
     user" features, they're admin-only and irrelevant to (can't even be
     run by) everyone else. Deliberately no combined "all + admin" view --
@@ -897,10 +934,10 @@ async def _handle_help(
             "Shows a count and asks for confirmation first.",
         ),
         (
-            f"{_COMMAND_PREFIX}poll refresh",
+            f"{_COMMAND_PREFIX}refresh poll",
             "Reply to a poll (or anything in its thread) to actively re-fetch its current tallies/closed "
             "state right now, rather than waiting for the remote server to push an update (some, like "
-            "Pleroma/Akkoma, never do).",
+            "Pleroma/Akkoma, never do). Any local user -- unlike the admin-only ;refresh below.",
         ),
         (
             f"{_COMMAND_PREFIX}hide followers",
@@ -3122,21 +3159,17 @@ def _reply_target_event_id(content: dict) -> str | None:
     return in_reply_to.get("event_id")
 
 
-async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict) -> None:
-    """";poll refresh" -- actively re-fetches a mirrored poll's own live AP
-    object and refreshes its tallies reply / closed state right now,
-    rather than only ever waiting for a push ``Update`` some remote
-    implementations (confirmed for Pleroma/Akkoma) never send at all --
-    see ``bridge.note_mirroring.refresh_poll_tallies``'s own docstring for
-    the shared mechanism (the same one that already runs automatically
-    right after a local vote).
-
-    Resolves the poll from whatever this command was sent as a reply to --
-    either directly to the poll's own event, or to anything else inside
-    its thread (most naturally the tallies reply itself, or a human
-    reply), trying the specific reply target first and falling back to the
+async def _resolve_poll_refresh_target(request: Request, content: dict) -> FederatedEvent | None:
+    """Resolves whatever poll ``content`` was sent as a reply to -- either
+    directly to the poll's own event, or to anything else inside its
+    thread (most naturally the tallies reply itself, or a human reply),
+    trying the specific reply target first and falling back to the
     thread's own root event id, since only the poll's own root event has a
-    tracked ``FederatedEvent`` to resolve at all."""
+    tracked ``FederatedEvent`` to resolve at all. ``None`` if ``content``
+    isn't a reply/thread message at all, or resolves to nothing tracked.
+    Shared by ``_handle_poll_refresh`` (";refresh poll") and bare
+    ";refresh" (``_handle_refresh``, when run as a reply inside a poll's
+    own thread instead of naming a ghost)."""
     repository = request.app.state.repository
     relates_to = content.get("m.relates_to") or {}
     candidate_ids: list[str] = []
@@ -3148,21 +3181,28 @@ async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict)
         if root and root not in candidate_ids:
             candidate_ids.append(root)
 
-    if not candidate_ids:
-        await _notice(
-            request, room_id,
-            f'Reply to a poll (or anything in its thread) with "{_COMMAND_PREFIX}poll refresh" '
-            "to refresh its tallies.",
-        )
-        return
-
-    target = None
     for candidate_id in candidate_ids:
         target = await repository.get_federated_event_by_matrix_event(candidate_id)
         if target is not None:
-            break
+            return target
+    return None
+
+
+async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict) -> None:
+    """";refresh poll" -- actively re-fetches a mirrored poll's own live AP
+    object and refreshes its tallies reply / closed state right now,
+    rather than only ever waiting for a push ``Update`` some remote
+    implementations (confirmed for Pleroma/Akkoma) never send at all --
+    see ``bridge.note_mirroring.refresh_poll_tallies``'s own docstring for
+    the shared mechanism (the same one that already runs automatically
+    right after a local vote)."""
+    target = await _resolve_poll_refresh_target(request, content)
     if target is None:
-        await _notice(request, room_id, "Couldn't find a tracked poll to refresh there.")
+        await _notice(
+            request, room_id,
+            f'Reply to a poll (or anything in its thread) with "{_COMMAND_PREFIX}refresh poll" '
+            "to refresh its tallies.",
+        )
         return
 
     if await refresh_poll_tallies(request, target=target):
@@ -3171,8 +3211,8 @@ async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict)
         await _notice(request, room_id, "Couldn't refresh that poll -- it may no longer be reachable.")
 
 
-async def _handle_refresh(request: Request, *, sender: str, room_id: str, argument: str) -> None:
-    """Admin-only: ``;refresh @user@instance.org`` (or bare ``;refresh`` run
+async def _handle_refresh(request: Request, *, sender: str, room_id: str, argument: str, content: dict) -> None:
+    """``;refresh @user@instance.org`` (admin-only, or bare ``;refresh`` run
     inside that account's own Remote User Room, same "argument or implied
     by the room" convention as ``;follow`` -- see its own docstring)
     re-fetches a ghost's live ActivityPub actor document right now and
@@ -3196,7 +3236,25 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
       "both"), actively removed if it doesn't (e.g. the operator just
       turned this off, or switched to "events" only), rather than leaving
       a stale value in place forever either way.
+
+    Bare ``;refresh`` (no argument) run as a reply inside a poll's own
+    thread refreshes THAT poll instead -- same resolution and permission
+    level (any local user, no admin check) as ``;refresh poll`` itself,
+    and mutually exclusive with the ghost-profile refresh above: replying
+    to refresh a poll never also touches anyone's profile (explicit user
+    request 2026-07-11). Only falls through to the admin-gated
+    ghost-profile behavior below when this ISN'T a reply that resolves to
+    a tracked poll at all.
     """
+    if not argument.strip():
+        poll_target = await _resolve_poll_refresh_target(request, content)
+        if poll_target is not None:
+            if await refresh_poll_tallies(request, target=poll_target):
+                await _notice(request, room_id, "Refreshed.")
+            else:
+                await _notice(request, room_id, "Couldn't refresh that poll -- it may no longer be reachable.")
+            return
+
     if not await _is_matrix_admin(request, sender):
         await _notice(request, room_id, "Only a Matrix server admin can refresh a ghost's profile.")
         return

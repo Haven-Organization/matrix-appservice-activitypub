@@ -40,7 +40,7 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 
 - Polls are bridged bidirectionally, as real Matrix poll widgets (MSC3381), not text. A Profile Room poll becomes a `Create{Question}`; an incoming poll from a followed account is mirrored the same way a post is, but as an actual interactive poll.
 - Voting either direction works: a local vote on a mirrored (remote-owned) poll federates out as a private vote to the poll's author; a remote vote on your own poll makes that voter's ghost cast a real Matrix poll response, so Matrix's own widget tallies it alongside everyone else's.
-- A mirrored poll's results are shown as a "Fediverse Tallies" thread reply, seeded from whatever the poll already shows at import time and actively refreshed after a vote or via `;poll refresh` -- some remote servers (confirmed for Pleroma/Akkoma) never push a live tally update over federation at all, so this doesn't rely solely on one arriving.
+- A mirrored poll's results are shown as a "Fediverse Tallies" thread reply, seeded from whatever the poll already shows at import time and actively refreshed after a vote or via `;refresh poll` -- some remote servers (confirmed for Pleroma/Akkoma) never push a live tally update over federation at all, so this doesn't rely solely on one arriving.
 - An incoming poll closing is mirrored as a real poll-end event in the same thread.
 
 ### Direct messages and chats

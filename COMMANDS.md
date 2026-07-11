@@ -36,7 +36,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;leave unfollowed`](#leave-unfollowed)
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
-- [`;poll refresh`](#poll-refresh-reply-to-a-poll-or-anything-in-its-thread)
+- [`;refresh poll`](#refresh-poll-reply-to-a-poll-or-anything-in-its-thread)
 - [`;widget`](#widget)
 - [`;allow`](#allow-mxidroomhomeserver-value)
 - [`;disallow`](#disallow-mxidroomhomeserver-value)
@@ -50,7 +50,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;help`, or tag the bot with nothing else recognizable. `;help all` shows an expanded list of advanced/maintenance commands anyone can use for their own stuff. `;help admin` instead shows the commands actually gated to a Matrix server admin (`;allow`/`;disallow`/`;allowed`/`;refresh`) -- its own separate tier, never combined with `;help all`.
 
-**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `poll refresh`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`. `;help admin` instead appends just `allow`/`disallow`/`allowed`/`refresh` -- those aren't shown under `;help all` at all, since they can't be run by anyone but a Matrix server admin regardless.
+**What it does:** Sends a table of commands as a rich `m.text` message (not a notice, so it isn't visually suppressed by "hide notices" client settings). Plain `;help` shows only the everyday commands: `help`, `create profile`, `follow`, `following`, `dm`, `chat`, `import <url>`, `repost`, `banner`. `;help all` appends the advanced/maintenance set: `link profile`, `unlink profile`, `delete profile`, `replace room`, `rejoin`, `leave unfollowed`, `refresh poll`, `hide`/`show`, `block`/`unblock`, `import follows`, `mute`/`unmute`, `backfill`, `widget`. `;help admin` instead appends just `allow`/`disallow`/`allowed`/`refresh` -- those aren't shown under `;help all` at all, since they can't be run by anyone but a Matrix server admin regardless.
 
 **Who can run it:** Anyone, including users on other Matrix homeservers. This is the one exception to the local-users-only rule.
 
@@ -319,13 +319,15 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ---
 
-## `;poll refresh` (reply to a poll, or anything in its thread)
+## `;refresh poll` (reply to a poll, or anything in its thread)
 
-**Syntax:** `;poll refresh`, sent as a reply to a mirrored poll's own event, or to anything else inside its thread (e.g. its tallies message, or a human reply).
+**Syntax:** `;refresh poll`, or just bare `;refresh` with no argument, sent as a reply to a mirrored poll's own event, or to anything else inside its thread (e.g. its tallies message, or a human reply). Renamed 2026-07-11 from `;poll refresh`.
 
 **What it does:** Actively re-fetches the poll's current live state from its own ActivityPub id and reflects it: refreshed vote tallies (posted/edited as a thread reply under the poll) and closed state, if it's ended. Exists because some remote implementations -- confirmed for Pleroma/Akkoma -- never push a live update over federation at all, live or at close, so a mirrored poll's tallies can otherwise sit stale forever. The same refresh already runs automatically right after you vote on a mirrored poll; this command is for anyone who wants to check again without voting again (which most polls don't allow anyway).
 
-**Who can run it:** Any local user.
+Bare `;refresh` checks for poll-thread context FIRST, before falling back to the admin-only ghost-profile refresh below -- so replying to refresh a poll never also touches anyone's profile, and vice versa: a bare `;refresh` that isn't a reply to anything tracked (or isn't a reply at all) falls straight through to the ghost-profile behavior instead.
+
+**Who can run it:** Any local user -- unlike the admin-only `;refresh [@user@instance.org]` below, despite sharing the same keyword.
 
 **Notes:** Best-effort -- if the poll is no longer reachable (deleted, network error), you'll get a notice saying so instead of a silent no-op.
 
@@ -377,7 +379,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 ## `;refresh [@user@instance.org]`
 
-**Syntax:** `;refresh @user@instance.org`, or bare `;refresh` run inside that account's own Remote User Room (same "argument or implied by the room" convention as `;follow`).
+**Syntax:** `;refresh @user@instance.org`, or bare `;refresh` run inside that account's own Remote User Room (same "argument or implied by the room" convention as `;follow`). If bare `;refresh` is instead sent as a reply inside a poll's own thread, it refreshes that poll instead -- see `;refresh poll` above -- never both at once.
 
 **What it does:** Re-fetches the ghost's live ActivityPub actor document right now and brings everything this bridge keeps in sync with it up to date immediately, rather than waiting for whatever would normally trigger it (a reply/reaction, or an inbound `Update` some remote servers may never actually send):
 

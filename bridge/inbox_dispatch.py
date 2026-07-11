@@ -1064,7 +1064,7 @@ async def _maybe_handle_poll_vote(request: Request, obj: dict, activity: Activit
 # own idempotency check), since a malicious server could otherwise still
 # re-send a "closed" Update forever. This cooldown is specific to INBOUND,
 # remote-triggered refreshes -- the user-triggered paths (a local vote, or
-# ";poll refresh") go through refresh_poll_tallies instead, which doesn't
+# ";refresh poll") go through refresh_poll_tallies instead, which doesn't
 # need it (see that function's own docstring for why)."""
 _TALLY_REFRESH_COOLDOWN_SECONDS = 60.0
 _last_tally_refresh_at: dict[str, float] = {}
