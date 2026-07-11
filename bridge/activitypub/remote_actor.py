@@ -88,6 +88,27 @@ def extract_banner_url(actor_doc: dict) -> str | None:
     return _extract_image_field_url(actor_doc.get("image"))
 
 
+def extract_actor_url(actor_doc: dict) -> str | None:
+    """The actor's own canonical, human-facing profile page (AS2's ``url``
+    field), for MSC4503's ``m.external_handle.url`` -- distinct from
+    ``id``, which is often an API endpoint rather than something a human
+    can open (e.g. Pleroma/Akkoma's ``.../users/alice`` versus Mastodon's
+    ``.../@alice``). Same list/Link-object/string handling as
+    ``bridge.note_mirroring.source_post_url``'s identical field on a Note,
+    just for an Actor's own top-level ``url`` instead. Falls back to
+    ``id`` if no usable ``url`` is present, same reasoning as that
+    function: some usable link is better than none."""
+    url = actor_doc.get("url")
+    if isinstance(url, list):
+        url = url[0] if url else None
+    if isinstance(url, dict):
+        url = url.get("href") or url.get("url")
+    if isinstance(url, str) and url:
+        return url
+    actor_id = actor_doc.get("id")
+    return actor_id if isinstance(actor_id, str) else None
+
+
 def extract_attachments(obj: dict) -> list[dict]:
     """Normalize a Note's ``attachment`` field to a list of ``{"url", "media_type", "name"}`` dicts.
 

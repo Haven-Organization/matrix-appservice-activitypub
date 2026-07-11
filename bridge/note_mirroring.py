@@ -33,6 +33,7 @@ from bridge.activitypub.delivery import DeliveryError, deliver_activity
 from bridge.activitypub.models import AS_PUBLIC, Activity, Actor, PublicKey
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
+    extract_actor_url,
     extract_attachments,
     extract_banner_url,
     extract_icon_url,
@@ -89,6 +90,93 @@ SOCIAL_PROFILE_ROOM_TYPE = "org.matrix.msc4501.social.profile"
 # a local user may deliberately want a different room entirely as their
 # general Matrix-wide social profile.
 SOCIAL_PROFILE_ROOM_ID_FIELD = "org.matrix.msc4501.social.profile_room_id"
+
+# MSC4503 (External Protocol Handles) -- a ghost's actual ActivityPub
+# handle (e.g. "@alice@mastodon.social"), which neither displayname (their
+# free-text, non-unique AP display name) nor their bridge-generated MXID
+# actually carries. Same field, same shape, used two ways -- see
+# set_ghost_external_handle (an MSC4133 profile field, kept current) and
+# event_external_handle_content (a point-in-time snapshot on each event,
+# since a handle can change, e.g. Fediverse account migration, after a
+# given event was already sent).
+EXTERNAL_HANDLE_FIELD = "org.matrix.msc4503.external_handle"
+
+
+def _external_handle_value(config, *, handle: str, profile_url: str | None = None) -> dict:
+    """Builds an MSC4503 ``m.external_handle`` object. ``protocol.avatar_url``
+    is the bridge bot's own configured avatar (``appservice.bot_avatar_mxc``,
+    per the user's explicit choice 2026-07-10) -- omitted if the operator
+    never set one, same as every other optional field here."""
+    protocol: dict = {"id": "activitypub", "displayname": "Fediverse"}
+    if config.appservice.bot_avatar_mxc:
+        protocol["avatar_url"] = config.appservice.bot_avatar_mxc
+    value: dict = {"handle": handle, "protocol": protocol}
+    if profile_url:
+        value["url"] = profile_url
+    return value
+
+
+async def set_ghost_external_handle(
+    request: Request, *, mxid: str, handle: str, profile_url: str | None = None
+) -> None:
+    """Point ``mxid`` (a ghost) at ``handle`` as its MSC4503
+    ``m.external_handle`` profile field -- same MSC4133 mechanism, same
+    best-effort/off-by-default reasoning, as ``set_ghost_profile_room_id``
+    right above (see ``bridge.config.BridgeSection.msc4503_external_handle``,
+    "profile"/"both"). Call this every time a ghost's Remote User Room is
+    registered or changes (a first follow, a mention-triggered import, or
+    a ``;replace room``), same call sites as set_ghost_profile_room_id --
+    a handle essentially never changes short of the account itself moving,
+    which this bridge has no separate signal for anyway."""
+    if request.app.state.config.bridge.msc4503_external_handle not in ("profile", "both"):
+        return
+    synapse = request.app.state.synapse
+    config = request.app.state.config
+    try:
+        await synapse.set_profile_field(
+            mxid, EXTERNAL_HANDLE_FIELD, _external_handle_value(config, handle=handle, profile_url=profile_url)
+        )
+    except SynapseError:
+        logger.info("Could not set %s for %s", EXTERNAL_HANDLE_FIELD, mxid, exc_info=True)
+
+
+async def clear_ghost_external_handle(request: Request, *, mxid: str) -> None:
+    """Remove ``mxid``'s MSC4503 ``m.external_handle`` profile field, if
+    set -- the inverse of ``set_ghost_external_handle``, used by
+    ``;refresh`` to retract a stale field left over from before
+    ``bridge.msc4503_external_handle`` was turned off (or set to
+    "events" only), rather than leaving it stuck at whatever it was last
+    set to forever. Best-effort, same as every other MSC4133 call here --
+    a homeserver without MSC4133 support (or a field that was never set
+    in the first place) just 404s/errors, silently."""
+    synapse = request.app.state.synapse
+    try:
+        await synapse.delete_profile_field(mxid, EXTERNAL_HANDLE_FIELD)
+    except SynapseError:
+        logger.info("Could not clear %s for %s", EXTERNAL_HANDLE_FIELD, mxid, exc_info=True)
+
+
+async def event_external_handle_content(request: Request, actor_id: str) -> dict | None:
+    """The MSC4503 ``m.external_handle`` value to embed on a single mirrored
+    event authored by ``actor_id``, or ``None`` if the feature is off or no
+    handle is on record for them yet. Sourced from the already-cached
+    ``GhostProfile.handle`` (no network fetch) -- deliberately without a
+    ``url``, unlike the profile-field use above: that would need caching
+    the actor's profile-page URL alongside the handle, a
+    ``GhostProfile`` schema change this feature doesn't need badly enough
+    to justify on its own. A per-event snapshot is exactly the point of
+    this half of MSC4503 (see EXTERNAL_HANDLE_FIELD's own docstring) --
+    called at every one of this bridge's existing content.external_url
+    call sites, the closest existing precedent for "a link back to
+    wherever this came from" on a mirrored event."""
+    if request.app.state.config.bridge.msc4503_external_handle not in ("events", "both"):
+        return None
+    repository = request.app.state.repository
+    ghost_profile = await repository.get_ghost_profile(actor_id)
+    if ghost_profile is None or not ghost_profile.handle:
+        return None
+    return _external_handle_value(request.app.state.config, handle=ghost_profile.handle)
+
 
 # The inverse of SOCIAL_PROFILE_ROOM_ID_FIELD: a room-level state event
 # (state_key "", content {"user_id": "@alice:example.org"}) asserting
@@ -1846,6 +1934,9 @@ async def mirror_direct_message(
     src = source_post_url(note)
     if src:
         message_content["external_url"] = src
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # Only the first attachment (if any) is embedded as real Matrix media --
     # see attach_media_to_content's docstring for why the rest are appended
@@ -2220,6 +2311,9 @@ async def ensure_remote_actor_room(
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await set_ghost_external_handle(
+            request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc)
+        )
         await set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
         if banner_mxc:
             await set_ghost_room_banner(request, room_id=new_room_id, ghost_user_id=mxid, banner_mxc=banner_mxc)
@@ -2278,6 +2372,9 @@ async def _import_note_locked(
     src = source_post_url(note)
     if src:
         message_content["external_url"] = src
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # Only the first attachment (if any) is embedded as real Matrix media --
     # see attach_media_to_content's docstring for why the rest are appended
@@ -2436,6 +2533,9 @@ async def _import_question_locked(
     src = source_post_url(question)
     if src:
         poll_content["external_url"] = src
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        poll_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     config = request.app.state.config
     max_clock_skew = config.federation.max_clock_skew

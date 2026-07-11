@@ -60,6 +60,24 @@ class BridgeSection:
     # registration until the operator has actually opted into MSC4133 on
     # the homeserver side too. Turn on once that's done.
     set_msc4501_profile_room_id: bool = False
+    # Whether/where to set org.matrix.msc4503.external_handle (MSC4503,
+    # "External Protocol Handles") on every ghost -- carrying the actual
+    # ActivityPub handle (e.g. "@alice@mastodon.social") a display name and
+    # bridge-generated MXID alone can't express. Two independent places it
+    # can go, since they have different tradeoffs (see
+    # bridge.note_mirroring.set_ghost_external_handle/
+    # event_external_handle_content):
+    #   - "profile": an MSC4133 profile field on the ghost's own Matrix
+    #     account, kept current -- needs the homeserver's own MSC4133
+    #     support (same as set_msc4501_profile_room_id above; not on by
+    #     default even there).
+    #   - "events": a point-in-time snapshot on every event the ghost
+    #     sends -- no such dependency, always safe/additive.
+    #   - "both": both of the above.
+    #   - "off" (default): neither -- same off-by-default reasoning as
+    #     set_msc4501_profile_room_id, since at least the "profile" half
+    #     needs an explicit homeserver opt-in first.
+    msc4503_external_handle: str = "off"
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
     # same convention as Matrix's own m.relates_to) on every mirrored boost
     # (Announce), quote-post, and cross-posted reply echo -- see
@@ -316,6 +334,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         raise ConfigError(
             f"bridge.third_party_access_mode must be 'follow_only' or 'full', got {third_party_access_mode!r}"
         )
+    msc4503_external_handle = bridge_raw.get("msc4503_external_handle", "off")
+    if msc4503_external_handle not in ("off", "profile", "events", "both"):
+        raise ConfigError(
+            "bridge.msc4503_external_handle must be one of 'off', 'profile', 'events', 'both', "
+            f"got {msc4503_external_handle!r}"
+        )
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -325,6 +349,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         accept_federated_knocks=bool(bridge_raw.get("accept_federated_knocks", False)),
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
         set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", False)),
+        msc4503_external_handle=msc4503_external_handle,
         set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,

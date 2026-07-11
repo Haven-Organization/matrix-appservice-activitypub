@@ -237,6 +237,20 @@ class SynapseClient:
             as_user_id=user_id,
         )
 
+    async def delete_profile_field(self, user_id: str, key: str) -> None:
+        """Remove an arbitrary profile field via MSC4133 -- the DELETE
+        counterpart to ``set_profile_field``, same endpoint shape and same
+        homeserver-support caveat. Used to retract a field that's no
+        longer supposed to be set (e.g. ``;refresh`` clearing
+        ``m.external_handle`` after ``bridge.msc4503_external_handle`` was
+        turned off) rather than leaving a stale value in place forever."""
+        await self._request(
+            "DELETE",
+            f"/_matrix/client/v3/profile/{user_id}/{quote(key, safe='')}",
+            token=self._as_token,
+            as_user_id=user_id,
+        )
+
     async def create_room(
         self,
         *,

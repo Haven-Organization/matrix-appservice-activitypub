@@ -81,6 +81,7 @@ from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
+    EXTERNAL_HANDLE_FIELD,
     HAVEN_REMOVE_HEADER_FIELD,
     POLL_END_EVENT_TYPE,
     SOCIAL_REL_TYPE_REPLY,
@@ -89,6 +90,7 @@ from bridge.note_mirroring import (
     activity_lock,
     actor_html_with_avatar,
     ensure_remote_actor_room,
+    event_external_handle_content,
     extract_poll_tallies,
     find_poll_thread_children,
     import_note,
@@ -1429,6 +1431,9 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url
+    handle_content = await event_external_handle_content(request, activity.actor)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # Only the first attachment (if any) is embedded as real Matrix media --
     # see attach_media_to_content's docstring for why the rest are appended
@@ -1669,6 +1674,9 @@ async def _mirror_note_as_reply(
     source_url = _source_post_url(note)
     if source_url:
         message_content["external_url"] = source_url
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # See _handle_create's identical reasoning: only the first attachment is
     # embedded, the rest are appended as plain links -- an ActivityPub post
@@ -1812,6 +1820,9 @@ async def _echo_reply_in_own_room(
     source_url = _source_post_url(note)
     if source_url:
         message_content["external_url"] = source_url
+    handle_content = await event_external_handle_content(request, author_actor_id)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
     attachments = extract_attachments(note)
     message_content, _ = await _attach_media_to_content(request, message_content, attachments)
 
@@ -2091,6 +2102,14 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     message_content = await _build_repost_message(
         request, remote_room, obj, original_author_id, original_actor_doc, imported_link, imported_ref,
     )
+    # The actual SENDER of this event is the booster (remote_room's own
+    # ghost), not original_author_id (whose content is only quoted/embedded
+    # here) -- MSC4503 defines this field as the sender's handle, same
+    # distinction external_url doesn't need to make since IT deliberately
+    # points at the boosted post's own permalink instead.
+    handle_content = await event_external_handle_content(request, activity.actor)
+    if handle_content:
+        message_content[EXTERNAL_HANDLE_FIELD] = handle_content
 
     # See _handle_create's identical reasoning: only the boosted post's
     # first attachment is embedded, the rest are appended as plain links --

@@ -71,6 +71,21 @@ bridge:
   # on once your homeserver actually supports it.
   # set_msc4501_profile_room_id: false
 
+  # Set org.matrix.msc4503.external_handle (MSC4503, "External Protocol
+  # Handles") on every ghost -- carrying its actual ActivityPub handle
+  # (e.g. "@alice@mastodon.social"). One of:
+  #   - "off" (default)
+  #   - "profile": an MSC4133 profile field on the ghost's own account
+  #     (needs the same homeserver support as set_msc4501_profile_room_id
+  #     above)
+  #   - "events": a snapshot on every event the ghost sends (no such
+  #     dependency)
+  #   - "both"
+  # Changing this only affects ghosts going forward -- an admin can force
+  # an existing ghost's profile field into line with a new value (set,
+  # updated, or removed) right away via ";refresh".
+  # msc4503_external_handle: off
+
   # Set org.matrix.msc4501.social.relates_to on every mirrored boost,
   # quote-post, and cross-posted reply echo. On by default -- purely
   # additive content a non-MSC4501 client just ignores.
