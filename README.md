@@ -14,7 +14,7 @@ Every ActivityPub identity or conversation the bridge manages is backed by an or
 - **Remote User Room**: one shared room per remote fediverse account, mirroring everything they post. Created the first time anyone follows or imports from that account, and reused by every local follower after that.
 - **Ghost DM room**: a private 1:1 room between a local user and a remote account, carrying ActivityPub `Note`-based direct messages.
 - **Ghost Chat room**: a private 1:1 room carrying ActivityPub `ChatMessage`s (Pleroma/Akkoma's separate instant-messaging concept). Deliberately never the same room as a DM, even between the same two parties.
-- **Notification room**: a private 1:1 room between a local user and the bridge bot itself, named "Fediverse Notifications". New followers, mentions, reposts, and likes/reactions land here instead of in the Profile Room, since a Profile Room can have other Matrix users invited into it and a feed of who's interacting with you is a privacy leak with no fediverse-side equivalent.
+- **Notification room**: a private 1:1 room between a local user and the bridge bot itself, named "Fediverse Notifications". Notification messages for new followers, mentions, reposts, and likes/reactions land here.
 
 Every remote account you interact with gets a deterministic "ghost" Matrix user (`@ap_user_instance:yourdomain`) that posts, reacts, and DMs on their behalf inside Matrix. Its display name, avatar, and (for a Remote User Room) banner stay in sync with their real ActivityPub profile.
 
