@@ -5,7 +5,7 @@ pushing a local actor's own identity changes out over ActivityPub.
 Used by both ``bridge.commands`` (the ``import`` command, the various
 room-creation flows, and the ``banner`` command) and ``bridge.inbox_dispatch``
 (mirroring a followed account's own posts/replies, and -- via ``import_note``
--- importing whatever a followed account boosts), and by
+-- importing whatever a followed account reposts), and by
 ``bridge.profile_posts`` (keeping a local actor's name/bio/avatar in sync
 with their Profile Room's own Matrix state via ``push_profile_update``).
 Lives here, in none of those, because ``commands`` and ``inbox_dispatch``
@@ -231,7 +231,7 @@ SOCIAL_PROFILE_USER_ID_POWER_LEVEL = 100
 # client with no idea what this is just ignores it.
 SOCIAL_RELATES_TO_FIELD = "org.matrix.msc4501.social.relates_to"
 
-# SOCIAL_RELATES_TO_FIELD's "rel_type" for a boost (Announce) or quote-post:
+# SOCIAL_RELATES_TO_FIELD's "rel_type" for a repost (Announce) or quote-post:
 # the related event is the thing being reposted.
 SOCIAL_REL_TYPE_REPOST = "org.matrix.msc4501.social.repost"
 
@@ -257,7 +257,7 @@ def social_relates_to(
     displayname: str | None = None,
 ) -> dict:
     """Builds a ``SOCIAL_RELATES_TO_FIELD`` value -- shared by every mirrored
-    event that relates to another one this way (a repost/boost, a quote-post,
+    event that relates to another one this way (a repost, a quote-post,
     or a cross-posted reply's echo). ``sender`` (the referenced post's own
     author's mxid) is mandatory per the MSC; callers are responsible for not
     calling this at all when it can't be resolved (see
@@ -271,8 +271,8 @@ def social_relates_to(
     asserting the caller's own outer event ``content`` already IS a full
     copy of the referenced post rather than duplicating it a second time
     inside this block. Per the MSC's own text, this is ONLY valid for a
-    genuine repost/boost with no reposting-user commentary of its own
-    (``SOCIAL_REL_TYPE_REPOST``'s pure-boost case -- see
+    genuine repost with no reposting-user commentary of its own
+    (``SOCIAL_REL_TYPE_REPOST``'s pure-repost case -- see
     ``bridge.inbox_dispatch._build_repost_message``'s own docstring, the
     only caller that passes it) -- never a quote-post (whose outer content
     is the quoter's own caption, not a copy of the quoted post) and never
@@ -292,7 +292,7 @@ def social_relates_to(
 
 # Set (bool, always ``True`` when present) on a mirrored event whose body/
 # formatted_body starts with a bridge-generated attribution line -- "🔁 X
-# boosted Y's post:" (_build_repost_message) or "⤵️ Reply to X's post:"
+# reposted Y's post:" (_build_repost_message) or "⤵️ Reply to X's post:"
 # (_echo_reply_in_own_room) -- ahead of the actual mirrored content, rather
 # than the mirrored content being the entire body verbatim. Haven's own
 # field (not part of MSC4501 or any other spec), requested 2026-07-08, so
@@ -302,8 +302,8 @@ def social_relates_to(
 # (bridge.commands._handle_repost) -- both put a REAL caption first, with
 # any bridge-generated attribution coming after, not a header "at the top"
 # in the sense this field means. Also deliberately NOT set on anything sent
-# as the bridge BOT itself (e.g. send_boost's own reaction-triggered
-# notice, posted into the booster's Profile Room as the bot rather than a
+# as the bridge BOT itself (e.g. send_repost's own reaction-triggered
+# notice, posted into the reposter's Profile Room as the bot rather than a
 # ghost) -- Haven only ever needs to strip a header from a mirrored
 # fediverse-authored post, never from the bridge's own first-party notices.
 HAVEN_REMOVE_HEADER_FIELD = "software.haven.remove_header"
@@ -407,7 +407,7 @@ async def upsert_poll_tally_reply(
     eventual ``poll.end`` (both real mirrored copies of the remote account's
     own activity), this specific message is bridge-GENERATED informational
     content the remote account never actually said, same category as
-    ``send_boost``'s own "you boosted" card (see its docstring for that
+    ``send_repost``'s own "you reposted" card (see its docstring for that
     distinction). The bot is always already a member of a Remote User Room
     with equal standing to the ghost (``additional_creators=[bot_mxid]`` at
     room-creation time -- see ``ensure_remote_actor_room``), so no extra
@@ -456,7 +456,7 @@ async def maybe_send_poll_end(
     """Sends ``org.matrix.msc3381.poll.end`` for a poll confirmed closed --
     as the GHOST (not the bot), since this is the poll author's own real
     act, exactly like every other mirrored copy of their activity, not
-    bridge-generated commentary (see ``bridge.reaction_bridge.send_boost``'s
+    bridge-generated commentary (see ``bridge.reaction_bridge.send_repost``'s
     docstring for that distinction). The ghost is already guaranteed a room
     member (it created the room), so no extra join step is needed.
 
@@ -535,7 +535,7 @@ async def refresh_poll_tallies(request: Request, *, target: FederatedEvent) -> b
 
 def mirrored_post_event_type(config) -> str:
     """The event type to use when mirroring a remote fediverse account's
-    own posts, replies, and boosts into Matrix (never DMs/Chats, which
+    own posts, replies, and reposts into Matrix (never DMs/Chats, which
     aren't "posts") -- SOCIAL_POST_EVENT_TYPE if
     ``bridge.use_msc4501_post_event_type`` is on, otherwise the ordinary
     ``m.room.message`` every client already understands."""
@@ -677,8 +677,8 @@ def thread_reply_relates_to(*, event_id: str, thread_root_event_id: str | None) 
 
     Shared by every bot-composed reply that needs to land in the right
     thread: ``bridge.inbox_dispatch._mirror_note_as_reply`` (an inbound AP
-    reply) and the ``;boost``/``;repost``/reaction-boost confirmation
-    notices (``bridge.commands``, ``bridge.reaction_bridge``) alike.
+    reply) and the ``;repost``/reaction-repost confirmation notices
+    (``bridge.commands``, ``bridge.reaction_bridge``) alike.
     """
     return {
         "rel_type": "m.thread",
@@ -780,17 +780,17 @@ async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, 
     build had been observed rendering its own generated pill AND the
     anchor's inner content side by side), but an empty anchor contributes
     NOTHING to anything that extracts the message's text content, which
-    is exactly what Element Web's desktop notification text does: a boost
-    card notified as "boosted 's post" with both names missing (reported
+    is exactly what Element Web's desktop notification text does: a repost
+    card notified as "reposted 's post" with both names missing (reported
     live via dunst, 2026-07-03). With the name inside, the user confirmed
     it renders correctly on BOTH Element Web and current Element X -- the
     old double-render no longer reproduces, so there is no tradeoff left:
     never emit an empty pill anchor.
 
-    Shared by the boost/repost profile notices (``bridge.reaction_bridge``,
+    Shared by the repost profile notices (``bridge.reaction_bridge``,
     ``bridge.commands``), inbound quote rendering (``bridge.inbox_dispatch``),
     and the mirrored-repost card (``bridge.inbox_dispatch._build_repost_message``)
-    -- every rendering of "X boosted/reposted Y's post" looks the same
+    -- every rendering of "X reposted Y's post" looks the same
     regardless of whether X and Y are local, remote, or which side of the
     bridge made the repost.
     """
@@ -824,14 +824,14 @@ async def merge_attachment_into_content(
     itself -- pass them in too (read back from the FIRST call's own
     returned ``info.w``/``info.h``, e.g. via ``ImportedNote.first_attachment_width``/
     ``_height``) if the caller has them, or they're silently dropped for
-    this copy (confirmed live 2026-07-10: a boosted video's confirmation
+    this copy (confirmed live 2026-07-10: a reposted video's confirmation
     card was missing its dimensions entirely -- cut off in Element's
     timeline -- because the reuse path here had no way to carry them over
     before this parameter existed).
 
     When no ``mxc_uri`` is given, a fresh fetch still recognizes -- and
     reuses without re-uploading -- an attachment URL that turns out to be
-    this bridge's OWN media proxy (e.g. boosting a local user's post; see
+    this bridge's OWN media proxy (e.g. reposting a local user's post; see
     ``fetch_and_upload_media_with_dimensions``'s ``public_base_url``).
 
     Returns ``(content, mxc_uri)`` -- ``message_content`` unchanged and
@@ -901,7 +901,7 @@ async def attach_media_to_content(
     own shape: the second element is the mxc:// URI the FIRST attachment
     ended up uploaded as (None if there were no attachments, or embedding
     it failed), for a caller needing to reuse that same upload elsewhere
-    (e.g. mirroring the same boosted post's first attachment into both the
+    (e.g. mirroring the same reposted post's first attachment into both the
     original author's room and a repost summary card). If embedding the
     first attachment fails outright, every attachment (including that
     first one) is linked instead, rather than silently dropping it."""
@@ -1211,7 +1211,12 @@ async def push_profile_update(request: Request, actor_record: ActorRecord) -> No
         id=actor_url(base, actor_record.username),
         preferred_username=actor_record.username,
         name=actor_record.display_name or actor_record.username,
-        summary=actor_record.summary,
+        # Same reasoning as bridge.activitypub.routes._build_actor's
+        # identical conversion -- plain actor_record.summary has no <a
+        # href> around a URL in someone's bio, so it renders as inert text
+        # on the far end instead of a clickable link (confirmed live
+        # 2026-07-11).
+        summary=plain_text_to_note_html(actor_record.summary) if actor_record.summary else actor_record.summary,
         url=actor_url(base, actor_record.username),
         inbox=inbox_url(base, actor_record.username),
         outbox=outbox_url(base, actor_record.username),
@@ -1674,7 +1679,7 @@ async def notify_mentioned_locals(
     author_handle = (author_profile.handle if author_profile else None) or author_actor_id
     # A real pill (see notification_actor_html, same convention every other
     # notification in this bridge uses -- e.g. bridge.inbox_dispatch's own
-    # "X liked/boosted your post") rather than the bare "@user@instance"
+    # "X liked/reposted your post") rather than the bare "@user@instance"
     # text this used to be stuck with -- falls back to plain escaped text
     # only if we somehow have no synced ghost profile/mxid for them at all,
     # which shouldn't normally happen (mirroring the mentioning post itself
@@ -2136,10 +2141,10 @@ class ImportedNote:
 # future multi-process deployment sharing one Postgres database. Generic
 # over any string key (not just an imported post's own AP object id) --
 # reused by bridge.inbox_dispatch._handle_announce, keyed by the Announce
-# activity's own id, to close the identical race for a redelivered boost
+# activity's own id, to close the identical race for a redelivered repost
 # (confirmed live 2026-07-10: two near-simultaneous deliveries of the same
 # Announce both passed its own top-level "already handled?" dedup check
-# before either had recorded it, each re-uploading the boosted attachment
+# before either had recorded it, each re-uploading the reposted attachment
 # under its own fresh mxc:// and sending its own duplicate repost card).
 _activity_locks: dict[str, asyncio.Lock] = {}
 _activity_lock_waiters: dict[str, int] = {}
@@ -2167,14 +2172,14 @@ async def import_note(
     ``author_actor_id`` -- creating that room (and a ghost for the author)
     first if it doesn't exist yet. Reuses, rather than re-imports, whatever
     already mirrors this exact post by any path (a follow, an earlier
-    import, an earlier boost, ...). ``inviter``, if given, is best-effort
+    import, an earlier repost, ...). ``inviter``, if given, is best-effort
     invited into the room either way. ``ImportedNote.federated_event`` is
     None if the post has no usable ``id``, or actually sending it into
     Matrix failed outright.
 
     Shared by ``bridge.commands``'s ``import`` command and
     ``bridge.inbox_dispatch``'s ``Announce``/quote-post handling
-    (automatically importing whatever a followed account boosts/reposts, or
+    (automatically importing whatever a followed account reposts/reposts, or
     whatever an inbound quote-post's own target turns out to be). Doesn't
     handle reply-threading the way ``import`` does for its own case -- a
     caller that cares should check for a trackable parent first and only
@@ -2216,7 +2221,7 @@ async def ensure_remote_actor_room(
     The second tuple element is the ghost's own freshly-uploaded avatar
     mxc://, but ONLY when this call is the one that actually created the
     room (``None`` if it already existed) -- callers that render an
-    author's avatar (e.g. a boost/repost card) need this because
+    author's avatar (e.g. a repost card) need this because
     ``RemoteActorRoom.icon_url`` alone is a remote https:// URL, not yet
     uploaded to this homeserver's own media repo.
 

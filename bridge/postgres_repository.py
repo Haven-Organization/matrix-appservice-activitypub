@@ -128,8 +128,8 @@ _SCHEMA_STATEMENTS = [
         ap_object_id TEXT NOT NULL,
         author_actor_id TEXT NOT NULL,
         thread_root_event_id TEXT,
-        boosted_object_id TEXT,
-        boosted_author_actor_id TEXT,
+        reposted_object_id TEXT,
+        reposted_author_actor_id TEXT,
         is_primary_event BOOLEAN NOT NULL DEFAULT TRUE
     )
     """,
@@ -287,8 +287,30 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS banner_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS thread_root_event_id TEXT",
-    "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS boosted_object_id TEXT",
-    "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS boosted_author_actor_id TEXT",
+    # Renamed 2026-07-11 (boost -> repost terminology, project-wide) -- a
+    # DO block (not a plain ADD COLUMN IF NOT EXISTS like the others here)
+    # since this needs to actually preserve existing data via RENAME
+    # COLUMN, not just ensure the column exists; guarded so it's a no-op
+    # both on a fresh database (created with reposted_object_id directly,
+    # never had the old name at all) and on one that's already been
+    # through this migration once.
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'federated_events' AND column_name = 'boosted_object_id'
+        ) AND NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'federated_events' AND column_name = 'reposted_object_id'
+        ) THEN
+            ALTER TABLE federated_events RENAME COLUMN boosted_object_id TO reposted_object_id;
+            ALTER TABLE federated_events RENAME COLUMN boosted_author_actor_id TO reposted_author_actor_id;
+        END IF;
+    END $$;
+    """,
+    "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS reposted_object_id TEXT",
+    "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS reposted_author_actor_id TEXT",
     "ALTER TABLE federated_events ADD COLUMN IF NOT EXISTS is_primary_event BOOLEAN NOT NULL DEFAULT TRUE",
     # Drops the table-wide UNIQUE a table created before is_primary_event
     # existed still has -- Postgres's default name for a single-column
@@ -743,20 +765,20 @@ class PostgresActorRepository:
             """
             INSERT INTO federated_events
                 (event_id, room_id, ap_object_id, author_actor_id, thread_root_event_id,
-                 boosted_object_id, boosted_author_actor_id, is_primary_event)
+                 reposted_object_id, reposted_author_actor_id, is_primary_event)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (event_id) DO UPDATE SET
                 room_id = EXCLUDED.room_id,
                 ap_object_id = EXCLUDED.ap_object_id,
                 author_actor_id = EXCLUDED.author_actor_id,
                 thread_root_event_id = EXCLUDED.thread_root_event_id,
-                boosted_object_id = EXCLUDED.boosted_object_id,
-                boosted_author_actor_id = EXCLUDED.boosted_author_actor_id,
+                reposted_object_id = EXCLUDED.reposted_object_id,
+                reposted_author_actor_id = EXCLUDED.reposted_author_actor_id,
                 is_primary_event = EXCLUDED.is_primary_event
             """,
             record.event_id, record.room_id, record.ap_object_id,
             record.author_actor_id, record.thread_root_event_id,
-            record.boosted_object_id, record.boosted_author_actor_id,
+            record.reposted_object_id, record.reposted_author_actor_id,
             is_primary,
         )
 
@@ -778,8 +800,8 @@ class PostgresActorRepository:
             ap_object_id=row["ap_object_id"],
             author_actor_id=row["author_actor_id"],
             thread_root_event_id=row["thread_root_event_id"],
-            boosted_object_id=row["boosted_object_id"],
-            boosted_author_actor_id=row["boosted_author_actor_id"],
+            reposted_object_id=row["reposted_object_id"],
+            reposted_author_actor_id=row["reposted_author_actor_id"],
         )
 
     # -- AppService transaction idempotency --------------------------------

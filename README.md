@@ -25,15 +25,15 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 - **Incoming posts**: a followed account's `Create{Note}` is mirrored as a plain Matrix message into their Remote User Room. It's HTML-sanitized to a safe tag subset and deduplicated by the post's ActivityPub object ID.
 - **Replies, both directions**: a Matrix reply or thread-reply to a mirrored post federates out with the correct `inReplyTo`, tagging the parent author and every other participant already in the thread (fetched live from the parent, so the "reply to @a @b" line reads correctly on the far end). Incoming replies are mirrored as real Matrix thread replies, walking up untracked ancestors and auto-importing the true root if needed so the reply always has somewhere real to land.
 - **Guest posting**: a different local user posting inside someone else's Profile Room federates as their own post, under their own actor and outbox, with the room owner auto-mentioned.
-- **Edits**: a Matrix edit (`m.replace`) federates as `Update` on the same Note ID, never delete-and-recreate, so replies, likes, and boosts referencing it stay intact.
+- **Edits**: a Matrix edit (`m.replace`) federates as `Update` on the same Note ID, never delete-and-recreate, so replies, likes, and reposts referencing it stay intact.
 - **Deletes**: redacting your own distributed post sends a signed `Delete` to every follower. An incoming `Delete` for a tracked post redacts the mirrored Matrix event, but only if the sender actually matches the recorded author.
 - **Backfill**: `;backfill` (or an inbound reply chain with gaps) pulls an account's outbox or a specific thread's replies through the exact same mirroring path a live delivery uses, so history is indistinguishable from anything that arrived live.
 - **Quote-posts**: Akkoma/Pleroma/Fedibird/Misskey-style quote fields are detected on the way in (any auto-appended "RT: link" fallback text is stripped) and rendered as a quote card. `;repost <caption>` sends a real quote-post of your own the other way.
 
-### Reactions and boosts
+### Reactions and reposts
 
 - **Reactions**: a plain 👍 Matrix reaction sends `Like`. Any other emoji sends `EmojiReact` (a Pleroma/Misskey/Akkoma extension) carrying the literal emoji. Incoming `Like`/`EmojiReact` become `m.reaction` events from a ghost, and redacting a reaction in either direction sends or receives the matching `Undo`.
-- **Boosts**: reacting with 🔁, or running `;boost` as a reply, sends a real `Announce` (not a Like) to both your followers and the original author, plus a "🔁 you boosted" card in your own Profile Room. An incoming `Announce` renders the same card and independently imports the boosted post into its original author's own room, so it's reply/react-able there too. Un-boosting (redacting the reaction, the command, or the card, all three are linked) sends `Undo(Announce)`.
+- **Reposts**: reacting with 🔁, or running bare `;repost` as a reply, sends a real `Announce` (not a Like) to both your followers and the original author, plus a "🔁 you reposted" card in your own Profile Room. An incoming `Announce` renders the same card and independently imports the reposted post into its original author's own room, so it's reply/react-able there too. Un-reposting (redacting the reaction, the command, or the card, all three are linked) sends `Undo(Announce)`.
 - **Custom emoji**: Pleroma/Misskey/Akkoma image-emoji shortcodes (in post text, reactions, or display names) are resolved against the object's own metadata to an uploaded `mxc://` image and inlined next to the shortcode text, in both directions.
 
 ### Polls

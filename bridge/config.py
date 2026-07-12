@@ -79,7 +79,7 @@ class BridgeSection:
     #     needs an explicit homeserver opt-in first.
     msc4503_external_handle: str = "off"
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
-    # same convention as Matrix's own m.relates_to) on every mirrored boost
+    # same convention as Matrix's own m.relates_to) on every mirrored repost
     # (Announce), quote-post, and cross-posted reply echo -- see
     # bridge.inbox_dispatch's _handle_announce/_handle_create/
     # _echo_reply_in_own_room. On by default: unlike
@@ -88,11 +88,11 @@ class BridgeSection:
     # MSC4501 is just ignores the extra field and renders the message
     # exactly as it always has.
     set_msc4501_relates_to: bool = True
-    # For a mirrored boost specifically (never a quote-post or reply, which
+    # For a mirrored repost specifically (never a quote-post or reply, which
     # always carry real commentary of their own -- see
     # bridge.inbox_dispatch._build_repost_message's own docstring): whether
     # relates_to asserts content_inline (the mirrored event's own content
-    # already IS the boosted post's content, so relates_to.content would
+    # already IS the reposted post's content, so relates_to.content would
     # just be a second copy of the same thing) instead of duplicating that
     # content into relates_to.content a second time. On by default -- less
     # redundant storage per event. Set to false to duplicate into
@@ -123,7 +123,7 @@ class BridgeSection:
     #     never mirror the quoted post, relates_to stays unset.
     quote_import_policy: str = "known"
     # Whether to mirror a remote fediverse account's posts (their own new
-    # posts, replies, and boosts -- never DMs/Chats, which aren't "posts")
+    # posts, replies, and reposts -- never DMs/Chats, which aren't "posts")
     # using org.matrix.msc4501.social.post as the event TYPE, instead of
     # the ordinary m.room.message every other client already understands.
     # Off by default, and NOT recommended to turn on until Phase 2 of

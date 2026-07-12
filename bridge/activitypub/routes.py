@@ -159,7 +159,15 @@ async def _build_actor(request: Request, record) -> Actor:
     else:
         display_name = record.display_name or record.username
         icon_url = record.icon_url
-        summary = record.summary
+        # AS2's summary is conventionally HTML, same as a Note's content --
+        # sending it as bare plaintext (record.summary itself, straight
+        # from the Profile Room's m.room.topic) means a URL in someone's
+        # bio has no <a href> anchor at all, so remote software renders it
+        # as inert text instead of a clickable link (confirmed live
+        # 2026-07-11). plain_text_to_note_html is the same escape/autolink/
+        # paragraph-wrap helper already used for every mirrored post's own
+        # content, for exactly this reason.
+        summary = plain_text_to_note_html(record.summary) if record.summary else record.summary
         banner_url = record.banner_url
         # Advertises the "Chat" option (see bridge.chat_bridge) on software
         # that checks for it -- every local actor accepts them, same as
@@ -268,7 +276,7 @@ def _reconstruct_note_body(federated, event_content: dict, attachment: dict | No
     the Matrix event that mirrors it (shared by ``get_outbox`` and
     ``get_note``).
 
-    ``federated.boosted_object_id`` set means this is a ``;repost``'s own
+    ``federated.reposted_object_id`` set means this is a ``;repost``'s own
     echo (see ``bridge.commands._handle_repost``) -- its Matrix event's
     ``body`` is NEVER "just a filename" the way an ordinary media post's
     is (see ``bridge.inbox_dispatch.build_preview_media_content``, which
@@ -279,10 +287,10 @@ def _reconstruct_note_body(federated, event_content: dict, attachment: dict | No
     attachment is a genuine caption only under the caption convention
     (separate differing ``filename`` -- see ``bridge.media.media_caption``),
     else it's just the filename and is blanked."""
-    if federated.boosted_object_id:
+    if federated.reposted_object_id:
         body = (event_content.get("body") or "").strip()
         caption = split_repost_caption(body)
-        return body, build_repost_note_content(caption, federated.boosted_object_id), federated.boosted_object_id
+        return body, build_repost_note_content(caption, federated.reposted_object_id), federated.reposted_object_id
     body = media_caption(event_content) if attachment is not None else (event_content.get("body") or "").strip()
     return body, (plain_text_to_note_html(body) if body else ""), None
 
@@ -954,7 +962,7 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     Pleroma/Akkoma) send as just the IRI, not the full Note. Without this
     route that fetch 404s, silently dropping the repost card
     ``bridge.inbox_dispatch._handle_announce`` would otherwise build in the
-    booster's own Remote User Room (the DM notification to the post's
+    reposter's own Remote User Room (the DM notification to the post's
     owner still fires regardless, since that only needs our own
     ``FederatedEvent`` bookkeeping, not a live fetch of the object) --
     confirmed missing this route by that exact symptom.

@@ -1,4 +1,4 @@
-"""Sends the bridge bot's own notices (new follower, mention, boost, like,
+"""Sends the bridge bot's own notices (new follower, mention, repost, like,
 ...) to a Matrix user via a private 1:1 room with the bot, rather than into
 their linked Profile Room.
 
@@ -18,7 +18,7 @@ there waiting rather than appearing as a surprise invite later), and reused
 after (looked up by ``matrix_user_id`` via ``ActorRepository.get_bot_dm_room``)
 rather than a fresh room every time.
 
-Every notification sent into this room -- new follower, mention, boost,
+Every notification sent into this room -- new follower, mention, repost,
 like/reaction -- is an ordinary ``m.text`` message, never ``m.notice``
 (which most clients render more quietly, and which Matrix's default push
 rules suppress from notifying at all before any other rule gets a say) and
@@ -50,7 +50,7 @@ NOTIFICATIONS_ROOM_NAME = "Fediverse Notifications"
 
 def notification_actor_html(*, mxid: str, handle: str, display_name: str | None = None) -> str:
     """Builds the user-pill HTML fragment at the start of every
-    notification that names who/what triggered it (new follower, boost,
+    notification that names who/what triggered it (new follower, repost,
     reaction, ...) -- shared so all of them look the same.
 
     A real Matrix user pill (an ``<a href="https://matrix.to/#/{mxid}">``,
@@ -76,12 +76,12 @@ def notification_actor_html(*, mxid: str, handle: str, display_name: str | None 
 _WELCOME_BODY = (
     "Fediverse Notifications\n"
     "I'll DM you here whenever something happens on the fediverse that involves you -- new "
-    "followers, mentions, likes, and boosts. Stay in this room to keep receiving them."
+    "followers, mentions, likes, and reposts. Stay in this room to keep receiving them."
 )
 _WELCOME_FORMATTED_BODY = (
     "<p><strong>Fediverse Notifications</strong></p>"
     "<p>I'll DM you here whenever something happens on the fediverse that involves you -- new "
-    "followers, mentions, likes, and boosts. Stay in this room to keep receiving them.</p>"
+    "followers, mentions, likes, and reposts. Stay in this room to keep receiving them.</p>"
 )
 
 

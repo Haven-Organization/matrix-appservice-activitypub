@@ -29,8 +29,8 @@ class _ExpectedNotFoundFilter(logging.Filter):
     published-media allowlist).
 
     ``/actor/{username}/notes/{id}`` -- remote servers dereferencing a Note's
-    own AP id directly (e.g. to verify/render a quote-post or boost, or a
-    boost fetching the object because it was sent as a bare IRI rather than
+    own AP id directly (e.g. to verify/render a quote-post or repost, or a
+    repost fetching the object because it was sent as a bare IRI rather than
     embedded -- see ``bridge.activitypub.routes.get_note``, which now
     actually serves these). A genuine 404 here still means a stale/bad
     reference (a deleted post, wrong note id, ...) rather than the route

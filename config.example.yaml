@@ -86,13 +86,13 @@ bridge:
   # updated, or removed) right away via ";refresh".
   # msc4503_external_handle: off
 
-  # Set org.matrix.msc4501.social.relates_to on every mirrored boost,
+  # Set org.matrix.msc4501.social.relates_to on every mirrored repost,
   # quote-post, and cross-posted reply echo. On by default -- purely
   # additive content a non-MSC4501 client just ignores.
   # set_msc4501_relates_to: true
 
-  # For a mirrored boost, assert content_inline (the event's own content
-  # already IS the boosted post's content) instead of duplicating that
+  # For a mirrored repost, assert content_inline (the event's own content
+  # already IS the reposted post's content) instead of duplicating that
   # content a second time into relates_to.content. On by default. Turn off
   # to restore the old duplicate-into-relates_to.content behavior, e.g. if
   # a client you care about doesn't handle content_inline yet.

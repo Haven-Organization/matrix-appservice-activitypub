@@ -87,7 +87,7 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
     own_actor_id = actor_url(base, actor_record.username)
     if federated.author_actor_id != own_actor_id:
         return True  # only the post's own author can edit it (Matrix PLs permitting others is irrelevant AP-side)
-    if federated.boosted_object_id:
+    if federated.reposted_object_id:
         return True  # a ;repost echo's AP content isn't derived from its Matrix body -- not editable this way
     if await repository.is_ghost_dm_room(federated.room_id) or await repository.is_ghost_chat_room(federated.room_id):
         return True  # see module docstring -- private edits not federated yet

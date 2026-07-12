@@ -385,7 +385,7 @@ def message_addresses_bot(content: dict, config) -> bool:
 
 # Single-word commands blocked outright for a third-party sender currently
 # effective-Follow-Only, regardless of argument (see _effective_third_party_mode).
-_FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost"}
+_FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost", "boost"}
 
 # (subcommand, lowercased argument) pairs blocked the same way -- these
 # subcommands only actually dispatch to anything when paired with this
@@ -620,8 +620,15 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         elif subcommand == "chat":
             await _handle_chat(request, sender=sender, room_id=room_id, handle=argument, content=content)
         elif subcommand == "boost":
-            await _handle_boost(
-                request, sender=sender, room_id=room_id, content=content, event_id=event.get("event_id")
+            # Undocumented alias for a caption-less ";repost" -- kept for
+            # muscle memory/anyone still typing the old keyword, but never
+            # shown in _handle_help/COMMANDS.md (see _handle_repost's own
+            # docstring for the full reasoning). Always treated as
+            # caption-less regardless of any trailing text, matching what
+            # ";boost" always meant historically -- it never took a caption.
+            await _handle_repost(
+                request, sender=sender, room_id=room_id, content=content, caption="",
+                event_id=event.get("event_id"),
             )
         elif subcommand == "repost":
             await _handle_repost(
@@ -719,7 +726,7 @@ async def _notice(request: Request, room_id: str, message: str, *, relates_to: d
 
 def _command_reply_relates_to(content: dict, command_event_id: str | None) -> dict | None:
     """``m.relates_to`` for the bot's own reply to a ``;boost``/``;repost``
-    command message -- so its "Boosted."/"Reposted." confirmation lands as
+    command message -- so its "Reposted." confirmation lands as
     a reply to the command itself (and, if the command was sent as a
     thread reply, in that same thread -- see ``thread_reply_relates_to``)
     instead of a bare unrelated message in the room. None if there's no
@@ -895,8 +902,9 @@ async def _handle_help(
             "Fetch and mirror a single fediverse post by its URL.",
         ),
         (
-            f"{_COMMAND_PREFIX}repost <caption>",
-            "Reply to a fediverse post with this to repost it as a new post of your own, with your own caption.",
+            f"{_COMMAND_PREFIX}repost [<caption>]",
+            "Reply to a fediverse post with this to repost it -- bare, a plain repost (same as reacting with "
+            "🔁); with a caption, a new post of your own quoting the original with your added commentary.",
         ),
         (
             f"{_COMMAND_PREFIX}banner mxc://server/mediaid",
@@ -3374,61 +3382,50 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     await _notice(request, room_id, f"Refreshed {handle_str}.")
 
 
-async def _handle_boost(request: Request, *, sender: str, room_id: str, content: dict, event_id: str | None) -> None:
-    """Retired 2026-07-08: ``;boost`` used to send a signed ``Announce`` of
-    whatever fediverse post it was sent as a reply to, equivalent to
-    reacting with 🔁 (see ``bridge.reaction_bridge.send_boost``, still the
-    live path for the emoji reaction). Kept around as a hidden fallback --
-    deliberately dropped from ``_handle_help`` and ``COMMANDS.md`` -- purely
-    so a new user's muscle memory or a stuck-and-guessing reply doesn't hit
-    "unknown command" instead of a pointer to the real way to do it. Every
-    other Matrix client capable of running this bridge at all can also react
-    with an emoji at this point, making the command genuinely redundant, not
-    just less convenient. A reaction-triggered boost also has a real Matrix
-    user actually sending it, which a bot-issued command reply never could
-    (nothing else in this bridge sends anything AS a real local user, only
-    ever as the bot) -- one more reason to just point people at the
-    reaction instead of trying to preserve feature parity here."""
-    relates_to = _command_reply_relates_to(content, event_id)
-    await _notice(
-        request, room_id,
-        f'"{_COMMAND_PREFIX}boost" isn\'t needed -- react to a fediverse post with 🔁 to boost it.',
-        relates_to=relates_to,
-    )
-
-
 async def _handle_repost(
     request: Request, *, sender: str, room_id: str, content: dict, caption: str, event_id: str | None,
 ) -> None:
-    """Repost the fediverse post ``;repost <caption>`` was sent as a reply
-    to -- unlike ``;boost``/an ``Announce``, this is a brand new ``Create``
-    of the sender's own, with ``caption`` as its text, so it carries
-    commentary an Announce has no room for. Marked as quoting the original
-    via ``Note.quote_uri`` (see its docstring) for AP receivers that render
-    an actual quote card, with a plain link still appended to the content
-    for ones that don't.
+    """Repost the fediverse post ``;repost`` (or its undocumented ``;boost``
+    alias) was sent as a reply to -- MSC4501 models a caption-less repost
+    and one WITH added commentary (a "quote-post" in Mastodon/Fediverse
+    terms) as the same underlying ``social.repost`` relation, just with or
+    without inline content, so this bridge merges them into one command the
+    same way (renamed/unified 2026-07-11; ``;boost`` used to be this
+    caption-less half's own separate, since-retired command):
+
+    - No caption (bare ``;repost``, or ``;boost``): a real ``Announce`` of
+      the original -- see ``bridge.reaction_bridge.send_repost``, the exact
+      same function reacting with 🔁 already calls, so a command-triggered
+      repost and a reaction-triggered one are indistinguishable afterwards
+      (same "you reposted" card, same ``ReactionRecord``, same Undo path).
+    - A caption (``;repost <your caption>``): a brand new ``Create`` of the
+      sender's own, with ``caption`` as its text, so it carries commentary
+      an Announce has no room for. Marked as quoting the original via
+      ``Note.quote_uri`` (see its docstring) for AP receivers that render
+      an actual quote card, with a plain link still appended to the content
+      for ones that don't.
 
     Delivered and recorded like an ordinary top-level post (see
-    ``bridge.profile_posts``), but the bot's own rendering of it always
-    posts into the sender's OWN Profile Room specifically -- never wherever
-    the command happened to be run from (most commonly a reply to the
-    original post inside ITS OWN author's Remote User Room), which would
-    otherwise read as a notification landing in a room that isn't the
+    ``bridge.profile_posts``) either way, but the bot's own rendering of it
+    always posts into the sender's OWN Profile Room specifically -- never
+    wherever the command happened to be run from (most commonly a reply to
+    the original post inside ITS OWN author's Remote User Room), which
+    would otherwise read as a notification landing in a room that isn't the
     reposter's timeline at all, and that their own followers -- the actual
     intended audience -- aren't even in. A plain "Reposted." notice still
     goes wherever the command was run, but only when that's a different
-    room, so the sender gets some acknowledgement there too. That rendering
-    is the caption, then an "X reposted Y's post" line (pills -- see
-    ``actor_html_with_avatar``) and a preview of the original underneath:
-    a real image/video attachment if the original post had one (see
-    ``build_preview_media_content`` -- Element X doesn't render one
-    embedded in a caption's own HTML at all), otherwise a ``<blockquote>``
-    of its text, not a bare appended link.
+    room, so the sender gets some acknowledgement there too. With a
+    caption, that rendering is the caption, then an "X reposted Y's post"
+    line (pills -- see ``actor_html_with_avatar``) and a preview of the
+    original underneath: a real image/video attachment if the original
+    post had one (see ``build_preview_media_content`` -- Element X doesn't
+    render one embedded in a caption's own HTML at all), otherwise a
+    ``<blockquote>`` of its text, not a bare appended link.
 
     Every notice this sends (including the usage/error ones, and the final
     "Reposted." ack) replies to the command message itself, in the same
     thread if it was sent as a thread reply -- see
-    ``_command_reply_relates_to``, same reasoning as ``_handle_boost``."""
+    ``_command_reply_relates_to``."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     repository = request.app.state.repository
@@ -3436,10 +3433,11 @@ async def _handle_repost(
 
     target_event_id = _reply_target_event_id(content)
     caption = caption.strip()
-    if not target_event_id or not caption:
+    if not target_event_id:
         await _notice(
             request, room_id,
-            f'Reply to a fediverse post with "{_COMMAND_PREFIX}repost <your caption>" to repost it.',
+            f'Reply to a fediverse post with "{_COMMAND_PREFIX}repost" (or "{_COMMAND_PREFIX}repost '
+            '<your caption>" to add your own commentary) to repost it.',
             relates_to=relates_to,
         )
         return
@@ -3459,10 +3457,28 @@ async def _handle_repost(
         )
         return
 
-    # Same reasoning as send_boost: repost the actual original post/author,
+    if not caption:
+        # Bare repost -- exactly what reacting with 🔁 already does; see
+        # send_repost's own docstring for why this is shared code, not a
+        # separate implementation. Imported locally (not at module level)
+        # to avoid a circular import: bridge.reaction_bridge itself
+        # imports from this module (is_third_party_still_allowed), same
+        # reasoning bridge.reply_bridge's own docstring gives for why IT
+        # duplicates rather than imports a helper from here.
+        from bridge.reaction_bridge import send_repost
+
+        await send_repost(
+            request, actor_record=actor_record, parent=parent, matrix_event_id=event_id,
+            room_id=room_id, reactor_matrix_user_id=sender,
+        )
+        if room_id != actor_record.room_id:
+            await _notice(request, room_id, "Reposted.", relates_to=relates_to)
+        return
+
+    # Same reasoning as send_repost: repost the actual original post/author,
     # not a mirrored repost message's own Announce-activity bookkeeping.
-    target_object_id = parent.boosted_object_id or parent.ap_object_id
-    target_author_actor_id = parent.boosted_author_actor_id or parent.author_actor_id
+    target_object_id = parent.reposted_object_id or parent.ap_object_id
+    target_author_actor_id = parent.reposted_author_actor_id or parent.author_actor_id
 
     base = config.bridge.public_base_url
     own_actor_id = actor_url(base, actor_record.username)
@@ -3517,7 +3533,7 @@ async def _handle_repost(
     # The real (possibly mirrored-copy) Matrix event for the ORIGINAL post,
     # not necessarily `parent` itself -- `parent` is whatever message the
     # ";repost" command was sent as a reply to, which (same reasoning as
-    # send_boost) might itself be a mirrored repost's own card rather than
+    # send_repost) might itself be a mirrored repost's own card rather than
     # the original post. Falls back to `parent` in the (shouldn't-happen)
     # case that lookup somehow misses.
     preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
@@ -3529,7 +3545,7 @@ async def _handle_repost(
     # preview_text alongside preview media means the post had BOTH media
     # and a real caption (_fetch_post_preview only returns caption-worthy
     # text for media posts) -- quote the caption AND attach the media
-    # preview, same as bridge.reaction_bridge.send_boost's identical card.
+    # preview, same as bridge.reaction_bridge.send_repost's identical card.
     quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
 
     _, reposter_html = await actor_html_with_avatar(request, own_actor_id)
@@ -3583,7 +3599,7 @@ async def _handle_repost(
             # without this, a receiver that re-fetches the Note fresh
             # (rather than trusting the originally-delivered Create's
             # embedded copy) would see a plain post with no quote at all.
-            boosted_object_id=target_object_id, boosted_author_actor_id=target_author_actor_id,
+            reposted_object_id=target_object_id, reposted_author_actor_id=target_author_actor_id,
         )
     )
     if room_id != destination_room_id:
@@ -4117,7 +4133,7 @@ async def _list_unfollowed_ghost_rooms(
     genuinely independent things in this bridge: a room invite can outlive
     an unfollow (there's no code path that kicks someone out just because
     they unfollowed), and various on-demand imports (a mention, a reply's
-    ancestor chain, someone else's boost) can land a user in a Remote User
+    ancestor chain, someone else's repost) can land a user in a Remote User
     Room's membership without them ever having run ``;follow`` there at
     all. Best-effort against listing itself failing; a room this can't
     even enumerate just doesn't show up rather than erroring the whole
@@ -4865,7 +4881,7 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
     Deliberately does NOT also establish an AP Follow the way it briefly did
     -- ActivityPub following only ever happens via the explicit `follow`
     command now, precisely so getting into a room (this way, or by knocking,
-    or by clicking a matrix.to link to a boosted post someone else's room
+    or by clicking a matrix.to link to a reposted post someone else's room
     mirrors) never has the side effect of following someone you never
     actually asked to follow.
     """

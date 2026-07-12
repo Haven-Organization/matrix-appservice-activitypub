@@ -118,8 +118,8 @@ CREATE TABLE IF NOT EXISTS federated_events (
     ap_object_id TEXT NOT NULL,
     author_actor_id TEXT NOT NULL,
     thread_root_event_id TEXT,
-    boosted_object_id TEXT,
-    boosted_author_actor_id TEXT,
+    reposted_object_id TEXT,
+    reposted_author_actor_id TEXT,
     is_primary_event INTEGER NOT NULL DEFAULT 1
 );
 
@@ -328,9 +328,19 @@ class SqliteActorRepository:
         if "thread_root_event_id" not in columns:
             self._conn.execute("ALTER TABLE federated_events ADD COLUMN thread_root_event_id TEXT")
             self._conn.commit()
-        if "boosted_object_id" not in columns:
-            self._conn.execute("ALTER TABLE federated_events ADD COLUMN boosted_object_id TEXT")
-            self._conn.execute("ALTER TABLE federated_events ADD COLUMN boosted_author_actor_id TEXT")
+        if "boosted_object_id" in columns and "reposted_object_id" not in columns:
+            # Renamed 2026-07-11 (boost -> repost terminology, project-wide)
+            # -- RENAME COLUMN preserves the existing data, unlike an
+            # ADD-COLUMN-then-drop, which is why this isn't just another
+            # ADD-COLUMN-IF-NOT-EXISTS guard like the others here.
+            self._conn.execute("ALTER TABLE federated_events RENAME COLUMN boosted_object_id TO reposted_object_id")
+            self._conn.execute(
+                "ALTER TABLE federated_events RENAME COLUMN boosted_author_actor_id TO reposted_author_actor_id"
+            )
+            self._conn.commit()
+        elif "reposted_object_id" not in columns:
+            self._conn.execute("ALTER TABLE federated_events ADD COLUMN reposted_object_id TEXT")
+            self._conn.execute("ALTER TABLE federated_events ADD COLUMN reposted_author_actor_id TEXT")
             self._conn.commit()
         if "is_primary_event" not in columns:
             # A database from before is_primary_event existed still has the
@@ -355,8 +365,8 @@ class SqliteActorRepository:
                     ap_object_id TEXT NOT NULL,
                     author_actor_id TEXT NOT NULL,
                     thread_root_event_id TEXT,
-                    boosted_object_id TEXT,
-                    boosted_author_actor_id TEXT,
+                    reposted_object_id TEXT,
+                    reposted_author_actor_id TEXT,
                     is_primary_event INTEGER NOT NULL DEFAULT 1
                 )
                 """
@@ -365,9 +375,9 @@ class SqliteActorRepository:
                 """
                 INSERT INTO federated_events
                     (event_id, room_id, ap_object_id, author_actor_id,
-                     thread_root_event_id, boosted_object_id, boosted_author_actor_id, is_primary_event)
+                     thread_root_event_id, reposted_object_id, reposted_author_actor_id, is_primary_event)
                 SELECT event_id, room_id, ap_object_id, author_actor_id,
-                       thread_root_event_id, boosted_object_id, boosted_author_actor_id, 1
+                       thread_root_event_id, reposted_object_id, reposted_author_actor_id, 1
                 FROM federated_events_old
                 """
             )
@@ -959,21 +969,21 @@ class SqliteActorRepository:
             """
             INSERT INTO federated_events
                 (event_id, room_id, ap_object_id, author_actor_id, thread_root_event_id,
-                 boosted_object_id, boosted_author_actor_id, is_primary_event)
+                 reposted_object_id, reposted_author_actor_id, is_primary_event)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 room_id=excluded.room_id,
                 ap_object_id=excluded.ap_object_id,
                 author_actor_id=excluded.author_actor_id,
                 thread_root_event_id=excluded.thread_root_event_id,
-                boosted_object_id=excluded.boosted_object_id,
-                boosted_author_actor_id=excluded.boosted_author_actor_id,
+                reposted_object_id=excluded.reposted_object_id,
+                reposted_author_actor_id=excluded.reposted_author_actor_id,
                 is_primary_event=excluded.is_primary_event
             """,
             (
                 record.event_id, record.room_id, record.ap_object_id,
                 record.author_actor_id, record.thread_root_event_id,
-                record.boosted_object_id, record.boosted_author_actor_id,
+                record.reposted_object_id, record.reposted_author_actor_id,
                 1 if is_primary else 0,
             ),
         )
@@ -1008,8 +1018,8 @@ class SqliteActorRepository:
             ap_object_id=row["ap_object_id"],
             author_actor_id=row["author_actor_id"],
             thread_root_event_id=row["thread_root_event_id"],
-            boosted_object_id=row["boosted_object_id"],
-            boosted_author_actor_id=row["boosted_author_actor_id"],
+            reposted_object_id=row["reposted_object_id"],
+            reposted_author_actor_id=row["reposted_author_actor_id"],
         )
 
     # -- AppService transaction idempotency --------------------------------

@@ -291,17 +291,22 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;leave unfollowed`, no argument.
 
-**What it does:** Finds every Remote User Room you're currently a member of for an account you don't (or no longer) follow -- room membership and following are tracked independently, so this can happen via an old unfollow that never kicked you out, or various on-demand imports (a mention, a reply's ancestor chain, someone else's boost) landing you in a room you never actually ran `;follow` in. Shows the count and a list first and asks you to reply "confirm" before removing anything -- nothing happens just from running the command. Removes you (kicks, via the bot) from each one; your own Profile Room, DMs, and Chats are never touched, only Remote User Rooms.
+**What it does:** Finds every Remote User Room you're currently a member of for an account you don't (or no longer) follow -- room membership and following are tracked independently, so this can happen via an old unfollow that never kicked you out, or various on-demand imports (a mention, a reply's ancestor chain, someone else's repost) landing you in a room you never actually ran `;follow` in. Shows the count and a list first and asks you to reply "confirm" before removing anything -- nothing happens just from running the command. Removes you (kicks, via the bot) from each one; your own Profile Room, DMs, and Chats are never touched, only Remote User Rooms.
 
 **Who can run it:** Requires a linked profile.
 
 ---
 
-## `;repost <caption>` (reply to a mirrored fediverse post)
+## `;repost [<caption>]` (reply to a mirrored fediverse post)
 
-**Syntax:** Sent as a reply to a tracked post, with a required, non-empty caption.
+**Syntax:** Sent as a reply to a tracked post, with or without a caption.
 
-**What it does:** Unlike reacting to a post with 🔁 (which sends a signed `Announce` -- a bare boost/repost with no commentary of your own), this creates a brand-new post of your own with the caption as its text, marked as quoting the original (for receivers that render real quote cards) with a plain link appended for those that don't. Delivered like an ordinary post: to your followers, the original author, and anyone mentioned in the caption. Always rendered into your own Profile Room, never wherever the command was actually run.
+**What it does:** MSC4501 models a plain repost and one with your own added commentary as the same underlying relation, just with or without inline content, so this bridge merges them into one command the same way:
+
+- **Bare** (`;repost`): sends a real, signed `Announce` -- exactly the same thing reacting to the post with 🔁 does, including the same "🔁 you reposted" card in your own Profile Room. A command-triggered repost and a reaction-triggered one are indistinguishable afterwards.
+- **With a caption** (`;repost <your caption>`): creates a brand-new post of your own with the caption as its text, marked as quoting the original (for receivers that render real quote cards) with a plain link appended for those that don't.
+
+Delivered like an ordinary post either way: to your followers, the original author, and (with a caption) anyone mentioned in it. Always rendered into your own Profile Room, never wherever the command was actually run.
 
 **Who can run it:** Requires a linked profile.
 

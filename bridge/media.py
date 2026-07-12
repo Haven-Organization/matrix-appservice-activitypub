@@ -120,14 +120,14 @@ async def fetch_and_upload_media_with_dimensions(
     fields are needed, not real decoding.
 
     ``public_base_url``, if given, lets this recognize ``url`` as our OWN
-    media proxy link (see ``resolve_own_media_proxy_mxc``) -- e.g. boosting
+    media proxy link (see ``resolve_own_media_proxy_mxc``) -- e.g. reposting
     a LOCAL user's post carries an attachment URL pointing right back at
     this bridge -- and reuse that already-uploaded ``mxc://`` directly
     (pulling bytes straight from Synapse's own authenticated media API,
     via ``SynapseClient.download_media``, just to determine dimensions)
     instead of round-tripping through our own public endpoint and
     re-uploading a brand new, wasteful, un-deduplicated copy of a file
-    already on this homeserver (confirmed live 2026-07-10: boosting the
+    already on this homeserver (confirmed live 2026-07-10: reposting the
     same local post from N different remote accounts produced N distinct
     mxc:// copies of the identical video).
 

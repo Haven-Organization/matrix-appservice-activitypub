@@ -496,7 +496,7 @@ class SynapseClient:
 
     async def get_event(self, room_id: str, event_id: str, *, as_user_id: str | None = None) -> dict[str, Any]:
         """Fetch a single event's full content -- used to build a compact
-        preview of a post being reacted to/boosted (see
+        preview of a post being reacted to/reposted (see
         ``bridge.inbox_dispatch._notify_post_owner``) without needing to
         re-derive it from anywhere else, since a notification about it is
         sent into a different room (the bot's DM with the owner) than the

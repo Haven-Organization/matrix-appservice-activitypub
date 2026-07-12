@@ -137,14 +137,14 @@ class FederatedEvent:
 
     For a mirrored repost (an inbound ``Announce``), ``ap_object_id`` and
     ``author_actor_id`` deliberately name the *Announce activity itself* and
-    its booster -- not the boosted post or its original author -- since
+    its reposter -- not the reposted post or its original author -- since
     that's the key an inbound ``Undo(Announce)`` and Announce redelivery
-    dedup both need to look this record up by. ``boosted_object_id``/
-    ``boosted_author_actor_id`` separately record the boosted post's own AP
+    dedup both need to look this record up by. ``reposted_object_id``/
+    ``reposted_author_actor_id`` separately record the reposted post's own AP
     id and its real author, so a *reaction* to the repost message (a Like or
     EmojiReact someone sends on the Matrix side) can be addressed to the
     actual post and delivered to its actual author, instead of nonsensically
-    "liking" a booster's Announce activity and notifying the wrong account.
+    "liking" a reposter's Announce activity and notifying the wrong account.
     Both None for anything that isn't a mirrored repost.
     """
 
@@ -153,8 +153,8 @@ class FederatedEvent:
     ap_object_id: str
     author_actor_id: str
     thread_root_event_id: str | None = None
-    boosted_object_id: str | None = None
-    boosted_author_actor_id: str | None = None
+    reposted_object_id: str | None = None
+    reposted_author_actor_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,9 +200,9 @@ class ReactionRecord:
     local user who reacted) is set, depending on direction.
 
     ``secondary_event_id`` is a SECOND Matrix event that also undoes this
-    same activity if redacted -- used for an outbound boost specifically
-    (see ``bridge.reaction_bridge.send_boost``): the booster's own reaction/
-    ``;boost`` command message is ``event_id``, and the "you boosted so-and-
+    same activity if redacted -- used for an outbound repost specifically
+    (see ``bridge.reaction_bridge.send_repost``): the reposter's own reaction/
+    ``;repost`` command message is ``event_id``, and the "you reposted so-and-
     so's post" record posted into their Profile Room is
     ``secondary_event_id``, so redacting EITHER one works, matching how a
     repost's own Profile Room record (an ordinary ``FederatedEvent``, not a

@@ -51,7 +51,7 @@ acting for themselves, never on someone else's behalf, so there's no
 admin-override case to mirror here. Like ``rejoin``, accepting a knock
 deliberately does NOT also follow the account on the fediverse -- getting
 into a room (by any door: knocking, ``rejoin``, or just clicking a
-matrix.to link into a Remote User Room someone else's boost mirrored into)
+matrix.to link into a Remote User Room someone else's repost mirrored into)
 should never have the side effect of following someone; only the explicit
 ``follow`` command does that.
 
@@ -496,7 +496,7 @@ async def _notify_if_not_following(
     """Remind ``joined_user`` that being in this Remote User Room doesn't by
     itself mean they're following its account -- neither knocking,
     ``rejoin``, nor just landing here via a matrix.to link (e.g. from a
-    boosted post someone else's room mirrored) establishes an AP Follow
+    reposted post someone else's room mirrored) establishes an AP Follow
     anymore (see ``bridge.commands._ensure_following``'s docstring), so
     without this they could easily assume they're following someone they
     never actually asked to. A no-op if they already are (whether from
@@ -588,7 +588,7 @@ async def _welcome_to_profile_room(request: Request, *, room_id: str, joined_use
         "This room IS your Fediverse profile:\n" + "\n".join(f"  - {point}" for point in profile_points),
         'Use ";follow @user@instance.org" to start following fediverse accounts.',
         "I've also invited you to a \"Fediverse Notifications\" DM -- accept it to get notified there "
-        "of new followers, mentions, likes, and boosts (kept separate from this room so anyone else "
+        "of new followers, mentions, likes, and reposts (kept separate from this room so anyone else "
         "you've invited in here can't see them).",
     ]
     html_bullets = [
@@ -597,7 +597,7 @@ async def _welcome_to_profile_room(request: Request, *, room_id: str, joined_use
         + "</ul>",
         "Use <code>;follow @user@instance.org</code> to start following fediverse accounts.",
         "I've also invited you to a \"Fediverse Notifications\" DM -- accept it to get notified there "
-        "of new followers, mentions, likes, and boosts (kept separate from this room so anyone else "
+        "of new followers, mentions, likes, and reposts (kept separate from this room so anyone else "
         "you've invited in here can't see them).",
     ]
     if space_room_id:

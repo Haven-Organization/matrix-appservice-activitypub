@@ -69,19 +69,19 @@ def _effective_ap_object_id(fe: FederatedEvent) -> str:
     ``FederatedEvent``'s docstring), which isn't a real Note/Object at all;
     naming it in ``inReplyTo`` produces a reply most fediverse software
     can't properly thread (or even accept) since it doesn't resolve to an
-    actual post. ``boosted_object_id`` is the real boosted Note's own id.
+    actual post. ``reposted_object_id`` is the real reposted Note's own id.
     """
-    return fe.boosted_object_id or fe.ap_object_id
+    return fe.reposted_object_id or fe.ap_object_id
 
 
 def _effective_author_actor_id(fe: FederatedEvent) -> str:
     """The actor a reply should actually be addressed/delivered to.
 
     Same reasoning as ``_effective_ap_object_id``: a mirrored repost's own
-    ``author_actor_id`` is the booster, who merely reshared the post --
+    ``author_actor_id`` is the reposter, who merely reshared the post --
     replying should reach the post's actual original author instead.
     """
-    return fe.boosted_author_actor_id or fe.author_actor_id
+    return fe.reposted_author_actor_id or fe.author_actor_id
 
 
 async def _resolve_remote_recipient(

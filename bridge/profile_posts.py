@@ -53,46 +53,47 @@ from bridge.note_mirroring import (
     deliver_to_actor_or_followers,
     push_profile_update,
 )
-from bridge.reaction_bridge import note_msc4501_native_repost, send_boost
+from bridge.reaction_bridge import note_msc4501_native_repost, send_repost
 from bridge.repository import FederatedEvent
 
 logger = logging.getLogger(__name__)
 
 # Matches a body that's ENTIRELY a matrix.to permalink or a matrix: URI
 # (MSC2312) and nothing else -- per MSC4501, a repost with no added
-# caption (i.e. a plain boost) always has its body reduced to just this,
-# with the real content living in org.matrix.msc4501.social.relates_to
+# caption (i.e. a plain repost/boost) always has its body reduced to just
+# this, with the real content living in org.matrix.msc4501.social.relates_to
 # instead. A genuine caption (real added commentary) fails this match, so
-# _maybe_boost_msc4501_repost's caller only ever treats a caption-less
-# repost as a boost -- one WITH a caption falls through to the ordinary
-# post path, same as ";repost" already does for the outbound direction.
+# _maybe_suppress_msc4501_repost_record's caller only ever treats a
+# caption-less repost this way -- one WITH a caption falls through to the
+# ordinary post path, same as ";repost" already does for the outbound
+# direction.
 _BARE_MATRIX_LINK_BODY_RE = re.compile(r"^(https://matrix\.to/#/\S+|matrix:\S+)$")
 
 
-async def _maybe_boost_forwarded_post(
+async def _maybe_repost_forwarded_post(
     request: Request, *, actor_record, room_id: str, matrix_event_id: str, external_url: str
 ) -> bool:
     """Turn a mirrored fediverse post FORWARDED into the owner's Profile Room
     (Element's "forward message", which copies the source event's content
-    verbatim into the target room) into a boost of the original post.
+    verbatim into the target room) into a repost of the original post.
 
     Detection is ``external_url``: the bridge stamps it on every mirrored
     fediverse post (see ``bridge.note_mirroring.source_post_url``), no
     Matrix client puts one on a hand-typed message, and a forward copies it
     along with everything else -- so a Profile Room message carrying one is
     the owner putting someone else's mirrored post on their own timeline.
-    Fediverse-wise that act is an ``Announce`` (boost) of the original --
+    Fediverse-wise that act is an ``Announce`` (repost) of the original --
     NOT authorship of a byte-identical new post, which is what falling
     through to the ordinary fresh-post path would publish in their name.
 
-    Returns True if this was handled as a boost -- ``send_boost`` does the
+    Returns True if this was handled as a repost -- ``send_repost`` does the
     full job (delivers the Announce, posts the standard "\U0001F501 X
-    boosted Y's post" card, records the ``ReactionRecord``), with THIS
-    forwarded event recorded as the boost's trigger, so redacting the
-    forward un-boosts exactly like redacting a boost reaction/command
+    reposted Y's post" card, records the ``ReactionRecord``), with THIS
+    forwarded event recorded as the repost's trigger, so redacting the
+    forward un-reposts exactly like redacting a repost reaction/command
     would. Returns False to let the caller fall through to the ordinary
     fresh-post path: the URL doesn't resolve to any post we track, or the
-    tracked post lives in a private DM/Chat room -- a boost would publicly
+    tracked post lives in a private DM/Chat room -- a repost would publicly
     ``Announce`` an object our own serving route (correctly) refuses to
     serve (see ``bridge.activitypub.routes.get_note``'s privacy check), so
     the forward stays what it always was, content the owner chose to
@@ -101,7 +102,7 @@ async def _maybe_boost_forwarded_post(
     repository = request.app.state.repository
 
     if await repository.get_reaction_by_matrix_event(matrix_event_id) is not None:
-        return True  # redelivered transaction -- this exact forward already boosted
+        return True  # redelivered transaction -- this exact forward already reposted
 
     parent = await repository.get_federated_event_by_ap_object(external_url)
     if parent is None:
@@ -126,7 +127,7 @@ async def _maybe_boost_forwarded_post(
     if await repository.is_ghost_dm_room(parent.room_id) or await repository.is_ghost_chat_room(parent.room_id):
         return False
 
-    await send_boost(
+    await send_repost(
         request,
         actor_record=actor_record,
         parent=parent,
@@ -138,12 +139,12 @@ async def _maybe_boost_forwarded_post(
 
 
 async def _maybe_suppress_msc4501_repost_record(
-    request: Request, *, relates_to: dict, body: str, booster_matrix_user_id: str,
+    request: Request, *, relates_to: dict, body: str, reposter_matrix_user_id: str,
 ) -> bool:
-    """Recognizes -- and consumes, WITHOUT itself boosting anything -- the
+    """Recognizes -- and consumes, WITHOUT itself reposting anything -- the
     ``org.matrix.msc4501.social.relates_to`` record an MSC4501-aware client
-    (e.g. Haven) posts into the booster's own Profile Room for a
-    caption-less repost (a boost): ``rel_type:
+    (e.g. Haven) posts into the reposter's own Profile Room for a
+    caption-less repost (a "boost" in Mastodon's terms): ``rel_type:
     "org.matrix.msc4501.social.repost"`` with the body reduced to nothing
     but a matrix.to/matrix: permalink, per the spec's own convention.
 
@@ -151,36 +152,36 @@ async def _maybe_suppress_msc4501_repost_record(
     post TOGETHER WITH this record -- two Matrix events for one logical
     repost, not two independent ones. The reaction ALONE already triggers
     a real AP ``Announce`` on its own (``maybe_federate_reaction`` ->
-    ``send_boost``, pre-existing, unrelated to this function). This
+    ``send_repost``, pre-existing, unrelated to this function). This
     function's only job is stopping THIS record from falling through to
     the ordinary fresh-post path and being published as a new post
     containing nothing but the bare permalink text (confirmed live
     2026-07-09: that's exactly what happened before this existed) --
-    deliberately does NOT also call ``send_boost`` itself: doing so
-    double-boosted (two "you boosted" cards, two Announces) for the exact
+    deliberately does NOT also call ``send_repost`` itself: doing so
+    double-reposted (two "you reposted" cards, two Announces) for the exact
     same repost, confirmed live the same day this was first added, since
     the reaction was already independently doing it.
 
-    Also tells ``send_boost`` (via ``note_msc4501_native_repost``) that a
-    native record for this exact boost now exists, so its own "you
-    boosted" card -- redundant with this native record when both land in
+    Also tells ``send_repost`` (via ``note_msc4501_native_repost``) that a
+    native record for this exact repost now exists, so its own "you
+    reposted" card -- redundant with this native record when both land in
     the SAME Profile Room, e.g. Haven's own social page and this bridge's
     Profile Room being the same room -- gets skipped (or retroactively
     redacted if the reaction happened to arrive first and already posted
     it). See that function's own docstring for the arrival-order handling.
 
     A repost WITH a real added caption is a genuine quote-post, not a
-    boost -- MSC4501 doesn't pair those with a reaction, so it must fall
-    through to the ordinary post path instead (matching ``;repost``'s own
-    outbound distinction) -- the caller only invokes this once the body's
-    already been confirmed to be nothing but a bare link (see
+    plain repost -- MSC4501 doesn't pair those with a reaction, so it must
+    fall through to the ordinary post path instead (matching ``;repost``'s
+    own outbound distinction) -- the caller only invokes this once the
+    body's already been confirmed to be nothing but a bare link (see
     ``_BARE_MATRIX_LINK_BODY_RE``), which is what keeps this from
     misfiring on one."""
-    boosted_event_id = relates_to.get("event_id")
-    if not boosted_event_id or not _BARE_MATRIX_LINK_BODY_RE.match(body):
+    reposted_event_id = relates_to.get("event_id")
+    if not reposted_event_id or not _BARE_MATRIX_LINK_BODY_RE.match(body):
         return False
     await note_msc4501_native_repost(
-        request, booster_matrix_user_id=booster_matrix_user_id, boosted_event_id=boosted_event_id,
+        request, reposter_matrix_user_id=reposter_matrix_user_id, reposted_event_id=reposted_event_id,
     )
     return True
 
@@ -253,7 +254,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         return True  # already distributed (e.g. a redelivered transaction) -- nothing to do
 
     # A genuine MSC4501-native caption-less repost (a real MSC4501 client,
-    # e.g. Haven, not Element's own "forward message") is ALREADY boosted
+    # e.g. Haven, not Element's own "forward message") is ALREADY reposted
     # via its paired 🔁 reaction (see maybe_federate_reaction) -- this just
     # keeps this accompanying record from also publishing the bare
     # permalink text as a new post in the owner's name -- see
@@ -262,15 +263,15 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
         if await _maybe_suppress_msc4501_repost_record(
             request, relates_to=relates_to, body=(content.get("body") or "").strip(),
-            booster_matrix_user_id=actor_record.matrix_user_id,
+            reposter_matrix_user_id=actor_record.matrix_user_id,
         ):
             return True
 
-    # A forwarded mirrored post becomes a boost of the original, not a new
-    # post published in the owner's name -- see _maybe_boost_forwarded_post.
+    # A forwarded mirrored post becomes a repost of the original, not a new
+    # post published in the owner's name -- see _maybe_repost_forwarded_post.
     external_url = content.get("external_url")
     if isinstance(external_url, str) and external_url:
-        if await _maybe_boost_forwarded_post(
+        if await _maybe_repost_forwarded_post(
             request,
             actor_record=actor_record,
             room_id=room_id,

@@ -68,13 +68,13 @@ def resolve_own_media_proxy_mxc(base_url: str, url: str) -> str | None:
     ``build_ap_attachment``), returns the exact ``mxc://`` URI it encodes;
     ``None`` for anything else (a genuinely-remote URL).
 
-    Used to recognize a boosted/quoted post's attachment as media we
+    Used to recognize a reposted/quoted post's attachment as media we
     ALREADY have on this homeserver -- e.g. a local user's own post,
-    boosted by a remote follower, carries an attachment URL pointing right
+    reposted by a remote follower, carries an attachment URL pointing right
     back at this same proxy -- so it can be reused as-is instead of being
     downloaded through our own public endpoint and re-uploaded to Synapse
     as a brand new, wasteful, un-deduplicated copy (confirmed live
-    2026-07-10: boosting the same local post from N different remote
+    2026-07-10: reposting the same local post from N different remote
     accounts produced N distinct mxc:// copies of the identical file).
     """
     prefix = f"{base_url}/media/"
