@@ -210,31 +210,6 @@ async def send_repost(
     )
     activity_dict = announce_activity.to_dict()
 
-    # Fans out to the reposter's OWN followers -- deliver_to_actor_or_followers
-    # resolves a local actor id to exactly that (see its docstring) -- since
-    # a repost is a public act that should show up for them, same as an
-    # ordinary top-level post.
-    await deliver_to_actor_or_followers(
-        request,
-        target_actor_id=own_actor_id,
-        activity=activity_dict,
-        key_id=main_key_id(base, actor_record.username),
-        private_key_pem=actor_record.private_key_pem,
-    )
-    # Separately reaches the original author directly, so they're notified
-    # of the repost even if they don't already follow the reposter back (the
-    # common case) -- deliver_to_actor_or_followers again handles the
-    # original author turning out to be another local bridge user instead
-    # of a genuinely remote one.
-    if target_author_actor_id and target_author_actor_id != own_actor_id:
-        await deliver_to_actor_or_followers(
-            request,
-            target_actor_id=target_author_actor_id,
-            activity=activity_dict,
-            key_id=main_key_id(base, actor_record.username),
-            private_key_pem=actor_record.private_key_pem,
-        )
-
     # A visible record of the repost in the reposter's OWN Profile Room --
     # not just the (otherwise silent, for the emoji-reaction trigger) AP
     # side -- so anyone following that room (see the room's own purpose:
@@ -244,6 +219,23 @@ async def send_repost(
     # as ReactionRecord.secondary_event_id -- redacting THIS message undoes
     # the repost exactly like redacting the original reaction/command
     # message would.
+    #
+    # Deliberately built and sent BEFORE the two deliver_to_actor_or_followers
+    # calls below, not after -- delivery is sequential, one HTTP POST per
+    # recipient, each allowed up to config.federation.request_timeout before
+    # giving up, so with several followers (or a slow/unreachable inbox) it
+    # can easily take a minute or more. already_has_native_record's whole
+    # point is catching an MSC4501 native record (see
+    # note_msc4501_native_repost) that arrived moments earlier in the SAME
+    # room -- if this check only ran after delivery finished, it would miss
+    # native records well outside _REPOST_CARD_DEDUP_WINDOW_SECONDS purely
+    # because delivery took too long, not because the two were ever
+    # unrelated (confirmed live 2026-07-12: a repost with several followers
+    # took ~74s to reach this point, so a native record posted seconds
+    # earlier had already aged out of the window by the time this ran).
+    # Delivery's own success/failure never gated the notice anyway (see
+    # deliver_to_actor_or_followers's docstring -- best-effort throughout),
+    # so nothing about correctness depends on this order.
     notice_event_id: str | None = None
     repost_dedup_key = (reactor_matrix_user_id, parent.event_id)
     already_has_native_record = (
@@ -290,12 +282,9 @@ async def send_repost(
         # once. body is always the full plain_body (with quote + link),
         # never just a bare permalink.
         #
-        # Deliberately NOT setting HAVEN_REMOVE_HEADER_FIELD either -- unlike
-        # _build_repost_message/_echo_reply_in_own_room (both sent as the
-        # relevant GHOST), this notice is sent as the bridge BOT (below,
-        # as_user_id=bot_mxid) into the reposter's own Profile Room, not as
-        # a mirrored fediverse-authored post. See HAVEN_REMOVE_HEADER_FIELD's
-        # own docstring for why that distinction matters.
+        # Same reasoning rules out SOCIAL_BODY_FIELD/SOCIAL_FORMATTED_BODY_FIELD
+        # too -- never set without SOCIAL_RELATES_TO_FIELD alongside them, and
+        # this notice deliberately never sets that either (immediately above).
         notice_content = build_preview_media_content(
             plain_body=plain_body,
             formatted_caption=formatted_caption,
@@ -313,6 +302,31 @@ async def send_repost(
             _pending_repost_card[repost_dedup_key] = (actor_record.room_id, notice_event_id, time.monotonic())
         except SynapseError:
             logger.warning("Failed to post repost notice in %s", actor_record.room_id, exc_info=True)
+
+    # Fans out to the reposter's OWN followers -- deliver_to_actor_or_followers
+    # resolves a local actor id to exactly that (see its docstring) -- since
+    # a repost is a public act that should show up for them, same as an
+    # ordinary top-level post.
+    await deliver_to_actor_or_followers(
+        request,
+        target_actor_id=own_actor_id,
+        activity=activity_dict,
+        key_id=main_key_id(base, actor_record.username),
+        private_key_pem=actor_record.private_key_pem,
+    )
+    # Separately reaches the original author directly, so they're notified
+    # of the repost even if they don't already follow the reposter back (the
+    # common case) -- deliver_to_actor_or_followers again handles the
+    # original author turning out to be another local bridge user instead
+    # of a genuinely remote one.
+    if target_author_actor_id and target_author_actor_id != own_actor_id:
+        await deliver_to_actor_or_followers(
+            request,
+            target_actor_id=target_author_actor_id,
+            activity=activity_dict,
+            key_id=main_key_id(base, actor_record.username),
+            private_key_pem=actor_record.private_key_pem,
+        )
 
     if matrix_event_id or notice_event_id:
         await repository.record_reaction(
@@ -354,6 +368,19 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
     parent = await repository.get_federated_event_by_matrix_event(target_event_id)
     if parent is None:
         return False  # reacting to a purely-local Matrix message; nothing to federate
+
+    matrix_event_id = event.get("event_id")
+    if matrix_event_id and await repository.get_reaction_by_matrix_event(matrix_event_id) is not None:
+        # A redelivered AS transaction for a reaction we already fully
+        # handled -- confirmed live 2026-07-12: a slow/erroring delivery
+        # attempt made Synapse retry the whole transaction ~74s and ~136s
+        # later, and this function had no guard against re-running (unlike
+        # e.g. _maybe_repost_forwarded_post's identical check), so a single
+        # 🔁 reaction produced two duplicate real Announces and two
+        # duplicate "you reposted" cards. Same reasoning applies to a plain
+        # Like/EmojiReact, not just a repost, so this guards the whole
+        # function rather than just the repost branch below.
+        return True
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:
