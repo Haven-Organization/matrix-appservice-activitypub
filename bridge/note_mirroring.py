@@ -290,23 +290,44 @@ def social_relates_to(
         value["content"] = content
     return value
 
-# Set (bool, always ``True`` when present) on a mirrored event whose body/
+# MSC4501's own fields for exactly what HAVEN_REMOVE_HEADER_FIELD (Haven's
+# own bespoke, pre-standard convention -- retired 2026-07-13 now that the
+# MSC itself covers this) used to signal: a mirrored event whose body/
 # formatted_body starts with a bridge-generated attribution line -- "🔁 X
-# reposted Y's post:" (_build_repost_message) or "⤵️ Reply to X's post:"
-# (_echo_reply_in_own_room) -- ahead of the actual mirrored content, rather
-# than the mirrored content being the entire body verbatim. Haven's own
-# field (not part of MSC4501 or any other spec), requested 2026-07-08, so
-# it can strip that header off entirely when rendering instead of treating
-# it as part of the post's own text. Deliberately NOT set on a quote-post's
-# own tail (_quoted_post_render) or an outbound ;repost's own echo
-# (bridge.commands._handle_repost) -- both put a REAL caption first, with
-# any bridge-generated attribution coming after, not a header "at the top"
-# in the sense this field means. Also deliberately NOT set on anything sent
-# as the bridge BOT itself (e.g. send_repost's own reaction-triggered
-# notice, posted into the reposter's Profile Room as the bot rather than a
-# ghost) -- Haven only ever needs to strip a header from a mirrored
-# fediverse-authored post, never from the bridge's own first-party notices.
-HAVEN_REMOVE_HEADER_FIELD = "software.haven.remove_header"
+# reposted Y's post:" (_build_repost_message), "⤵️ Reply to X's post:"
+# (_echo_reply_in_own_room), or a quote-post/captioned-repost's own tail
+# (_quoted_post_render's inbound rendering, bridge.commands._handle_repost's
+# outbound echo) -- ahead of/around the actual mirrored content. Per the
+# MSC: "A compliant social client SHOULD render m.social.body/
+# m.social.formatted_body in place of body/formatted_body when present. A
+# non-compliant client... renders body/formatted_body exactly as it would
+# for any other message, unaffected by these fields' presence" -- so,
+# unlike the old boolean marker, these two carry the ACTUAL replacement
+# content directly (just the reposter/replier's own real text and its HTML,
+# with no bridge-generated header/quoted-content wrapper around it) rather
+# than a flag telling a client how to edit body itself down to that same
+# thing.
+#
+# Only ever set TOGETHER with SOCIAL_RELATES_TO_FIELD (never body/
+# formatted_body's real content duplicated here with no relates_to signal
+# to justify it), and only when there's something for them to actually
+# carry -- omitted for a caption-less quote-post/reply whose own real text
+# is empty, same as every other "don't add a field with nothing useful in
+# it" convention already used everywhere else in this codebase. A
+# briefly-tried alternative (always setting these to "" even when empty,
+# so a compliant client never has to fall back to a presence check)
+# was tried and reverted the same day, 2026-07-13: Haven already recognizes
+# a caption-less repost by ``body`` alone being a bare matrix.to/matrix:
+# permalink (see ``_build_repost_message``'s own docstring, MSC4501's own
+# convention for that shape), so an empty ``social.body``/``formatted_body``
+# added nothing a compliant client actually needed -- don't reintroduce it.
+# Per the MSC's own "MUST only be set when body/formatted_body (and
+# format) is also present" rule (trivially satisfied here -- every caller
+# of these already has both) and its "MUST NOT be set on m.social.post
+# events" rule (an ordinary top-level post has no bridge-generated header
+# to strip in the first place, so no caller ever reaches for these there).
+SOCIAL_BODY_FIELD = "org.matrix.msc4501.social.body"
+SOCIAL_FORMATTED_BODY_FIELD = "org.matrix.msc4501.social.formatted_body"
 
 # The event TYPE (not a content field) MSC4501 proposes in place of
 # m.room.message for a "real" social-media-style post -- see
@@ -316,9 +337,9 @@ HAVEN_REMOVE_HEADER_FIELD = "software.haven.remove_header"
 # has never heard of this event type won't render the event at all.
 SOCIAL_POST_EVENT_TYPE = "org.matrix.msc4501.social.post"
 
-# Bare boolean marker (not part of any spec -- a Haven-specific convention,
-# same category as HAVEN_REMOVE_HEADER_FIELD above) on the bridge's own
-# poll-tallies thread reply (see ``upsert_poll_tally_reply`` below), so a
+# Bare boolean marker (not part of any spec -- a Haven-specific convention)
+# on the bridge's own poll-tallies thread reply (see ``upsert_poll_tally_reply``
+# below), so a
 # later refresh can reliably find and edit THIS message again via
 # SynapseClient.get_relations rather than creating a duplicate one --
 # deliberately not stored in any DB table (this project's "read live state

@@ -244,6 +244,8 @@ from bridge.note_mirroring import attach_media_to_content as _attach_media_to_co
 from bridge.note_mirroring import resolve_old_remote_actor_room as _resolve_old_remote_actor_room
 from bridge.note_mirroring import (
     EXTERNAL_HANDLE_FIELD,
+    SOCIAL_BODY_FIELD,
+    SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
@@ -3561,9 +3563,10 @@ async def _handle_repost(
     plain_body = f"{caption}\n\n{plain_body}"
 
     post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
+    caption_html = f"<p>{html.escape(caption)}</p>"
     formatted_caption = (
-        f"<p>{html.escape(caption)}</p>"
-        f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
+        caption_html
+        + f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
     )
     echo_content = build_preview_media_content(
         plain_body=plain_body, formatted_caption=formatted_caption,
@@ -3575,6 +3578,13 @@ async def _handle_repost(
             event_id=preview_target.event_id, room_id=preview_target.room_id,
             sender=original_sender, displayname=original_displayname, content=preview_full_content,
         )
+        # A compliant client's replacement for body/formatted_body: just the
+        # reposter's OWN caption, without the "🔁 reposted X's post: ..."
+        # tail appended above -- see SOCIAL_BODY_FIELD's own docstring. This
+        # branch only runs with a real caption (the bare-repost case returns
+        # via send_repost long before here), so it's never empty.
+        echo_content[SOCIAL_BODY_FIELD] = caption
+        echo_content[SOCIAL_FORMATTED_BODY_FIELD] = caption_html
     # Always lands in the reposter's OWN Profile Room -- never wherever the
     # command happened to be run from (e.g. a reply inside the ORIGINAL
     # author's Remote User Room, replying to their own mirrored post there),

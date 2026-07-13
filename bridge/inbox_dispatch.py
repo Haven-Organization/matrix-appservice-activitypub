@@ -82,8 +82,9 @@ from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
     EXTERNAL_HANDLE_FIELD,
-    HAVEN_REMOVE_HEADER_FIELD,
     POLL_END_EVENT_TYPE,
+    SOCIAL_BODY_FIELD,
+    SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
@@ -1422,6 +1423,18 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             displayname=quote_render.quoted_displayname,
             content=quote_render.full_content,
         )
+        # A compliant client's replacement for body/formatted_body: just the
+        # quoter's OWN added commentary, not the "🔁 reposted X's post: ..."
+        # tail appended above (already fully captured on the far end via
+        # m.social.relates_to itself) -- see SOCIAL_BODY_FIELD's own
+        # docstring. Omitted entirely for a caption-less quote (plain
+        # empty) -- confirmed live 2026-07-13 (see SOCIAL_BODY_FIELD's own
+        # docstring) that an empty social.body is noise a compliant client
+        # doesn't need, not a useful disambiguation.
+        if plain:
+            message_content[SOCIAL_BODY_FIELD] = plain
+            if "formatted_body" in message_content:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = safe_html or html.escape(plain)
     if mentions.mentioned_locals:
         # A pill alone (the <a href="matrix.to/..."> in formatted_body,
         # above) only makes the mention a clickable link -- an intentional
@@ -1813,10 +1826,18 @@ async def _echo_reply_in_own_room(
         "body": plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
-        HAVEN_REMOVE_HEADER_FIELD: True,
     }
     if reply_relates_to is not None:
         message_content[SOCIAL_RELATES_TO_FIELD] = reply_relates_to
+        # A compliant client's replacement for body/formatted_body: the
+        # reply's own real text alone, without the "⤵️ Reply to X's post:"
+        # header or the trailing thread_link -- see SOCIAL_BODY_FIELD's own
+        # docstring. Omitted for a caption-less reply (e.g. an image with no
+        # text of its own) -- same reasoning, confirmed live 2026-07-13.
+        if plain:
+            message_content[SOCIAL_BODY_FIELD] = plain
+            if content_html:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = content_html
     source_url = _source_post_url(note)
     if source_url:
         message_content["external_url"] = source_url
@@ -2116,10 +2137,19 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     # an ActivityPub post always maps to exactly one Matrix event, reposted
     # or not.
     attachments = extract_attachments(obj)
+    # _build_repost_message already reduced body to nothing but imported_link
+    # when it attached m.social.relates_to (see its own docstring, MSC4501's
+    # own requirement) -- attach_media_to_content's "Other Attachments:"
+    # appendix is exactly the kind of extra body text that requirement rules
+    # out, so restore the bare permalink afterward when that's the case.
+    # formatted_body is untouched either way -- only body is spec-constrained.
+    is_bare_msc4501_body = SOCIAL_RELATES_TO_FIELD in message_content
     message_content, _ = await _attach_media_to_content(
         request, message_content, attachments, mxc_uri=imported_attachment_mxc,
         width=imported_attachment_width, height=imported_attachment_height,
     )
+    if is_bare_msc4501_body and imported_link:
+        message_content["body"] = imported_link
 
     synapse = request.app.state.synapse
     federation_config = request.app.state.config.federation
@@ -2221,15 +2251,22 @@ async def _build_repost_message(
     dict (``msgtype``, ``url``, ``info``, etc., not just extracted text,
     since a plain-text copy would be blank for an uncaptioned image/video
     repost) and duplicating it into ``relates_to.content`` explicitly.
-    ``body`` always carries the full plain-text rendering (attribution
-    line, reposted content, trailing permalink) -- never swapped down to a
-    bare permalink, even when ``m.social.relates_to`` is also set, same as
-    ``send_repost``'s identical choice (see that function's own comment):
-    an MSC4501-aware client already gets an unambiguous repost signal from
-    ``m.social.relates_to`` itself, so there's no need to make ``body``
-    otherwise look empty to every other client and to anyone just reading
-    the plain text (confirmed live 2026-07-11 -- a bare-permalink ``body``
-    read as a broken/empty repost, not a recognized MSC4501 shape)."""
+    Per MSC4501, a caption-less repost's plain ``body`` MUST be reduced to
+    nothing but a matrix.to permalink to the reposted event whenever
+    ``m.social.relates_to`` is actually attached (``use_relates_to`` below)
+    -- ``formatted_body`` (and, for a non-MSC4501-aware client reading only
+    plain text, the fact that ``m.social.relates_to`` even exists) is where
+    the real rendering lives. This does NOT apply to ``send_repost``'s own
+    "you reposted" notice card (a different function, in
+    ``bridge.reaction_bridge``): that one deliberately never sets
+    ``m.social.relates_to`` at all -- see its own docstring -- so the MSC's
+    bare-``body`` rule for a relates_to-bearing event never applies to it in
+    the first place; it's the bridge's own confirmation card, not a mirrored
+    MSC4501 repost record.
+    A 2026-07-11 change here briefly made ``body`` always carry full content
+    even with ``m.social.relates_to`` set, on the theory that a bare-link
+    ``body`` "looked empty" -- reverted 2026-07-12 per explicit correction:
+    that's the spec-compliant shape, not a bug -- don't reintroduce it."""
     original_sender: str | None = None
     original_displayname: str | None = None
     if original_author_id:
@@ -2288,10 +2325,14 @@ async def _build_repost_message(
     )
     message_content = {
         "msgtype": "m.text",
-        "body": plain_body,
+        # Per MSC4501, a repost's plain body MUST be nothing but a matrix.to
+        # permalink to the reposted event when m.social.relates_to is set --
+        # see this function's own docstring. formatted_body (below) keeps
+        # the full rich card regardless; only an MSC4501-aware client parses
+        # body at all.
+        "body": imported_link if use_relates_to else plain_body,
         "format": "org.matrix.custom.html",
         "formatted_body": header_html + content_html,
-        HAVEN_REMOVE_HEADER_FIELD: True,
     }
     if use_relates_to:
         quoted_room_id, quoted_event_id = imported_ref
@@ -2301,6 +2342,19 @@ async def _build_repost_message(
             sender=original_sender, displayname=original_displayname,
             content_inline=content_inline, content=None if content_inline else reposted_content,
         )
+        # A compliant client's replacement for body/formatted_body: the
+        # reposted post's own content alone, without the "🔁 reposted X's
+        # post:" header above it -- see SOCIAL_BODY_FIELD's own docstring.
+        # Omitted for a caption-less repost of a text-free (media-only)
+        # post -- confirmed live 2026-07-13: Haven already recognizes an
+        # empty repost by body alone being a bare matrix.to/matrix: link
+        # (per MSC4501's own convention -- see this function's docstring),
+        # so an empty social.body/formatted_body would be pure noise, not a
+        # disambiguation a compliant client actually needs.
+        if plain:
+            message_content[SOCIAL_BODY_FIELD] = plain
+            if content_html:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = content_html
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url
