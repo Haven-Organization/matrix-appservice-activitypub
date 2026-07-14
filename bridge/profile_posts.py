@@ -50,6 +50,7 @@ from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
+    build_repost_note_content,
     deliver_to_actor_or_followers,
     push_profile_update,
 )
@@ -171,17 +172,126 @@ async def _maybe_suppress_msc4501_repost_record(
     it). See that function's own docstring for the arrival-order handling.
 
     A repost WITH a real added caption is a genuine quote-post, not a
-    plain repost -- MSC4501 doesn't pair those with a reaction, so it must
-    fall through to the ordinary post path instead (matching ``;repost``'s
-    own outbound distinction) -- the caller only invokes this once the
-    body's already been confirmed to be nothing but a bare link (see
+    plain repost -- still paired with the same 🔁 reaction (confirmed live
+    2026-07-13: an earlier version of this docstring wrongly assumed
+    otherwise), but handled by ``_maybe_handle_msc4501_quote_post``
+    instead, which -- unlike this function -- DOES itself federate
+    something (a ``Create``/``quote_uri``, not an ``Announce``) -- the
+    caller only invokes THIS function once the body's already been
+    confirmed to be nothing but a bare link (see
     ``_BARE_MATRIX_LINK_BODY_RE``), which is what keeps this from
-    misfiring on one."""
+    misfiring on a captioned one."""
     reposted_event_id = relates_to.get("event_id")
     if not reposted_event_id or not _BARE_MATRIX_LINK_BODY_RE.match(body):
         return False
     await note_msc4501_native_repost(
         request, reposter_matrix_user_id=reposter_matrix_user_id, reposted_event_id=reposted_event_id,
+    )
+    return True
+
+
+async def _maybe_handle_msc4501_quote_post(
+    request: Request, *, relates_to: dict, body: str, content: dict, actor_record, room_id: str, matrix_event_id: str,
+) -> bool:
+    """Recognizes -- and itself fully federates -- the
+    ``org.matrix.msc4501.social.relates_to`` record an MSC4501-aware client
+    (e.g. Haven) posts into the reposter's own Profile Room for a repost
+    WITH added commentary (a "quote-post" in Fediverse terms): same
+    ``rel_type: "org.matrix.msc4501.social.repost"`` as a caption-less one
+    (see ``_maybe_suppress_msc4501_repost_record``), but with real text in
+    ``body`` rather than a bare permalink.
+
+    Confirmed live 2026-07-13: without this, such a record fell all the way
+    through to the ordinary fresh-post path below, which published the
+    caption alone as a context-free new post with no relation to the
+    original AT ALL -- while the paired 🔁 reaction, unaware any of this was
+    happening, still fired its own bare, caption-less ``Announce``
+    (``send_repost``). Two wrong federated actions for one logical
+    quote-post, and neither of them an actual quote.
+
+    Builds the exact same shape ``bridge.commands._handle_repost``'s own
+    captioned branch does (a ``Create`` of a fresh ``Note`` with
+    ``quote_uri`` set to the original, content = the caption plus an
+    ``RT:`` link fallback -- see ``build_repost_note_content``, and
+    ``bridge.activitypub.routes``'s own ``reposted_object_id``-gated
+    reconstruction for why that FederatedEvent field has to be set below
+    too), but doesn't need that command's own separate bot-authored "echo"
+    message: the client's own message (``matrix_event_id``) IS already the
+    visible record in the room, so it's recorded directly against this
+    Note instead of a second synthetic one.
+
+    Also tells ``send_repost`` (via ``note_msc4501_native_repost``,
+    ``is_quote=True``) that this repost is now fully handled, so its own
+    Announce doesn't ALSO fire -- see that function's own docstring,
+    including the residual arrival-order race if the reaction happens to
+    land first."""
+    reposted_event_id = relates_to.get("event_id")
+    if not reposted_event_id:
+        return False
+
+    repository = request.app.state.repository
+    parent = await repository.get_federated_event_by_matrix_event(reposted_event_id)
+    if parent is None:
+        return False  # not a post we're tracking -- can't build a quote_uri for it
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    target_object_id = parent.reposted_object_id or parent.ap_object_id
+    target_author_actor_id = parent.reposted_author_actor_id or parent.author_actor_id
+    own_actor_id = actor_url(base, actor_record.username)
+
+    caption, mention_tags, mention_cc = await resolve_pill_mentions(request, body, content)
+    already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+    plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, caption, already_tagged=already_tagged)
+    mention_tags += plaintext_tags
+    mention_cc += plaintext_cc
+    mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+
+    note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
+    published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    note = Note(
+        id=note_id,
+        attributed_to=own_actor_id,
+        content=build_repost_note_content(caption, target_object_id, mention_links),
+        published=published,
+        to=[AS_PUBLIC],
+        cc=[followers_url(base, actor_record.username), target_author_actor_id, *mention_cc],
+        tag=mention_tags,
+        quote_uri=target_object_id,
+    )
+    create_activity = Activity(
+        id=f"{note_id}/activity", type="Create", actor=own_actor_id, object=note,
+        published=published, to=note.to, cc=note.cc,
+    )
+    activity_dict = create_activity.to_dict()
+
+    await repository.record_federated_event(
+        FederatedEvent(
+            event_id=matrix_event_id, room_id=room_id, ap_object_id=note_id, author_actor_id=own_actor_id,
+            reposted_object_id=target_object_id, reposted_author_actor_id=target_author_actor_id,
+        )
+    )
+
+    await deliver_to_actor_or_followers(
+        request, target_actor_id=own_actor_id, activity=activity_dict,
+        key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+    )
+    if target_author_actor_id and target_author_actor_id != own_actor_id:
+        await deliver_to_actor_or_followers(
+            request, target_actor_id=target_author_actor_id, activity=activity_dict,
+            key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+        )
+    for mention_actor_id in dict.fromkeys(mention_cc):
+        if mention_actor_id in (own_actor_id, target_author_actor_id):
+            continue
+        await deliver_to_actor_or_followers(
+            request, target_actor_id=mention_actor_id, activity=activity_dict,
+            key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+        )
+
+    await note_msc4501_native_repost(
+        request, reposter_matrix_user_id=actor_record.matrix_user_id, reposted_event_id=reposted_event_id,
+        is_quote=True,
     )
     return True
 
@@ -261,9 +371,23 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     # _maybe_suppress_msc4501_repost_record for the full reasoning.
     relates_to = content.get(SOCIAL_RELATES_TO_FIELD)
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
+        social_repost_body = (content.get("body") or "").strip()
         if await _maybe_suppress_msc4501_repost_record(
-            request, relates_to=relates_to, body=(content.get("body") or "").strip(),
+            request, relates_to=relates_to, body=social_repost_body,
             reposter_matrix_user_id=actor_record.matrix_user_id,
+        ):
+            return True
+        # Not a bare permalink -- a genuine quote-post (repost + real
+        # commentary), which needs its OWN Create/quote_uri sent out (see
+        # _maybe_handle_msc4501_quote_post) rather than falling through to
+        # the ordinary fresh-post path below, which has no idea this body
+        # is a caption for something and no way to attach a quote_uri to
+        # prove it. Falls through unchanged only if the reposted post
+        # itself isn't one we're tracking (can't build a quote_uri for it
+        # either way) -- same as if relates_to had never been present.
+        if await _maybe_handle_msc4501_quote_post(
+            request, relates_to=relates_to, body=social_repost_body, content=content,
+            actor_record=actor_record, room_id=room_id, matrix_event_id=matrix_event_id,
         ):
             return True
 

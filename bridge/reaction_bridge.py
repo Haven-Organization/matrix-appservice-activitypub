@@ -114,21 +114,34 @@ def _is_repost_emoji(key: str) -> bool:
 # ``relates_to["event_id"]`` on the native record, so no extra lookup is
 # needed on either side to agree on the same key).
 _REPOST_CARD_DEDUP_WINDOW_SECONDS = 15.0
-_native_repost_record_seen_at: dict[tuple[str, str], float] = {}
+_native_repost_record_seen_at: dict[tuple[str, str], tuple[float, bool]] = {}  # -> (seen_at, is_quote)
 _pending_repost_card: dict[tuple[str, str], tuple[str, str, float]] = {}  # -> (room_id, card_event_id, posted_at)
 
 
-async def note_msc4501_native_repost(request: Request, *, reposter_matrix_user_id: str, reposted_event_id: str) -> None:
+async def note_msc4501_native_repost(
+    request: Request, *, reposter_matrix_user_id: str, reposted_event_id: str, is_quote: bool = False,
+) -> None:
     """Called by ``bridge.profile_posts`` when an MSC4501-native repost
-    record lands in the reposter's own Profile Room. Records that this
-    exact repost now has a native record covering it (for the case
-    send_repost's own reaction-triggered call hasn't run yet), and
-    retroactively redacts send_repost's own "you reposted" card if it
+    record lands in the reposter's own Profile Room -- either a
+    caption-less one (``is_quote=False``, see
+    ``_maybe_suppress_msc4501_repost_record``) or a captioned quote-post
+    (``is_quote=True``, see ``_maybe_handle_msc4501_quote_post``, which
+    already fully federates its own ``Create``/``quote_uri`` for this
+    repost). Records that this exact repost now has a native record
+    covering it -- ``send_repost`` checks ``is_quote`` itself to decide
+    whether its OWN Announce should even fire at all (never, for a quote --
+    see that function's own reasoning) or just skip its redundant "you
+    reposted" notice card (a caption-less repost -- the Announce is still
+    the only actual federated action for that case).
+    Retroactively redacts send_repost's own "you reposted" card if it
     already got posted moments earlier (the reaction having arrived
-    first) -- either way, only one of the two ever ends up visible."""
+    first) -- either way, only one of the two Matrix-side records ever
+    ends up visible. Can't retroactively un-send an Announce that already
+    went out over federation by the time this runs, though -- see
+    send_repost's own docstring for that residual, accepted race."""
     key = (reposter_matrix_user_id, reposted_event_id)
     now = time.monotonic()
-    _native_repost_record_seen_at[key] = now
+    _native_repost_record_seen_at[key] = (now, is_quote)
     pending = _pending_repost_card.pop(key, None)
     if pending is None:
         return
@@ -183,11 +196,37 @@ async def send_repost(
     tracked reaction purely by matrix event id, without needing to know it
     was actually an Announce.
 
-    Returns the ``Announce`` activity's own id.
+    Returns the ``Announce`` activity's own id, or ``""`` if it was skipped
+    entirely (see the quote-post check immediately below).
     """
     repository = request.app.state.repository
     config = request.app.state.config
     base = config.bridge.public_base_url
+
+    # A genuine MSC4501-native QUOTE-post (caption + relates_to) for this
+    # exact repost already went out as its own Create/quote_uri (see
+    # bridge.profile_posts._maybe_handle_msc4501_quote_post) -- an Announce
+    # on top would be a second, redundant (and caption-less) federated
+    # action for one logical repost, not a legitimate additional one. Only
+    # short-circuits for a captioned (is_quote=True) native record; a bare
+    # one is Matrix-only bookkeeping with no AP action of its own (see
+    # _maybe_suppress_msc4501_repost_record), so THIS function's Announce
+    # remains the only actual federated action for that case and must
+    # still fire.
+    #
+    # If the paired 🔁 reaction happens to arrive BEFORE the quote-post's
+    # own relates_to record, this check misses (nothing recorded yet) and
+    # an incorrect bare Announce goes out before the quote-post code ever
+    # runs -- note_msc4501_native_repost still redacts this function's own
+    # Matrix-side notice card retroactively in that case, but the Announce
+    # itself, once delivered, can't be un-sent. Same class of unfixable
+    # ordering race as this module's other two-events-one-action
+    # coordination; left as a known, accepted gap rather than guessed-at.
+    repost_dedup_key = (reactor_matrix_user_id, parent.event_id)
+    seen = _native_repost_record_seen_at.get(repost_dedup_key)
+    already_has_native_record = seen is not None and time.monotonic() - seen[0] < _REPOST_CARD_DEDUP_WINDOW_SECONDS
+    if already_has_native_record and seen[1]:
+        return ""
 
     # Same reasoning as maybe_federate_reaction: a mirrored repost's own
     # ap_object_id/author_actor_id name the Announce activity and its
@@ -237,11 +276,6 @@ async def send_repost(
     # deliver_to_actor_or_followers's docstring -- best-effort throughout),
     # so nothing about correctness depends on this order.
     notice_event_id: str | None = None
-    repost_dedup_key = (reactor_matrix_user_id, parent.event_id)
-    already_has_native_record = (
-        time.monotonic() - _native_repost_record_seen_at.get(repost_dedup_key, 0.0)
-        < _REPOST_CARD_DEDUP_WINDOW_SECONDS
-    )
     if actor_record.room_id and not already_has_native_record:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
         preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
