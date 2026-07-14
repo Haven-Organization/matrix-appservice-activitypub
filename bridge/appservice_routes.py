@@ -32,9 +32,11 @@ checked before bot-tagged commands below, since it's recognized by reply
 target/content rather than being tagged/prefixed at all); bot-tagged
 command handling (see ``bridge.commands``); federating it as a chat
 message (see ``bridge.chat_bridge``) if the room is a ghost chat room;
-federating it as a reply to one; and finally, if it's a fresh post (or a new
-poll) in a linked Profile Room, converting and distributing it to followers
-as a new ActivityPub ``Create``.
+federating it as a reply to one; distributing a fresh post (or a new poll)
+in a linked Profile Room to followers as a new ActivityPub ``Create``; and,
+if none of the above claimed it, distributing it as a Shoot guild-Channel
+message (see ``bridge.channel_bridge.maybe_distribute_channel_message``) if
+the room is one.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
+from bridge.channel_bridge import maybe_distribute_channel_message
 from bridge.chat_bridge import maybe_federate_chat_message
 from bridge.commands import (
     maybe_handle_allow_homeserver_confirmation,
@@ -170,7 +173,9 @@ async def _handle_transaction(
                         if not handled_as_reply:
                             handled_as_poll_start = await maybe_distribute_profile_poll(request, event)
                             if not handled_as_poll_start:
-                                await maybe_distribute_profile_post(request, event)
+                                handled_as_channel_message = await maybe_distribute_channel_message(request, event)
+                                if not handled_as_channel_message:
+                                    await maybe_distribute_profile_post(request, event)
         except Exception:
             logger.exception(
                 "Error handling event %s (%s) in %s",

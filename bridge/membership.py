@@ -78,7 +78,12 @@ from bridge.matrix_links import matrix_to_room_link
 from bridge.note_mirroring import resolve_old_ghost_room_owner, resolve_old_remote_actor_room, unfollow_remote_actor
 from bridge.notifications import notification_actor_html
 from bridge.repository import RemoteActorRoom
-from bridge.spaces import add_room_to_space, remove_room_from_space
+from bridge.spaces import (
+    add_channel_room_to_guild_space,
+    add_room_to_space,
+    remove_channel_room_from_guild_space,
+    remove_room_from_space,
+)
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -408,10 +413,19 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     remote_room = await resolve_old_remote_actor_room(request, room_id)
     is_profile_room = await repository.get_profile_room_owner(room_id) == joined_user
     dm_room_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
-    if remote_room is None and not is_profile_room and dm_room_actor_id is None:
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    if remote_room is None and not is_profile_room and dm_room_actor_id is None and channel_room is None:
         return False  # not a room the bridge manages for this specific user
 
-    await add_room_to_space(request, matrix_user_id=joined_user, child_room_id=room_id)
+    # A Channel room belongs to its GUILD's own Space, not the joining
+    # user's personal Fediverse space -- these are two different space
+    # trees (see bridge.spaces.ensure_guild_space's docstring).
+    if channel_room is not None:
+        await add_channel_room_to_guild_space(
+            request, guild_actor_id=channel_room.guild_actor_id, child_room_id=room_id
+        )
+    else:
+        await add_room_to_space(request, matrix_user_id=joined_user, child_room_id=room_id)
 
     if remote_room is not None:
         await _notify_if_not_following(request, room_id=room_id, joined_user=joined_user, remote_room=remote_room)
@@ -663,7 +677,17 @@ async def maybe_handle_leave(request: Request, event: dict) -> bool:
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
     if remote_room is None:
-        return False  # not a Remote User Room at all
+        # A Channel room has no per-room follow relationship to undo the
+        # way a Remote User Room does -- just remove it from its guild's
+        # Space and stop, rather than falling into the unfollow logic below
+        # (which only makes sense for a Remote User Room).
+        channel_room = await repository.get_channel_room_by_room_id(room_id)
+        if channel_room is not None:
+            await remove_channel_room_from_guild_space(
+                request, guild_actor_id=channel_room.guild_actor_id, child_room_id=room_id
+            )
+            return True
+        return False  # not a Remote User Room or a Channel room
 
     # Space removal happens for ANY human leaving a Remote User Room,
     # independent of whether they even had a linked profile/were

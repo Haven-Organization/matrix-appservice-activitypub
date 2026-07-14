@@ -115,7 +115,17 @@ from bridge.note_mirroring import attach_media_to_content as _attach_media_to_co
 from bridge.note_mirroring import resolve_and_invite_ghost as _resolve_and_invite_ghost
 from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
 from bridge.note_mirroring import source_post_url as _source_post_url
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, PollVoteRecord, ReactionRecord, RemoteActorRoom
+from bridge.repository import (
+    ActorRecord,
+    FederatedEvent,
+    GhostProfile,
+    PendingGuildFollow,
+    PollVoteRecord,
+    ReactionRecord,
+    RemoteActorRoom,
+)
+from bridge.channel_bridge import ensure_channel_room, maybe_handle_channel_message
+from bridge.spaces import ensure_guild_space
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -636,14 +646,105 @@ async def _notify_post_owner(
 
 
 async def _handle_accept(request: Request, username: str, activity: Activity) -> None:
-    """A remote actor accepted a Follow that one of our local actors sent them."""
+    """A remote actor accepted a Follow that one of our local actors sent
+    them -- either an ordinary Follow (the generic path below, unchanged),
+    or one of OUR OWN FEP-bebd guild-join Follows (see
+    ``bridge.commands._handle_joinguild``), recognized by the accepted
+    Follow's own id matching a ``pending_guild_follows`` row and routed to
+    ``_handle_guild_accept`` instead."""
+    repository = request.app.state.repository
     inner = activity.object
+    follow_id = inner.get("id") if isinstance(inner, dict) else (inner if isinstance(inner, str) else None)
+    pending = await repository.get_pending_guild_follow(follow_id) if follow_id else None
+    if pending is not None:
+        await _handle_guild_accept(request, pending)
+        await repository.remove_pending_guild_follow(follow_id)
+        return
+
     target_actor_id = inner.get("object") if isinstance(inner, dict) and inner.get("type") == "Follow" else None
     if isinstance(target_actor_id, dict):
         target_actor_id = target_actor_id.get("id")
     if not target_actor_id:
         target_actor_id = activity.actor  # fall back: trust the sender as the accepted actor
-    await request.app.state.repository.add_following(username, target_actor_id)
+    await repository.add_following(username, target_actor_id)
+
+
+async def _handle_guild_accept(request: Request, pending: PendingGuildFollow) -> None:
+    """A Shoot guild Accepted our ``;joinguild`` join request -- records the
+    membership, caches the guild's own (cheap, flat) ``channels`` collection
+    so ``_handle_announce_locked`` can recognize a channel message via a
+    table lookup instead of a live fetch per message (see that function's
+    own disambiguation branch), creates/reuses the guild's Matrix Space,
+    creates a Matrix room for each of its channels right away (so the Space
+    shows the guild's whole layout on join, not just whichever channels
+    happen to get a message first), and notifies the joining user.
+    Deliberately does NOT walk the guild's own membership/Role structure at
+    all -- confirmed live 2026-07-14: creating a channel's ROOM needs
+    nothing beyond the cheap flat ``channels`` collection already cached
+    above; only knowing who ELSE (which Shoot members) is in it would need
+    that, and that's still resolved per-message as people actually speak
+    (see ``bridge.channel_bridge.ensure_channel_room``'s own docstring)."""
+    # Deferred import: bridge.commands already imports plenty from this
+    # module at the top level (_handle_create, _mirror_note_as_reply, ...),
+    # so importing _collect_recent_items from there at module level here
+    # would be a circular import -- same reasoning bridge.reaction_bridge's
+    # own deferred import of is_third_party_still_allowed already gives.
+    from bridge.commands import _collect_recent_items
+
+    repository = request.app.state.repository
+    await repository.record_guild_membership(pending.username, pending.guild_actor_id)
+
+    try:
+        guild_doc = await fetch_actor(request, pending.guild_actor_id)
+    except RemoteActorFetchError:
+        guild_doc = {}
+    guild_name = guild_doc.get("name") or guild_doc.get("preferredUsername") or pending.guild_actor_id
+    channels_url = guild_doc.get("channels")
+
+    channels: list[tuple[str, str]] = []
+    if channels_url:
+        items = await _collect_recent_items(request, channels_url, limit=200)
+        channels = [
+            (item["id"], item.get("name") or item.get("preferredUsername") or "")
+            for item in items
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if channels:
+            await repository.record_guild_channels(pending.guild_actor_id, channels)
+
+    space_room_id = await ensure_guild_space(
+        request, guild_actor_id=pending.guild_actor_id, guild_name=guild_name,
+        invite_matrix_user_id=pending.matrix_user_id,
+    )
+
+    if space_room_id is not None:
+        for channel_actor_id, _name in channels:
+            await ensure_channel_room(request, channel_actor_id=channel_actor_id, guild_actor_id=pending.guild_actor_id)
+        body = f"You've joined {guild_name} -- see {space_room_id} for its channels."
+    else:
+        body = f"You've joined {guild_name}, but its Matrix Space couldn't be created."
+    await notify_user(request, matrix_user_id=pending.matrix_user_id, content={"msgtype": "m.notice", "body": body})
+
+
+async def _handle_reject(request: Request, username: str, activity: Activity) -> None:
+    """A remote actor rejected a Follow -- today this ONLY matters for our
+    own FEP-bebd guild-join Follows (an invalid/expired invite code), the
+    same recognition ``_handle_accept`` uses. An ordinary (non-guild)
+    Reject is a no-op, matching this bridge's behavior before this handler
+    existed at all (there was no ``"Reject"`` entry in ``_HANDLERS``, so it
+    was previously just logged-and-dropped as an unrecognized activity
+    type)."""
+    repository = request.app.state.repository
+    inner = activity.object
+    follow_id = inner.get("id") if isinstance(inner, dict) else (inner if isinstance(inner, str) else None)
+    pending = await repository.get_pending_guild_follow(follow_id) if follow_id else None
+    if pending is None:
+        return
+    await repository.remove_pending_guild_follow(follow_id)
+    await notify_user(
+        request, matrix_user_id=pending.matrix_user_id,
+        content={"msgtype": "m.notice", "body": "Your guild invite code was rejected (invalid or expired)."},
+    )
 
 
 async def _handle_undo(request: Request, username: str, activity: Activity) -> None:
@@ -2053,6 +2154,16 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     if announce_id and await repository.get_federated_event_by_ap_object(announce_id) is not None:
         return  # already handled (e.g. a redelivered transaction) -- covers the notification below too
 
+    # A Shoot guild-Channel's own fan-out of an ordinary channel message is
+    # ALSO an Announce (activity.actor is the Channel itself) -- same
+    # activity type as an ordinary repost, but not one at all. Must be
+    # recognized and diverted here, before any of the repost-specific
+    # logic below runs, or a channel message gets misread as "the Channel
+    # reposted something" -- see channel_bridge.maybe_handle_channel_message's
+    # own docstring.
+    if await maybe_handle_channel_message(request, activity):
+        return
+
     reposted_id = activity.object_id()
     reposted_target = await repository.get_federated_event_by_ap_object(reposted_id) if reposted_id else None
     if reposted_target is not None:
@@ -2660,6 +2771,7 @@ async def _resolve_inbox(request: Request, actor_id: str) -> str:
 _HANDLERS = {
     "Follow": _handle_follow,
     "Accept": _handle_accept,
+    "Reject": _handle_reject,
     "Undo": _handle_undo,
     "Create": _handle_create,
     "Update": _handle_update,

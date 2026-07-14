@@ -27,8 +27,12 @@ import asyncpg
 
 from bridge.repository import (
     ActorRecord,
+    ChannelRoom,
     FederatedEvent,
     GhostProfile,
+    GuildChannel,
+    GuildMembership,
+    PendingGuildFollow,
     PollVoteRecord,
     ReactionRecord,
     RemoteActorRoom,
@@ -271,6 +275,70 @@ _SCHEMA_STATEMENTS = [
         actor_id TEXT NOT NULL,
         matrix_user_id TEXT NOT NULL,
         is_current BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+    # Shoot Guild/Channel bridging (see bridge.channel_bridge) -- an
+    # outstanding FEP-bebd guild-join Follow, between sending it and the
+    # guild's Accept/Reject arriving back over the inbox. See
+    # ActorRepository.record_pending_guild_follow's docstring.
+    """
+    CREATE TABLE IF NOT EXISTS pending_guild_follows (
+        follow_id TEXT PRIMARY KEY,
+        guild_actor_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        matrix_user_id TEXT NOT NULL,
+        invite_code TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS guild_memberships (
+        username TEXT NOT NULL,
+        guild_actor_id TEXT NOT NULL,
+        PRIMARY KEY (username, guild_actor_id)
+    )
+    """,
+    # Separate from guild_memberships -- the Space is one-per-guild, shared
+    # by every local member, not one-per-membership-row. Same shape as
+    # user_spaces, just keyed by guild instead of by Matrix user.
+    """
+    CREATE TABLE IF NOT EXISTS guild_spaces (
+        guild_actor_id TEXT PRIMARY KEY,
+        space_room_id TEXT NOT NULL
+    )
+    """,
+    # A joined guild's own flat `channels` collection, cached once right
+    # after the join Accept -- see ActorRepository.get_guild_channel's
+    # docstring for why this makes inbound Announce disambiguation a table
+    # lookup instead of a live fetch per message.
+    """
+    CREATE TABLE IF NOT EXISTS guild_channels (
+        channel_actor_id TEXT PRIMARY KEY,
+        guild_actor_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_guild_channels_guild ON guild_channels (guild_actor_id)",
+    # One Matrix room per Shoot Channel -- deliberately no single
+    # ghost_user_id column the way remote_actor_rooms has one, since a
+    # channel's messages come from many different guild-member ghosts,
+    # resolved per-message.
+    """
+    CREATE TABLE IF NOT EXISTS channel_rooms (
+        channel_actor_id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL UNIQUE,
+        guild_actor_id TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    # Which member ghosts have already been seen/invited in a channel room
+    # -- pure optimization (resolve_and_invite_ghost is already idempotent
+    # on its own), not a correctness dependency.
+    """
+    CREATE TABLE IF NOT EXISTS channel_room_members (
+        room_id TEXT NOT NULL,
+        member_actor_id TEXT NOT NULL,
+        PRIMARY KEY (room_id, member_actor_id)
     )
     """,
     # Additive migrations for columns introduced after a table's initial
@@ -1017,6 +1085,137 @@ class PostgresActorRepository:
             ON CONFLICT (matrix_user_id) DO UPDATE SET space_room_id = EXCLUDED.space_room_id
             """,
             matrix_user_id, space_room_id,
+        )
+
+    # -- Shoot guild/channel bridging ----------------------------------------
+
+    async def record_pending_guild_follow(self, record: PendingGuildFollow) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO pending_guild_follows
+                (follow_id, guild_actor_id, username, matrix_user_id, invite_code, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (follow_id) DO UPDATE SET
+                guild_actor_id = EXCLUDED.guild_actor_id,
+                username = EXCLUDED.username,
+                matrix_user_id = EXCLUDED.matrix_user_id,
+                invite_code = EXCLUDED.invite_code,
+                created_at = EXCLUDED.created_at
+            """,
+            record.follow_id, record.guild_actor_id, record.username,
+            record.matrix_user_id, record.invite_code, record.created_at,
+        )
+
+    async def get_pending_guild_follow(self, follow_id: str) -> PendingGuildFollow | None:
+        row = await self._pool.fetchrow("SELECT * FROM pending_guild_follows WHERE follow_id = $1", follow_id)
+        if row is None:
+            return None
+        return PendingGuildFollow(
+            follow_id=row["follow_id"], guild_actor_id=row["guild_actor_id"], username=row["username"],
+            matrix_user_id=row["matrix_user_id"], invite_code=row["invite_code"], created_at=row["created_at"],
+        )
+
+    async def remove_pending_guild_follow(self, follow_id: str) -> None:
+        await self._pool.execute("DELETE FROM pending_guild_follows WHERE follow_id = $1", follow_id)
+
+    async def record_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        await self._pool.execute(
+            "INSERT INTO guild_memberships (username, guild_actor_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            username, guild_actor_id,
+        )
+
+    async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM guild_memberships WHERE username = $1 AND guild_actor_id = $2", username, guild_actor_id
+        )
+        if row is None:
+            return None
+        return GuildMembership(username=row["username"], guild_actor_id=row["guild_actor_id"])
+
+    async def is_guild_member(self, guild_actor_id: str) -> bool:
+        row = await self._pool.fetchrow(
+            "SELECT 1 FROM guild_memberships WHERE guild_actor_id = $1 LIMIT 1", guild_actor_id
+        )
+        return row is not None
+
+    async def list_guild_members(self, guild_actor_id: str) -> list[str]:
+        rows = await self._pool.fetch("SELECT username FROM guild_memberships WHERE guild_actor_id = $1", guild_actor_id)
+        return [row["username"] for row in rows]
+
+    async def remove_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        await self._pool.execute(
+            "DELETE FROM guild_memberships WHERE username = $1 AND guild_actor_id = $2", username, guild_actor_id,
+        )
+
+    async def set_guild_space(self, guild_actor_id: str, space_room_id: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO guild_spaces (guild_actor_id, space_room_id) VALUES ($1, $2)
+            ON CONFLICT (guild_actor_id) DO UPDATE SET space_room_id = EXCLUDED.space_room_id
+            """,
+            guild_actor_id, space_room_id,
+        )
+
+    async def get_guild_space(self, guild_actor_id: str) -> str | None:
+        row = await self._pool.fetchrow("SELECT space_room_id FROM guild_spaces WHERE guild_actor_id = $1", guild_actor_id)
+        return row["space_room_id"] if row else None
+
+    async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
+        for channel_actor_id, name in channels:
+            await self._pool.execute(
+                """
+                INSERT INTO guild_channels (channel_actor_id, guild_actor_id, name) VALUES ($1, $2, $3)
+                ON CONFLICT (channel_actor_id) DO UPDATE SET
+                    guild_actor_id = EXCLUDED.guild_actor_id, name = EXCLUDED.name
+                """,
+                channel_actor_id, guild_actor_id, name,
+            )
+
+    async def get_guild_channel(self, channel_actor_id: str) -> GuildChannel | None:
+        row = await self._pool.fetchrow("SELECT * FROM guild_channels WHERE channel_actor_id = $1", channel_actor_id)
+        if row is None:
+            return None
+        return GuildChannel(
+            channel_actor_id=row["channel_actor_id"], guild_actor_id=row["guild_actor_id"], name=row["name"]
+        )
+
+    @staticmethod
+    def _row_to_channel_room(row) -> ChannelRoom:
+        return ChannelRoom(
+            channel_actor_id=row["channel_actor_id"], room_id=row["room_id"],
+            guild_actor_id=row["guild_actor_id"], display_name=row["display_name"],
+        )
+
+    async def get_channel_room(self, channel_actor_id: str) -> ChannelRoom | None:
+        row = await self._pool.fetchrow("SELECT * FROM channel_rooms WHERE channel_actor_id = $1", channel_actor_id)
+        return self._row_to_channel_room(row) if row else None
+
+    async def get_channel_room_by_room_id(self, room_id: str) -> ChannelRoom | None:
+        row = await self._pool.fetchrow("SELECT * FROM channel_rooms WHERE room_id = $1", room_id)
+        return self._row_to_channel_room(row) if row else None
+
+    async def register_channel_room(self, record: ChannelRoom) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO channel_rooms (channel_actor_id, room_id, guild_actor_id, display_name)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (channel_actor_id) DO UPDATE SET
+                room_id = EXCLUDED.room_id, guild_actor_id = EXCLUDED.guild_actor_id,
+                display_name = EXCLUDED.display_name
+            """,
+            record.channel_actor_id, record.room_id, record.guild_actor_id, record.display_name,
+        )
+
+    async def is_channel_member_known(self, room_id: str, member_actor_id: str) -> bool:
+        row = await self._pool.fetchrow(
+            "SELECT 1 FROM channel_room_members WHERE room_id = $1 AND member_actor_id = $2", room_id, member_actor_id
+        )
+        return row is not None
+
+    async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
+        await self._pool.execute(
+            "INSERT INTO channel_room_members (room_id, member_actor_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            room_id, member_actor_id,
         )
 
     # -- bot DM rooms --------------------------------------------------------

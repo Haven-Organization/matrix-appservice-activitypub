@@ -188,6 +188,7 @@ import html
 import inspect
 import logging
 import re
+import time
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -212,6 +213,7 @@ from bridge.activitypub.webfinger import (
     WebfingerError,
     WebfingerNotFoundError,
     WebfingerUnreachableError,
+    resolve_invite_code,
     resolve_remote_actor_id,
 )
 from bridge.crypto import generate_keypair
@@ -275,7 +277,7 @@ from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
 from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
 from bridge.note_mirroring import SOCIAL_PROFILE_USER_ID_STATE_TYPE, SOCIAL_PROFILE_USER_ID_POWER_LEVEL
 from bridge.note_mirroring import source_post_url as _source_post_url
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, RemoteActorRoom
+from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, PendingGuildFollow, RemoteActorRoom
 from bridge.room_widget import add_bridge_widget
 from bridge.spaces import add_room_to_space
 from bridge.synapse_client import SynapseError
@@ -295,7 +297,7 @@ _COMMAND_PREFIX = ";"
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
     r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help|"
-    r"disallow|allowed|allow|refresh"
+    r"disallow|allowed|allow|refresh|joinguild|leaveguild"
 )
 
 
@@ -651,6 +653,10 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_poll_refresh(request, room_id=room_id, content=content)
         elif subcommand == "refresh":
             await _handle_refresh(request, sender=sender, room_id=room_id, argument=argument, content=content)
+        elif subcommand == "joinguild":
+            await _handle_joinguild(request, sender=sender, room_id=room_id, argument=argument)
+        elif subcommand == "leaveguild":
+            await _handle_leaveguild(request, sender=sender, room_id=room_id)
         else:
             await _notice(
                 request, room_id, f'Unknown command -- try "{_COMMAND_PREFIX}help" to see what I can do.'
@@ -1591,6 +1597,197 @@ async def _ensure_following(
     # and calling this again there is a harmless no-op if one does arrive.
     await repository.add_following(actor_record.username, remote_actor_id)
     return True
+
+
+async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """Join a Shoot guild (an ``Organization`` actor) using an invite code,
+    per FEP-bebd. ``argument`` is ``CODE@guild.example.com`` -- the bare
+    form, not the ``invite:CODE@domain`` WebFinger resource string itself,
+    which this prepends automatically (see ``resolve_invite_code``).
+
+    Unlike ``;follow``, this can't resolve synchronously: the guild's
+    ``Accept``/``Reject`` arrives later over the inbox (see
+    ``bridge.inbox_dispatch``'s ``_handle_accept``/``_handle_reject``), so
+    this only ever sends the join request and records it as pending --
+    the notice deliberately doesn't say "Joined", since the invite code
+    might turn out to be invalid/expired.
+    """
+    config = request.app.state.config
+    repository = request.app.state.repository
+    base = config.bridge.public_base_url
+
+    argument = argument.strip()
+    if "@" not in argument:
+        await _notice(
+            request, room_id, f"Usage: {_COMMAND_PREFIX}joinguild CODE@guild.example.com",
+        )
+        return
+    code, domain = argument.split("@", 1)
+    code = code.removeprefix("invite:")
+
+    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    if actor_record is None:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile before joining a guild -- run "{_COMMAND_PREFIX}link profile" '
+            "in your own room first.",
+        )
+        return
+
+    try:
+        invite_code_doc, qualified_mention = await resolve_invite_code(request, code, domain)
+    except WebfingerNotFoundError:
+        await _notice(request, room_id, f"That invite code wasn't found on {domain} -- check it and try again.")
+        return
+    except WebfingerUnreachableError:
+        await _notice(request, room_id, f"Couldn't reach {domain} right now -- try again in a bit.")
+        return
+    except WebfingerError as exc:
+        await _notice(request, room_id, f"Could not resolve that invite code: {exc}")
+        return
+
+    guild_actor_id = invite_code_doc.get("attributedTo")
+    # Confirmed live 2026-07-14: Shoot's own InviteCode embeds the full
+    # guild actor object here rather than a bare IRI -- same
+    # embedded-object-or-bare-IRI ambiguity Activity.from_dict already
+    # normalizes for `actor`, just missed here on the first pass.
+    if isinstance(guild_actor_id, dict):
+        guild_actor_id = guild_actor_id.get("id")
+    if not guild_actor_id:
+        await _notice(request, room_id, "That invite code's own object is missing required fields.")
+        return
+
+    if await repository.is_guild_member(guild_actor_id):
+        await _notice(request, room_id, "This bridge has already joined that guild.")
+        return
+
+    try:
+        guild_doc = await fetch_actor(request, guild_actor_id)
+    except RemoteActorFetchError as exc:
+        await _notice(request, room_id, f"Could not fetch the guild's own actor document: {exc}")
+        return
+    guild_inbox = guild_doc.get("inbox")
+    if not guild_inbox:
+        await _notice(request, room_id, "The guild's own actor document has no inbox.")
+        return
+
+    follow_id = f"{actor_url(base, actor_record.username)}/follows/{uuid.uuid4().hex}"
+    follow_activity = Activity(
+        id=follow_id,
+        type="Follow",
+        actor=actor_url(base, actor_record.username),
+        object=guild_actor_id,
+        instrument=qualified_mention,
+    )
+
+    # Recorded BEFORE delivery, not after -- confirmed live 2026-07-14:
+    # Shoot's own FollowActivityHandler processes the join and sends its
+    # Accept back to us SYNCHRONOUSLY, inside the same request our
+    # deliver_activity POST is still waiting on -- their Accept can reach
+    # our inbox and finish processing before our own delivery call even
+    # returns. Recording the pending row only after delivery "succeeded"
+    # lost that race every time: _handle_accept found no row yet, fell
+    # through to the generic (no-op-for-guilds) path, and by the time this
+    # function got around to recording it, the Accept had already come and
+    # gone. Rolled back below if delivery turns out to have failed after all.
+    await repository.record_pending_guild_follow(
+        PendingGuildFollow(
+            follow_id=follow_id, guild_actor_id=guild_actor_id, username=actor_record.username,
+            matrix_user_id=sender, invite_code=code, created_at=time.time(),
+        )
+    )
+    try:
+        await deliver_activity(
+            request.app.state.http_client,
+            inbox_url=guild_inbox,
+            activity=follow_activity.to_dict(),
+            key_id=main_key_id(base, actor_record.username),
+            private_key_pem=actor_record.private_key_pem,
+        )
+    except DeliveryError as exc:
+        await repository.remove_pending_guild_follow(follow_id)
+        await _notice(request, room_id, f"Could not send the join request: {exc}")
+        return
+
+    guild_name = guild_doc.get("name") or guild_doc.get("preferredUsername") or domain
+    await _notice(
+        request, room_id, f"Join request sent to {guild_name} -- you'll be notified once it's confirmed.",
+    )
+
+
+async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> None:
+    """``;leaveguild``, run inside one of that guild's own Channel rooms --
+    sends a real ``Undo(Follow)`` (the spec-correct way to leave, so a
+    server that DOES handle it properly stops treating us as a member) and
+    drops this bridge's own local membership tracking.
+
+    Only the local side actually takes effect right now: confirmed live
+    2026-07-14 by reading Shoot's own ``Undo`` handler
+    (``src/util/activitypub/inbox/handlers/undo.ts``) -- it validates the
+    undone object is Follow-shaped and then does nothing else at all
+    (a literal ``// TODO: undo the follow`` with no implementation below
+    it), so Shoot itself never actually removes the membership, its cached
+    (possibly avatar-less -- see ``bridge.channel_bridge``'s own docstring
+    on why a stale cache can get permanently stuck) ``User``/``Member``
+    row, or anything else. This command still sends the Undo (it's free,
+    and correct behavior for any OTHER implementation that DOES honor it)
+    and still drops OUR OWN tracking regardless -- ``;joinguild`` on a
+    NEW guild is unaffected by any of this either way, since it's keyed
+    entirely by that guild's own distinct ``guild_actor_id``."""
+    repository = request.app.state.repository
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    if channel_room is None:
+        await _notice(
+            request, room_id, f'"{_COMMAND_PREFIX}leaveguild" only works inside one of that guild\'s own Channel rooms.',
+        )
+        return
+
+    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    if actor_record is None:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile before leaving a guild -- run "{_COMMAND_PREFIX}link profile" '
+            "in your own room first.",
+        )
+        return
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    guild_actor_id = channel_room.guild_actor_id
+    own_actor_id = actor_url(base, actor_record.username)
+
+    try:
+        guild_doc = await fetch_actor(request, guild_actor_id)
+    except RemoteActorFetchError as exc:
+        await _notice(request, room_id, f"Could not fetch the guild's own actor document: {exc}")
+        return
+    guild_inbox = guild_doc.get("inbox")
+    if guild_inbox:
+        undo_activity = Activity(
+            id=f"{own_actor_id}/undos/{uuid.uuid4().hex}",
+            type="Undo",
+            actor=own_actor_id,
+            object={"type": "Follow", "actor": own_actor_id, "object": guild_actor_id},
+        )
+        try:
+            await deliver_activity(
+                request.app.state.http_client,
+                inbox_url=guild_inbox,
+                activity=undo_activity.to_dict(),
+                key_id=main_key_id(base, actor_record.username),
+                private_key_pem=actor_record.private_key_pem,
+            )
+        except DeliveryError as exc:
+            logger.warning("Failed to deliver guild-leave Undo(Follow) to %s: %s", guild_inbox, exc)
+
+    await repository.remove_guild_membership(actor_record.username, guild_actor_id)
+    guild_name = guild_doc.get("name") or guild_doc.get("preferredUsername") or guild_actor_id
+    await _notice(
+        request, room_id,
+        f"Left {guild_name} on this bridge's own side. Its Space and Channel rooms are untouched -- "
+        f'leave them yourself in Matrix if you don\'t want them anymore. Note: Shoot itself doesn\'t '
+        f"actually process guild-leave yet, so it will still list you as a member there regardless.",
+    )
 
 
 async def _handle_unfollow(request: Request, *, sender: str, room_id: str, handle: str, content: dict) -> None:
@@ -3255,7 +3452,19 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     request 2026-07-11). Only falls through to the admin-gated
     ghost-profile behavior below when this ISN'T a reply that resolves to
     a tracked poll at all.
+
+    ``;refresh guild``, run inside one of that guild's own Channel rooms,
+    re-syncs its live channel list instead -- see ``_handle_refresh_guild``.
+    Also not admin-gated: being present in a Channel room at all already
+    means the bot invited you as a recorded guild member (see
+    ``bridge.channel_bridge.ensure_channel_room``), same trust level this
+    bridge already extends anyone sufficiently-powered in a room elsewhere
+    (e.g. a Profile Room's topic/name/avatar).
     """
+    if argument.strip() == "guild":
+        await _handle_refresh_guild(request, room_id=room_id)
+        return
+
     if not argument.strip():
         poll_target = await _resolve_poll_refresh_target(request, content)
         if poll_target is not None:
@@ -3382,6 +3591,39 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     )
 
     await _notice(request, room_id, f"Refreshed {handle_str}.")
+
+
+async def _handle_refresh_guild(request: Request, *, room_id: str) -> None:
+    """``;refresh guild``, run inside one of a joined guild's own Channel
+    rooms -- re-fetches that guild's live ``channels`` collection right now
+    and creates a Matrix room for any channel added since it was joined (or
+    since the last refresh), rather than waiting for a new channel's first
+    message to trigger lazy discovery (see
+    ``bridge.channel_bridge.maybe_handle_channel_message``'s own docstring
+    on why that's the only OTHER way this bridge ever finds out -- Shoot
+    itself never federates channel creation at all, confirmed by reading
+    its own source). Useful specifically for an empty new channel nobody's
+    posted in yet, which lazy discovery alone would never surface."""
+    repository = request.app.state.repository
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    if channel_room is None:
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}refresh guild" only works inside one of that guild\'s own Channel rooms.',
+        )
+        return
+
+    # Deferred: bridge.channel_bridge already imports from bridge.commands
+    # (message_addresses_bot, _collect_recent_items -- both deferred
+    # themselves for the identical reason), so importing from there at
+    # module level here would be circular.
+    from bridge.channel_bridge import sync_guild_channels
+
+    channels = await sync_guild_channels(request, channel_room.guild_actor_id)
+    if channels:
+        await _notice(request, room_id, f"Refreshed -- {len(channels)} channel(s) known now.")
+    else:
+        await _notice(request, room_id, "Couldn't refresh that guild's channel list -- it may not be reachable.")
 
 
 async def _handle_repost(

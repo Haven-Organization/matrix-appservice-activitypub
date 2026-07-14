@@ -27,8 +27,12 @@ from pathlib import Path
 
 from bridge.repository import (
     ActorRecord,
+    ChannelRoom,
     FederatedEvent,
     GhostProfile,
+    GuildChannel,
+    GuildMembership,
+    PendingGuildFollow,
     PollVoteRecord,
     ReactionRecord,
     RemoteActorRoom,
@@ -246,6 +250,63 @@ CREATE TABLE IF NOT EXISTS ghost_chat_room_history (
     actor_id TEXT NOT NULL,
     matrix_user_id TEXT NOT NULL,
     is_current INTEGER NOT NULL DEFAULT 0
+);
+
+-- Shoot Guild/Channel bridging (see bridge.channel_bridge) -- an outstanding
+-- FEP-bebd guild-join Follow, between sending it and the guild's
+-- Accept/Reject arriving back over the inbox. See
+-- ActorRepository.record_pending_guild_follow's docstring.
+CREATE TABLE IF NOT EXISTS pending_guild_follows (
+    follow_id TEXT PRIMARY KEY,
+    guild_actor_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    matrix_user_id TEXT NOT NULL,
+    invite_code TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS guild_memberships (
+    username TEXT NOT NULL,
+    guild_actor_id TEXT NOT NULL,
+    PRIMARY KEY (username, guild_actor_id)
+);
+
+-- Separate from guild_memberships -- the Space is one-per-guild, shared by
+-- every local member, not one-per-membership-row. Same shape as
+-- user_spaces, just keyed by guild instead of by Matrix user.
+CREATE TABLE IF NOT EXISTS guild_spaces (
+    guild_actor_id TEXT PRIMARY KEY,
+    space_room_id TEXT NOT NULL
+);
+
+-- A joined guild's own flat `channels` collection, cached once right after
+-- the join Accept -- see ActorRepository.get_guild_channel's docstring for
+-- why this makes inbound Announce disambiguation a table lookup instead of
+-- a live fetch per message.
+CREATE TABLE IF NOT EXISTS guild_channels (
+    channel_actor_id TEXT PRIMARY KEY,
+    guild_actor_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_guild_channels_guild ON guild_channels (guild_actor_id);
+
+-- One Matrix room per Shoot Channel -- deliberately no single ghost_user_id
+-- column the way remote_actor_rooms has one, since a channel's messages
+-- come from many different guild-member ghosts, resolved per-message.
+CREATE TABLE IF NOT EXISTS channel_rooms (
+    channel_actor_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL UNIQUE,
+    guild_actor_id TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT ''
+);
+
+-- Which member ghosts have already been seen/invited in a channel room --
+-- pure optimization (resolve_and_invite_ghost is already idempotent on its
+-- own), not a correctness dependency.
+CREATE TABLE IF NOT EXISTS channel_room_members (
+    room_id TEXT NOT NULL,
+    member_actor_id TEXT NOT NULL,
+    PRIMARY KEY (room_id, member_actor_id)
 );
 """
 
@@ -1319,6 +1380,208 @@ class SqliteActorRepository:
 
     async def register_user_space(self, matrix_user_id: str, space_room_id: str) -> None:
         await self._run(self._register_user_space, matrix_user_id, space_room_id)
+
+    # -- Shoot guild/channel bridging ----------------------------------------
+
+    def _record_pending_guild_follow(self, record: PendingGuildFollow) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO pending_guild_follows
+                (follow_id, guild_actor_id, username, matrix_user_id, invite_code, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(follow_id) DO UPDATE SET
+                guild_actor_id=excluded.guild_actor_id,
+                username=excluded.username,
+                matrix_user_id=excluded.matrix_user_id,
+                invite_code=excluded.invite_code,
+                created_at=excluded.created_at
+            """,
+            (
+                record.follow_id, record.guild_actor_id, record.username,
+                record.matrix_user_id, record.invite_code, record.created_at,
+            ),
+        )
+        self._conn.commit()
+
+    async def record_pending_guild_follow(self, record: PendingGuildFollow) -> None:
+        await self._run(self._record_pending_guild_follow, record)
+
+    def _get_pending_guild_follow(self, follow_id: str) -> PendingGuildFollow | None:
+        row = self._conn.execute(
+            "SELECT * FROM pending_guild_follows WHERE follow_id = ?", (follow_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return PendingGuildFollow(
+            follow_id=row["follow_id"], guild_actor_id=row["guild_actor_id"], username=row["username"],
+            matrix_user_id=row["matrix_user_id"], invite_code=row["invite_code"], created_at=row["created_at"],
+        )
+
+    async def get_pending_guild_follow(self, follow_id: str) -> PendingGuildFollow | None:
+        return await self._run(self._get_pending_guild_follow, follow_id)
+
+    def _remove_pending_guild_follow(self, follow_id: str) -> None:
+        self._conn.execute("DELETE FROM pending_guild_follows WHERE follow_id = ?", (follow_id,))
+        self._conn.commit()
+
+    async def remove_pending_guild_follow(self, follow_id: str) -> None:
+        await self._run(self._remove_pending_guild_follow, follow_id)
+
+    def _record_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO guild_memberships (username, guild_actor_id) VALUES (?, ?)",
+            (username, guild_actor_id),
+        )
+        self._conn.commit()
+
+    async def record_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        await self._run(self._record_guild_membership, username, guild_actor_id)
+
+    def _get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
+        row = self._conn.execute(
+            "SELECT * FROM guild_memberships WHERE username = ? AND guild_actor_id = ?",
+            (username, guild_actor_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return GuildMembership(username=row["username"], guild_actor_id=row["guild_actor_id"])
+
+    async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
+        return await self._run(self._get_guild_membership, username, guild_actor_id)
+
+    def _is_guild_member(self, guild_actor_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM guild_memberships WHERE guild_actor_id = ? LIMIT 1", (guild_actor_id,)
+        ).fetchone()
+        return row is not None
+
+    async def is_guild_member(self, guild_actor_id: str) -> bool:
+        return await self._run(self._is_guild_member, guild_actor_id)
+
+    def _list_guild_members(self, guild_actor_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT username FROM guild_memberships WHERE guild_actor_id = ?", (guild_actor_id,)
+        ).fetchall()
+        return [row["username"] for row in rows]
+
+    async def list_guild_members(self, guild_actor_id: str) -> list[str]:
+        return await self._run(self._list_guild_members, guild_actor_id)
+
+    def _remove_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM guild_memberships WHERE username = ? AND guild_actor_id = ?", (username, guild_actor_id),
+        )
+        self._conn.commit()
+
+    async def remove_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        await self._run(self._remove_guild_membership, username, guild_actor_id)
+
+    def _set_guild_space(self, guild_actor_id: str, space_room_id: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO guild_spaces (guild_actor_id, space_room_id) VALUES (?, ?)
+            ON CONFLICT(guild_actor_id) DO UPDATE SET space_room_id = excluded.space_room_id
+            """,
+            (guild_actor_id, space_room_id),
+        )
+        self._conn.commit()
+
+    async def set_guild_space(self, guild_actor_id: str, space_room_id: str) -> None:
+        await self._run(self._set_guild_space, guild_actor_id, space_room_id)
+
+    def _get_guild_space(self, guild_actor_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT space_room_id FROM guild_spaces WHERE guild_actor_id = ?", (guild_actor_id,)
+        ).fetchone()
+        return row["space_room_id"] if row else None
+
+    async def get_guild_space(self, guild_actor_id: str) -> str | None:
+        return await self._run(self._get_guild_space, guild_actor_id)
+
+    def _record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
+        for channel_actor_id, name in channels:
+            self._conn.execute(
+                """
+                INSERT INTO guild_channels (channel_actor_id, guild_actor_id, name) VALUES (?, ?, ?)
+                ON CONFLICT(channel_actor_id) DO UPDATE SET guild_actor_id=excluded.guild_actor_id, name=excluded.name
+                """,
+                (channel_actor_id, guild_actor_id, name),
+            )
+        self._conn.commit()
+
+    async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
+        await self._run(self._record_guild_channels, guild_actor_id, channels)
+
+    def _get_guild_channel(self, channel_actor_id: str) -> GuildChannel | None:
+        row = self._conn.execute(
+            "SELECT * FROM guild_channels WHERE channel_actor_id = ?", (channel_actor_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return GuildChannel(
+            channel_actor_id=row["channel_actor_id"], guild_actor_id=row["guild_actor_id"], name=row["name"]
+        )
+
+    async def get_guild_channel(self, channel_actor_id: str) -> GuildChannel | None:
+        return await self._run(self._get_guild_channel, channel_actor_id)
+
+    def _get_channel_room(self, channel_actor_id: str) -> ChannelRoom | None:
+        row = self._conn.execute(
+            "SELECT * FROM channel_rooms WHERE channel_actor_id = ?", (channel_actor_id,)
+        ).fetchone()
+        return self._row_to_channel_room(row) if row else None
+
+    async def get_channel_room(self, channel_actor_id: str) -> ChannelRoom | None:
+        return await self._run(self._get_channel_room, channel_actor_id)
+
+    def _get_channel_room_by_room_id(self, room_id: str) -> ChannelRoom | None:
+        row = self._conn.execute("SELECT * FROM channel_rooms WHERE room_id = ?", (room_id,)).fetchone()
+        return self._row_to_channel_room(row) if row else None
+
+    async def get_channel_room_by_room_id(self, room_id: str) -> ChannelRoom | None:
+        return await self._run(self._get_channel_room_by_room_id, room_id)
+
+    def _register_channel_room(self, record: ChannelRoom) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO channel_rooms (channel_actor_id, room_id, guild_actor_id, display_name)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(channel_actor_id) DO UPDATE SET
+                room_id=excluded.room_id, guild_actor_id=excluded.guild_actor_id, display_name=excluded.display_name
+            """,
+            (record.channel_actor_id, record.room_id, record.guild_actor_id, record.display_name),
+        )
+        self._conn.commit()
+
+    async def register_channel_room(self, record: ChannelRoom) -> None:
+        await self._run(self._register_channel_room, record)
+
+    @staticmethod
+    def _row_to_channel_room(row: sqlite3.Row) -> ChannelRoom:
+        return ChannelRoom(
+            channel_actor_id=row["channel_actor_id"], room_id=row["room_id"],
+            guild_actor_id=row["guild_actor_id"], display_name=row["display_name"],
+        )
+
+    def _is_channel_member_known(self, room_id: str, member_actor_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM channel_room_members WHERE room_id = ? AND member_actor_id = ?",
+            (room_id, member_actor_id),
+        ).fetchone()
+        return row is not None
+
+    async def is_channel_member_known(self, room_id: str, member_actor_id: str) -> bool:
+        return await self._run(self._is_channel_member_known, room_id, member_actor_id)
+
+    def _record_channel_member(self, room_id: str, member_actor_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO channel_room_members (room_id, member_actor_id) VALUES (?, ?)",
+            (room_id, member_actor_id),
+        )
+        self._conn.commit()
+
+    async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
+        await self._run(self._record_channel_member, room_id, member_actor_id)
 
     # -- bot DM rooms --------------------------------------------------------
 

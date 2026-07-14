@@ -122,6 +122,65 @@ class RemoteActorRoom:
 
 
 @dataclass(frozen=True)
+class PendingGuildFollow:
+    """An outstanding FEP-bebd guild-join Follow, between sending it and the
+    guild's Accept/Reject arriving back over the inbox -- unlike an ordinary
+    Follow (which this bridge always treats as accepted optimistically), a
+    guild join is genuinely gated on the invite code's validity, so it can't
+    resolve synchronously the way ``;follow`` does. Consumed (removed) the
+    moment the matching Accept/Reject arrives -- see
+    ``bridge.inbox_dispatch``'s ``_handle_accept``/``_handle_reject``.
+    """
+
+    follow_id: str
+    guild_actor_id: str
+    username: str
+    matrix_user_id: str
+    invite_code: str
+    created_at: float
+
+
+@dataclass(frozen=True)
+class GuildMembership:
+    """One local actor's membership in a joined Shoot guild -- recorded once
+    its ``Follow<Organization>`` is actually Accepted (see
+    ``PendingGuildFollow``). The guild's own Matrix Space (shared across
+    every local member, not per-membership) is tracked separately -- see
+    ``ActorRepository.get_guild_space``/``set_guild_space``."""
+
+    username: str
+    guild_actor_id: str
+
+
+@dataclass(frozen=True)
+class GuildChannel:
+    """One entry from a joined guild's own ``channels`` collection, cached
+    once right after the join Accept (see ``_handle_guild_accept``) so an
+    inbound ``Announce`` can recognize its actor as a known channel via a
+    plain table lookup instead of a live fetch per message -- see
+    ``bridge.inbox_dispatch._handle_announce_locked``'s own disambiguation
+    branch."""
+
+    channel_actor_id: str
+    guild_actor_id: str
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class ChannelRoom:
+    """Maps a Shoot Channel (``Group`` actor) to the Matrix room mirroring
+    it. Deliberately has no single ``ghost_user_id`` the way
+    ``RemoteActorRoom`` does -- a channel's messages come from many
+    different guild-member ghosts, not one, resolved per-message (see
+    ``bridge.channel_bridge``)."""
+
+    channel_actor_id: str
+    room_id: str
+    guild_actor_id: str
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
 class FederatedEvent:
     """Bidirectional link between a Matrix event and the AP object it represents.
 
@@ -423,6 +482,111 @@ class ActorRepository(Protocol):
         it consumes the flag to trigger the one-time auto-backfill. A
         no-op if the room has no pending backfill (already consumed, or
         never set in the first place)."""
+        ...
+
+    async def record_pending_guild_follow(self, record: PendingGuildFollow) -> None:
+        """Record a just-sent guild-join Follow, to be matched against its
+        Accept/Reject when it arrives."""
+        ...
+
+    async def get_pending_guild_follow(self, follow_id: str) -> PendingGuildFollow | None:
+        """The pending guild-join Follow matching ``follow_id`` (the Follow
+        activity's own id), or None if there isn't one -- either it was
+        never one of ours, or it's already been resolved."""
+        ...
+
+    async def remove_pending_guild_follow(self, follow_id: str) -> None:
+        """Consume a pending guild-join Follow once its Accept/Reject has
+        been handled."""
+        ...
+
+    async def record_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        """Record ``username`` as a member of ``guild_actor_id`` -- called
+        once their guild-join Follow is Accepted."""
+        ...
+
+    async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
+        """``username``'s membership record for ``guild_actor_id``, or None
+        if they aren't (or never were) a member."""
+        ...
+
+    async def is_guild_member(self, guild_actor_id: str) -> bool:
+        """Whether ANY local actor is currently a member of
+        ``guild_actor_id`` -- guards against a redundant ``;joinguild`` for
+        a guild this bridge has already joined (same "tracked per local
+        actor, checked in aggregate" convention as ``is_anyone_following``)."""
+        ...
+
+    async def list_guild_members(self, guild_actor_id: str) -> list[str]:
+        """Every local username currently a member of ``guild_actor_id`` --
+        used to invite each of them into a Channel room the first time it's
+        created (see ``bridge.channel_bridge``)."""
+        ...
+
+    async def remove_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        """Drop ``username``'s membership record for ``guild_actor_id`` --
+        see ``bridge.commands._handle_leaveguild``. Purely local bookkeeping:
+        Shoot's own ``Undo(Follow)`` handler is currently a no-op stub
+        (confirmed by reading its source, ``src/util/activitypub/inbox/
+        handlers/undo.ts`` -- validates the object is Follow-shaped, then
+        does nothing else at all), so this is the only side of "leaving" a
+        guild that actually takes effect anywhere right now."""
+        ...
+
+    async def set_guild_space(self, guild_actor_id: str, space_room_id: str) -> None:
+        """Record ``space_room_id`` as ``guild_actor_id``'s Matrix Space --
+        shared by every local member of that guild, unlike the per-user
+        ``user_spaces``/``get_user_space`` (see ``bridge.spaces``)."""
+        ...
+
+    async def get_guild_space(self, guild_actor_id: str) -> str | None:
+        """The room ID of ``guild_actor_id``'s Matrix Space (see
+        ``bridge.spaces.ensure_guild_space``), or None if it doesn't exist
+        yet."""
+        ...
+
+    async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
+        """Cache ``guild_actor_id``'s own ``channels`` collection (each a
+        ``(channel_actor_id, name)`` pair) -- see ``_handle_guild_accept``.
+        Replaces any previously cached list for the same guild."""
+        ...
+
+    async def get_guild_channel(self, channel_actor_id: str) -> GuildChannel | None:
+        """Whether ``channel_actor_id`` is a channel of a guild this bridge
+        has joined -- the disambiguation lookup
+        ``bridge.inbox_dispatch._handle_announce_locked`` uses to recognize
+        a Shoot channel message before falling through to its ordinary
+        repost-Announce logic."""
+        ...
+
+    async def get_channel_room(self, channel_actor_id: str) -> ChannelRoom | None:
+        """The Matrix room mirroring ``channel_actor_id``, or None if
+        nothing's arrived in it yet -- Channel rooms are created lazily, on
+        a channel's first message (see ``bridge.channel_bridge``)."""
+        ...
+
+    async def get_channel_room_by_room_id(self, room_id: str) -> ChannelRoom | None:
+        """The reverse of ``get_channel_room`` -- which Channel ``room_id``
+        mirrors, or None if it isn't a channel room at all. Used by
+        ``bridge.membership``'s join/leave gates and outbound channel-message
+        federation to recognize the room."""
+        ...
+
+    async def register_channel_room(self, record: ChannelRoom) -> None:
+        """Record a freshly created Channel room."""
+        ...
+
+    async def is_channel_member_known(self, room_id: str, member_actor_id: str) -> bool:
+        """Whether ``member_actor_id`` has already been seen (and so
+        already has a ghost invited) in the channel room ``room_id`` --
+        pure optimization to skip a redundant resolve+invite, not a
+        correctness dependency (``resolve_and_invite_ghost`` is already
+        idempotent on its own)."""
+        ...
+
+    async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
+        """Record that ``member_actor_id`` has now been seen speaking in
+        the channel room ``room_id``."""
         ...
 
     async def record_federated_event(self, record: FederatedEvent, *, is_primary: bool = True) -> None:
@@ -739,6 +903,13 @@ class InMemoryActorRepository:
         self._ghost_chat_room_ids: set[str] = set()
         self._ghost_chat_room_history: dict[str, tuple[str, str]] = {}  # room_id -> (actor_id, matrix_user_id)
         self._third_party_allows: dict[tuple[str, str], ThirdPartyAllowRecord] = {}
+        self._pending_guild_follows: dict[str, PendingGuildFollow] = {}
+        self._guild_memberships: dict[tuple[str, str], GuildMembership] = {}
+        self._guild_spaces: dict[str, str] = {}
+        self._guild_channels: dict[str, GuildChannel] = {}
+        self._channel_rooms: dict[str, ChannelRoom] = {}
+        self._channel_rooms_by_room_id: dict[str, ChannelRoom] = {}
+        self._channel_room_members: set[tuple[str, str]] = set()
 
     async def get_local_actor(self, username: str) -> ActorRecord | None:
         state = self._actors.get(username)
@@ -925,6 +1096,63 @@ class InMemoryActorRepository:
         updated = replace(record, pending_backfill=False)
         self._remote_rooms[record.actor_id] = updated
         self._remote_rooms_by_room_id[room_id] = updated
+
+    async def record_pending_guild_follow(self, record: PendingGuildFollow) -> None:
+        self._pending_guild_follows[record.follow_id] = record
+
+    async def get_pending_guild_follow(self, follow_id: str) -> PendingGuildFollow | None:
+        return self._pending_guild_follows.get(follow_id)
+
+    async def remove_pending_guild_follow(self, follow_id: str) -> None:
+        self._pending_guild_follows.pop(follow_id, None)
+
+    async def record_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        self._guild_memberships[(username, guild_actor_id)] = GuildMembership(
+            username=username, guild_actor_id=guild_actor_id
+        )
+
+    async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
+        return self._guild_memberships.get((username, guild_actor_id))
+
+    async def is_guild_member(self, guild_actor_id: str) -> bool:
+        return any(gid == guild_actor_id for _, gid in self._guild_memberships)
+
+    async def list_guild_members(self, guild_actor_id: str) -> list[str]:
+        return [u for (u, gid) in self._guild_memberships if gid == guild_actor_id]
+
+    async def remove_guild_membership(self, username: str, guild_actor_id: str) -> None:
+        self._guild_memberships.pop((username, guild_actor_id), None)
+
+    async def set_guild_space(self, guild_actor_id: str, space_room_id: str) -> None:
+        self._guild_spaces[guild_actor_id] = space_room_id
+
+    async def get_guild_space(self, guild_actor_id: str) -> str | None:
+        return self._guild_spaces.get(guild_actor_id)
+
+    async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
+        for channel_actor_id, name in channels:
+            self._guild_channels[channel_actor_id] = GuildChannel(
+                channel_actor_id=channel_actor_id, guild_actor_id=guild_actor_id, name=name
+            )
+
+    async def get_guild_channel(self, channel_actor_id: str) -> GuildChannel | None:
+        return self._guild_channels.get(channel_actor_id)
+
+    async def get_channel_room(self, channel_actor_id: str) -> ChannelRoom | None:
+        return self._channel_rooms.get(channel_actor_id)
+
+    async def get_channel_room_by_room_id(self, room_id: str) -> ChannelRoom | None:
+        return self._channel_rooms_by_room_id.get(room_id)
+
+    async def register_channel_room(self, record: ChannelRoom) -> None:
+        self._channel_rooms[record.channel_actor_id] = record
+        self._channel_rooms_by_room_id[record.room_id] = record
+
+    async def is_channel_member_known(self, room_id: str, member_actor_id: str) -> bool:
+        return (room_id, member_actor_id) in self._channel_room_members
+
+    async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
+        self._channel_room_members.add((room_id, member_actor_id))
 
     async def record_federated_event(self, record: FederatedEvent, *, is_primary: bool = True) -> None:
         self._federated_by_matrix_event[record.event_id] = record

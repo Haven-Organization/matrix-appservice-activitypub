@@ -183,6 +183,13 @@ class Note:
     # side_effects.ex); Mastodon doesn't gate on type here, so "Answer" is
     # correct for both. Absent for every ordinary post.
     name: str | None = None
+    # FEP-7888 containment: set on an outbound Shoot Channel message (see
+    # bridge.channel_bridge.maybe_distribute_channel_message) to the
+    # Channel actor it belongs to -- matches the shape Shoot's own channel
+    # messages use (confirmed live 2026-07-14: attributedTo names the
+    # AUTHOR, context/to name the CHANNEL). Absent for every ordinary
+    # top-level post, which has no such containment to express.
+    context: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _without_none(
@@ -202,6 +209,7 @@ class Note:
                 "tag": self.tag,
                 "attachment": self.attachment,
                 "name": self.name,
+                "context": self.context,
             }
         )
 
@@ -327,6 +335,10 @@ class Activity:
     # matched against `content` by bridge.inbox_dispatch to resolve the
     # reaction's actual image. Absent (empty) for every other activity type.
     tag: list[dict[str, Any]] = field(default_factory=list)
+    # FEP-bebd's invite-gated Follow: the InviteCode object's own id, carried
+    # on a Follow<Organization> to join a Shoot guild. Absent for every other
+    # activity type/ordinary Follow.
+    instrument: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         obj: Any
@@ -345,6 +357,7 @@ class Activity:
                 "to": self.to,
                 "cc": self.cc,
                 "content": self.content,
+                "instrument": self.instrument,
             }
         )
 
@@ -375,6 +388,7 @@ class Activity:
             cc=list(data.get("cc", []) or []),
             content=data.get("content"),
             tag=list(data.get("tag", []) or []),
+            instrument=data.get("instrument"),
         )
 
     def object_id(self) -> str | None:

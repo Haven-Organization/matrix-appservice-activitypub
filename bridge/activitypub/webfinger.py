@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from fastapi import Request
+
+from bridge.activitypub.remote_actor import RemoteActorFetchError, fetch_actor
 
 ACCT_RE = re.compile(r"^acct:([^@]+)@(.+)$")
 
@@ -116,6 +119,84 @@ async def resolve_remote_actor_id(http_client: httpx.AsyncClient, acct: str) -> 
                 return href
 
     raise WebfingerNotFoundError(f"No ActivityPub actor link found in webfinger response for {handle!r}")
+
+
+async def resolve_invite_code(request: Request, code: str, domain: str) -> tuple[dict[str, Any], str]:
+    """Resolve a Shoot guild invite code to ``(invite_code_object,
+    qualified_mention)``, per FEP-bebd's optional WebFinger extension
+    (``?resource=invite:CODE@domain``).
+
+    ``qualified_mention`` is the exact ``code@domain`` string a joining
+    ``Follow`` must carry in its ``instrument`` field -- confirmed live
+    2026-07-14 against Shoot's own ``FollowActivityHandler`` source: it is
+    NOT the InviteCode object's own IRI (an earlier version of this
+    function assumed that and got a live 400 "Shoot only supports
+    InviteCodes from itself"), and the ``domain`` half specifically must
+    match the guild's ``federation.webapp_url`` hostname -- which can
+    differ from whichever host actually answers WebFinger (confirmed live:
+    ``chat.understars.dev`` serves WebFinger for codes canonically
+    qualified as ``@understars.dev``). Rather than reconstruct this from
+    whatever domain we happened to query, it's read straight back out of
+    the WebFinger response's own ``subject`` field (stripping its
+    ``invite:`` prefix), which reports the canonical qualification
+    regardless of which host actually served the response.
+
+    The object itself is fetched (a SIGNED GET -- unlike the WebFinger step
+    itself, Shoot's own maintainer has said "basically everything is
+    private and requires an authorised user (via http signatures) to
+    access", see ``bridge.activitypub.remote_actor.fetch_actor``, already
+    signs every GET as the bridge's own service actor) so its
+    ``attributedTo`` (the guild being invited to) is available too.
+
+    Raises the same ``WebfingerNotFoundError``/``WebfingerUnreachableError``
+    split as ``resolve_remote_actor_id`` for the WebFinger step; a failure
+    fetching the resolved IRI itself raises ``WebfingerUnreachableError``
+    (wrapping the underlying ``RemoteActorFetchError``), since by that point
+    WebFinger has already given an authoritative "the code resolves to
+    this" answer -- any failure past that point is a reachability problem,
+    not a "no such code" one.
+    """
+    url = f"https://{domain}/.well-known/webfinger"
+    try:
+        response = await request.app.state.http_client.get(
+            url, params={"resource": f"invite:{code}@{domain}"},
+            headers={"Accept": "application/jrd+json, application/json"},
+        )
+    except httpx.RequestError as exc:
+        raise WebfingerUnreachableError(f"Could not reach {domain}: {exc}") from exc
+
+    if response.status_code >= 500:
+        raise WebfingerUnreachableError(
+            f"{domain} returned a server error ({response.status_code}) resolving invite code {code!r}"
+        )
+    if response.status_code >= 400:
+        raise WebfingerNotFoundError(f"{domain} has no invite code {code!r} ({response.status_code})")
+
+    try:
+        document = response.json()
+    except ValueError as exc:
+        raise WebfingerUnreachableError(
+            f"{domain} returned a webfinger response that isn't valid JSON for invite code {code!r}"
+        ) from exc
+
+    invite_code_url: str | None = None
+    for link in document.get("links", []):
+        if link.get("rel") == "self" and "activity+json" in (link.get("type") or ""):
+            href = link.get("href")
+            if href:
+                invite_code_url = href
+                break
+    if invite_code_url is None:
+        raise WebfingerNotFoundError(f"No InviteCode link found in webfinger response for code {code!r}")
+
+    subject = document.get("subject")
+    qualified_mention = subject.removeprefix("invite:") if isinstance(subject, str) else f"{code}@{domain}"
+
+    try:
+        invite_code_doc = await fetch_actor(request, invite_code_url)
+    except RemoteActorFetchError as exc:
+        raise WebfingerUnreachableError(f"Could not fetch InviteCode object at {invite_code_url}: {exc}") from exc
+    return invite_code_doc, qualified_mention
 
 
 def build_local_webfinger_document(
