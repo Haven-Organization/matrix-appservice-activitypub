@@ -537,7 +537,7 @@ async def refresh_poll_tallies(request: Request, *, target: FederatedEvent) -> b
     if remote_room is None:
         return False
     try:
-        question = await fetch_actor(request.app.state.http_client, target.ap_object_id)
+        question = await fetch_actor(request, target.ap_object_id)
     except RemoteActorFetchError:
         return False
     if question.get("type") != "Question":
@@ -1379,7 +1379,7 @@ async def resolve_and_invite_ghost(request: Request, actor_id: str, room_id: str
         return None
 
     try:
-        actor_doc = await fetch_actor(http_client, actor_id)
+        actor_doc = await fetch_actor(request, actor_id)
     except RemoteActorFetchError:
         actor_doc = {}
 
@@ -1765,7 +1765,7 @@ async def provision_ghost(request: Request, actor_id: str) -> tuple[str, dict, s
         return None
 
     try:
-        actor_doc = await fetch_actor(http_client, actor_id)
+        actor_doc = await fetch_actor(request, actor_id)
     except RemoteActorFetchError:
         actor_doc = {}
 

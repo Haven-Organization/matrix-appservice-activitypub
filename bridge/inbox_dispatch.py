@@ -796,7 +796,7 @@ async def _maybe_import_quoted_note(
     if policy == "known" and await repository.get_remote_actor_room(quoted_author_id) is None:
         return None
     try:
-        author_doc = await fetch_actor(request.app.state.http_client, quoted_author_id)
+        author_doc = await fetch_actor(request, quoted_author_id)
     except RemoteActorFetchError:
         author_doc = {}
     imported = await import_note(request, note=quoted_obj, author_actor_id=quoted_author_id, author_doc=author_doc)
@@ -902,7 +902,7 @@ async def _quoted_post_render(
         quoted_ref = (existing.room_id, existing.event_id)
     else:
         try:
-            quoted_obj = await fetch_actor(request.app.state.http_client, quote_uri)
+            quoted_obj = await fetch_actor(request, quote_uri)
         except RemoteActorFetchError:
             quoted_obj = None
         if quoted_obj is not None and quoted_obj.get("type") == "Note":
@@ -1189,7 +1189,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             logger.info("Dropping Question from an actor nobody here follows: %s", activity.actor)
             return
         try:
-            author_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+            author_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             author_doc = {}
         await import_question(request, question=obj, author_actor_id=activity.actor, author_doc=author_doc)
@@ -1293,7 +1293,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # would. import_note does its own dedup (redelivery-safe) and runs
         # notify_mentioned_locals itself.
         try:
-            author_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+            author_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             author_doc = {}
         await import_note(request, note=obj, author_actor_id=activity.actor, author_doc=author_doc)
@@ -1320,7 +1320,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # Y's post" card below instead of just its own (often blank, for a
         # commentless renote) content.
         try:
-            author_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+            author_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             author_doc = {}
         remote_room, _ = await ensure_remote_actor_room(
@@ -1354,7 +1354,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # intended, but produced no notification at all, since nothing
         # here previously called _notify_post_owner for a quote.
         try:
-            quoter_actor_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+            quoter_actor_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             quoter_actor_doc = {}
         await _notify_post_owner(
@@ -1598,7 +1598,7 @@ async def _backfill_ancestor_chain(
         if root_author is None:
             return None, False
         try:
-            root_author_doc = await fetch_actor(request.app.state.http_client, root_author)
+            root_author_doc = await fetch_actor(request, root_author)
         except RemoteActorFetchError:
             root_author_doc = {}
         imported = await import_note(
@@ -2057,7 +2057,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     reposted_target = await repository.get_federated_event_by_ap_object(reposted_id) if reposted_id else None
     if reposted_target is not None:
         try:
-            reposter_actor_doc = await fetch_actor(request.app.state.http_client, activity.actor)
+            reposter_actor_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             reposter_actor_doc = {}
         await _notify_post_owner(
@@ -2079,7 +2079,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     original_actor_doc: dict = {}
     if isinstance(original_author_id, str):
         try:
-            original_actor_doc = await fetch_actor(request.app.state.http_client, original_author_id)
+            original_actor_doc = await fetch_actor(request, original_author_id)
         except RemoteActorFetchError:
             original_actor_doc = {}
 
@@ -2194,7 +2194,7 @@ async def _resolve_object(request: Request, obj_field) -> dict | None:
         try:
             # fetch_actor is a generic AP-Accept-header GET despite the name
             # -- reused here to fetch a Note, not an actor.
-            return await fetch_actor(request.app.state.http_client, obj_field)
+            return await fetch_actor(request, obj_field)
         except RemoteActorFetchError:
             return None
     return None
@@ -2367,7 +2367,7 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     obj = activity.object
     if isinstance(obj, str):
         try:
-            obj = await fetch_actor(request.app.state.http_client, obj)
+            obj = await fetch_actor(request, obj)
         except RemoteActorFetchError:
             return
     if isinstance(obj, dict) and obj.get("type") == "Question":

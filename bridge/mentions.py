@@ -78,7 +78,7 @@ async def _author_handle(request: Request, author_id: str) -> str | None:
     if profile is not None and profile.handle:
         return profile.handle if profile.handle.startswith("@") else f"@{profile.handle}"
     try:
-        actor_doc = await fetch_actor(request.app.state.http_client, author_id)
+        actor_doc = await fetch_actor(request, author_id)
     except RemoteActorFetchError:
         return None
     username = actor_doc.get("preferredUsername") or author_id.rstrip("/").rsplit("/", 1)[-1]

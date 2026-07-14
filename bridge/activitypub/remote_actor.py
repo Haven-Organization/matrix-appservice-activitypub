@@ -5,17 +5,50 @@ from __future__ import annotations
 import httpx
 from fastapi import Request
 
-from bridge.activitypub.urls import username_from_actor_url
+from bridge.activitypub.signatures import sign_request
+from bridge.activitypub.urls import main_key_id, username_from_actor_url
 
 
 class RemoteActorFetchError(Exception):
     """Raised when a remote actor document can't be fetched or parsed."""
 
 
-async def fetch_actor(http_client: httpx.AsyncClient, actor_id: str) -> dict:
-    """``GET`` an actor's JSON-LD document."""
+async def fetch_actor(request: Request, actor_id: str) -> dict:
+    """``GET`` an actor's JSON-LD document, signed as the bridge's own
+    persistent service actor (see ``bridge.service_actor``).
+
+    Some servers require HTTP Signatures on actor-document GETs too, not
+    just inbox POSTs ("authorized fetch"/secure mode -- Mastodon supports
+    this as an admin-configurable mode; confirmed live 2026-07-14 that
+    Shoot's own reference deployment at chat.understars.dev requires it
+    unconditionally) -- an unsigned GET gets a flat ``400 Missing
+    signature`` with no actor document recoverable from it at all, which
+    broke EVERY use of this function against that server: inbound Follow/
+    Create signature verification (``ActorKeyCache.get``, which fetches the
+    sender's public key this same way and hit the identical wall), ghost
+    provisioning, mention/quote resolution, all of it. Signing
+    unconditionally costs nothing against a server that doesn't require
+    it (the signature is simply ignored), so there's no reason to make it
+    optional/conditional.
+    """
+    config = request.app.state.config
+    service_actor = request.app.state.service_actor
+    headers = {"Accept": "application/activity+json"}
+    headers.update(
+        sign_request(
+            method="GET",
+            url=actor_id,
+            body=b"",
+            key_id=main_key_id(config.bridge.public_base_url, service_actor.username),
+            private_key_pem=service_actor.private_key_pem,
+            # No body on a GET -- Digest doesn't apply (see deliver_activity's
+            # own default DEFAULT_SIGNED_HEADERS, which DOES include Digest,
+            # for the contrasting POST case).
+            signed_headers=("(request-target)", "host", "date"),
+        )
+    )
     try:
-        response = await http_client.get(actor_id, headers={"Accept": "application/activity+json"})
+        response = await request.app.state.http_client.get(actor_id, headers=headers)
     except httpx.HTTPError as exc:
         raise RemoteActorFetchError(f"Failed to fetch actor {actor_id}: {exc}") from exc
 
@@ -46,7 +79,7 @@ async def resolve_actor_inbox(request: Request, actor_id: str) -> str | None:
     if remote_room is not None:
         return remote_room.inbox_url
     try:
-        doc = await fetch_actor(request.app.state.http_client, actor_id)
+        doc = await fetch_actor(request, actor_id)
     except RemoteActorFetchError:
         return None
     return doc.get("inbox")

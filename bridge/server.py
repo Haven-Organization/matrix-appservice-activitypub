@@ -22,6 +22,7 @@ from fastapi import FastAPI
 
 from bridge.activitypub.routes import router as activitypub_router
 from bridge.activitypub.signatures import ActorKeyCache
+from bridge.activitypub.urls import main_key_id
 from bridge.appservice_routes import router as appservice_router
 from bridge.config import BridgeConfig, ConfigError
 from bridge.ghosts import ensure_ghost_user
@@ -120,6 +121,17 @@ def create_app(
         app.state.config = config
         app.state.repository = repository or await _create_repository(config)
 
+        # Moved ahead of http_client/key_cache below (only needs the
+        # repository) so its key material is available to sign THEIR own
+        # setup -- see ActorKeyCache's signing_key_id/signing_private_key_pem
+        # below.
+        app.state.service_actor = await load_or_create_service_actor(
+            app.state.repository,
+            localpart=config.appservice.bot_localpart,
+            matrix_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
+            display_name="Fediverse Bridge",
+        )
+
         # Several real-world implementations (Pleroma/Akkoma notably) 302 a
         # post's human-facing permalink (e.g. /notice/<id>) to its actual AP
         # object URL (e.g. /objects/<uuid>) rather than content-negotiating
@@ -131,7 +143,16 @@ def create_app(
         http_client = httpx.AsyncClient(timeout=config.federation.request_timeout, follow_redirects=True)
         app.state.http_client = http_client
         app.state.key_cache = ActorKeyCache(
-            http_client, ttl_seconds=config.federation.actor_key_cache_ttl
+            http_client,
+            ttl_seconds=config.federation.actor_key_cache_ttl,
+            # Some servers require HTTP Signatures on actor-document GETs
+            # too, not just inbox POSTs (confirmed live 2026-07-14 against
+            # Shoot's own chat.understars.dev -- see
+            # bridge.activitypub.remote_actor.fetch_actor's own docstring
+            # for the fuller story) -- signed as the bridge's own service
+            # actor, the same identity used for every other fetch_actor call.
+            signing_key_id=main_key_id(config.bridge.public_base_url, app.state.service_actor.username),
+            signing_private_key_pem=app.state.service_actor.private_key_pem,
         )
         app.state.synapse = SynapseClient(
             config.synapse.base_url,
@@ -140,13 +161,6 @@ def create_app(
             timeout=config.federation.request_timeout,
         )
         await _wait_for_synapse_ready(app.state.synapse, config.synapse.base_url)
-
-        app.state.service_actor = await load_or_create_service_actor(
-            app.state.repository,
-            localpart=config.appservice.bot_localpart,
-            matrix_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
-            display_name="Fediverse Bridge",
-        )
 
         if config.appservice.bot_display_name or config.appservice.bot_avatar_mxc:
             # Compare-first: only push the bot's profile when it actually

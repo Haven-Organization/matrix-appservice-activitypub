@@ -1249,7 +1249,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
     if tagged_ghost is not None:
         remote_actor_id = tagged_ghost.actor_id
         try:
-            actor_doc = await fetch_actor(http_client, remote_actor_id)
+            actor_doc = await fetch_actor(request, remote_actor_id)
         except RemoteActorFetchError as exc:
             await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
             return
@@ -1277,7 +1277,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             await _follow_local_actor(request, sender=sender, room_id=room_id, target=target)
             return
         try:
-            actor_doc = await fetch_actor(http_client, remote_actor_id)
+            actor_doc = await fetch_actor(request, remote_actor_id)
         except RemoteActorFetchError as exc:
             await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
             return
@@ -1292,7 +1292,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             return
         remote_actor_id = remote_room_here.actor_id
         try:
-            actor_doc = await fetch_actor(http_client, remote_actor_id)
+            actor_doc = await fetch_actor(request, remote_actor_id)
         except RemoteActorFetchError as exc:
             await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
             return
@@ -2477,7 +2477,7 @@ async def _run_follows_import(
                 skipped += 1
                 continue
             try:
-                actor_doc = await fetch_actor(http_client, remote_actor_id)
+                actor_doc = await fetch_actor(request, remote_actor_id)
             except RemoteActorFetchError as exc:
                 failures.append((handle, f"couldn't fetch their account: {exc}"))
                 continue
@@ -2548,7 +2548,7 @@ async def _collect_recent_items(request: Request, collection: dict | str, *, lim
                 items.append(entry)
             elif isinstance(entry, str):
                 try:
-                    items.append(await fetch_actor(http_client, entry))
+                    items.append(await fetch_actor(request, entry))
                 except RemoteActorFetchError:
                     continue
 
@@ -2556,7 +2556,7 @@ async def _collect_recent_items(request: Request, collection: dict | str, *, lim
         root = collection
     else:
         try:
-            root = await fetch_actor(http_client, collection)
+            root = await fetch_actor(request, collection)
         except RemoteActorFetchError:
             return items
 
@@ -2572,7 +2572,7 @@ async def _collect_recent_items(request: Request, collection: dict | str, *, lim
                 break  # a misbehaving server looping "next" back on itself
             seen_urls.add(page_ref)
             try:
-                page = await fetch_actor(http_client, page_ref)
+                page = await fetch_actor(request, page_ref)
             except RemoteActorFetchError:
                 break
         await _extend(page.get("orderedItems") if page.get("orderedItems") is not None else page.get("items"))
@@ -2703,7 +2703,7 @@ async def _resolve_backfill_source(
                 "That thread isn't one I'm tracking -- can't tell which fediverse post it maps to."
             )
         try:
-            root_note = await fetch_actor(http_client, root_event.ap_object_id)
+            root_note = await fetch_actor(request, root_event.ap_object_id)
         except RemoteActorFetchError as exc:
             raise _BackfillSourceError(f"Couldn't fetch that thread's post: {exc}") from exc
         replies = root_note.get("replies")
@@ -2713,7 +2713,7 @@ async def _resolve_backfill_source(
         return raw_items, None
 
     try:
-        actor_doc = await fetch_actor(http_client, remote_room.actor_id)
+        actor_doc = await fetch_actor(request, remote_room.actor_id)
     except RemoteActorFetchError as exc:
         raise _BackfillSourceError(f"Couldn't fetch their account: {exc}") from exc
     outbox = actor_doc.get("outbox")
@@ -2888,14 +2888,14 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     repository = request.app.state.repository
 
     try:
-        obj = await fetch_actor(http_client, url)
+        obj = await fetch_actor(request, url)
     except RemoteActorFetchError as exc:
         fallback_url = _pretty_post_url_fallback(url)
         if fallback_url is None:
             await _notice(request, room_id, f"Could not fetch {url}: {exc}")
             return
         try:
-            obj = await fetch_actor(http_client, fallback_url)
+            obj = await fetch_actor(request, fallback_url)
         except RemoteActorFetchError:
             await _notice(request, room_id, f"Could not fetch {url}: {exc}")
             return
@@ -2951,7 +2951,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         # import_question, which does its own ghost/room provisioning
         # (shared with live inbound poll mirroring; see its own docstring).
         try:
-            author_doc = await fetch_actor(http_client, author_actor_id)
+            author_doc = await fetch_actor(request, author_actor_id)
         except RemoteActorFetchError as exc:
             await _notice(request, room_id, f"Could not fetch the poll's author ({author_actor_id}): {exc}")
             return
@@ -3009,7 +3009,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     # standalone behavior: mirror into a Remote User Room dedicated to THIS
     # post's own author, creating one on demand.
     try:
-        author_doc = await fetch_actor(http_client, author_actor_id)
+        author_doc = await fetch_actor(request, author_actor_id)
     except RemoteActorFetchError as exc:
         await _notice(request, room_id, f"Could not fetch the post's author ({author_actor_id}): {exc}")
         return
@@ -3303,7 +3303,7 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
         remote_actor_id = remote_room.actor_id
 
     try:
-        actor_doc = await fetch_actor(http_client, remote_actor_id)
+        actor_doc = await fetch_actor(request, remote_actor_id)
     except RemoteActorFetchError as exc:
         await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
         return
@@ -4530,7 +4530,7 @@ async def _replace_remote_actor_room(
     bot_mxid = _bot_mxid(config)
 
     try:
-        actor_doc = await fetch_actor(http_client, remote_room.actor_id)
+        actor_doc = await fetch_actor(request, remote_room.actor_id)
     except RemoteActorFetchError:
         actor_doc = {}
 

@@ -200,10 +200,19 @@ class ActorKeyCache:
     ``publicKey.publicKeyPem`` from the returned Actor JSON-LD document.
     """
 
-    def __init__(self, http_client: httpx.AsyncClient, ttl_seconds: int = 3600) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        ttl_seconds: int = 3600,
+        *,
+        signing_key_id: str,
+        signing_private_key_pem: str,
+    ) -> None:
         self._client = http_client
         self._ttl = ttl_seconds
         self._cache: dict[str, tuple[float, str]] = {}
+        self._signing_key_id = signing_key_id
+        self._signing_private_key_pem = signing_private_key_pem
 
     async def get(self, key_id: str) -> str:
         cached = self._cache.get(key_id)
@@ -211,6 +220,21 @@ class ActorKeyCache:
             return cached[1]
 
         actor_url = key_id.split("#", 1)[0]
+        # Signed the same way bridge.activitypub.remote_actor.fetch_actor is
+        # (see that function's own docstring) -- some servers require HTTP
+        # Signatures on this GET too, not just inbox POSTs, and this is the
+        # one actor-document fetch in the whole codebase that ISN'T routed
+        # through fetch_actor (it runs during signature verification itself,
+        # before a full Request/app.state is necessarily the natural thing
+        # to thread through), so it needs its own copy of the same fix.
+        headers = {"Accept": "application/activity+json"}
+        headers.update(
+            sign_request(
+                method="GET", url=actor_url, body=b"",
+                key_id=self._signing_key_id, private_key_pem=self._signing_private_key_pem,
+                signed_headers=("(request-target)", "host", "date"),
+            )
+        )
         # A remote actor can be gone (410, deleted account), unreachable, or
         # just not JSON -- any of that means we can't verify this request,
         # which is a normal, expected outcome (someone signing with a key
@@ -218,9 +242,7 @@ class ActorKeyCache:
         # SignatureError so the caller rejects the request with a clean 401,
         # not an unhandled exception crashing the whole response with a 500.
         try:
-            response = await self._client.get(
-                actor_url, headers={"Accept": "application/activity+json"}
-            )
+            response = await self._client.get(actor_url, headers=headers)
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as exc:
