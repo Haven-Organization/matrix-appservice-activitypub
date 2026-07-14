@@ -1041,6 +1041,24 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     attachment = build_ap_attachment(base, event_content)
     _body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
 
+    # A redaction empties a Matrix event's `content` (Synapse still serves
+    # the event itself -- `get_event` above only 404s if it's gone
+    # entirely) rather than removing it, so a redacted post's own
+    # FederatedEvent row is still there and still resolves here -- without
+    # this check this route just re-served the same (now content-less)
+    # Note forever, live-confirmed 2026-07-13 on a post whose Matrix side
+    # had already been redacted (and whose followers -- if any existed --
+    # already got a real Delete via bridge.delete_bridge): anyone
+    # dereferencing this URL directly (a remote server rendering a
+    # permalink, not relying on push delivery) kept getting a normal `200
+    # Note` with blank content indefinitely, never a real "this is gone."
+    # Same "nothing here" test get_outbox/_build_post_view already use
+    # (_fetch_room_outbox_notes/_build_post_view's own `if not body and
+    # attachment is None` checks) -- kept consistent rather than adding a
+    # second, separately-drifting way to detect "empty."
+    if not _body and attachment is None:
+        raise HTTPException(status_code=410, detail="Gone")
+
     note_tags: list[dict] = []
     guest_mention = await _guest_post_owner_mention(request, federated)
     if guest_mention is not None:
