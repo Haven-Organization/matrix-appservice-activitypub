@@ -335,6 +335,19 @@ class SynapseClient:
         is_v12_plus = _room_version_is_v12_or_later(effective_version)
 
         override = dict(power_level_content_override) if power_level_content_override else None
+        # Synapse rejects ANY power_level_content_override.users on a
+        # pre-v12 (non-implicit-creator) room unless as_user_id itself is
+        # already a key in it -- regardless of what level it's granted or
+        # whether additional_creators is even in play (confirmed via
+        # synapse/handlers/room.py's own "'users' did not contain %s"
+        # check). setdefault so an explicit level a caller already put
+        # there for as_user_id is never clobbered.
+        if not is_v12_plus and override and "users" in override:
+            override = dict(override)
+            users_override = dict(override.get("users") or {})
+            if as_user_id:
+                users_override.setdefault(as_user_id, 100)
+            override["users"] = users_override
         if additional_creators and not is_v12_plus:
             override = dict(override or {})
             users_override = dict(override.get("users") or {})
