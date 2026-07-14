@@ -45,10 +45,12 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
+from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
 from bridge.commands import is_third_party_still_allowed, message_addresses_bot
@@ -192,6 +194,22 @@ async def _send_outbound_dm(
     (rather than folded into one generic function covering both) since the
     public case's ``to``/``cc`` addressing and recipient resolution are
     different enough that sharing would need more branching than it'd save.
+
+    ``content``'s HTML wrapping (``plain_text_to_note_html`` -- every other
+    outbound Note, DM or public, gets this) assumes a Mastodon-family
+    recipient that renders ``content`` as sanitized HTML. Confirmed live
+    2026-07-14: Shoot (github.com/MaddyUnderStars/shoot) stores AND
+    displays a message's ``content`` completely raw, no HTML parsing at
+    all (its own transformer just does ``content: note.content``/
+    ``content: message.content`` in both directions, verbatim) -- so the
+    ``<p>...</p>`` tags show up as literal, visible text in its UI instead
+    of ever being rendered as paragraphs. Detected via NodeInfo (see
+    ``bridge.activitypub.nodeinfo.remote_software_name`` -- nothing in a
+    Shoot actor DOCUMENT itself is distinguishable from an ordinary
+    Mastodon ``Person``), and only applied here (DM/Chat delivery to a
+    single known fediverse party) -- ordinary public replies keep the HTML
+    convention unconditionally, since Shoot's own channel/guild model
+    doesn't interact with that path at all yet (see GitHub issue #3).
     """
     repository = request.app.state.repository
     config = request.app.state.config
@@ -226,10 +244,16 @@ async def _send_outbound_dm(
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    recipient_domain = urlsplit(recipient_actor_id).hostname or ""
+    software = await remote_software_name(request, recipient_domain) if recipient_domain else None
+    # See this function's own docstring -- Shoot renders `content` completely
+    # raw, so the usual HTML wrapping shows up as literal tag text there.
+    content_html = body if software == "shoot" else plain_text_to_note_html(body, mention_links)
+
     note = Note(
         id=note_id,
         attributed_to=actor_url(base, actor_record.username),
-        content=plain_text_to_note_html(body, mention_links) if body else "",
+        content=content_html if body else "",
         published=published,
         to=[recipient_actor_id],
         cc=mention_cc,
@@ -355,20 +379,32 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             thread_root_event_id=None,
         )
 
-        try:
-            offending_event_id = event.get("event_id")
-            notice_content: dict = {
-                "msgtype": "m.notice",
-                "body": "Your message was sent to the fediverse as a new direct message, not a "
-                "reply -- reply directly to a specific message next time to keep it in that thread.",
-            }
-            # Same reasoning as the link-profile notice above: a real reply
-            # to the message it's talking about, so it's obvious which one.
-            if offending_event_id:
-                notice_content["m.relates_to"] = {"m.in_reply_to": {"event_id": offending_event_id}}
-            await request.app.state.synapse.send_message_event(room_id, notice_content, as_user_id=bot_mxid)
-        except Exception:
-            logger.warning("Failed to send new-DM notice to %s", room_id, exc_info=True)
+        # This notice exists to steer a Mastodon/Pleroma-style DM partner
+        # toward proper inReplyTo threading, which THEIR own UI benefits
+        # from -- but Shoot's chat UI has no equivalent concept at all
+        # (every message is just an ordinary sequential chat message, never
+        # "should have been a reply"), so for a Shoot recipient specifically
+        # this fired on every single message with nothing to actually warn
+        # about (confirmed live 2026-07-14 -- a normal back-and-forth chat
+        # produced this notice constantly). Same NodeInfo detection as
+        # _send_outbound_dm's own content-format check.
+        recipient_domain = urlsplit(recipient_actor_id).hostname or ""
+        software = await remote_software_name(request, recipient_domain) if recipient_domain else None
+        if software != "shoot":
+            try:
+                offending_event_id = event.get("event_id")
+                notice_content: dict = {
+                    "msgtype": "m.notice",
+                    "body": "Your message was sent to the fediverse as a new direct message, not a "
+                    "reply -- reply directly to a specific message next time to keep it in that thread.",
+                }
+                # Same reasoning as the link-profile notice above: a real reply
+                # to the message it's talking about, so it's obvious which one.
+                if offending_event_id:
+                    notice_content["m.relates_to"] = {"m.in_reply_to": {"event_id": offending_event_id}}
+                await request.app.state.synapse.send_message_event(room_id, notice_content, as_user_id=bot_mxid)
+            except Exception:
+                logger.warning("Failed to send new-DM notice to %s", room_id, exc_info=True)
         return True
 
     parent = await repository.get_federated_event_by_matrix_event(target_event_id)
