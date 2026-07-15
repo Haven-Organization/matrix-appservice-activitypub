@@ -2,9 +2,9 @@
 
 ![A Matrix room mirroring the Free Software Foundation's Mastodon account side-by-side with the actual Mastodon profile, showing matching posts](screenshots/screenshot1.png)
 
-Turns your Matrix server into a fully functioning ActivityPub server. Matrix  users can post, follow, reply, react, and DM across the fediverse using ordinary Matrix rooms and clients. No separate account or server needed.  
+Turns your Matrix server into a fully functioning ActivityPub server. Matrix  users can post, follow, reply, react, and DM across the fediverse using ordinary Matrix rooms and clients. No separate account or server needed.
 
-Runs natively as a single Python process, no containers required. It talks to your homeserver exclusively through the Client-Server API (plus the Application Service push API for inbound events), never by touching its database directly. Its Admin API is also used by default, for two admin-gated commands (checking another user's admin status, and a couple of full-room-sweep commands) that have no Client-Server equivalent -- see `bridge.use_synapse_admin_api` in `config.example.yaml` if you'd rather not grant that (see "What homeservers are supported?" below). It also stores no post content or media of its own; that all lives in Matrix rooms. The only local state is bookkeeping (linked identities, follow relationships, keys, and the Matrix-event/ActivityPub-object map), kept in a SQLite file or a Postgres database.
+Runs natively as a single Python process, no containers required. It talks to your homeserver through the Client-Server API (plus the Application Service push API for inbound events), never by touching its database directly. It also stores no post content or media of its own; that all lives in Matrix rooms. The only local state is bookkeeping (linked identities, follow relationships, keys, and the Matrix-event/ActivityPub-object map), kept in a SQLite file or a Postgres database.
 
 ## Core concepts
 
@@ -93,7 +93,7 @@ Everything above is controlled from inside Matrix by tagging the bridge bot or t
 
 ## What homeservers are supported?
 
-Synapse is the only homeserver this bridge has actually been tested against. It should work against any other spec-compliant homeserver in theory -- the Client-Server and Application Service APIs it relies on are standard, not Synapse-specific -- with one exception: `bridge.use_synapse_admin_api` (on by default) depends on Synapse's own Admin API, which isn't part of the spec and other implementations aren't guaranteed to have. Turn it off if you're not running Synapse.
+Synapse is the only homeserver this bridge has actually been tested against. It should work against any other spec-compliant homeserver in theory, with one exception: `bridge.use_synapse_admin_api` (on by default) depends on Synapse's own Admin API, which isn't part of the spec and other implementations aren't guaranteed to have. Turn it off if you're not running Synapse.
 
 Running on other homeservers is untested, experimental territory as of this writing. When turning `bridge.use_synapse_admin_api` off: populate `bridge.admins` (see `config.example.yaml`), since admin status no longer falls back to a Synapse API check. As soon as the bridge is started up, spot-test every command by hand rather than assuming it behaves the same as the Synapse-backed path; and watch the bridge's logs closely to make sure you're not getting any unexpected errors.
 
