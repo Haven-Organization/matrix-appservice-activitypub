@@ -2262,11 +2262,25 @@ async def _handle_banner(request: Request, *, sender: str, room_id: str, argumen
 
 
 async def _is_matrix_admin(request: Request, mxid: str) -> bool:
-    """Whether ``mxid`` is a Synapse server admin -- gates commands that
+    """Whether ``mxid`` counts as a bridge admin -- gates commands that
     manage a room representing someone *else's* identity (a Remote User
     Room mirroring a fediverse account nobody here necessarily owns), as
     opposed to a user's own linked Profile Room, which they can always
-    manage themselves regardless of admin status."""
+    manage themselves regardless of admin status.
+
+    ``bridge.admins`` (an explicit MXID list) is checked first, no live
+    query at all -- ADDITIVE only: being left off it never takes admin
+    rights away from an actual Synapse server admin. Only if ``mxid``
+    isn't listed there AND ``bridge.use_synapse_admin_api`` is on does
+    this fall back to asking Synapse itself (the only way to learn that
+    for an MXID the operator didn't already name) -- with that setting
+    off, an unlisted MXID is simply not an admin, full stop; no API call
+    is even attempted (see that setting's own docstring for why)."""
+    config = request.app.state.config
+    if mxid in config.bridge.admins:
+        return True
+    if not config.bridge.use_synapse_admin_api:
+        return False
     try:
         return await request.app.state.synapse.admin_is_server_admin(mxid)
     except SynapseError:
@@ -4239,6 +4253,84 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
     return True
 
 
+async def _list_bridge_managed_rooms(request: Request, sender: str) -> list[str]:
+    """Every bridge-managed room (Remote User Room, ghost DM/Chat room)
+    ``sender`` -- a real local Matrix user, never a ghost/the bot -- is
+    CURRENTLY a member of. Shared by ``_execute_delete_profile``'s room
+    sweep and ``_list_unfollowed_ghost_rooms``.
+
+    Ghost DM/Chat rooms are found directly and exactly, straight from this
+    bridge's own repository (each row already records its one owning
+    local user -- ``list_ghost_dm_rooms_for_user``/
+    ``list_ghost_chat_rooms_for_user``), then confirmed via a live
+    ``get_joined_members`` check (the bot is already a member of every
+    one of these -- see ``ensure_ghost_dm_room``/its Chat counterpart)
+    before being included. That confirmation step is required, not
+    redundant: confirmed live 2026-07-14 that this bridge's own
+    bookkeeping can list a DM/Chat room as ``sender``'s CURRENT one for a
+    ghost even after they've actually left it in Matrix (nothing clears
+    that record on a plain room-leave) -- without this check, a stale row
+    would make ``_execute_delete_profile`` attempt (harmlessly, but
+    noisily) to kick someone from a room they're not even in anymore.
+    Cheap regardless -- bounded by this ONE user's own DM/Chat room count,
+    not bridge-wide.
+
+    A Remote User Room has no such single owner (anyone following, or
+    who's ever had a post imported from, that same remote actor can be a
+    member), so it's resolved differently depending on
+    ``bridge.use_synapse_admin_api``:
+    - On (default): one ``admin_list_joined_rooms`` call gets EVERY room
+      ``sender`` is in, homeserver-wide; kept only the ones that turn out
+      to already be a tracked Remote User Room. O(1) Admin API call, and
+      already exclusively "join" state by construction -- no separate
+      confirmation step needed here the way the DM/Chat case above does.
+    - Off (see that setting's own docstring -- only tested against
+      Synapse itself, untested on every other homeserver): no admin call
+      exists to make, so this instead walks EVERY Remote User Room this
+      bridge tracks bridge-wide (``list_all_remote_actor_room_ids``) and
+      checks live room membership per room as the bot (already a member
+      of each -- see ``ensure_remote_actor_room``). Correct, but
+      O(bridge-wide room count) instead of O(this user's rooms) --
+      meaningfully slower at real scale, which is exactly why the fast
+      path above is still used whenever the Admin API is actually
+      available."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+
+    dm_chat_room_ids = list(await repository.list_ghost_dm_rooms_for_user(sender))
+    dm_chat_room_ids += await repository.list_ghost_chat_rooms_for_user(sender)
+    rooms: list[str] = []
+    for candidate_room_id in dm_chat_room_ids:
+        try:
+            members = await synapse.get_joined_members(candidate_room_id, as_user_id=bot_mxid)
+        except SynapseError:
+            continue
+        if sender in members:
+            rooms.append(candidate_room_id)
+
+    if config.bridge.use_synapse_admin_api:
+        try:
+            joined_rooms = await synapse.admin_list_joined_rooms(sender)
+        except SynapseError:
+            logger.warning("Could not list rooms for %s via Admin API", sender, exc_info=True)
+            joined_rooms = []
+        for candidate_room_id in joined_rooms:
+            if await repository.get_remote_actor_room_by_room_id(candidate_room_id) is not None:
+                rooms.append(candidate_room_id)
+        return rooms
+
+    for candidate_room_id in await repository.list_all_remote_actor_room_ids():
+        try:
+            members = await synapse.get_joined_members(candidate_room_id, as_user_id=bot_mxid)
+        except SynapseError:
+            continue
+        if sender in members:
+            rooms.append(candidate_room_id)
+    return rooms
+
+
 async def _execute_delete_profile(request: Request, *, sender: str, room_id: str) -> None:
     """The actual, irreversible deletion -- only ever reached via a
     confirmed ``maybe_handle_delete_confirmation``. See
@@ -4291,20 +4383,8 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
     # the end to land in) or their Fediverse space (kicked separately,
     # next, since it isn't one of these room *kinds* at all).
     space_room_id = await repository.get_user_space(sender)
-    try:
-        joined_rooms = await synapse.admin_list_joined_rooms(sender)
-    except SynapseError:
-        logger.warning("Could not list rooms for %s while deleting profile", sender, exc_info=True)
-        joined_rooms = []
-    for other_room_id in joined_rooms:
+    for other_room_id in await _list_bridge_managed_rooms(request, sender):
         if other_room_id in (profile_room_id, space_room_id):
-            continue
-        is_bridge_room = (
-            await repository.get_remote_actor_room_by_room_id(other_room_id) is not None
-            or await repository.is_ghost_dm_room(other_room_id)
-            or await repository.is_ghost_chat_room(other_room_id)
-        )
-        if not is_bridge_room:
             continue
         try:
             await synapse.kick_user(other_room_id, sender, as_user_id=bot_mxid, reason="Fediverse profile deleted")
@@ -4379,30 +4459,22 @@ async def _list_unfollowed_ghost_rooms(
 ) -> list[tuple[str, str, str]]:
     """Every Remote User Room ``sender`` currently belongs to that they do
     NOT (or no longer) follow -- ``(room_id, actor_id, handle)`` tuples.
-    Membership (``SynapseClient.admin_list_joined_rooms``, the same Admin
-    API call ``_execute_delete_profile`` already uses to enumerate a user's
-    rooms) and following (``ActorRepository.is_following``) are two
-    genuinely independent things in this bridge: a room invite can outlive
-    an unfollow (there's no code path that kicks someone out just because
-    they unfollowed), and various on-demand imports (a mention, a reply's
-    ancestor chain, someone else's repost) can land a user in a Remote User
-    Room's membership without them ever having run ``;follow`` there at
-    all. Best-effort against listing itself failing; a room this can't
-    even enumerate just doesn't show up rather than erroring the whole
-    command out."""
+    Membership (``_list_bridge_managed_rooms``, shared with
+    ``_execute_delete_profile``) and following (``ActorRepository.is_following``)
+    are two genuinely independent things in this bridge: a room invite can
+    outlive an unfollow (there's no code path that kicks someone out just
+    because they unfollowed), and various on-demand imports (a mention, a
+    reply's ancestor chain, someone else's repost) can land a user in a
+    Remote User Room's membership without them ever having run ``;follow``
+    there at all. Best-effort against listing itself failing; a room this
+    can't even enumerate just doesn't show up rather than erroring the
+    whole command out."""
     repository = request.app.state.repository
-    synapse = request.app.state.synapse
-    try:
-        joined_rooms = await synapse.admin_list_joined_rooms(sender)
-    except SynapseError:
-        logger.warning("Could not list rooms for %s for ;leave unfollowed", sender, exc_info=True)
-        return []
-
     unfollowed: list[tuple[str, str, str]] = []
-    for candidate_room_id in joined_rooms:
+    for candidate_room_id in await _list_bridge_managed_rooms(request, sender):
         remote_room = await repository.get_remote_actor_room_by_room_id(candidate_room_id)
         if remote_room is None:
-            continue  # not a Remote User Room at all (own profile room, a DM/Chat, ...)
+            continue  # not a Remote User Room at all (a DM/Chat room)
         if await repository.is_following(username, remote_room.actor_id):
             continue
         handle = remote_room.display_name or remote_room.actor_id
@@ -5244,9 +5316,13 @@ async def _handle_allow(request: Request, *, sender: str, room_id: str, argument
         # room" -- there's no separate live membership query). Doesn't block
         # the grant either way, just informs -- the bot might be invited
         # into it moments later.
+        # The bot's OWN rooms -- unlike an arbitrary real human's, this
+        # never needed the Admin API at all: the bot is within this
+        # bridge's own registered AS namespace, so a plain C-S
+        # joined_rooms call (impersonating it) already has full access.
         bot_mxid = _bot_mxid(request.app.state.config)
         try:
-            bot_rooms = await request.app.state.synapse.admin_list_joined_rooms(bot_mxid)
+            bot_rooms = await request.app.state.synapse.get_joined_rooms(bot_mxid)
         except SynapseError:
             bot_rooms = []
         await repository.add_third_party_allow("room", value, granted_by=sender)

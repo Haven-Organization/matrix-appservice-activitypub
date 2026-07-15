@@ -390,6 +390,20 @@ class SynapseClient:
         )
         return result["room_id"]
 
+    async def get_joined_rooms(self, user_id: str) -> list[str]:
+        """``GET .../joined_rooms`` -- every room ``user_id`` currently has
+        ``join`` membership in, as THEMSELVES (AS impersonation via
+        ``as_user_id``) -- ordinary Client-Server API, no admin token
+        needed. Only ever correct for an account within this bridge's OWN
+        registered AS namespace (a ghost, or the bot) -- there is no C-S
+        way to ask this for an arbitrary OTHER real human account, which
+        is exactly the gap ``admin_list_joined_rooms`` below covers
+        instead."""
+        result = await self._request(
+            "GET", "/_matrix/client/v3/joined_rooms", token=self._as_token, as_user_id=user_id
+        )
+        return result.get("joined_rooms") or []
+
     async def get_joined_members(self, room_id: str, *, as_user_id: str | None = None) -> list[str]:
         """``GET .../joined_members`` -- the user IDs currently joined to
         ``room_id``. ``as_user_id`` must itself already be joined (this is
@@ -717,9 +731,13 @@ class SynapseClient:
 
     async def admin_list_joined_rooms(self, user_id: str) -> list[str]:
         """Every room ``user_id`` currently has ``join`` membership in --
-        used by ``delete profile`` to sweep every bridge-managed room
-        (Remote User Rooms, ghost DM/chat rooms) a user is in, without
-        needing our own bookkeeping to already know the full list up front."""
+        used by ``;delete profile``'s room sweep and ``;leave unfollowed``
+        for an arbitrary REAL local user (never a ghost/the bot -- those
+        use ``get_joined_rooms`` above instead, no admin token needed).
+        ``bridge.commands._list_bridge_managed_rooms`` is the only caller;
+        it falls back to a slower, no-admin-API alternative when
+        ``bridge.use_synapse_admin_api`` is off, see that function's own
+        docstring."""
         result = await self._request(
             "GET", f"/_synapse/admin/v1/users/{user_id}/joined_rooms", token=self._admin_token
         )

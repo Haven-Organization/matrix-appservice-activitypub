@@ -113,12 +113,31 @@ bridge:
   # actual type, so a non-MSC4501 client won't render it at all.
   # use_msc4501_post_event_type: false
 
+  # MXIDs treated as bridge admins regardless of Synapse server-admin
+  # status. Always additive -- a real Synapse admin not listed here still
+  # gets bridge-admin rights too as long as use_synapse_admin_api (below)
+  # is on.
+  # admins: []
+
+  # Whether the bridge is allowed to call Synapse's own Admin API (used to
+  # check whether an arbitrary OTHER user is a server admin, and to
+  # enumerate an arbitrary OTHER user's rooms for ;delete profile/;leave
+  # unfollowed). On by default. Turning this off is what lets the bridge
+  # run against a homeserver that doesn't support Synapse's Admin API --
+  # EXPERIMENTAL: only tested with Synapse. Untested on all other
+  # homeservers. Admin status then relies entirely on the `admins` list
+  # above, and the two room-sweep commands fall back to a slower,
+  # bridge-wide scan. Spot-test every admin-gated command and
+  # watch this bridge's own logs closely if you turn this off.
+  # use_synapse_admin_api: true
+
 synapse:
   # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.
   base_url: http://localhost:8008
   # The homeserver's server_name (the part after the colon in @user:server.name).
   server_name: matrix.example.org
   # Access token for an account with admin: true, used for the Admin API.
+  # Only required while bridge.use_synapse_admin_api (above) is on, the default.
   admin_token: "syt_replace_me"
 
 appservice:

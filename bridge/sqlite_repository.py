@@ -953,6 +953,13 @@ class SqliteActorRepository:
     async def get_remote_actor_room_by_room_id(self, room_id: str) -> RemoteActorRoom | None:
         return await self._run(self._get_remote_actor_room_by_room_id, room_id)
 
+    def _list_all_remote_actor_room_ids(self) -> list[str]:
+        rows = self._conn.execute("SELECT room_id FROM remote_actor_rooms").fetchall()
+        return [row["room_id"] for row in rows]
+
+    async def list_all_remote_actor_room_ids(self) -> list[str]:
+        return await self._run(self._list_all_remote_actor_room_ids)
+
     def _register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # pending_backfill is deliberately NOT in the DO UPDATE SET below --
         # see the identical reasoning in PostgresActorRepository's version
@@ -1704,6 +1711,15 @@ class SqliteActorRepository:
     async def get_ghost_dm_room_ids_for_actor(self, actor_id: str) -> list[str]:
         return await self._run(self._get_ghost_dm_room_ids_for_actor, actor_id)
 
+    def _list_ghost_dm_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT room_id FROM ghost_dm_rooms WHERE matrix_user_id = ?", (matrix_user_id,)
+        ).fetchall()
+        return [row["room_id"] for row in rows]
+
+    async def list_ghost_dm_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        return await self._run(self._list_ghost_dm_rooms_for_user, matrix_user_id)
+
     # -- ghost chat rooms (ActivityPub ChatMessage, distinct from DM) -------
 
     def _get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
@@ -1791,3 +1807,12 @@ class SqliteActorRepository:
 
     async def get_ghost_chat_room_ids_for_actor(self, actor_id: str) -> list[str]:
         return await self._run(self._get_ghost_chat_room_ids_for_actor, actor_id)
+
+    def _list_ghost_chat_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT room_id FROM ghost_chat_rooms WHERE matrix_user_id = ?", (matrix_user_id,)
+        ).fetchall()
+        return [row["room_id"] for row in rows]
+
+    async def list_ghost_chat_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        return await self._run(self._list_ghost_chat_rooms_for_user, matrix_user_id)

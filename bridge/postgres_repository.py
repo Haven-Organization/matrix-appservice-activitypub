@@ -758,6 +758,10 @@ class PostgresActorRepository:
         row = await self._pool.fetchrow("SELECT * FROM remote_actor_rooms WHERE room_id = $1", room_id)
         return self._row_to_remote_room(row) if row else None
 
+    async def list_all_remote_actor_room_ids(self) -> list[str]:
+        rows = await self._pool.fetch("SELECT room_id FROM remote_actor_rooms")
+        return [row["room_id"] for row in rows]
+
     async def register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # pending_backfill is deliberately NOT in the DO UPDATE SET below --
         # only the initial INSERT sets it (from the caller's RemoteActorRoom,
@@ -1299,6 +1303,12 @@ class PostgresActorRepository:
         rows = await self._pool.fetch("SELECT room_id FROM ghost_dm_rooms WHERE actor_id = $1", actor_id)
         return [row["room_id"] for row in rows]
 
+    async def list_ghost_dm_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        rows = await self._pool.fetch(
+            "SELECT room_id FROM ghost_dm_rooms WHERE matrix_user_id = $1", matrix_user_id
+        )
+        return [row["room_id"] for row in rows]
+
     # -- ghost chat rooms (ActivityPub ChatMessage, distinct from DM) -------
 
     async def get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
@@ -1357,4 +1367,10 @@ class PostgresActorRepository:
 
     async def get_ghost_chat_room_ids_for_actor(self, actor_id: str) -> list[str]:
         rows = await self._pool.fetch("SELECT room_id FROM ghost_chat_rooms WHERE actor_id = $1", actor_id)
+        return [row["room_id"] for row in rows]
+
+    async def list_ghost_chat_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        rows = await self._pool.fetch(
+            "SELECT room_id FROM ghost_chat_rooms WHERE matrix_user_id = $1", matrix_user_id
+        )
         return [row["room_id"] for row in rows]

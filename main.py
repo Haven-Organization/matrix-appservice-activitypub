@@ -16,6 +16,8 @@ import uvicorn
 from bridge.config import ConfigError, load_config
 from bridge.server import create_app
 
+logger = logging.getLogger(__name__)
+
 _NOTE_OBJECT_404_RE = re.compile(r"^/actor/[^/]+/notes/[^/]+$")
 
 
@@ -68,6 +70,15 @@ def main(argv: list[str]) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("uvicorn.access").addFilter(_ExpectedNotFoundFilter())
+
+    if not config.bridge.use_synapse_admin_api:
+        logger.warning(
+            "bridge.use_synapse_admin_api is OFF -- this is an EXPERIMENTAL configuration, only ever "
+            "tested with Synapse. Untested on all other homeservers. Admin-gated commands now rely "
+            "entirely on bridge.admins, and ;delete profile/;leave unfollowed use a slower, "
+            "less-exercised room-discovery fallback. Spot-test every admin-gated command and watch "
+            "this bridge's own logs closely."
+        )
 
     app = create_app(config)
     # uvicorn's own logging.config.dictConfig hardcodes "uvicorn"/

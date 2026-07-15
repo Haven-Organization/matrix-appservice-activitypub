@@ -2,9 +2,9 @@
 
 ![A Matrix room mirroring the Free Software Foundation's Mastodon account side-by-side with the actual Mastodon profile, showing matching posts](screenshots/screenshot1.png)
 
-A Matrix Application Service that bridges Matrix to ActivityPub (Mastodon, Pleroma, Akkoma, Misskey, and friends), so a Matrix homeserver's users can post, follow, reply, react, and DM across the fediverse using ordinary Matrix rooms and clients. No separate fediverse account needed.
+Turns your Matrix server into a fully functioning ActivityPub server. Matrix  users can post, follow, reply, react, and DM across the fediverse using ordinary Matrix rooms and clients. No separate account or server needed.  
 
-Runs natively as a single Python process, no containers required. It talks to Synapse exclusively through the Client-Server and Admin APIs (plus the Application Service push API for inbound events), never by touching Synapse's database directly. It also stores no post content or media of its own; that all lives in Matrix rooms. The only local state is bookkeeping (linked identities, follow relationships, keys, and the Matrix-event/ActivityPub-object map), kept in a SQLite file or a Postgres database.
+Runs natively as a single Python process, no containers required. It talks to your homeserver exclusively through the Client-Server API (plus the Application Service push API for inbound events), never by touching its database directly. Its Admin API is also used by default, for two admin-gated commands (checking another user's admin status, and a couple of full-room-sweep commands) that have no Client-Server equivalent -- see `bridge.use_synapse_admin_api` in `config.example.yaml` if you'd rather not grant that (see "What homeservers are supported?" below). It also stores no post content or media of its own; that all lives in Matrix rooms. The only local state is bookkeeping (linked identities, follow relationships, keys, and the Matrix-event/ActivityPub-object map), kept in a SQLite file or a Postgres database.
 
 ## Core concepts
 
@@ -58,7 +58,7 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 ### Media
 
 - Incoming attachments (image, video, audio, document) are downloaded and re-uploaded as real Matrix media. Extra attachments beyond the first are appended as links, since one ActivityPub post maps to exactly one Matrix event.
-- Outgoing Matrix media becomes an ActivityPub `attachment` pointing at the bridge's own public media proxy (`/media/{server}/{id}`), never Synapse directly, since remote servers have no Matrix access token. Only media explicitly published this way is ever served.
+- Outgoing Matrix media becomes an ActivityPub `attachment` pointing at the bridge's own public media proxy (`/media/{server}/{id}`), never your homeserver directly, since remote servers have no Matrix access token. Only media explicitly published this way is ever served.
 
 ### Follows and moderation
 
@@ -91,6 +91,12 @@ For the exact ActivityPub activity types, Matrix event shapes, and implementatio
 
 Everything above is controlled from inside Matrix by tagging the bridge bot or typing a `;`-prefixed command (`;follow @user@instance.org`, `;help`, and so on). See [COMMANDS.md](COMMANDS.md) for the complete reference.
 
+## What homeservers are supported?
+
+Synapse is the only homeserver this bridge has actually been tested against. It should work against any other spec-compliant homeserver in theory -- the Client-Server and Application Service APIs it relies on are standard, not Synapse-specific -- with one exception: `bridge.use_synapse_admin_api` (on by default) depends on Synapse's own Admin API, which isn't part of the spec and other implementations aren't guaranteed to have. Turn it off if you're not running Synapse.
+
+Running on other homeservers is untested, experimental territory as of this writing. When turning `bridge.use_synapse_admin_api` off: populate `bridge.admins` (see `config.example.yaml`), since admin status no longer falls back to a Synapse API check. As soon as the bridge is started up, spot-test every command by hand rather than assuming it behaves the same as the Synapse-backed path; and watch the bridge's logs closely to make sure you're not getting any unexpected errors.
+
 ## Setup
 
 1. Install dependencies and generate a config:
@@ -101,15 +107,15 @@ Everything above is controlled from inside Matrix by tagging the bridge bot or t
 
    This creates a virtualenv, installs `requirements.txt`, and generates `config.yaml` from `config.example.yaml` with fresh random AppService tokens.
 
-2. Edit `config.yaml`. At minimum set `bridge.domain`, `bridge.public_base_url`, `synapse.base_url`, `synapse.server_name`, and `synapse.admin_token` (an access token for a Synapse account with `admin: true`). See `config.example.yaml` for every option; each is documented inline (storage backend, logging level, federation timeouts, backfill defaults, and more).
+2. Edit `config.yaml`. At minimum set `bridge.domain`, `bridge.public_base_url`, `synapse.base_url`, and `synapse.server_name` (these fields are named after Synapse, but just mean "your homeserver" -- see "What homeservers are supported?" above). Also set `synapse.admin_token` (an access token for a homeserver account with `admin: true`) unless you've explicitly turned off `bridge.use_synapse_admin_api`. See `config.example.yaml` for every option; each is documented inline (storage backend, logging level, federation timeouts, backfill defaults, and more).
 
-3. Generate the AppService registration and wire it into Synapse:
+3. Generate the AppService registration and wire it into your homeserver:
 
    ```sh
    .venv/bin/python -m bridge.appservice config.yaml appservice-registration.yaml
    ```
 
-   Add the resulting file's path to Synapse's `homeserver.yaml` under `app_service_config_files`, then restart Synapse.
+   Add the resulting file's path to your homeserver's own application-service registration config (`app_service_config_files` in `homeserver.yaml`, if you're running Synapse), then restart it.
 
 4. Run the bridge:
 

@@ -177,6 +177,44 @@ class BridgeSection:
     # one at creation time (poll's own published time + this many days)
     # rather than omit the field outright.
     poll_default_duration_days: int = 7
+    # MXIDs treated as bridge admins regardless of their actual Synapse
+    # server-admin status (gates the same commands _is_matrix_admin always
+    # has -- custom ;backfill counts, managing a Remote User Room that
+    # isn't theirs, the full ;delete profile room sweep). Checked BEFORE
+    # any live Synapse Admin API query, so listing someone here works
+    # whether or not use_synapse_admin_api is even on. A real Synapse
+    # server admin NOT listed here still gets bridge-admin rights too, as
+    # long as use_synapse_admin_api is on -- this list only ever ADDS
+    # admins, it doesn't take the role away from anyone Synapse itself
+    # already grants it to.
+    admins: list[str] = field(default_factory=list)
+    # Whether this bridge is allowed to call Synapse's own Admin API at
+    # all (see bridge.synapse_client.SynapseClient's "-- Admin API --"
+    # section) -- checking whether an arbitrary OTHER user is a server
+    # admin, and enumerating which rooms an arbitrary OTHER user currently
+    # belongs to (used by ;delete profile's full room sweep and ;leave
+    # unfollowed). Both have no Client-Server API equivalent: AS
+    # impersonation only ever covers this bridge's OWN registered
+    # namespace (ghosts + the bot), never an arbitrary real human account
+    # on someone else's. On by default, matching every deployment of this
+    # bridge before this setting existed.
+    #
+    # Turning this OFF is what makes the bridge able to run against a
+    # homeserver that doesn't implement (or won't grant) Synapse's
+    # Admin API -- e.g. a non-Synapse homeserver, or a Synapse deployment
+    # where the operator doesn't want to hand out an admin token. This
+    # path is EXPERIMENTAL: only ever tested against Synapse itself --
+    # untested on every other homeserver implementation as of this
+    # setting's introduction. Admin-gated status falls back entirely to
+    # the `admins` list above
+    # (so give it real entries, or nobody gets those commands), and the
+    # two room-sweep commands switch to a slower, bridge-wide fallback
+    # (see bridge.commands._list_bridge_managed_rooms) that hasn't been
+    # exercised against real non-Synapse traffic yet. Spot-test every
+    # admin-gated command and watch this bridge's own logs closely after
+    # turning this off -- don't just assume it works the same as the
+    # Synapse-backed path.
+    use_synapse_admin_api: bool = True
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -186,7 +224,14 @@ class BridgeSection:
 class SynapseSection:
     base_url: str
     server_name: str
-    admin_token: str
+    # Required (see load_config's own validation) only when
+    # bridge.use_synapse_admin_api is on -- the two features it gates
+    # (bridge.BridgeSection.use_synapse_admin_api's own docstring has the
+    # full list) are the only things in this whole codebase that ever use
+    # it. Optional here, not just defaulted, so a config that omits it
+    # entirely reads as a deliberate choice rather than an accident this
+    # dataclass papers over.
+    admin_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -358,13 +403,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         local_profile_room_join_rule=local_profile_room_join_rule,
         third_party_access_mode=third_party_access_mode,
         poll_default_duration_days=int(bridge_raw.get("poll_default_duration_days", 7)),
+        admins=list(bridge_raw.get("admins", []) or []),
+        use_synapse_admin_api=bool(bridge_raw.get("use_synapse_admin_api", True)),
     )
 
     synapse_section = SynapseSection(
         base_url=_require(synapse_raw, "base_url", "synapse").rstrip("/"),
         server_name=_require(synapse_raw, "server_name", "synapse"),
-        admin_token=_require(synapse_raw, "admin_token", "synapse"),
+        admin_token=synapse_raw.get("admin_token") or None,
     )
+    if bridge_section.use_synapse_admin_api and not synapse_section.admin_token:
+        raise ConfigError(
+            "synapse.admin_token is required when bridge.use_synapse_admin_api is on (the default) -- "
+            "either set it, or explicitly turn bridge.use_synapse_admin_api off (see its own docstring "
+            "in bridge/config.py for what that trades away)."
+        )
 
     appservice_section = AppserviceSection(
         registration_path=_require(appservice_raw, "registration_path", "appservice"),

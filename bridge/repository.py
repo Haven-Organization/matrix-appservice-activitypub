@@ -463,6 +463,21 @@ class ActorRepository(Protocol):
 
     async def register_remote_actor_room(self, record: RemoteActorRoom) -> None: ...
 
+    async def list_all_remote_actor_room_ids(self) -> list[str]:
+        """Every Remote User Room this bridge tracks, bridge-wide -- unlike
+        a DM/Chat room, a Remote User Room has no single owning local
+        user (anyone following, or who's ever had a post imported from,
+        that same remote actor can be a member), so there's no per-user
+        query to make here the way ``list_ghost_dm_rooms_for_user`` can.
+        Used only by ``bridge.commands._list_bridge_managed_rooms``'s
+        no-Synapse-Admin-API fallback, which pairs this with a live
+        ``get_joined_members`` check per room (the bot is already a
+        member of every one of these, see ``ensure_remote_actor_room``) --
+        expensive at real scale (bridge-wide room count instead of just
+        one user's rooms), so never called at all when
+        ``bridge.use_synapse_admin_api`` is on."""
+        ...
+
     async def get_remote_actor_room_history_actor_id(self, room_id: str) -> str | None:
         """The fediverse actor ``room_id`` is OR EVER WAS the Remote User
         Room for -- unlike ``get_remote_actor_room_by_room_id``, this
@@ -811,6 +826,22 @@ class ActorRepository(Protocol):
         """The ``ChatMessage`` counterpart of ``get_ghost_dm_room_ids_for_actor``."""
         ...
 
+    async def list_ghost_dm_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        """Every DM room ID ``matrix_user_id`` (a LOCAL user, not a remote
+        actor) currently has open, across every ghost they've ever DMed --
+        the reverse of ``get_ghost_dm_room_ids_for_actor``. Used by
+        ``bridge.commands._list_bridge_managed_rooms`` (see its own
+        docstring) as a direct, exact, no-Synapse-API alternative to
+        asking Synapse "what rooms is this user in" and filtering --
+        unlike a Remote User Room, a DM room already has exactly one
+        owning local user recorded against it, so no live membership
+        check is even needed here."""
+        ...
+
+    async def list_ghost_chat_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        """The ``ChatMessage`` counterpart of ``list_ghost_dm_rooms_for_user``."""
+        ...
+
     async def get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         """The room ID of the 1:1 ``ChatMessage`` room between the ghost
         for ``actor_id`` and ``matrix_user_id`` (see
@@ -1067,6 +1098,9 @@ class InMemoryActorRepository:
     async def get_remote_actor_room_by_room_id(self, room_id: str) -> RemoteActorRoom | None:
         return self._remote_rooms_by_room_id.get(room_id)
 
+    async def list_all_remote_actor_room_ids(self) -> list[str]:
+        return list(self._remote_rooms_by_room_id.keys())
+
     async def register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # Same reasoning as register_local_actor: a room replacement moves
         # this actor to a new room_id -- drop the old reverse mapping.
@@ -1296,6 +1330,13 @@ class InMemoryActorRepository:
             if room_actor_id == actor_id
         ]
 
+    async def list_ghost_dm_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        return [
+            dm_room_id
+            for (_actor_id, room_matrix_user_id), dm_room_id in self._ghost_dm_rooms.items()
+            if room_matrix_user_id == matrix_user_id
+        ]
+
     async def get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         return self._ghost_chat_rooms.get((actor_id, matrix_user_id))
 
@@ -1327,4 +1368,11 @@ class InMemoryActorRepository:
             chat_room_id
             for (room_actor_id, _matrix_user_id), chat_room_id in self._ghost_chat_rooms.items()
             if room_actor_id == actor_id
+        ]
+
+    async def list_ghost_chat_rooms_for_user(self, matrix_user_id: str) -> list[str]:
+        return [
+            chat_room_id
+            for (_actor_id, room_matrix_user_id), chat_room_id in self._ghost_chat_rooms.items()
+            if room_matrix_user_id == matrix_user_id
         ]
