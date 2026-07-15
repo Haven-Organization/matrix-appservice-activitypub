@@ -2474,7 +2474,11 @@ async def _build_repost_message(
 
 async def _handle_update(request: Request, username: str, activity: Activity) -> None:
     """A followed remote actor changed their profile -- keep our mirror (the
-    ghost user and the Remote User Room's name/avatar/banner) in sync."""
+    ghost user and the Remote User Room's name/avatar/banner) in sync. Also
+    routes an edited poll (``Question``) or an edited already-mirrored post
+    (``Note``, see ``_handle_note_update``) to their own handlers -- an
+    ``Update`` covers all three cases, distinguished purely by the object's
+    own type."""
     obj = activity.object
     if isinstance(obj, str):
         try:
@@ -2484,9 +2488,12 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     if isinstance(obj, dict) and obj.get("type") == "Question":
         await _handle_question_update(request, obj)
         return
+    if isinstance(obj, dict) and obj.get("type") == "Note":
+        await _handle_note_update(request, obj)
+        return
 
     if not isinstance(obj, dict) or obj.get("type") not in _ACTOR_TYPES:
-        return  # not a profile update we care about (e.g. an edited Note)
+        return  # not a profile update we care about
 
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room(activity.actor)
@@ -2553,6 +2560,92 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     await repository.record_ghost_profile(
         GhostProfile(actor_id=remote_room.actor_id, display_name=new_name, icon_url=new_icon_url)
     )
+
+
+async def _handle_note_update(request: Request, obj: dict) -> None:
+    """A remote author edited an already-mirrored Note -- rebuilds its
+    content from scratch (the same recipe ``import_note``'s own Create-path
+    uses: mentions, custom emoji, attachments -- see
+    ``note_mirroring._import_note_locked``) and re-sends it as a real
+    Matrix edit (``m.replace``), same shape ``upsert_poll_tally_reply``
+    already uses elsewhere in this codebase for its own edits (fallback
+    ``"* ..."`` body/formatted_body for a non-edit-aware client, the real
+    replacement entirely in ``m.new_content``). Keeps the mirrored event's
+    own ``event_id``, unlike a redact+resend, which would orphan any reply
+    already anchored to it.
+
+    Confirmed live 2026-07-15: an inbound ``Update<Note>`` was previously
+    silently dropped entirely -- ``_handle_update`` only ever recognized a
+    profile Update, this is what handles the "someone edited their post"
+    case that function used to explicitly exclude (its own docstring said
+    so). A caption-less post edited to ADD an image was the live example
+    that surfaced this gap -- the Create-time mirror had no attachment at
+    all, and the follow-up Update was never applied."""
+    ap_object_id = obj.get("id")
+    if not ap_object_id:
+        return
+    repository = request.app.state.repository
+    federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if federated is None:
+        return  # not a post we mirror at all -- nothing to edit
+
+    remote_room = await repository.get_remote_actor_room(federated.author_actor_id)
+    if remote_room is None:
+        # Shouldn't happen -- import_note always resolves/creates the
+        # actual author's own Remote User Room before ever recording this
+        # FederatedEvent -- but best-effort throughout, same as everywhere
+        # else in this module.
+        return
+
+    synapse = request.app.state.synapse
+    config = request.app.state.config
+
+    mentions = await resolve_mention_pills(request, room_id=federated.room_id, note=obj)
+    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    if safe_html:
+        safe_html = await inline_custom_emoji(
+            request.app.state.http_client, synapse, repository, safe_html, obj.get("tag") or [],
+            subject_id=ap_object_id,
+        )
+    new_content: dict = {"msgtype": "m.text", "body": plain}
+    if safe_html and safe_html != plain:
+        new_content["format"] = "org.matrix.custom.html"
+        new_content["formatted_body"] = safe_html
+    if mentions.mentioned_locals:
+        new_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
+    src = _source_post_url(obj)
+    if src:
+        new_content["external_url"] = src
+    handle_content = await event_external_handle_content(request, federated.author_actor_id)
+    if handle_content:
+        new_content[EXTERNAL_HANDLE_FIELD] = handle_content
+
+    # Only the first attachment (if any) is embedded as real Matrix media --
+    # same reasoning as _import_note_locked's identical comment: an
+    # ActivityPub post always maps to exactly one Matrix event.
+    attachments = extract_attachments(obj)
+    new_content, _first_attachment_mxc = await _attach_media_to_content(request, new_content, attachments)
+
+    # MSC2676: the top-level body/formatted_body is the "* ..." fallback a
+    # client that doesn't understand edits at all just shows as a plain
+    # new message -- the real replacement lives entirely in m.new_content,
+    # which a compliant client renders in the original event's place
+    # instead. Same shape upsert_poll_tally_reply already builds for its
+    # own edits elsewhere in this codebase.
+    edit_content = dict(new_content)
+    edit_content["body"] = f"* {new_content.get('body', '')}"
+    if "formatted_body" in new_content:
+        edit_content["formatted_body"] = f"* {new_content['formatted_body']}"
+    edit_content["m.new_content"] = new_content
+    edit_content["m.relates_to"] = {"rel_type": "m.replace", "event_id": federated.event_id}
+
+    try:
+        await synapse.send_message_event(
+            federated.room_id, edit_content, as_user_id=remote_room.ghost_user_id,
+            event_type=mirrored_post_event_type(config),
+        )
+    except SynapseError:
+        logger.warning("Failed to mirror edit of %s", ap_object_id, exc_info=True)
 
 
 async def _handle_block(request: Request, username: str, activity: Activity) -> None:
