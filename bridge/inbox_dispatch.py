@@ -1327,6 +1327,14 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         )
         return
 
+    # Set only when a reply's own ancestor chain turns out unusable (a
+    # broken/inaccessible ancestor, or one deeper than
+    # _resolve_ancestor_chain's own max_depth) -- (parent_handle,
+    # parent_author_html, external_link) for the "⤵️ Reply to" header the
+    # ordinary top-level path below adds in that case. See its own
+    # assignment further down for why this exists at all.
+    unresolved_reply_context: tuple[str, str, str] | None = None
+
     in_reply_to_ap = obj.get("inReplyTo")
     if in_reply_to_ap:
         chain = await _resolve_ancestor_chain(request, in_reply_to_ap)
@@ -1374,6 +1382,31 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                         request, note=obj, reply_event=reply_event, parent=parent, author_actor_id=activity.actor
                     )
                 return
+
+        # The chain itself is unusable (a broken/inaccessible ancestor
+        # somewhere up it, or one deeper than max_depth -- see
+        # _resolve_ancestor_chain's own docstring for both), so there's no
+        # real thread to build. This reply's own IMMEDIATE target is still
+        # worth one extra, isolated fetch, purely for display: confirmed
+        # live 2026-07-15 that a reply whose direct parent was perfectly
+        # fine mirrored as a totally context-free standalone post, purely
+        # because a MUCH older ancestor several hops further up the same
+        # thread (on a third, unrelated instance) turned out to be a
+        # genuine 404 for everyone, not just us -- nothing about that
+        # should erase the fact that THIS post visibly replies to a real,
+        # perfectly fine, still-reachable post one hop up. Best-effort:
+        # if even this single fetch fails too, falls through with no
+        # header at all, same as before this existed.
+        try:
+            immediate_parent_note = await _resolve_object(request, in_reply_to_ap)
+        except Exception:
+            immediate_parent_note = None
+        if immediate_parent_note is not None and immediate_parent_note.get("type") == "Note":
+            immediate_parent_author_id = _note_author(immediate_parent_note)
+            if isinstance(immediate_parent_author_id, str):
+                parent_handle, parent_author_html = await actor_html_with_avatar(request, immediate_parent_author_id)
+                external_link = _source_post_url(immediate_parent_note) or in_reply_to_ap
+                unresolved_reply_context = (parent_handle, parent_author_html, external_link)
 
     # Extracted early (not just where it's used for rendering, below) since
     # a quote of a post we already track is itself a relevance signal --
@@ -1509,6 +1542,24 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     if (safe_html and safe_html != plain) or quote_html_tail:
         message_content["format"] = "org.matrix.custom.html"
         message_content["formatted_body"] = (safe_html or html.escape(plain)) + quote_html_tail
+    if unresolved_reply_context is not None:
+        # Wraps whatever body/formatted_body already got built above (quote
+        # tail included, if this was ALSO a quote-post) -- applied last so
+        # it never has to know about or reorder around that logic, same
+        # "prepend a header, everything else stays exactly as it would
+        # otherwise be" shape as _echo_reply_in_own_room's own header,
+        # just with an EXTERNAL link (no Matrix event exists for this
+        # parent -- that's the whole reason this branch runs at all)
+        # instead of a matrix.to one.
+        parent_handle, parent_author_html, external_link = unresolved_reply_context
+        message_content["body"] = f"⤵️ Reply to {parent_handle}'s post:\n\n{message_content['body']}".strip()
+        message_content["format"] = "org.matrix.custom.html"
+        header_html = (
+            f"<p>⤵️ Reply to {parent_author_html}'s "
+            f'<a href="{html.escape(external_link, quote=True)}">post</a>:</p>'
+        )
+        existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
+        message_content["formatted_body"] = header_html + existing_html
     if (
         request.app.state.config.bridge.set_msc4501_relates_to
         and quote_render is not None
