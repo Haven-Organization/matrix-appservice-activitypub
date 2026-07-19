@@ -75,7 +75,7 @@ from bridge.activitypub.remote_actor import (
 )
 from bridge.activitypub.sanitize import strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, main_key_id, username_from_actor_url
-from bridge.matrix_links import matrix_to_link
+from bridge.matrix_links import matrix_to_link, room_pill_html
 from bridge.custom_emoji import emoji_img_html, inline_custom_emoji, resolve_custom_emoji_image
 from bridge.media import fetch_and_upload_media, filename_with_extension
 from bridge.ghosts import ghost_mxid
@@ -721,9 +721,17 @@ async def _handle_guild_accept(request: Request, pending: PendingGuildFollow) ->
         for channel_actor_id, _name in channels:
             await ensure_channel_room(request, channel_actor_id=channel_actor_id, guild_actor_id=pending.guild_actor_id)
         body = f"You've joined {guild_name} -- see {space_room_id} for its channels."
+        formatted_body = f"You've joined {html.escape(guild_name)} -- see {room_pill_html(space_room_id)} for its channels."
     else:
         body = f"You've joined {guild_name}, but its Matrix Space couldn't be created."
-    await notify_user(request, matrix_user_id=pending.matrix_user_id, content={"msgtype": "m.notice", "body": body})
+        formatted_body = f"You've joined {html.escape(guild_name)}, but its Matrix Space couldn't be created."
+    await notify_user(
+        request, matrix_user_id=pending.matrix_user_id,
+        content={
+            "msgtype": "m.notice", "body": body,
+            "format": "org.matrix.custom.html", "formatted_body": formatted_body,
+        },
+    )
 
 
 async def _handle_reject(request: Request, username: str, activity: Activity) -> None:
@@ -2456,13 +2464,27 @@ async def _build_repost_message(
             safe_html, obj.get("tag") or [], subject_id=obj.get("id"),
         )
 
-    plain_body = f"\U0001F501 reposted {original_handle}'s post:\n\n{plain}".strip()
+    # "> " on every line (plaintext's own equivalent of the HTML
+    # <blockquote> below) and a real <blockquote> wrapper -- without
+    # either, the reposted post's own words render visually IDENTICAL to
+    # the reposter's own, reading as if the reposter said it themselves
+    # (confirmed live 2026-07-15). Every OTHER "here's a copy of someone
+    # else's post" card in this bridge (send_repost's notice,
+    # ;repost's echo, _quoted_post_render's quote-post preview) already
+    # does this -- this function and _echo_reply_in_own_room's header
+    # were the only two that didn't, and unlike this one,
+    # _echo_reply_in_own_room's own content_html is the REPLIER's own
+    # words, not a quote of someone else's, so blockquoting IT would be
+    # wrong -- deliberately left alone.
+    quoted_plain = "\n".join(f"> {line}" for line in plain.split("\n")) if plain else ""
+    plain_body = f"\U0001F501 reposted {original_handle}'s post:\n\n{quoted_plain}".strip()
     if imported_link:
         plain_body += f"\n\n{imported_link}"
 
     post_pill_html = f'<a href="{html.escape(imported_link, quote=True)}">post</a>' if imported_link else "post"
     header_html = f"<p>\U0001F501 reposted {original_author_html}'s {post_pill_html}:</p>"
-    content_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
+    inner_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
+    content_html = f"<blockquote>{inner_html}</blockquote>" if inner_html else ""
 
     config = request.app.state.config
     content_inline = config.bridge.use_msc4501_content_inline
@@ -2507,6 +2529,10 @@ async def _build_repost_message(
         # A compliant client's replacement for body/formatted_body: the
         # reposted post's own content alone, without the "🔁 reposted X's
         # post:" header above it -- see SOCIAL_BODY_FIELD's own docstring.
+        # inner_html specifically, NOT content_html -- a compliant client
+        # renders its OWN quote/repost styling around this, so it must be
+        # the bare content, not pre-wrapped in the <blockquote> content_html
+        # now carries for the plain (non-MSC4501-aware) formatted_body above.
         # Omitted for a caption-less repost of a text-free (media-only)
         # post -- confirmed live 2026-07-13: Haven already recognizes an
         # empty repost by body alone being a bare matrix.to/matrix: link
@@ -2515,8 +2541,8 @@ async def _build_repost_message(
         # disambiguation a compliant client actually needs.
         if plain:
             message_content[SOCIAL_BODY_FIELD] = plain
-            if content_html:
-                message_content[SOCIAL_FORMATTED_BODY_FIELD] = content_html
+            if inner_html:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = inner_html
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url

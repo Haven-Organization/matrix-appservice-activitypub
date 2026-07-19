@@ -233,7 +233,7 @@ from bridge.inbox_dispatch import (
     _resolve_ancestor_chain,
     build_preview_media_content,
 )
-from bridge.matrix_links import matrix_to_link, matrix_to_room_link
+from bridge.matrix_links import matrix_to_link, matrix_to_room_link, room_pill_html
 from bridge.media import fetch_and_upload_media
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.notifications import NOTIFICATIONS_ROOM_NAME as _NOTIFICATIONS_ROOM_NAME
@@ -494,7 +494,7 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             residue = residue.replace(config.appservice.bot_display_name, "")
         residue = residue.strip(f" \t\n\r{_COMMAND_PREFIX}")
         if not residue:
-            await _handle_help(request, room_id=room_id)
+            await _handle_help(request, room_id=room_id, sender=sender)
         else:
             await _notice(
                 request, room_id, f'Not sure what you mean -- try "{_COMMAND_PREFIX}help" to see what I can do.'
@@ -514,7 +514,7 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         if subcommand == "help":
             help_arg = argument.strip().lower()
             await _handle_help(
-                request, room_id=room_id, show_all=help_arg == "all", show_admin=help_arg == "admin",
+                request, room_id=room_id, sender=sender, show_all=help_arg == "all", show_admin=help_arg == "admin",
             )
             return True
 
@@ -719,11 +719,22 @@ _check_command_keywords_cover_dispatch()
 _command_relates_to_var: ContextVar[dict | None] = ContextVar("_command_relates_to_var", default=None)
 
 
-async def _notice(request: Request, room_id: str, message: str, *, relates_to: dict | None = None) -> None:
+async def _notice(
+    request: Request, room_id: str, message: str, *, relates_to: dict | None = None, html_message: str | None = None,
+) -> None:
+    """Sends a plain ``m.notice`` -- ``message`` -- or, when ``html_message``
+    is given too, an HTML-formatted one instead (``message`` stays the
+    plain-text fallback for clients/notification text that don't render
+    ``formatted_body``). Pass ``html_message`` whenever the notice names a
+    room -- e.g. via ``bridge.matrix_links.room_pill_html`` -- so it renders
+    as a real clickable pill rather than a bare, unclickable room id."""
     config = request.app.state.config
     if relates_to is None:
         relates_to = _command_relates_to_var.get()
     content: dict = {"msgtype": "m.notice", "body": message}
+    if html_message is not None:
+        content["format"] = "org.matrix.custom.html"
+        content["formatted_body"] = html_message
     if relates_to:
         content["m.relates_to"] = relates_to
     try:
@@ -852,7 +863,7 @@ async def _mark_room_replaced(request: Request, *, old_room_id: str, as_user_id:
 
 
 async def _handle_help(
-    request: Request, *, room_id: str, show_all: bool = False, show_admin: bool = False,
+    request: Request, *, room_id: str, sender: str, show_all: bool = False, show_admin: bool = False,
 ) -> None:
     """Sent as an ordinary ``m.text`` message, not ``m.notice`` -- someone
     asking what the bot can do should get an answer that stands out, not
@@ -875,12 +886,30 @@ async def _handle_help(
     -- kept out of ``;help all`` entirely, since they're not "advanced
     user" features, they're admin-only and irrelevant to (can't even be
     run by) everyone else. Deliberately no combined "all + admin" view --
-    each tier answers one specific "what can I do" question."""
+    each tier answers one specific "what can I do" question.
+
+    ``show_admin`` is refused outright (with its own notice, nothing listed)
+    for anyone ``_is_matrix_admin`` doesn't recognize -- the admin tier lists
+    real capabilities a non-admin literally cannot use, not just
+    "advanced"/inconvenient ones, so exposing it is a real (if minor)
+    information leak, not just clutter. The pointer to ``;help admin`` in
+    the other two tiers' own outro is hidden the same way, for the same
+    reason -- a non-admin has no use for it and no way to act on it, so
+    advertising it at all is pointless at best."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
+    is_admin = await _is_matrix_admin(request, sender)
+    if show_admin and not is_admin:
+        await _notice(request, room_id, "Only a Matrix server admin can use this.")
+        return
     intro = (
         f'Hi, I\'m the fediverse bridge! Start a message with "{_COMMAND_PREFIX}" to give me a command '
         f'(e.g. "{_COMMAND_PREFIX}help"). You can also tag me in place of "{_COMMAND_PREFIX}":'
+    )
+    intro_html = (
+        f"Hi, I'm the fediverse bridge! Start a message with <code>{html.escape(_COMMAND_PREFIX)}</code> to give "
+        f"me a command (e.g. <code>{html.escape(_COMMAND_PREFIX)}help</code>). You can also tag me in place of "
+        f"<code>{html.escape(_COMMAND_PREFIX)}</code>:"
     )
     commands = [
         (f"{_COMMAND_PREFIX}help", "Show this message."),
@@ -1022,18 +1051,26 @@ async def _handle_help(
 
     body = intro + "\n\n" + "\n\n".join(f"{cmd}\n  - {desc}" for cmd, desc in commands)
     formatted_body = (
-        f"<p>{html.escape(intro)}</p>"
+        f"<p>{intro_html}</p>"
         "<table><thead><tr><th>Command</th><th>Description</th></tr></thead>"
         f"<tbody>{''.join(f'<tr><td>{html.escape(cmd)}</td><td>{html.escape(desc)}</td></tr>' for cmd, desc in commands)}</tbody></table>"
     )
     if not show_all:
         outro = f'Advanced/maintenance commands are hidden here -- use "{_COMMAND_PREFIX}help all" to see them too.'
+        outro_html = (
+            f"Advanced/maintenance commands are hidden here -- use "
+            f"<code>{html.escape(_COMMAND_PREFIX)}help all</code> to see them too."
+        )
         body += f"\n\n{outro}"
-        formatted_body += f"<p>{html.escape(outro)}</p>"
-    if not show_admin:
+        formatted_body += f"<p>{outro_html}</p>"
+    if not show_admin and is_admin:
         outro = f'Matrix server admin commands are hidden here -- use "{_COMMAND_PREFIX}help admin" to see them.'
+        outro_html = (
+            f"Matrix server admin commands are hidden here -- use "
+            f"<code>{html.escape(_COMMAND_PREFIX)}help admin</code> to see them."
+        )
         body += f"\n\n{outro}"
-        formatted_body += f"<p>{html.escape(outro)}</p>"
+        formatted_body += f"<p>{outro_html}</p>"
     help_content: dict = {
         "msgtype": "m.text",
         "body": body,
@@ -1049,20 +1086,45 @@ async def _handle_help(
         logger.warning("Failed to send help message to %s", room_id, exc_info=True)
 
 
+_COMMAND_PILL_MXID_RE = re.compile(r'href="https://matrix\.to/#/(@[^"/?]+)"')
+
+
+def _mentioned_mxids(content: dict) -> list[str]:
+    """All mxids ``content`` names as a mention target -- both the
+    structured, reliable ``m.mentions.user_ids`` (MSC3952 intentional
+    mentions, set when a mention is picked from a client's autocomplete) AND
+    any matrix.to pill anchor literally present in ``formatted_body``. The
+    latter covers a pill that ended up in the message body WITHOUT also
+    setting ``m.mentions`` -- e.g. pasted in rather than picked from
+    autocomplete -- which is otherwise indistinguishable from a hand-typed
+    handle to everything downstream of here. Order doesn't matter to any
+    caller, only membership; de-duplicated so a pill that's ALSO in
+    ``m.mentions`` (the common case) isn't checked twice."""
+    mxids = list((content.get("m.mentions") or {}).get("user_ids") or [])
+    formatted_body = content.get("formatted_body")
+    if isinstance(formatted_body, str):
+        for mxid in _COMMAND_PILL_MXID_RE.findall(formatted_body):
+            if mxid not in mxids:
+                mxids.append(mxid)
+    return mxids
+
+
 async def _resolve_tagged_ghost(request: Request, content: dict) -> GhostProfile | None:
-    """If ``content``'s ``m.mentions`` names one of our own ghost users (a
-    fediverse account already mirrored here, e.g. picked from a Matrix
-    client's mention autocomplete rather than typed out by hand), return
-    that ghost's profile. Lets ``follow``/``unfollow`` accept a tagged ghost
-    pill the same way they accept a typed-out ``@user@instance.org`` handle
-    -- without a redundant webfinger round-trip, since we already know the
-    actor id from having ghosted them before. The reverse-direction
-    counterpart of ``bridge.mentions.resolve_pill_mentions``, which does
-    this same mxid-to-ghost lookup for an outgoing post's mentions."""
+    """If ``content`` names one of our own ghost users (a fediverse account
+    already mirrored here) via ``m.mentions`` or a matrix.to pill in
+    ``formatted_body`` -- see ``_mentioned_mxids`` -- return that ghost's
+    profile. Lets ``follow``/``unfollow`` accept a tagged ghost pill the
+    same way they accept a typed-out ``@user@instance.org`` handle -- without
+    a redundant webfinger round-trip, since we already know the actor id
+    from having ghosted them before. The reverse-direction counterpart of
+    ``bridge.mentions.resolve_pill_mentions``, which does this same
+    mxid-to-ghost lookup for an outgoing post's mentions. A bare, hand-typed
+    Matrix ID with no pill/mention structure at all is handled separately --
+    see ``_resolve_mxid_handle``."""
     config = request.app.state.config
     repository = request.app.state.repository
     ghost_prefix = f"@{config.appservice.user_prefix}"
-    for mxid in (content.get("m.mentions") or {}).get("user_ids") or []:
+    for mxid in _mentioned_mxids(content):
         if not mxid.startswith(ghost_prefix):
             continue  # a mention of a real Matrix user, or the bot -- not a fediverse ghost
         profile = await repository.get_ghost_profile_by_mxid(mxid)
@@ -1072,21 +1134,58 @@ async def _resolve_tagged_ghost(request: Request, content: dict) -> GhostProfile
 
 
 async def _resolve_tagged_local_actor(request: Request, content: dict) -> ActorRecord | None:
-    """If ``content``'s ``m.mentions`` names a real local Matrix user (never
-    a ghost, never the bot) who has a linked fediverse profile, return their
-    ``ActorRecord``. The local-user counterpart of ``_resolve_tagged_ghost``
-    -- lets ``follow``/``unfollow`` accept tagging a fellow bridge user
-    directly, the same way tagging a ghost already works."""
+    """If ``content`` names a real local Matrix user (never a ghost, never
+    the bot) via ``m.mentions`` or a matrix.to pill in ``formatted_body`` --
+    see ``_mentioned_mxids`` -- who has a linked fediverse profile, return
+    their ``ActorRecord``. The local-user counterpart of
+    ``_resolve_tagged_ghost`` -- lets ``follow``/``unfollow`` accept tagging
+    a fellow bridge user directly, the same way tagging a ghost already
+    works."""
     config = request.app.state.config
     repository = request.app.state.repository
     bot_mxid = _bot_mxid(config)
     ghost_prefix = f"@{config.appservice.user_prefix}"
-    for mxid in (content.get("m.mentions") or {}).get("user_ids") or []:
+    for mxid in _mentioned_mxids(content):
         if mxid == bot_mxid or mxid.startswith(ghost_prefix):
             continue
         record = await repository.get_local_actor_by_matrix_id(mxid)
         if record is not None:
             return record
+    return None
+
+
+async def _resolve_mxid_handle(request: Request, handle: str) -> tuple[str, str, ActorRecord | None] | None:
+    """If ``handle`` is itself a bare Matrix ID (``@localpart:server``) --
+    typed by hand with no client-recorded mention structure at all, unlike
+    a pill/autocomplete mention (see ``_resolve_tagged_ghost``/
+    ``_resolve_tagged_local_actor``/``_mentioned_mxids``, which cover those)
+    -- resolves it the same way a tagged mention would: a ghost's own
+    cached handle, or a local bridge user's own fediverse handle. Returns
+    ``(remote_actor_id, display_handle, local_record)``, shaped exactly
+    like ``_resolve_target_actor``'s return value -- ``local_record`` is set
+    only for a local bridge user. Returns None if ``handle`` doesn't even
+    look like a Matrix ID (most calls -- this is checked well before any
+    webfinger attempt), or looks like one but isn't a ghost or local user we
+    actually know: callers should fall through to their usual webfinger
+    resolution either way, exactly as if this function didn't exist."""
+    if not _MXID_RE.match(handle):
+        return None
+    config = request.app.state.config
+    repository = request.app.state.repository
+    base = config.bridge.public_base_url
+
+    local_record = await repository.get_local_actor_by_matrix_id(handle)
+    if local_record is not None:
+        return (
+            actor_url(base, local_record.username),
+            f"@{local_record.username}@{config.bridge.domain}",
+            local_record,
+        )
+
+    profile = await repository.get_ghost_profile_by_mxid(handle)
+    if profile is not None and profile.handle:
+        return profile.actor_id, profile.handle, None
+
     return None
 
 
@@ -1098,8 +1197,9 @@ async def _resolve_target_actor(
     the target's own ``ActorRecord`` if they're another LOCAL bridge user,
     else ``None`` for a genuinely remote account. Same resolution order as
     ``follow``/``unfollow`` (see ``_handle_follow``'s docstring): a tagged
-    ghost/local-actor mention pill, an explicit ``@user@instance.org``
-    handle, or -- with no argument at all -- whichever account's own room
+    ghost/local-actor mention pill, a bare Matrix ID (see
+    ``_resolve_mxid_handle``), an explicit ``@user@instance.org`` handle,
+    or -- with no argument at all -- whichever account's own room
     this command was run inside (a Remote User Room, or another local
     user's Profile Room). Unlike ``follow``, never requires an existing
     Remote User Room/fetches the target's actor document at all -- you can
@@ -1120,6 +1220,9 @@ async def _resolve_target_actor(
         return tagged_ghost.actor_id, tagged_ghost.handle or tagged_ghost.actor_id, None
 
     if handle:
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            return mxid_match
         try:
             remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
         except WebfingerNotFoundError:
@@ -1227,13 +1330,20 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
     actor. ``handle`` may be omitted entirely if this is run from inside
     that account's own Remote User Room -- the room itself already names
     exactly who'd otherwise have to be spelled out. A tagged ghost pill
-    (``content``'s ``m.mentions``) works the same as typing out the handle
-    -- see ``_resolve_tagged_ghost`` -- and takes priority over ``handle``
-    if somehow both are present, since a resolved mention is unambiguous
-    where parsed text could in principle be wrong.
+    (``content``'s ``m.mentions``, or a matrix.to pill pasted into
+    ``formatted_body`` -- see ``_mentioned_mxids``) works the same as typing
+    out the handle -- see ``_resolve_tagged_ghost`` -- and takes priority
+    over ``handle`` if somehow both are present, since a resolved mention is
+    unambiguous where parsed text could in principle be wrong. ``handle``
+    itself may ALSO be a bare Matrix ID (typed by hand, with none of that
+    mention structure at all) instead of a ``@user@instance.org`` fediverse
+    handle -- see ``_resolve_mxid_handle``, checked first and, on no match,
+    falling through to the ordinary webfinger resolution below exactly as
+    before.
 
     If the target turns out to be another LOCAL bridge user -- tagged
-    directly (see ``_resolve_tagged_local_actor``), or named by their own
+    directly (see ``_resolve_tagged_local_actor``), named by their own
+    Matrix ID (see ``_resolve_mxid_handle``), or named by their own
     ``@user@ourdomain`` handle, which webfinger resolves exactly like any
     other account's -- this hands off to ``_follow_local_actor`` instead of
     the remote flow below: a ghost/Remote User Room is never appropriate
@@ -1261,32 +1371,44 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             return
         handle = tagged_ghost.handle
     elif handle:
-        try:
-            remote_actor_id = await resolve_remote_actor_id(http_client, handle)
-        except WebfingerNotFoundError:
-            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
-            return
-        except WebfingerUnreachableError:
-            await _notice(
-                request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
-            )
-            return
-        except WebfingerError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
-        local_username = username_from_actor_url(config.bridge.public_base_url, remote_actor_id)
-        if local_username is not None:
-            target = await repository.get_local_actor(local_username)
-            if target is None:
-                await _notice(request, room_id, f"{handle} doesn't look like an active profile on this bridge.")
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            remote_actor_id, handle, local_record = mxid_match
+            if local_record is not None:
+                await _follow_local_actor(request, sender=sender, room_id=room_id, target=local_record)
                 return
-            await _follow_local_actor(request, sender=sender, room_id=room_id, target=target)
-            return
-        try:
-            actor_doc = await fetch_actor(request, remote_actor_id)
-        except RemoteActorFetchError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
+            try:
+                actor_doc = await fetch_actor(request, remote_actor_id)
+            except RemoteActorFetchError as exc:
+                await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
+                return
+        else:
+            try:
+                remote_actor_id = await resolve_remote_actor_id(http_client, handle)
+            except WebfingerNotFoundError:
+                await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+                return
+            except WebfingerUnreachableError:
+                await _notice(
+                    request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
+                )
+                return
+            except WebfingerError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
+            local_username = username_from_actor_url(config.bridge.public_base_url, remote_actor_id)
+            if local_username is not None:
+                target = await repository.get_local_actor(local_username)
+                if target is None:
+                    await _notice(request, room_id, f"{handle} doesn't look like an active profile on this bridge.")
+                    return
+                await _follow_local_actor(request, sender=sender, room_id=room_id, target=target)
+                return
+            try:
+                actor_doc = await fetch_actor(request, remote_actor_id)
+            except RemoteActorFetchError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
     else:
         remote_room_here = await repository.get_remote_actor_room_by_room_id(room_id)
         if remote_room_here is None:
@@ -1345,7 +1467,10 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
         else:
             await _notice(request, room_id, f"Could not follow {handle}: {follow_error}.")
         return
-    await _notice(request, room_id, f"Following {handle}. Posts will appear in {followed_room_id}.")
+    await _notice(
+        request, room_id, f"Following {handle}. Posts will appear in {followed_room_id}.",
+        html_message=f"Following {html.escape(handle)}. Posts will appear in {room_pill_html(followed_room_id)}.",
+    )
 
 
 
@@ -1549,7 +1674,10 @@ async def _follow_local_actor(
         },
     )
     if not quiet:
-        await _notice(request, room_id, f"Following {handle}. You've been invited to {target.room_id}.")
+        await _notice(
+            request, room_id, f"Following {handle}. You've been invited to {target.room_id}.",
+            html_message=f"Following {html.escape(handle)}. You've been invited to {room_pill_html(target.room_id)}.",
+        )
     return None
 
 
@@ -1820,28 +1948,36 @@ async def _handle_unfollow(request: Request, *, sender: str, room_id: str, handl
     if tagged_ghost is not None:
         remote_room = await repository.get_remote_actor_room(tagged_ghost.actor_id)
     elif handle:
-        try:
-            remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
-        except WebfingerNotFoundError:
-            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
-            return
-        except WebfingerUnreachableError:
-            await _notice(
-                request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
-            )
-            return
-        except WebfingerError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
-        local_username = username_from_actor_url(config.bridge.public_base_url, remote_actor_id)
-        if local_username is not None:
-            target = await repository.get_local_actor(local_username)
-            if target is None:
-                await _notice(request, room_id, f"{handle} doesn't look like an active profile on this bridge.")
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            remote_actor_id, handle, local_record = mxid_match
+            if local_record is not None:
+                await _unfollow_local_actor(request, sender=sender, room_id=room_id, target=local_record)
                 return
-            await _unfollow_local_actor(request, sender=sender, room_id=room_id, target=target)
-            return
-        remote_room = await repository.get_remote_actor_room(remote_actor_id)
+            remote_room = await repository.get_remote_actor_room(remote_actor_id)
+        else:
+            try:
+                remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
+            except WebfingerNotFoundError:
+                await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+                return
+            except WebfingerUnreachableError:
+                await _notice(
+                    request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
+                )
+                return
+            except WebfingerError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
+            local_username = username_from_actor_url(config.bridge.public_base_url, remote_actor_id)
+            if local_username is not None:
+                target = await repository.get_local_actor(local_username)
+                if target is None:
+                    await _notice(request, room_id, f"{handle} doesn't look like an active profile on this bridge.")
+                    return
+                await _unfollow_local_actor(request, sender=sender, room_id=room_id, target=target)
+                return
+            remote_room = await repository.get_remote_actor_room(remote_actor_id)
     else:
         remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
 
@@ -1863,7 +1999,10 @@ async def _handle_unfollow(request: Request, *, sender: str, room_id: str, handl
         return
 
     if room_id != remote_room.room_id:
-        await _notice(request, room_id, f"Unfollowed and removed you from {remote_room.room_id}.")
+        await _notice(
+            request, room_id, f"Unfollowed and removed you from {remote_room.room_id}.",
+            html_message=f"Unfollowed and removed you from {room_pill_html(remote_room.room_id)}.",
+        )
 
     # The kick above is what actually drives the unfollow (see this
     # function's own docstring -- bridge.membership sees the resulting
@@ -1919,6 +2058,10 @@ async def _unfollow_local_actor(request: Request, *, sender: str, room_id: str, 
         request, room_id,
         f"Unfollowed {handle}. You're still in {target.room_id} if you were invited there -- "
         "leave it yourself if you'd like to.",
+        html_message=(
+            f"Unfollowed {html.escape(handle)}. You're still in {room_pill_html(target.room_id)} "
+            "if you were invited there -- leave it yourself if you'd like to."
+        ),
     )
 
     unfollowed_pill = notification_actor_html(mxid=target.matrix_user_id, handle=handle)
@@ -1951,17 +2094,26 @@ async def _handle_list_following(request: Request, *, sender: str, room_id: str)
         return
 
     lines = []
+    html_lines = []
     for actor_id in sorted(following):
         remote_room = await repository.get_remote_actor_room(actor_id)
         domain = urlsplit(actor_id).hostname or ""
         username = actor_id.rstrip("/").rsplit("/", 1)[-1]
         handle = f"@{username}@{domain}"
         label = f"{remote_room.display_name} ({handle})" if remote_room and remote_room.display_name else handle
+        html_label = html.escape(label)
         if remote_room is not None:
             label += f" -- {matrix_to_room_link(remote_room.room_id)}"
+            html_label += f" -- {room_pill_html(remote_room.room_id)}"
         lines.append(f"- {label}")
+        html_lines.append(f"- {html_label}")
 
-    await _notice(request, room_id, f"Following {len(following)} account(s):\n" + "\n".join(lines))
+    await _notice(
+        request, room_id, f"Following {len(following)} account(s):\n" + "\n".join(lines),
+        html_message=(
+            f"<p>Following {len(following)} account(s):</p><p>" + "<br>".join(html_lines) + "</p>"
+        ),
+    )
 
 
 async def _handle_set_collection_visibility(
@@ -2313,19 +2465,30 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
     if tagged_ghost is not None:
         remote_actor_id = tagged_ghost.actor_id
     elif handle:
-        try:
-            remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
-        except WebfingerNotFoundError:
-            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
-            return
-        except WebfingerUnreachableError:
-            await _notice(
-                request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
-            )
-            return
-        except WebfingerError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            remote_actor_id, handle, local_record = mxid_match
+            if local_record is not None:
+                await _notice(
+                    request, room_id,
+                    f"{handle} looks like a local user on this bridge -- just start an "
+                    "ordinary Matrix DM with them directly, no bridge command needed.",
+                )
+                return
+        else:
+            try:
+                remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
+            except WebfingerNotFoundError:
+                await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+                return
+            except WebfingerUnreachableError:
+                await _notice(
+                    request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
+                )
+                return
+            except WebfingerError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
     else:
         remote_room_here = await repository.get_remote_actor_room_by_room_id(room_id)
         if remote_room_here is None:
@@ -2376,14 +2539,17 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
         return
 
     link = matrix_to_room_link(dm_room_id)
+    pill = room_pill_html(dm_room_id, display_name)
     if already_existed:
         await _notice(
-            request, room_id, f"You already have a DM room with {display_name}: {link} -- send your message there."
+            request, room_id, f"You already have a DM room with {display_name}: {link} -- send your message there.",
+            html_message=f"You already have a DM room with {html.escape(display_name)}: {pill} -- send your message there.",
         )
     else:
         await _notice(
             request, room_id,
             f"Started a DM with {display_name}: {link} -- you've been invited, send your message there.",
+            html_message=f"Started a DM with {html.escape(display_name)}: {pill} -- you've been invited, send your message there.",
         )
 
 
@@ -2404,19 +2570,30 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
     if tagged_ghost is not None:
         remote_actor_id = tagged_ghost.actor_id
     elif handle:
-        try:
-            remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
-        except WebfingerNotFoundError:
-            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
-            return
-        except WebfingerUnreachableError:
-            await _notice(
-                request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
-            )
-            return
-        except WebfingerError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            remote_actor_id, handle, local_record = mxid_match
+            if local_record is not None:
+                await _notice(
+                    request, room_id,
+                    f"{handle} looks like a local user on this bridge -- just start an "
+                    "ordinary Matrix DM with them directly, no bridge command needed.",
+                )
+                return
+        else:
+            try:
+                remote_actor_id = await resolve_remote_actor_id(request.app.state.http_client, handle)
+            except WebfingerNotFoundError:
+                await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+                return
+            except WebfingerUnreachableError:
+                await _notice(
+                    request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit."
+                )
+                return
+            except WebfingerError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
     else:
         remote_room_here = await repository.get_remote_actor_room_by_room_id(room_id)
         if remote_room_here is None:
@@ -2481,14 +2658,17 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
         return
 
     link = matrix_to_room_link(chat_room_id)
+    pill = room_pill_html(chat_room_id, display_name)
     if already_existed:
         await _notice(
-            request, room_id, f"You already have a chat with {display_name}: {link} -- send your message there."
+            request, room_id, f"You already have a chat with {display_name}: {link} -- send your message there.",
+            html_message=f"You already have a chat with {html.escape(display_name)}: {pill} -- send your message there.",
         )
     else:
         await _notice(
             request, room_id,
             f"Started a chat with {display_name}: {link} -- you've been invited, send your message there.",
+            html_message=f"Started a chat with {html.escape(display_name)}: {pill} -- you've been invited, send your message there.",
         )
 
 
@@ -3139,6 +3319,10 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         await _notice(
             request, room_id,
             f"{url} is a local post -- you've been invited to {local_author.room_id} instead of importing it.",
+            html_message=(
+                f"{html.escape(url)} is a local post -- you've been invited to "
+                f"{room_pill_html(local_author.room_id)} instead of importing it."
+            ),
         )
         return
 
@@ -3435,7 +3619,9 @@ async def _handle_poll_refresh(request: Request, *, room_id: str, content: dict)
 async def _handle_refresh(request: Request, *, sender: str, room_id: str, argument: str, content: dict) -> None:
     """``;refresh @user@instance.org`` (admin-only, or bare ``;refresh`` run
     inside that account's own Remote User Room, same "argument or implied
-    by the room" convention as ``;follow`` -- see its own docstring)
+    by the room" convention as ``;follow`` -- see its own docstring; a
+    tagged ghost mention pill or a bare Matrix ID both work here too, same
+    as ``;follow`` -- see ``_resolve_tagged_ghost``/``_resolve_mxid_handle``)
     re-fetches a ghost's live ActivityPub actor document right now and
     brings everything this bridge keeps in sync with it up to date
     immediately, rather than waiting for whatever next triggers it
@@ -3497,19 +3683,32 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     synapse = request.app.state.synapse
     repository = request.app.state.repository
 
+    tagged_ghost = await _resolve_tagged_ghost(request, content)
     handle = argument.strip()
-    if handle:
-        try:
-            remote_actor_id = await resolve_remote_actor_id(http_client, handle)
-        except WebfingerNotFoundError:
-            await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+    if tagged_ghost is not None:
+        remote_room = await repository.get_remote_actor_room(tagged_ghost.actor_id)
+        if remote_room is None:
+            await _notice(request, room_id, f"{tagged_ghost.handle} isn't a ghost on this bridge yet.")
             return
-        except WebfingerUnreachableError:
-            await _notice(request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit.")
-            return
-        except WebfingerError as exc:
-            await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
-            return
+    elif handle:
+        mxid_match = await _resolve_mxid_handle(request, handle)
+        if mxid_match is not None:
+            remote_actor_id, handle, local_record = mxid_match
+            if local_record is not None:
+                await _notice(request, room_id, f"{handle} is a local bridge user, not a ghost -- nothing to refresh.")
+                return
+        else:
+            try:
+                remote_actor_id = await resolve_remote_actor_id(http_client, handle)
+            except WebfingerNotFoundError:
+                await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+                return
+            except WebfingerUnreachableError:
+                await _notice(request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit.")
+                return
+            except WebfingerError as exc:
+                await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+                return
         remote_room = await repository.get_remote_actor_room(remote_actor_id)
         if remote_room is None:
             await _notice(request, room_id, f"{handle} isn't a ghost on this bridge yet.")
@@ -3894,6 +4093,10 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
             request, room_id,
             f"{sender} is already linked as {existing.username}@{config.bridge.domain} "
             f"(room {existing.room_id}).",
+            html_message=(
+                f"{html.escape(sender)} is already linked as {existing.username}@{config.bridge.domain} "
+                f"(room {room_pill_html(existing.room_id)})."
+            ),
         )
         return
 
@@ -3993,9 +4196,14 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
 
     verb = "Re-created" if existing is not None else "Created"
     message = f"{verb} {new_room_id} and linked it as {username}@{config.bridge.domain} -- you've been invited and made admin there."
+    html_message = (
+        f"{verb} {room_pill_html(new_room_id)} and linked it as {username}@{config.bridge.domain} "
+        "-- you've been invited and made admin there."
+    )
     if existing is not None:
         message += " Your followers/following from before are preserved."
-    await _notice(request, room_id, message)
+        html_message += " Your followers/following from before are preserved."
+    await _notice(request, room_id, message, html_message=html_message)
 
 
 async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -> None:
@@ -4009,6 +4217,10 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
             request, room_id,
             f"{sender} is already linked as {existing.username}@{config.bridge.domain} "
             f"(room {existing.room_id}).",
+            html_message=(
+                f"{html.escape(sender)} is already linked as {existing.username}@{config.bridge.domain} "
+                f"(room {room_pill_html(existing.room_id)})."
+            ),
         )
         return
 
@@ -4831,6 +5043,10 @@ async def _replace_profile_room(
         request, old_room_id,
         f"Replaced. {actor_record.username}@{config.bridge.domain} now publishes from {new_room_id} "
         "instead -- you've been invited there. This room is no longer linked.",
+        html_message=(
+            f"Replaced. {actor_record.username}@{config.bridge.domain} now publishes from "
+            f"{room_pill_html(new_room_id)} instead -- you've been invited there. This room is no longer linked."
+        ),
     )
 
 
@@ -4962,6 +5178,10 @@ async def _replace_remote_actor_room(
         request, old_room_id,
         f"Replaced. {username}@{domain}'s posts now mirror into {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
+        html_message=(
+            f"Replaced. {username}@{domain}'s posts now mirror into {room_pill_html(new_room_id)} instead -- "
+            "you've been invited there. This room is no longer linked."
+        ),
     )
 
 
@@ -5055,6 +5275,10 @@ async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str,
         request, old_room_id,
         f"Replaced. Your DMs with {display_name} now continue in {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
+        html_message=(
+            f"Replaced. Your DMs with {html.escape(display_name)} now continue in {room_pill_html(new_room_id)} "
+            "instead -- you've been invited there. This room is no longer linked."
+        ),
     )
 
 
@@ -5127,6 +5351,10 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
         request, old_room_id,
         f"Replaced. Your chat with {display_name} now continues in {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
+        html_message=(
+            f"Replaced. Your chat with {html.escape(display_name)} now continues in {room_pill_html(new_room_id)} "
+            "instead -- you've been invited there. This room is no longer linked."
+        ),
     )
 
 
@@ -5173,6 +5401,10 @@ async def _replace_notification_room(request: Request, *, old_room_id: str, matr
         request, old_room_id,
         f"Replaced. Your Fediverse Notifications now continue in {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
+        html_message=(
+            f"Replaced. Your Fediverse Notifications now continue in {room_pill_html(new_room_id)} instead -- "
+            "you've been invited there. This room is no longer linked."
+        ),
     )
 
 
@@ -5244,7 +5476,10 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
     except SynapseError as exc:
         await _notice(request, room_id, f"Could not invite {target_mxid} to {target_room_id}: {exc}")
         return
-    await _notice(request, room_id, f"Invited {target_mxid} to {target_room_id}.")
+    await _notice(
+        request, room_id, f"Invited {target_mxid} to {target_room_id}.",
+        html_message=f"Invited {html.escape(target_mxid)} to {room_pill_html(target_room_id)}.",
+    )
 
 
 # Matrix server_name shape: a domain (optionally with a port) -- deliberately
