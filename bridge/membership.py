@@ -586,16 +586,16 @@ async def _welcome_to_profile_room(request: Request, *, room_id: str, joined_use
     # so grouping them under it reads clearer than four flat, unrelated-
     # looking bullets would.
     profile_points = [
-        "Anything you post here (that isn't a bot command) goes out as a fediverse post.",
-        "This room's avatar is your fediverse avatar.",
-        "This room's topic is your fediverse bio.",
-        'Use ";banner mxc://server/mediaid" to set your fediverse profile\'s banner image.',
+        "Anything you post here (that isn't a bot command) goes out as a post.",
+        "This room's avatar is your avatar.",
+        "This room's topic is your bio.",
+        'Use ";banner mxc://server/mediaid" to set your profile\'s banner image.',
     ]
     profile_points_html = [
-        "Anything you post here (that isn't a bot command) goes out as a fediverse post.",
-        "This room's avatar is your fediverse avatar.",
-        "This room's topic is your fediverse bio.",
-        "Use <code>;banner mxc://server/mediaid</code> to set your fediverse profile's banner image.",
+        "Anything you post here (that isn't a bot command) goes out as a post.",
+        "This room's avatar is your avatar.",
+        "This room's topic is your bio.",
+        "Use <code>;banner mxc://server/mediaid</code> to set your profile's banner image.",
     ]
 
     plain_bullets = [
