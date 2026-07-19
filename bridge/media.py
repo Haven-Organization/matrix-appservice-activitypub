@@ -147,9 +147,7 @@ async def fetch_and_upload_media_with_dimensions(
             # falling through to an unnecessary, un-deduplicated re-upload.
             logger.warning("Could not re-fetch own media %s for dimensions", own_mxc, exc_info=True)
             return own_mxc, None, None
-        parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(download.content_type)
-        dimensions = parser(download.content) if parser else None
-        width, height = dimensions if dimensions is not None else (None, None)
+        width, height = _dimensions_with_fallback(download.content, download.content_type)
         return own_mxc, width, height
 
     response = await _download_media(http_client, url)
@@ -160,12 +158,33 @@ async def fetch_and_upload_media_with_dimensions(
     if mxc_uri is None:
         return None
 
-    width = height = None
-    parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(content_type)
-    dimensions = parser(response.content) if parser else None
-    if dimensions is not None:
-        width, height = dimensions
+    width, height = _dimensions_with_fallback(response.content, content_type)
     return mxc_uri, width, height
+
+
+def _dimensions_with_fallback(data: bytes, content_type: str) -> tuple[int | None, int | None]:
+    """Width/height for ``data``, trying ``content_type``'s own parser
+    first and falling back to magic-byte sniffing if that comes up empty
+    -- not just when ``content_type`` is one of ``_UNHELPFUL_CONTENT_TYPES``
+    the way ``_resolved_content_type`` itself falls back, but ANY time the
+    declared type's own parser found nothing, including a real, specific,
+    just plain WRONG one. Confirmed live 2026-07-15: a real clew.lol video
+    was served (both via its HTTP Content-Type header AND its filename)
+    labeled ``video/webm``, while its actual bytes were a genuine MP4--
+    the WebM parser naturally found nothing in real MP4 bytes, silently
+    dropping the dimensions entirely, even though the file's own magic
+    bytes unambiguously said MP4 the whole time. Never touches what gets
+    uploaded/labeled as -- purely a second attempt at dimensions, using
+    whichever parser the ACTUAL bytes call for instead of whichever the
+    server happened to claim."""
+    parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(content_type)
+    dimensions = parser(data) if parser else None
+    if dimensions is None:
+        sniffed_type = _sniff_content_type(data)
+        if sniffed_type and sniffed_type != content_type:
+            sniffed_parser = _DIMENSIONS_PARSER_BY_CONTENT_TYPE.get(sniffed_type)
+            dimensions = sniffed_parser(data) if sniffed_parser else None
+    return dimensions if dimensions is not None else (None, None)
 
 
 def _mp4_video_dimensions(data: bytes) -> tuple[int, int] | None:
