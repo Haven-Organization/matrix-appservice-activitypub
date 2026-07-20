@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity
-from bridge.activitypub.urls import actor_url, followers_url, main_key_id
+from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
@@ -96,6 +96,39 @@ def _is_repost_emoji(key: str) -> bool:
     reaction shorthand for reposting a post instead of merely reacting to
     it."""
     return key.replace(_VARIATION_SELECTOR_16, "") in _REPOST_EMOJIS
+
+
+# MSC4027 (custom images in reactions): a supporting client reacts with an
+# m.relates_to.key that's an mxc:// URI (the image itself) instead of a
+# unicode emoji/shortcode, plus a top-level shortcode field for alt text --
+# stable "shortcode", falling back to Beeper's older unstable
+# "com.beeper.reaction.shortcode" (both confirmed against Element's own
+# current source, matrix-react-sdk's reactionShortcode.ts/
+# ReactionsRowButtonViewModel.ts: `content.startsWith("mxc://")` is
+# literally how it decides whether to render an image). No config gate on
+# this (outbound) direction -- unlike the inbound one in
+# bridge.inbox_dispatch, which changes what OTHER Matrix clients render for
+# an existing reaction and so defaults off, this only ever fires for a
+# reaction a Matrix user chose to send using an image pack in the first
+# place; there's no plain-emoji reaction this could regress instead.
+_REACTION_SHORTCODE_FIELD = "shortcode"
+_REACTION_SHORTCODE_FIELD_LEGACY = "com.beeper.reaction.shortcode"
+
+
+def _is_custom_image_reaction_key(key: str) -> bool:
+    return key.startswith("mxc://")
+
+
+def _reaction_shortcode(content: dict, key: str) -> str:
+    """The AP-side custom-emoji shortcode (``:name:``) for a Matrix
+    MSC4027 custom-image reaction's own ``content`` -- from the event's
+    own ``shortcode``/``com.beeper.reaction.shortcode`` field if the
+    sending client set one (Element always does), else derived from the
+    image's own media id so the fediverse side still gets SOME
+    distinguishing text rather than a blank/meaningless one."""
+    shortcode = content.get(_REACTION_SHORTCODE_FIELD) or content.get(_REACTION_SHORTCODE_FIELD_LEGACY)
+    text = shortcode.strip() if isinstance(shortcode, str) and shortcode.strip() else key.rsplit("/", 1)[-1]
+    return text if text.startswith(":") and text.endswith(":") else f":{text.strip(':')}:"
 
 
 # Per MSC4501, a caption-less repost is TWO Matrix events for one logical
@@ -466,15 +499,39 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
     target_author_actor_id = parent.reposted_author_actor_id or parent.author_actor_id
 
     base = config.bridge.public_base_url
-    activity_type = "Like" if _is_favorite_emoji(key) else "EmojiReact"
-    activity_id = f"{actor_url(base, actor_record.username)}/reacts/{uuid.uuid4().hex}"
-    reaction_activity = Activity(
-        id=activity_id,
-        type=activity_type,
-        actor=actor_url(base, actor_record.username),
-        object=target_object_id,
-        content=key if activity_type == "EmojiReact" else None,
-    )
+    own_actor_id = actor_url(base, actor_record.username)
+    activity_id = f"{own_actor_id}/reacts/{uuid.uuid4().hex}"
+    if _is_custom_image_reaction_key(key):
+        # An MSC4027 custom-image reaction -- never a bare Like (there's no
+        # "favorite" analog for an arbitrary image pack sticker), always an
+        # EmojiReact carrying a real Emoji tag, same shape Pleroma/Misskey/
+        # Akkoma already use for their own custom-emoji reactions (see
+        # bridge.custom_emoji.resolve_custom_emoji_image, which resolves
+        # this exact tag shape on the INBOUND side). The image itself has
+        # to be published through the bridge's own public media proxy
+        # first -- an ordinary Matrix image-pack upload was never exposed
+        # publicly before now, unlike an avatar/attachment mxc that's
+        # already been through mark_media_published by the time it's
+        # federated.
+        await repository.mark_media_published(key)
+        shortcode = _reaction_shortcode(content, key)
+        reaction_activity = Activity(
+            id=activity_id,
+            type="EmojiReact",
+            actor=own_actor_id,
+            object=target_object_id,
+            content=shortcode,
+            tag=[{"type": "Emoji", "name": shortcode, "icon": {"type": "Image", "url": media_url(base, key)}}],
+        )
+    else:
+        activity_type = "Like" if _is_favorite_emoji(key) else "EmojiReact"
+        reaction_activity = Activity(
+            id=activity_id,
+            type=activity_type,
+            actor=own_actor_id,
+            object=target_object_id,
+            content=key if activity_type == "EmojiReact" else None,
+        )
 
     await deliver_to_actor_or_followers(
         request,

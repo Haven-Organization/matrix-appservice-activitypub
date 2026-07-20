@@ -2038,6 +2038,13 @@ async def _echo_reply_in_own_room(
 
 _DEFAULT_LIKE_EMOJI = "👍"
 
+# MSC4027 (custom images in reactions) -- see _handle_like_or_emoji_react's
+# own reasoning. Element's stable field name; bridge.reaction_bridge (the
+# outbound direction) also recognizes the older unstable
+# "com.beeper.reaction.shortcode" on the way IN from a Matrix client, but
+# this bridge only ever WRITES the stable name.
+_MSC4027_SHORTCODE_FIELD = "shortcode"
+
 # The reaction key _react_repost sends for an inbound Announce, and
 # _redact_repost_reaction looks for on undo -- MSC4501's own repost
 # emoji (see _build_repost_message/_quoted_post_render's identical choice),
@@ -2088,10 +2095,30 @@ async def _handle_like_or_emoji_react(request: Request, username: str, activity:
         request.app.state.http_client, request.app.state.synapse, repository, activity.tag, key
     )
 
+    # MSC4027 (custom images in reactions): mirror as a real m.reaction
+    # image, not just plain shortcode text -- only when the operator has
+    # opted in (bridge.msc4027_custom_reactions, off by default) AND the
+    # emoji actually resolved to an image. m.relates_to.key becomes the
+    # image's own mxc:// (what an MSC4027-aware client actually renders),
+    # with the original shortcode text moved to a top-level "shortcode"
+    # field for alt text -- exactly the shape Element's own current
+    # implementation sends/expects (confirmed against its source, not just
+    # the MSC text). Deliberately off by default: unlike every other
+    # MSC4501/4503 field this bridge sets, this REPLACES the one field
+    # every client (MSC4027-aware or not) already renders, so a client that
+    # doesn't understand it would show the literal mxc://... string as the
+    # reaction instead of the shortcode text it showed before -- a real
+    # regression, not just an ignored extra field, until the operator knows
+    # their users' clients support it.
+    reaction_content: dict = {"m.relates_to": {"rel_type": "m.annotation", "event_id": target.event_id, "key": key}}
+    if custom_emoji_mxc and request.app.state.config.bridge.msc4027_custom_reactions:
+        reaction_content["m.relates_to"]["key"] = custom_emoji_mxc
+        reaction_content[_MSC4027_SHORTCODE_FIELD] = key
+
     try:
         event_id = await synapse.send_message_event(
             target.room_id,
-            {"m.relates_to": {"rel_type": "m.annotation", "event_id": target.event_id, "key": key}},
+            reaction_content,
             event_type="m.reaction",
             as_user_id=ghost_mxid_,
         )

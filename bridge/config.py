@@ -78,6 +78,22 @@ class BridgeSection:
     #     set_msc4501_profile_room_id, since at least the "profile" half
     #     needs an explicit homeserver opt-in first.
     msc4503_external_handle: str = "off"
+    # Whether an inbound Like/EmojiReact whose custom-emoji shortcode
+    # resolves to an image (see bridge.custom_emoji.resolve_custom_emoji_image)
+    # gets mirrored as a real MSC4027 custom-image reaction -- an m.reaction
+    # whose m.relates_to.key is the image's own mxc:// (not the shortcode
+    # text) plus a top-level "shortcode" field carrying that text for
+    # alt-text/accessibility, matching Element's own shipped implementation
+    # (confirmed against its actual source, not just the MSC text: key
+    # becomes the mxc:// URI directly, no separate fallback field -- a
+    # client with no idea what MSC4027 is just shows the literal mxc://...
+    # string as the reaction's "emoji"). Off by default for exactly that
+    # reason: unlike set_msc4501_relates_to's purely-additive field, this
+    # replaces the one field every client (MSC4027-aware or not) actually
+    # renders, so it's a real regression for anyone on a client that
+    # doesn't understand it yet -- an operator should turn this on only
+    # once they know their users' clients support it.
+    msc4027_custom_reactions: bool = False
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
     # same convention as Matrix's own m.relates_to) on every mirrored repost
     # (Announce), quote-post, and cross-posted reply echo -- see
@@ -395,6 +411,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
         set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", False)),
         msc4503_external_handle=msc4503_external_handle,
+        msc4027_custom_reactions=bool(bridge_raw.get("msc4027_custom_reactions", False)),
         set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,

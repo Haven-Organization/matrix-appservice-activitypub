@@ -333,7 +333,10 @@ class Activity:
     # a Pleroma/Misskey/Akkoma extension shaped like Note.tag's own Emoji
     # entries ({"type": "Emoji", "name": ":blobcat:", "icon": {"url": ...}}),
     # matched against `content` by bridge.inbox_dispatch to resolve the
-    # reaction's actual image. Absent (empty) for every other activity type.
+    # reaction's actual image (inbound), or built the same way by
+    # bridge.reaction_bridge when mirroring an MSC4027 custom-image Matrix
+    # reaction back out (outbound). Absent (empty) for every other activity
+    # type.
     tag: list[dict[str, Any]] = field(default_factory=list)
     # FEP-bebd's invite-gated Follow: the InviteCode object's own id, carried
     # on a Follow<Organization> to join a Shoot guild. Absent for every other
@@ -357,6 +360,7 @@ class Activity:
                 "to": self.to,
                 "cc": self.cc,
                 "content": self.content,
+                "tag": self.tag,
                 "instrument": self.instrument,
             }
         )

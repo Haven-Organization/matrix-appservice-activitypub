@@ -15,87 +15,74 @@ bridge:
   listen_host: 127.0.0.1
   listen_port: 8090
 
-  # Address Synapse should push AppService transactions to. Defaults to
-  # http://{listen_host}:{listen_port}; only set this if Synapse and the
-  # bridge are on different hosts.
+  # Address Synapse should push AppService transactions to. Only set this if
+  # Synapse and the bridge are on different hosts.
   # internal_base_url: http://127.0.0.1:8090
 
   # Auto-accept knocks from OTHER homeservers' users the same as local ones.
-  # Off by default -- who gets auto-admitted into this server's rooms is
-  # this server's call; anyone already in a room can still invite one manually.
+  # Off by default -- who gets auto-admitted into this server's rooms is this
+  # server's call.
   # accept_federated_knocks: false
 
   # Default post count for ";backfill" with no explicit argument. A Matrix
-  # server admin can override this per-use; everyone else always gets this default.
+  # server admin can override this per-use.
   # backfill_default_count: 15
 
   # Join rule for a Remote User Room (a ghost's mirror of a remote fediverse
   # account). "knock" (default) lets anyone locked out ask their way back in
-  # without an admin. "invite" or "public" also work; "restricted"/
-  # "knock_restricted" aren't supported (need a space membership condition
-  # this bridge doesn't set up).
+  # without an admin. "invite"/"public" also work.
   # ghost_room_join_rule: knock
 
-  # Same as ghost_room_join_rule, but for a local user's own Profile Room
-  # (";create profile"/";link profile"/";replace room"). Separate setting
-  # since a local user's own room and a ghost's mirror of a stranger's
-  # account are different trust situations.
+  # Same as ghost_room_join_rule, but for a local user's own Profile Room.
   # local_profile_room_join_rule: knock
 
   # What an admin-allowlisted user on a DIFFERENT homeserver (see the
   # ";allow"/";disallow"/";allowed" commands) gets, once allowed:
   #   follow_only (default) - ";follow" and interact only. No Profile Room;
-  #                            their AP identity is minted automatically on
-  #                            first ";follow" with a bridge-held keypair,
-  #                            and always mirrors their live Matrix display
-  #                            name/avatar. No ";dm"/";chat"/";banner"/
-  #                            ";replace room"/";backfill"/";repost".
+  #                            their AP identity is minted automatically,
+  #                            always mirroring their live Matrix profile.
   #   full                    - identical to a local user: self-service
-  #                             ";create profile"/";link profile", full
-  #                             control of their own Profile Room, DM, Chat.
-  # A single deployment-wide setting, live and reversible -- flipping it
-  # doesn't touch any already-provisioned identity, it just changes what's
-  # reachable going forward (see this option's own docstring in
-  # bridge/config.py for the exact rules).
+  #                             ";create profile"/";link profile", DM, Chat.
+  # A single deployment-wide, reversible setting.
   # third_party_access_mode: follow_only
 
   # Matrix polls have no expiry; some fediverse receivers (Mastodon-family)
-  # refuse a poll with none at all. This many days from creation is sent as
-  # the poll's endTime instead of omitting it.
+  # refuse a poll with none. This many days from creation is sent as the
+  # poll's endTime instead.
   # poll_default_duration_days: 7
 
   # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
-  # Profiles) on every ghost, pointing at its Remote User Room. Off by
-  # default -- Synapse doesn't enable MSC4133 by default either (needs
-  # experimental_features.msc4133_enabled: true in homeserver.yaml). Turn
-  # on once your homeserver actually supports it.
+  # Profiles) on every ghost. Off by default -- needs
+  # experimental_features.msc4133_enabled: true in homeserver.yaml first.
   # set_msc4501_profile_room_id: false
 
-  # Set org.matrix.msc4503.external_handle (MSC4503, "External Protocol
-  # Handles") on every ghost -- carrying its actual ActivityPub handle
-  # (e.g. "@alice@mastodon.social"). One of:
+  # Set org.matrix.msc4503.external_handle (MSC4503) on every ghost, carrying
+  # its actual ActivityPub handle (e.g. "@alice@mastodon.social"). One of:
   #   - "off" (default)
-  #   - "profile": an MSC4133 profile field on the ghost's own account
-  #     (needs the same homeserver support as set_msc4501_profile_room_id
-  #     above)
-  #   - "events": a snapshot on every event the ghost sends (no such
-  #     dependency)
+  #   - "profile": an MSC4133 profile field (needs the same homeserver
+  #     support as set_msc4501_profile_room_id above)
+  #   - "events": a snapshot on every event the ghost sends instead
   #   - "both"
-  # Changing this only affects ghosts going forward -- an admin can force
-  # an existing ghost's profile field into line with a new value (set,
-  # updated, or removed) right away via ";refresh".
+  # An admin can force an existing ghost's field into line with a new value via ";refresh".
   # msc4503_external_handle: off
+
+  # Mirror an inbound custom-emoji Like/EmojiReact as a real MSC4027
+  # custom-image reaction instead of plain ":shortcode:" text. Off by
+  # default -- a client that doesn't understand MSC4027 would show the raw
+  # mxc://... string instead of the shortcode text it showed before, so
+  # only turn this on once you know your users' clients support it.
+  # Reacting with a custom image FROM Matrix always federates out as a
+  # custom-emoji EmojiReact regardless of this setting.
+  # msc4027_custom_reactions: false
 
   # Set org.matrix.msc4501.social.relates_to on every mirrored repost,
   # quote-post, and cross-posted reply echo. On by default -- purely
   # additive content a non-MSC4501 client just ignores.
   # set_msc4501_relates_to: true
 
-  # For a mirrored repost, assert content_inline (the event's own content
-  # already IS the reposted post's content) instead of duplicating that
-  # content a second time into relates_to.content. On by default. Turn off
-  # to restore the old duplicate-into-relates_to.content behavior, e.g. if
-  # a client you care about doesn't handle content_inline yet.
+  # For a mirrored repost, assert content_inline instead of duplicating the
+  # reposted content a second time into relates_to.content. On by default;
+  # turn off for a client that doesn't handle content_inline yet.
   # use_msc4501_content_inline: true
 
   # Whether an untracked quote-post's TARGET gets imported into its own
@@ -108,27 +95,20 @@ bridge:
 
   # Mirror a remote account's posts using org.matrix.msc4501.social.post as
   # the event TYPE instead of m.room.message. Off by default, and NOT
-  # RECOMMENDED until Phase 2 of MSC4501's rollout plan -- unlike the
-  # relates_to/content_inline options above, this changes the event's
-  # actual type, so a non-MSC4501 client won't render it at all.
+  # RECOMMENDED until Phase 2 of MSC4501's rollout plan -- a non-MSC4501
+  # client won't render the event at all.
   # use_msc4501_post_event_type: false
 
   # MXIDs treated as bridge admins regardless of Synapse server-admin
-  # status. Always additive -- a real Synapse admin not listed here still
-  # gets bridge-admin rights too as long as use_synapse_admin_api (below)
-  # is on.
+  # status. Always additive.
   # admins: []
 
-  # Whether the bridge is allowed to call Synapse's own Admin API (used to
-  # check whether an arbitrary OTHER user is a server admin, and to
-  # enumerate an arbitrary OTHER user's rooms for ;delete profile/;leave
-  # unfollowed). On by default. Turning this off is what lets the bridge
-  # run against a homeserver that doesn't support Synapse's Admin API --
-  # EXPERIMENTAL: only tested with Synapse. Untested on all other
-  # homeservers. Admin status then relies entirely on the `admins` list
-  # above, and the two room-sweep commands fall back to a slower,
-  # bridge-wide scan. Spot-test every admin-gated command and
-  # watch this bridge's own logs closely if you turn this off.
+  # Whether the bridge is allowed to call Synapse's own Admin API. On by
+  # default. Turning this off lets the bridge run against a homeserver
+  # without Synapse's Admin API -- EXPERIMENTAL, only tested with Synapse.
+  # Admin status then relies entirely on the `admins` list above. Spot-test
+  # every admin-gated command and watch this bridge's own logs if you turn
+  # this off.
   # use_synapse_admin_api: true
 
 synapse:
@@ -176,18 +156,12 @@ storage:
   # "sqlite" (default) -- a single file at {data_dir}/bridge.db, no setup
   # needed. "postgresql" -- connects to the server described below instead;
   # useful if you already run Postgres for something else (e.g. Synapse
-  # itself) and would rather not also manage a separate sqlite file, or need
-  # the bridge's bookkeeping reachable from more than one host. Either way
-  # the data stored is identical -- same tables, same content -- so this can
-  # be changed later without losing anything currently tracked (there's no
-  # automatic migration between the two yet, though: switching backends on
-  # an existing deployment starts that backend's storage empty).
+  # itself). Same data either way; switching backends on an existing
+  # deployment starts that backend's storage empty (no automatic migration).
   backend: sqlite
   # Only read when backend is "postgresql". Either set `dsn` directly
   # (postgresql://user:pass@host:port/dbname) or fill in the discrete
-  # fields below -- `dsn` wins if both are present. The discrete form exists
-  # mainly so a password with special characters doesn't have to be
-  # hand-URL-escaped into a DSN string here.
+  # fields below -- `dsn` wins if both are present.
   # postgres:
   #   dsn: "postgresql://matrix_appservice_activitypub:replace_me@localhost:5432/matrix_appservice_activitypub"
   #   host: localhost
@@ -210,13 +184,10 @@ federation:
   # How far in the past (days) a mirrored post's own "published" time is
   # trusted to set the Matrix event's displayed timestamp, before falling
   # back to "now" instead. Keep this comfortably BELOW your homeserver's own
-  # retention.default_policy.max_lifetime, if you have one configured in
-  # homeserver.yaml -- confirmed live that Synapse silently accepts (200 OK)
-  # but never actually persists/exposes an event whose custom timestamp is
-  # older than that policy allows, which is worse than just showing "now".
-  # There's no way for the bridge to detect your retention policy on its
-  # own, so this must be set by hand. Raise it (or set a very large value)
-  # if your homeserver has no retention policy limiting history at all.
+  # retention.default_policy.max_lifetime if you have one configured --
+  # Synapse silently accepts but never persists an event backdated past
+  # that. There's no way for the bridge to detect your retention policy on
+  # its own, so this must be set by hand.
   max_backdate_days: 730
 
 logging:
