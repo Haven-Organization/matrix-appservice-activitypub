@@ -45,7 +45,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import _effective_third_party_mode, message_addresses_bot
-from bridge.media import build_ap_attachment, media_caption
+from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPOST,
@@ -403,6 +403,11 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
             external_url=external_url,
         ):
             return True
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=content, room_id=room_id, sender=sender, trigger_event_id=matrix_event_id,
+    ):
+        return True  # an encrypted attachment, confirmation requested, nothing federates yet
 
     raw_body = (content.get("body") or "").strip()
     base = config.bridge.public_base_url

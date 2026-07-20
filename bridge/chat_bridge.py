@@ -32,7 +32,7 @@ from bridge.activitypub.models import Activity, ChatMessage
 from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.activitypub.urls import actor_url, main_key_id
 from bridge.commands import is_third_party_still_allowed, message_addresses_bot
-from bridge.media import build_ap_attachment
+from bridge.media import build_ap_attachment, resolve_attachment_or_request_confirmation
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
 
@@ -92,6 +92,11 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
     # the "no linked profile" case above.
     if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=content, room_id=room_id, sender=sender, trigger_event_id=event.get("event_id") or "",
+    ):
+        return True  # an encrypted attachment, confirmation requested, nothing federates yet
 
     base = config.bridge.public_base_url
     attachment = build_ap_attachment(base, content)

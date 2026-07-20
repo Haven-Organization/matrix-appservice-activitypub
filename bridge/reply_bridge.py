@@ -54,7 +54,7 @@ from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
 from bridge.commands import is_third_party_still_allowed, message_addresses_bot
-from bridge.media import build_ap_attachment, media_caption
+from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
 from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
@@ -183,7 +183,7 @@ async def _send_outbound_dm(
     recipient_actor_id: str,
     in_reply_to: str | None,
     thread_root_event_id: str | None,
-) -> None:
+) -> bool:
     """Build, deliver, and record a ``Create{Note}`` addressed privately to
     ``recipient_actor_id`` ONLY (never ``AS_PUBLIC``) -- shared by both a
     genuine reply within a ghost DM room and a fresh, unthreaded message in
@@ -210,10 +210,22 @@ async def _send_outbound_dm(
     single known fediverse party) -- ordinary public replies keep the HTML
     convention unconditionally, since Shoot's own channel/guild model
     doesn't interact with that path at all yet (see GitHub issue #3).
+
+    Returns whether it actually proceeded to send anything: False means
+    an encrypted attachment blocked it pending confirmation (see
+    bridge.media.resolve_attachment_or_request_confirmation), which
+    callers need to know so they don't send a follow-up notice describing
+    something that was never actually sent.
     """
     repository = request.app.state.repository
     config = request.app.state.config
     base = config.bridge.public_base_url
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=content, room_id=room_id, sender=event.get("sender", ""),
+        trigger_event_id=event.get("event_id") or "",
+    ):
+        return False  # an encrypted attachment, confirmation requested, nothing federates yet
 
     attachment = build_ap_attachment(base, content)
     # A media message's `body` is its real caption only under the caption
@@ -222,7 +234,7 @@ async def _send_outbound_dm(
     raw_body = strip_reply_fallback(content.get("body") or "")
     body = strip_reply_fallback(media_caption(content)) if attachment is not None else raw_body
     if not body and attachment is None:
-        return
+        return True
 
     if attachment is not None:
         await repository.mark_media_published(content["url"])
@@ -303,6 +315,7 @@ async def _send_outbound_dm(
                 thread_root_event_id=thread_root_event_id,
             )
         )
+    return True
 
 
 async def maybe_federate_reply(request: Request, event: dict) -> bool:
@@ -368,7 +381,7 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
             return True
 
-        await _send_outbound_dm(
+        sent = await _send_outbound_dm(
             request,
             event=event,
             content=content,
@@ -378,6 +391,8 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             in_reply_to=None,
             thread_root_event_id=None,
         )
+        if not sent:
+            return True  # an encrypted attachment blocked it, see _send_outbound_dm's own docstring
 
         # This notice exists to steer a Mastodon/Pleroma-style DM partner
         # toward proper inReplyTo threading, which THEIR own UI benefits
@@ -503,6 +518,11 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             thread_root_event_id=parent.thread_root_event_id or parent.event_id,
         )
         return True
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=content, room_id=room_id, sender=sender, trigger_event_id=event.get("event_id") or "",
+    ):
+        return True  # an encrypted attachment, confirmation requested, nothing federates yet
 
     base = config.bridge.public_base_url
     attachment = build_ap_attachment(base, content)

@@ -14,12 +14,18 @@ message into an AP attachment dict, used both for live distribution
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import html
 import logging
 import mimetypes
 
 import httpx
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from fastapi import Request
 
 from bridge.activitypub.urls import media_url, resolve_own_media_proxy_mxc
+from bridge.repository import ActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
 
 logger = logging.getLogger(__name__)
@@ -532,3 +538,214 @@ def build_ap_attachment(base_url: str, content: dict) -> dict | None:
     if mimetype:
         attachment["mediaType"] = mimetype
     return attachment
+
+
+# Encrypted attachments (content.file, not a plain content.url).
+#
+# A message like this is never itself an `m.room.encrypted` EVENT. That's
+# Matrix's separate, whole-room Olm/Megolm encryption, which this bridge's
+# ghosts/bot can't participate in at all (no device keys, no key exchange;
+# see bridge.membership's own docstring) and which never reaches this far in
+# the first place. This is specifically the case where the EVENT is ordinary
+# plaintext (readable exactly like any other message) but references a
+# separately, per-file-encrypted piece of media: typically a video/image
+# forwarded out of a genuinely E2EE room by a client (confirmed: Element)
+# that carries over the original encrypted upload rather than decrypting and
+# re-uploading plaintext on forward.
+#
+# The bridge can't federate ciphertext. A remote fediverse server has no way
+# to decrypt it, and never will (the AES key lives only in this one Matrix
+# event's own content, never part of any AP payload). Making it federatable
+# at all means decrypting it here and re-uploading a second, plaintext copy
+# to Synapse, a real, human-noticeable action (roughly doubles that file's
+# storage), so it's confirmation-gated rather than automatic. See
+# bridge.appservice_routes.maybe_handle_encrypted_attachment_confirmation
+# for the other half of this (the "confirm" reply recognizer and resume).
+
+ENCRYPTED_ATTACHMENT_WARNING_MARKER = "this message is encrypted"
+
+
+def unresolvable_encrypted_attachment_mxc(content: dict) -> str | None:
+    """If ``content`` is media-shaped (``m.image``/``m.video``/``m.audio``/
+    ``m.file``) but its file is per-file AES-encrypted (``content.file``,
+    Matrix's EncryptedFile shape) rather than a plain ``content.url``
+    string, returns the encrypted file's own ``mxc://``: the identifier
+    the rest of this section decrypts/caches against. Returns None for an
+    ordinary (unencrypted) attachment, a non-media message, or a malformed
+    ``content.file`` with nothing usable to decrypt; there's nothing to
+    resolve in any of those cases either way."""
+    if content.get("msgtype") not in _MATRIX_MSGTYPE_TO_AP_TYPE:
+        return None
+    if isinstance(content.get("url"), str):
+        return None  # already a plain, resolvable attachment
+    encrypted_file = content.get("file")
+    if not isinstance(encrypted_file, dict):
+        return None
+    mxc = encrypted_file.get("url")
+    if not isinstance(mxc, str) or not mxc.startswith("mxc://"):
+        return None
+    key = (encrypted_file.get("key") or {}).get("k")
+    if not isinstance(key, str) or not isinstance(encrypted_file.get("iv"), str):
+        return None  # malformed, nothing usable to decrypt with either way
+    return mxc
+
+
+def _b64_decode(value: str, *, urlsafe: bool) -> bytes:
+    """Matrix's EncryptedFile fields are unpadded base64. ``key.k``
+    (a JSON Web Key) uses the URL-safe alphabet per the JWK spec; ``iv``/
+    ``hashes.sha256`` use plain base64. Padding is re-added rather than
+    assumed present, since senders vary on whether they include it."""
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded) if urlsafe else base64.b64decode(padded)
+
+
+async def decrypt_and_reupload_encrypted_attachment(
+    http_client: httpx.AsyncClient, synapse: SynapseClient, repository: ActorRepository, content: dict,
+) -> str | None:
+    """Downloads, decrypts (AES-256-CTR), integrity-checks (the ciphertext's
+    own SHA-256, per the EncryptedFile's ``hashes.sha256``), and re-uploads
+    as plaintext the encrypted attachment ``unresolvable_encrypted_attachment_mxc``
+    identifies in ``content``. Returns the resulting PLAINTEXT ``mxc://``,
+    or None if ``content`` isn't an unresolved encrypted attachment at all,
+    or the attempt itself failed at any step.
+
+    Only ever called after the sender has explicitly confirmed (see
+    ``bridge.appservice_routes.maybe_handle_encrypted_attachment_confirmation``).
+    ``bridge.media.resolve_attachment_or_request_confirmation`` below is
+    what gates the unconfirmed, first-pass case and never reaches here.
+
+    Caches the result keyed by the encrypted file's own ``mxc://``, reusing
+    ``ActorRepository.get_custom_emoji_mxc``/``record_custom_emoji_mxc``
+    rather than a new table: the shape is identical to that cache's own
+    purpose (an expensive external reference resolved once to our own
+    already-uploaded mxc, never redone for the same source again), just
+    keyed by an encrypted mxc:// here instead of a remote AP image URL. A
+    cache hit (this same file already confirmed once before, e.g. a
+    redelivered/retried confirmation) skips decrypting/uploading again
+    entirely. Never mutates ``content`` itself; callers apply the result
+    (e.g. by setting ``content["url"]``) themselves."""
+    encrypted_mxc = unresolvable_encrypted_attachment_mxc(content)
+    if encrypted_mxc is None:
+        return None
+
+    cached = await repository.get_custom_emoji_mxc(encrypted_mxc)
+    if cached:
+        return cached
+
+    encrypted_file = content["file"]
+    try:
+        key_bytes = _b64_decode(encrypted_file["key"]["k"], urlsafe=True)
+        iv_bytes = _b64_decode(encrypted_file["iv"], urlsafe=False)
+        expected_sha256 = _b64_decode(encrypted_file["hashes"]["sha256"], urlsafe=False)
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Malformed EncryptedFile key/iv/hash for %s", encrypted_mxc)
+        return None
+
+    server_name, media_id = encrypted_mxc.removeprefix("mxc://").split("/", 1)
+    try:
+        download = await synapse.download_media(server_name, media_id)
+    except SynapseError:
+        logger.warning("Failed to download encrypted attachment %s", encrypted_mxc, exc_info=True)
+        return None
+
+    if hashlib.sha256(download.content).digest() != expected_sha256:
+        logger.warning("Encrypted attachment %s failed its own integrity check, refusing to decrypt", encrypted_mxc)
+        return None
+
+    try:
+        decryptor = Cipher(algorithms.AES(key_bytes), modes.CTR(iv_bytes)).decryptor()
+        plaintext = decryptor.update(download.content) + decryptor.finalize()
+    except ValueError:
+        logger.warning("Failed to decrypt attachment %s (bad key/iv length)", encrypted_mxc, exc_info=True)
+        return None
+
+    content_type = (content.get("info") or {}).get("mimetype") or download.content_type
+    filename = (content.get("body") or "").strip() or media_id
+    try:
+        new_mxc = await synapse.upload_media(plaintext, content_type, filename)
+    except SynapseError:
+        logger.warning("Failed to re-upload decrypted attachment %s", encrypted_mxc, exc_info=True)
+        return None
+
+    await repository.record_custom_emoji_mxc(encrypted_mxc, new_mxc)
+    return new_mxc
+
+
+async def _send_encrypted_attachment_confirmation_request(
+    request: Request, *, room_id: str, sender: str, trigger_event_id: str,
+) -> None:
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    display_name = sender
+    try:
+        profile = await synapse.get_profile(sender)
+        display_name = profile.get("displayname") or sender
+    except SynapseError:
+        pass
+
+    warning = (
+        f"⚠️{display_name}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. To send it to the fediverse, I will "
+        "need to upload a decrypted copy to your homeserver.\n\n"
+        'Reply to this message with "confirm" to send the decrypted copy.'
+    )
+    pill = f'<a href="https://matrix.to/#/{html.escape(sender, quote=True)}">{html.escape(display_name)}</a>'
+    formatted_warning = (
+        f"<p>⚠️{pill}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. To send it to the fediverse, I will "
+        "need to upload a decrypted copy to your homeserver.</p>"
+        '<p>Reply to this message with "confirm" to send the decrypted copy.</p>'
+    )
+    warning_content = {
+        "msgtype": "m.text",
+        "body": warning,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_warning,
+        "m.mentions": {"user_ids": [sender]},
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": trigger_event_id,
+            "is_falling_back": True,
+            "m.in_reply_to": {"event_id": trigger_event_id},
+        },
+    }
+    try:
+        await synapse.send_message_event(room_id, warning_content, as_user_id=bot_mxid)
+    except SynapseError:
+        logger.warning("Failed to send encrypted-attachment confirmation request to %s", room_id, exc_info=True)
+
+
+async def resolve_attachment_or_request_confirmation(
+    request: Request, *, content: dict, room_id: str, sender: str, trigger_event_id: str,
+) -> bool:
+    """Call this right before building/sending an outbound post/reply/DM/
+    edit/chat message whose attachment comes from ``content``. Every one
+    of this bridge's outbound send paths shares this single gate (called
+    from INSIDE each existing handler, after its own "is this event even
+    relevant to me" checks, not as a blanket pre-filter at the top of
+    dispatch: a pre-filter would fire a confirmation request even in a
+    room where nothing was ever going to federate anyway).
+
+    Returns True if it's safe to proceed: either there was nothing
+    encrypted to resolve, or an already-confirmed plaintext copy was found
+    in cache and applied to ``content["url"]`` in place (so
+    ``build_ap_attachment`` just works afterward, unmodified). Returns
+    False if a confirmation request was just sent as a thread reply to
+    ``trigger_event_id`` (tagging ``sender``); the caller must send
+    NOTHING for this event. See
+    ``bridge.appservice_routes.maybe_handle_encrypted_attachment_confirmation``
+    for how a later "confirm" reply resumes it."""
+    encrypted_mxc = unresolvable_encrypted_attachment_mxc(content)
+    if encrypted_mxc is None:
+        return True  # nothing encrypted here at all, ordinary path, proceed as normal
+
+    repository = request.app.state.repository
+    cached = await repository.get_custom_emoji_mxc(encrypted_mxc)
+    if cached:
+        content["url"] = cached
+        return True  # already confirmed and resolved earlier, apply it and proceed transparently
+
+    await _send_encrypted_attachment_confirmation_request(
+        request, room_id=room_id, sender=sender, trigger_event_id=trigger_event_id,
+    )
+    return False

@@ -26,17 +26,22 @@ federating a vote cast on a mirrored (externally-owned) poll, or that poll
 being closed (see ``bridge.poll_bridge``); federating a redaction of one of
 our own distributed posts as a signed
 ``Delete`` (see ``bridge.delete_bridge``); a bare "confirm" reply to one of
-our own ``delete profile`` warnings (see
-``bridge.commands.maybe_handle_delete_confirmation`` -- deliberately
-checked before bot-tagged commands below, since it's recognized by reply
-target/content rather than being tagged/prefixed at all); bot-tagged
-command handling (see ``bridge.commands``); federating it as a chat
-message (see ``bridge.chat_bridge``) if the room is a ghost chat room;
-federating it as a reply to one; distributing a fresh post (or a new poll)
-in a linked Profile Room to followers as a new ActivityPub ``Create``; and,
-if none of the above claimed it, distributing it as a Shoot guild-Channel
-message (see ``bridge.channel_bridge.maybe_distribute_channel_message``) if
-the room is one.
+our own ``delete profile``/``leave unfollowed``/``allow homeserver``/
+encrypted-attachment warnings (see ``bridge.commands.maybe_handle_delete_confirmation``
+and friends, and this module's own ``maybe_handle_encrypted_attachment_confirmation``,
+deliberately checked before bot-tagged commands below, since they're
+recognized by reply target/content rather than being tagged/prefixed at
+all); bot-tagged command handling (see ``bridge.commands``); then, via
+``_dispatch_outbound_send``: federating it as a chat message (see
+``bridge.chat_bridge``) if the room is a ghost chat room; federating it as
+a reply to one; distributing a fresh post (or a new poll) in a linked
+Profile Room to followers as a new ActivityPub ``Create``; and, if none of
+the above claimed it, distributing it as a Shoot guild-Channel message
+(see ``bridge.channel_bridge.maybe_distribute_channel_message``) if the
+room is one. An outbound send whose attachment turns out to be encrypted
+(``bridge.media.resolve_attachment_or_request_confirmation``) sends a
+confirmation request instead of federating anything, until answered by
+the "confirm" reply above.
 """
 
 from __future__ import annotations
@@ -46,9 +51,11 @@ from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
+from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.channel_bridge import maybe_distribute_channel_message
 from bridge.chat_bridge import maybe_federate_chat_message
 from bridge.commands import (
+    _reply_target_event_id,
     maybe_handle_allow_homeserver_confirmation,
     maybe_handle_command,
     maybe_handle_delete_confirmation,
@@ -56,6 +63,7 @@ from bridge.commands import (
 )
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
+from bridge.media import ENCRYPTED_ATTACHMENT_WARNING_MARKER, decrypt_and_reupload_encrypted_attachment
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
 from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
 from bridge.profile_posts import (
@@ -66,6 +74,7 @@ from bridge.profile_posts import (
 )
 from bridge.reaction_bridge import maybe_federate_reaction, maybe_federate_reaction_removal
 from bridge.reply_bridge import maybe_federate_reply
+from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +98,137 @@ def _check_hs_token(request: Request, authorization: str | None, access_token: s
 
     if not presented or presented != expected:
         raise HTTPException(status_code=403, detail="Invalid or missing hs_token")
+
+
+async def _dispatch_outbound_send(request: Request, event: dict) -> None:
+    """The inner half of the outbound chain: edit, chat message,
+    reply-or-DM, poll start, channel message, fresh profile post, in that
+    order. Extracted out of ``_handle_transaction``'s own per-event loop
+    so ``maybe_handle_encrypted_attachment_confirmation`` below can replay
+    it against a historical event once its sender confirms, without
+    duplicating this exact chain a second time. Each handler independently
+    decides whether ``event`` is even relevant to it (room type, sender,
+    ...), so replaying the whole chain against an arbitrary historical
+    event is always safe: at most one of them will actually do anything."""
+    handled_as_edit = await maybe_federate_edit(request, event)
+    if not handled_as_edit:
+        handled_as_chat = await maybe_federate_chat_message(request, event)
+        if not handled_as_chat:
+            handled_as_reply = await maybe_federate_reply(request, event)
+            if not handled_as_reply:
+                handled_as_poll_start = await maybe_distribute_profile_poll(request, event)
+                if not handled_as_poll_start:
+                    handled_as_channel_message = await maybe_distribute_channel_message(request, event)
+                    if not handled_as_channel_message:
+                        await maybe_distribute_profile_post(request, event)
+
+
+async def maybe_handle_encrypted_attachment_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    encrypted-attachment warnings (see
+    ``bridge.media.resolve_attachment_or_request_confirmation``), handled
+    whether or not it actually matched one, same stateless marker-based
+    pattern as ``bridge.commands.maybe_handle_delete_confirmation`` (the
+    original triggering event is recovered from the warning's OWN thread
+    relation, since it was sent as a real thread reply to it, rather than
+    any separately persisted "pending confirmation" state). Must run
+    before ``maybe_handle_command``/``_dispatch_outbound_send`` in the
+    dispatch chain, same reasoning as the other ``*_confirmation`` handlers.
+
+    Restricted to the ORIGINAL event's own sender confirming, not whoever
+    happens to reply "confirm" in the room: the action this triggers
+    (decrypting and re-publishing someone's forwarded file to the
+    fediverse) is sensitive enough that it shouldn't be triggerable by a
+    bystander.
+
+    Posts a plain "Sent." notice in the same thread once
+    ``_dispatch_outbound_send`` returns, so the sender has clear,
+    immediate confirmation it actually went out, matching the "Couldn't
+    decrypt/upload" notice on the failure branch above it."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    synapse = request.app.state.synapse
+    try:
+        warning_event = await synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if warning_event.get("sender") != bot_mxid:
+        return False
+    warning_content = warning_event.get("content") or {}
+    if ENCRYPTED_ATTACHMENT_WARNING_MARKER not in (warning_content.get("body") or ""):
+        return False
+
+    original_event_id = _reply_target_event_id(warning_content)
+    if not original_event_id:
+        return True  # our own warning, but somehow missing its own thread link, nothing to resume
+    try:
+        original_event = await synapse.get_event(room_id, original_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return True
+
+    if original_event.get("sender") != sender:
+        return True  # someone else's file, claimed (never falls through to ordinary handling), but ignored
+
+    original_content = original_event.get("content") or {}
+    new_content = original_content.get("m.new_content")
+    effective_content = new_content if isinstance(new_content, dict) else original_content
+    resolved_mxc = await decrypt_and_reupload_encrypted_attachment(
+        request.app.state.http_client, synapse, request.app.state.repository, effective_content,
+    )
+    if resolved_mxc is None:
+        try:
+            await synapse.send_message_event(
+                room_id,
+                {
+                    "msgtype": "m.notice",
+                    "body": "Couldn't decrypt/upload that file, nothing was sent to the fediverse.",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": original_event_id,
+                        "is_falling_back": True,
+                        "m.in_reply_to": {"event_id": event.get("event_id") or original_event_id},
+                    },
+                },
+                as_user_id=bot_mxid,
+            )
+        except SynapseError:
+            logger.warning("Failed to send decrypt-failure notice to %s", room_id, exc_info=True)
+        return True
+
+    effective_content["url"] = resolved_mxc
+    await _dispatch_outbound_send(request, original_event)
+    try:
+        await synapse.send_message_event(
+            room_id,
+            {
+                "msgtype": "m.notice",
+                "body": "✅ Sent.",
+                "m.relates_to": {
+                    "rel_type": "m.thread",
+                    "event_id": original_event_id,
+                    "is_falling_back": True,
+                    "m.in_reply_to": {"event_id": event.get("event_id") or original_event_id},
+                },
+            },
+            as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        logger.warning("Failed to send sent-confirmation notice to %s", room_id, exc_info=True)
+    return True
 
 
 async def _handle_transaction(
@@ -159,23 +299,18 @@ async def _handle_transaction(
             )
             if handled_as_allow_homeserver_confirmation:
                 continue
+            handled_as_encrypted_attachment_confirmation = await maybe_handle_encrypted_attachment_confirmation(
+                request, event
+            )
+            if handled_as_encrypted_attachment_confirmation:
+                continue
             handled_as_command = await maybe_handle_command(request, event)
             if not handled_as_command:
                 # Edits MUST be intercepted before the chat/reply/post
                 # paths: an m.replace event's own body is the "* ..."
                 # fallback text, and any of those paths would federate it
                 # as a fresh malformed post -- see bridge.edit_bridge.
-                handled_as_edit = await maybe_federate_edit(request, event)
-                if not handled_as_edit:
-                    handled_as_chat = await maybe_federate_chat_message(request, event)
-                    if not handled_as_chat:
-                        handled_as_reply = await maybe_federate_reply(request, event)
-                        if not handled_as_reply:
-                            handled_as_poll_start = await maybe_distribute_profile_poll(request, event)
-                            if not handled_as_poll_start:
-                                handled_as_channel_message = await maybe_distribute_channel_message(request, event)
-                                if not handled_as_channel_message:
-                                    await maybe_distribute_profile_post(request, event)
+                await _dispatch_outbound_send(request, event)
         except Exception:
             logger.exception(
                 "Error handling event %s (%s) in %s",

@@ -38,7 +38,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
-from bridge.media import build_ap_attachment, media_caption
+from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
 from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.reply_bridge import derive_in_reply_to
@@ -91,6 +91,12 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         return True  # a ;repost echo's AP content isn't derived from its Matrix body -- not editable this way
     if await repository.is_ghost_dm_room(federated.room_id) or await repository.is_ghost_chat_room(federated.room_id):
         return True  # see module docstring -- private edits not federated yet
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=new_content, room_id=federated.room_id, sender=sender,
+        trigger_event_id=event.get("event_id") or federated.event_id,
+    ):
+        return True  # an encrypted attachment, confirmation requested, nothing federates yet
 
     attachment = build_ap_attachment(base, new_content)
     raw_body = strip_reply_fallback(new_content.get("body") or "")
