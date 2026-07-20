@@ -34,7 +34,7 @@ See [FEATURES.md](FEATURES.md) for a breakdown of how each of these is actually 
 
 ## Controlling the bridge
 
-Everything above is controlled from inside Matrix, two ways: tagging the bridge bot or typing a `;`-prefixed command (`;follow @user@instance.org`, `;help`, and so on), or the room widget the bridge automatically adds to every room it creates, with buttons for most of those same commands. See [COMMANDS.md](COMMANDS.md) for the complete reference, including the widget's own entry.
+Most of what's above just happens through ordinary Matrix actions: sending a message, reacting, replying, editing. For everything else, like following an account, starting a DM, or managing your profile, tag the bridge bot or type a `;`-prefixed command (`;follow @user@instance.org`, `;help`, and so on), or use the room widget the bridge automatically adds to every room it creates, with buttons for most of those same commands. See [COMMANDS.md](COMMANDS.md) for the complete reference, including the widget's own entry.
 
 ## What homeservers are supported?
 
