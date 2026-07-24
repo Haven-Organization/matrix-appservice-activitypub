@@ -200,15 +200,30 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
     config = request.app.state.config
     try:
         parsed = parse_acct(resource)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        parsed = None
 
-    if parsed.domain != config.bridge.domain:
-        raise HTTPException(status_code=404, detail="Resource is not hosted on this domain")
+    if parsed is not None:
+        if parsed.domain != config.bridge.domain:
+            raise HTTPException(status_code=404, detail="Resource is not hosted on this domain")
+        username = parsed.username
+    else:
+        # `resource` isn't an acct: URI. WebFinger's own resource
+        # parameter is any URI per RFC 7033, not just acct:, and some
+        # implementations (confirmed live 2026-07-24: Misskey) query it
+        # with the actor's own URL instead, as an extra identity
+        # confirmation step before following/boosting. Reverse-resolve it
+        # the same way an inbound activity's actor field would be, rather
+        # than hard-rejecting a legitimate resource shape.
+        username = username_from_actor_url(config.bridge.public_base_url, resource)
+        if username is None:
+            raise HTTPException(
+                status_code=400, detail=f"Not a well-formed acct: URI or a known actor URL: {resource!r}"
+            )
 
-    record = await request.app.state.repository.get_local_actor(parsed.username)
+    record = await request.app.state.repository.get_local_actor(username)
     if record is None:
-        raise HTTPException(status_code=404, detail=f"No such actor: {parsed.username}")
+        raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
     document = build_local_webfinger_document(
         username=record.username,
@@ -218,7 +233,12 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
     return JSONResponse(content=document, media_type="application/jrd+json")
 
 
-@router.get("/actor/{username}")
+# Explicitly handles HEAD (FastAPI does not derive it from a GET route
+# automatically, same reasoning as get_media's identical handling).
+# Confirmed live 2026-07-24: Misskey HEAD-probes an actor URL as part of
+# its own resolution before following/boosting, and gave up (no inbox
+# delivery ever followed) once this returned 405.
+@router.api_route("/actor/{username}", methods=["GET", "HEAD"])
 async def get_actor(request: Request, username: str) -> Response:
     record = await _get_actor_record(request, username)
     if _prefers_html(request):
