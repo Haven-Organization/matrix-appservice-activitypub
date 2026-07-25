@@ -240,7 +240,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 **Syntax:** `;import <fediverse post URL>`, must start with `http://` or `https://`.
 
-**What it does:** Fetches a single post by URL and mirrors it regardless of whether you follow its author, creating or reusing a Remote User Room for them (but not actually following them) and inviting you into it. Already-mirrored posts aren't duplicated. If the URL is actually a local bridge user's own post, you're just invited into their real Profile Room instead. Falls back to alternate URL forms for instances that don't serve their "pretty" post URLs as fetchable JSON. If the post is a reply to something already tracked in the same room, it's mirrored as a proper threaded reply.
+**What it does:** Fetches a single post by URL and mirrors it regardless of whether you follow its author, creating or reusing a Remote User Room for them (but not actually following them) and inviting you into it. Already-mirrored posts aren't duplicated. If the URL is actually a local bridge user's own post, you're just invited into their real Profile Room instead. Falls back to alternate URL forms for instances that don't serve their "pretty" post URLs as fetchable JSON. If the post is a reply to something already tracked in the same room, it's mirrored as a proper threaded reply. A PeerTube video URL works too, mirrored into a Remote User Room for its own author the same way.
 
 **Who can run it:** Any local user. No linked profile required, since importing doesn't send anything out as you.
 

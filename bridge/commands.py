@@ -270,8 +270,10 @@ from bridge.note_mirroring import (
     deliver_to_actor_or_followers,
     ensure_ghost_chat_room,
     ensure_ghost_dm_room,
+    ensure_remote_actor_room,
     event_external_handle_content,
     import_question,
+    import_video,
     notify_mentioned_locals,
     provision_ghost,
     push_profile_update,
@@ -3427,7 +3429,12 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     ``_resolve_ancestor_chain`` is willing to fetch), does this fall back
     to the original behavior: creating/reusing a Remote User Room for the
     post's own author exactly like ``follow`` does (minus actually
-    following), and inviting the sender into it."""
+    following), and inviting the sender into it.
+
+    A PeerTube ``Video`` URL is accepted too, imported via ``import_video``
+    into a Remote User Room for its own author -- no reply-chain-walk
+    applies (a video is never itself a reply), so this is otherwise the
+    same standalone-author path a non-reply Note falls through to."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     if not url:
@@ -3454,7 +3461,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             await _notice(request, room_id, f"Could not fetch {url}: {exc}")
             return
 
-    if obj.get("type") not in ("Note", "Question"):
+    if obj.get("type") not in ("Note", "Question", "Video"):
         await _notice(request, room_id, f"{url} doesn't look like a fediverse post (got {obj.get('type')!r}).")
         return
 
@@ -3522,6 +3529,41 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         await _notice(
             request, room_id,
             f"Imported: {matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)}",
+        )
+        return
+
+    if obj.get("type") == "Video":
+        # Same reasoning as the Question branch above: no reply-chain-walk
+        # concept applies to a video (it's never itself a reply to
+        # anything), and unlike the standalone Note path below this reuses
+        # ensure_remote_actor_room directly rather than duplicating its own
+        # ghost/room provisioning inline -- see
+        # project_peertube_channel_following_scoping on why that function
+        # is already fully generic (Note/Question/Video alike). author_id
+        # here is the video's first attributedTo entry (real PeerTube order
+        # is owner Person, then channel Group -- see _note_author), the
+        # same "first tracked-or-not attribution wins" convention already
+        # used for plain post imports.
+        try:
+            author_doc = await fetch_actor(request, author_actor_id)
+        except RemoteActorFetchError as exc:
+            await _notice(request, room_id, f"Could not fetch the video's author ({author_actor_id}): {exc}")
+            return
+        remote_room, _ = await ensure_remote_actor_room(
+            request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=sender
+        )
+        if remote_room is None:
+            await _notice(request, room_id, f"Could not set up a room to import {url} into.")
+            return
+        new_federated_event = await import_video(
+            request, video=obj, author_actor_id=author_actor_id, remote_room=remote_room
+        )
+        if new_federated_event is None:
+            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
+            return
+        await _notice(
+            request, room_id,
+            f"Imported: {matrix_to_link(new_federated_event.room_id, new_federated_event.event_id)}",
         )
         return
 
