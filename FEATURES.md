@@ -58,6 +58,24 @@
 - `;replace room` recreates the Matrix room behind any identity (Profile Room, Remote User Room, DM, or Chat room) to pick up newer bridge features. It's entirely Matrix-side; nothing is sent over ActivityPub, since the identity itself doesn't change.
 - `;delete profile` is a confirmation-gated, irreversible account deletion. It sends a signed `Delete` to every follower, then erases the local identity.
 
+## PeerTube video channels
+
+Opt-in (`bridge.peertube_channels_enabled`, off by default -- every remote view/scrub of a hosted video streams through the bridge's own media proxy with no caching layer, a real bandwidth cost to weigh first).
+
+- **Publishing**: `;create channel <id>` turns a Matrix room into a real, federating PeerTube-compatible video channel -- a `Group`-typed ActivityPub actor with its own keypair, owned by an already-linked Profile. Reply to an uploaded video with `;publish` (`key: value` metadata lines -- name/category/license/language/tags/sensitive/commentsEnabled -- then a blank line and description) to federate it as a real PeerTube `Video`, delivered as `Create` to the owner's own followers and `Announce` to the channel's, matching PeerTube's own publish choreography.
+- `;edit` changes a published video's metadata without touching the file. `;replace video` swaps the underlying file while keeping the same video identity. `;unpublish` retracts it from the fediverse; the Matrix message itself is untouched, so it can be re-published later.
+- A video's reactions support a real `Dislike` (👎) alongside the usual `Like`/`EmojiReact`, and inbound `View` activities from remote instances are tallied into a durable view count. Comments (Matrix thread replies) federate as `Note`s the same way an ordinary post's replies do, and incoming comment content renders Markdown, PeerTube's own convention there.
+- Playback goes through the bridge's media proxy with extension-aware URLs and CORS preflight handling, so a remote video player can actually infer a playable file type and stream byte-range requests.
+- **Following**: `;follow` a remote PeerTube channel or account exactly like any other fediverse actor -- its videos show up as posts in your Remote User Room the same way an ordinary account's Notes do, and `;backfill` pulls its history in the same way too. Whether a followed video is downloaded and re-hosted natively or just linked back to its original instance as a card is controlled by `bridge.follow_video_media_mode` (`"link"`/`"embed"`, default `"link"`, falling back to a link card when the file is bigger than `bridge.follow_video_max_embed_mb`).
+
+## Guilds and channels (Shoot)
+
+- `;joinguild CODE@guild.example.com` joins a Shoot guild (an `Organization` actor) using an invite code, per FEP-bebd. The guild's `Accept` arrives later over the inbox, so this only sends and records the join request rather than confirming membership immediately.
+- A joined guild gets its own Matrix Space, with each of its text channels mirrored into a child Matrix room -- immediately for a channel already known when the guild was joined, or the first time anyone posts in a newer one otherwise.
+- Channel messages mirror bidirectionally: an incoming channel message is attributed to whichever guild member actually wrote it (never the channel actor itself), and an outgoing Matrix message sent in a channel room federates back out the same way.
+- `;leaveguild`, run inside one of that guild's own channel rooms, sends a real `Undo(Follow)` and drops the bridge's own local membership tracking.
+- `;refresh guild` re-syncs a guild's channel list by hand -- Shoot doesn't federate channel-creation events at all, so a channel created after the guild was joined is otherwise only discovered once someone actually posts in it.
+
 ## Discovery and federation plumbing
 
 - **HTTP Signatures** on every outbound activity and every inbound delivery, including cross-checking the signing key's actor against the activity's own claimed actor to reject spoofing.
@@ -66,4 +84,4 @@
 - A **shared inbox** endpoint, plus per-actor inboxes, both signature-verified.
 - **Knock-based self-service room access**: every bridge room uses Matrix's `knock` join rule, and a knock from that room's rightful local owner (current or a past, since-replaced room) is auto-accepted without side effects.
 
-For the exact ActivityPub activity types, Matrix event shapes, and implementation entry points behind each of these, see the source: `bridge/inbox_dispatch.py` for incoming, `bridge/note_mirroring.py`/`bridge/reply_bridge.py`/`bridge/reaction_bridge.py`/`bridge/edit_bridge.py`/`bridge/chat_bridge.py` for outgoing, and `bridge/activitypub/routes.py` for the ActivityPub HTTP surface the bridge itself serves.
+For the exact ActivityPub activity types, Matrix event shapes, and implementation entry points behind each of these, see the source: `bridge/inbox_dispatch.py` for incoming, `bridge/note_mirroring.py`/`bridge/reply_bridge.py`/`bridge/reaction_bridge.py`/`bridge/edit_bridge.py`/`bridge/chat_bridge.py` for outgoing, `bridge/activitypub/routes.py` for the ActivityPub HTTP surface the bridge itself serves, `bridge/peertube.py`/`bridge/commands.py` for video channels, and `bridge/channel_bridge.py`/`bridge/spaces.py` for Shoot guilds and channels.

@@ -8,13 +8,14 @@ Runs natively as a single Python process, no containers required. It talks to yo
 
 ## Core concepts
 
-Every ActivityPub identity or conversation the bridge manages is backed by an ordinary Matrix room, of one of five kinds:
+Every ActivityPub identity or conversation the bridge manages is backed by an ordinary Matrix room, of one of these kinds:
 
 - **Profile Room**: a local Matrix user's own linked ActivityPub identity (`username@bridge.domain`). Posting here publishes to the fediverse, and the room's membership doubles as a visible follower list.
 - **Remote User Room**: one shared room per remote fediverse account, mirroring everything they post. Created the first time anyone follows or imports from that account, and reused by every local follower after that.
 - **Ghost DM room**: a private 1:1 room between a local user and a remote account, carrying ActivityPub `Note`-based direct messages.
 - **Ghost Chat room**: a private 1:1 room carrying ActivityPub `ChatMessage`s (Pleroma/Akkoma's separate instant-messaging concept). Deliberately never the same room as a DM, even between the same two parties.
 - **Notification room**: a private 1:1 room between a local user and the bridge bot itself, named "Fediverse Notifications". Notification messages for new followers, mentions, reposts, and likes/reactions land here.
+- **PeerTube Channel room** (opt-in, `bridge.peertube_channels_enabled`): a Matrix room turned into a real, federating PeerTube-compatible video channel with its own ActivityPub identity, owned by a linked Profile. Posting a video here and running `;publish` federates it to the fediverse.
 
 Every remote account you interact with gets a deterministic "ghost" Matrix user (`@ap_user_instance:yourdomain`) that posts, reacts, and DMs on their behalf inside Matrix. Its display name, avatar, and (for a Remote User Room) banner stay in sync with their real ActivityPub profile.
 
@@ -28,6 +29,8 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 - Media
 - Follows and moderation
 - Profile and identity
+- PeerTube video channels, publishing and following
+- Guilds and channels (Shoot), joined via invite code
 - Discovery and federation plumbing
 
 See [FEATURES.md](FEATURES.md) for a breakdown of how each of these is actually bridged.
