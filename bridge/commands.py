@@ -302,7 +302,7 @@ from bridge.repository import (
     RemoteActorRoom,
 )
 from bridge.room_widget import add_bridge_widget
-from bridge.spaces import add_room_to_space
+from bridge.spaces import NOTIFICATIONS_ROOM_SPACE_ORDER, PROFILE_ROOM_SPACE_ORDER, add_room_to_space
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -4455,7 +4455,9 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=sender, as_user_id=bot_mxid)
-    await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
+    await add_room_to_space(
+        request, matrix_user_id=sender, child_room_id=new_room_id, order=PROFILE_ROOM_SPACE_ORDER
+    )
 
     verb = "Re-created" if existing is not None else "Created"
     message = f"{verb} {new_room_id} and linked it as {username}@{config.bridge.domain} -- you've been invited and made admin there."
@@ -5448,7 +5450,7 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
         # below unconditionally claims they've been invited to their
         # notifications room -- make sure that's actually still true.
         await ensure_bot_dm_invite(request, matrix_user_id=sender)
-    await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id)
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id, order=PROFILE_ROOM_SPACE_ORDER)
 
     # Best-effort: this requires the bot to have a high enough power level in
     # the user's room, which it won't by default unless granted one.
@@ -6194,7 +6196,7 @@ async def _replace_profile_room(
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=owner, as_user_id=bot_mxid)
-    await add_room_to_space(request, matrix_user_id=owner, child_room_id=new_room_id)
+    await add_room_to_space(request, matrix_user_id=owner, child_room_id=new_room_id, order=PROFILE_ROOM_SPACE_ORDER)
 
     tombstone_body = (
         f"This room has been replaced -- {actor_record.username}@{config.bridge.domain} now "
@@ -6556,6 +6558,9 @@ async def _replace_notification_room(request: Request, *, old_room_id: str, matr
 
     await repository.register_bot_dm_room(matrix_user_id, new_room_id)
     await add_bridge_widget(request, room_id=new_room_id)
+    await add_room_to_space(
+        request, matrix_user_id=matrix_user_id, child_room_id=new_room_id, order=NOTIFICATIONS_ROOM_SPACE_ORDER
+    )
 
     tombstone_body = f"This room has been replaced -- your Fediverse Notifications now continue in {new_room_id} instead."
     await _send_tombstone(

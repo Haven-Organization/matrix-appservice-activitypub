@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 SPACE_NAME = "Fediverse"
 _SPACE_ROOM_TYPE = "m.space"
 
+# m.space.child's own `order` key (MSC1772/room-summary): a room WITH an
+# order sorts lexicographically before every room WITHOUT one, is how every
+# client actually implements this (confirmed against Element's own
+# behavior) -- these two short, deliberately-adjacent strings just need to
+# keep a user's Profile Room and Notifications room pinned above their
+# unordered Remote User/DM/Chat rooms, in that relative order to each
+# other. Never used for anything else, so there's no need for a wider
+# allocation between them.
+PROFILE_ROOM_SPACE_ORDER = "0"
+NOTIFICATIONS_ROOM_SPACE_ORDER = "1"
+
 
 def _bot_mxid(config) -> str:
     return f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
@@ -74,7 +85,9 @@ async def ensure_user_space(request: Request, *, matrix_user_id: str) -> str | N
     return space_room_id
 
 
-async def _set_space_child(request: Request, *, space_room_id: str, child_room_id: str, add: bool) -> None:
+async def _set_space_child(
+    request: Request, *, space_room_id: str, child_room_id: str, add: bool, order: str | None = None
+) -> None:
     """Shared body for adding/removing ``child_room_id`` as a space child of
     ``space_room_id`` -- used by both the per-user Fediverse space
     (``add_room_to_space``/``remove_room_from_space``) and the per-guild
@@ -84,12 +97,20 @@ async def _set_space_child(request: Request, *, space_room_id: str, child_room_i
 
     Per the spec, an ``m.space.child`` event with no ``via`` key means "not
     actually a child" -- so removal is just overwriting it with empty
-    content, not a special "delete" operation."""
+    content, not a special "delete" operation. ``order`` (see
+    ``PROFILE_ROOM_SPACE_ORDER``/``NOTIFICATIONS_ROOM_SPACE_ORDER``) is
+    ignored when ``add`` is False -- a removed child has no ordering left
+    to carry."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     synapse = request.app.state.synapse
     via = [config.synapse.server_name]
-    content = {"via": via} if add else {}
+    if add:
+        content = {"via": via}
+        if order is not None:
+            content["order"] = order
+    else:
+        content = {}
     try:
         await synapse.send_state_event(space_room_id, "m.space.child", child_room_id, content, as_user_id=bot_mxid)
     except SynapseError:
@@ -115,15 +136,21 @@ async def _set_space_child(request: Request, *, space_room_id: str, child_room_i
         logger.info("Could not set m.space.parent on %s", child_room_id, exc_info=True)
 
 
-async def add_room_to_space(request: Request, *, matrix_user_id: str, child_room_id: str) -> None:
+async def add_room_to_space(
+    request: Request, *, matrix_user_id: str, child_room_id: str, order: str | None = None
+) -> None:
     """Add ``child_room_id`` as a child of ``matrix_user_id``'s Fediverse
     space, creating the space first if this is their first bridge-managed
-    room. Idempotent -- safe to call again for a room already listed.
-    Best-effort throughout."""
+    room. Idempotent -- safe to call again for a room already listed (also
+    the mechanism for CHANGING an already-set ``order`` later, though
+    nothing currently does). Best-effort throughout. ``order`` -- see
+    ``PROFILE_ROOM_SPACE_ORDER``/``NOTIFICATIONS_ROOM_SPACE_ORDER`` -- pins
+    a Profile Room or Notifications room above every other, unordered
+    child; omit it for anything else."""
     space_room_id = await ensure_user_space(request, matrix_user_id=matrix_user_id)
     if space_room_id is None:
         return
-    await _set_space_child(request, space_room_id=space_room_id, child_room_id=child_room_id, add=True)
+    await _set_space_child(request, space_room_id=space_room_id, child_room_id=child_room_id, add=True, order=order)
 
 
 async def remove_room_from_space(request: Request, *, matrix_user_id: str, child_room_id: str) -> None:

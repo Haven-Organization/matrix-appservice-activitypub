@@ -35,10 +35,14 @@ rather than duplicating the Undo logic.
 Also keeps each human's personal "Fediverse" space (``bridge.spaces``) in
 sync with which bridge-managed rooms they're actually in: joining one (their
 own linked Profile Room -- current or a past one they've since moved on
-from, per ``get_profile_room_owner`` -- or a Remote User Room) adds it as a
-space child; leaving a Remote User Room removes it again (a Profile Room,
-current or past, never gets removed even if they leave it -- see
-``maybe_handle_leave``).
+from, per ``get_profile_room_owner`` -- their Notifications room, a Remote
+User Room, or a ghost DM room) adds it as a space child; leaving a Remote
+User Room removes it again (a Profile Room, current or past, never gets
+removed even if they leave it -- see ``maybe_handle_leave``). A Profile
+Room and Notifications room are both given an explicit ``m.space.child``
+``order`` (``bridge.spaces.PROFILE_ROOM_SPACE_ORDER``/
+``NOTIFICATIONS_ROOM_SPACE_ORDER``) so they consistently sort above every
+other, unordered child in a client that honors ``order`` (Element does).
 
 Every fediverse-bridged room the bot creates uses the knock join rule (see
 ``bridge.note_mirroring.KNOCK_JOIN_RULE``) rather than invite-only,
@@ -79,6 +83,8 @@ from bridge.note_mirroring import resolve_old_ghost_room_owner, resolve_old_remo
 from bridge.notifications import notification_actor_html
 from bridge.repository import RemoteActorRoom
 from bridge.spaces import (
+    NOTIFICATIONS_ROOM_SPACE_ORDER,
+    PROFILE_ROOM_SPACE_ORDER,
     add_channel_room_to_guild_space,
     add_room_to_space,
     remove_channel_room_from_guild_space,
@@ -404,13 +410,16 @@ async def maybe_handle_knock(request: Request, event: dict) -> bool:
 async def maybe_handle_join(request: Request, event: dict) -> bool:
     """Returns True if this event was a human user joining a room the bridge
     manages for them -- their own linked Profile Room (current or a past one
-    they've since moved on from), a Remote User Room, or a ghost DM room
-    (``bridge.note_mirroring.mirror_direct_message``) -- handled by adding
-    it to their personal Fediverse space (see ``bridge.spaces``), creating
-    that space for them first if this is their first bridge-managed room,
-    plus a one-off orientation notice for all three (see module docstring;
-    a DM room's is specifically about how replying vs. not changes where a
-    message goes -- see ``_welcome_to_dm_room``)."""
+    they've since moved on from), their Notifications room, a Remote User
+    Room, or a ghost DM room (``bridge.note_mirroring.mirror_direct_message``)
+    -- handled by adding it to their personal Fediverse space (see
+    ``bridge.spaces``), creating that space for them first if this is their
+    first bridge-managed room, plus a one-off orientation notice for the
+    Profile/Remote User/DM cases (see module docstring; a DM room's is
+    specifically about how replying vs. not changes where a message goes --
+    see ``_welcome_to_dm_room``). The Notifications room gets its own
+    separate welcome the moment it's first created (``welcome_new_user``/
+    ``ensure_bot_dm_invite``), not here, so this doesn't repeat it."""
     if event.get("type") != "m.room.member":
         return False
     content = event.get("content") or {}
@@ -432,7 +441,11 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     is_profile_room = await repository.get_profile_room_owner(room_id) == joined_user
     dm_room_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
     channel_room = await repository.get_channel_room_by_room_id(room_id)
-    if remote_room is None and not is_profile_room and dm_room_actor_id is None and channel_room is None:
+    is_notification_room = await repository.get_bot_dm_room_owner(room_id) == joined_user
+    if (
+        remote_room is None and not is_profile_room and dm_room_actor_id is None
+        and channel_room is None and not is_notification_room
+    ):
         return False  # not a room the bridge manages for this specific user
 
     # A Channel room belongs to its GUILD's own Space, not the joining
@@ -441,6 +454,14 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     if channel_room is not None:
         await add_channel_room_to_guild_space(
             request, guild_actor_id=channel_room.guild_actor_id, child_room_id=room_id
+        )
+    elif is_profile_room:
+        await add_room_to_space(
+            request, matrix_user_id=joined_user, child_room_id=room_id, order=PROFILE_ROOM_SPACE_ORDER
+        )
+    elif is_notification_room:
+        await add_room_to_space(
+            request, matrix_user_id=joined_user, child_room_id=room_id, order=NOTIFICATIONS_ROOM_SPACE_ORDER
         )
     else:
         await add_room_to_space(request, matrix_user_id=joined_user, child_room_id=room_id)

@@ -41,6 +41,7 @@ from typing import Any
 from fastapi import Request
 
 from bridge.room_widget import add_bridge_widget
+from bridge.spaces import NOTIFICATIONS_ROOM_SPACE_ORDER, add_room_to_space
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -92,8 +93,13 @@ def _bot_mxid(config) -> str:
 async def ensure_bot_dm_room(request: Request, *, matrix_user_id: str) -> str | None:
     """Get-or-create the bot's 1:1 DM room with ``matrix_user_id``, inviting
     them into it if this is the first time the bot has ever notified them.
-    Returns the room ID, or None if creation failed outright -- best-effort,
-    same as the rest of the bridge's room bookkeeping."""
+    Added to their personal Fediverse space (``bridge.spaces``) pinned above
+    every unordered room there (see ``NOTIFICATIONS_ROOM_SPACE_ORDER``) --
+    same belt-and-suspenders reasoning as a Profile Room's own creation-time
+    call, on top of ``bridge.membership.maybe_handle_join``'s reactive one
+    for whenever ``matrix_user_id`` actually joins. Returns the room ID, or
+    None if creation failed outright -- best-effort, same as the rest of
+    the bridge's room bookkeeping."""
     repository = request.app.state.repository
     existing = await repository.get_bot_dm_room(matrix_user_id)
     if existing is not None:
@@ -116,6 +122,9 @@ async def ensure_bot_dm_room(request: Request, *, matrix_user_id: str) -> str | 
 
     await repository.register_bot_dm_room(matrix_user_id, room_id)
     await add_bridge_widget(request, room_id=room_id)
+    await add_room_to_space(
+        request, matrix_user_id=matrix_user_id, child_room_id=room_id, order=NOTIFICATIONS_ROOM_SPACE_ORDER
+    )
     return room_id
 
 
