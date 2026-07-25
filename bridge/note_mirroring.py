@@ -925,7 +925,10 @@ async def attach_media_to_content(
     (e.g. mirroring the same reposted post's first attachment into both the
     original author's room and a repost summary card). If embedding the
     first attachment fails outright, every attachment (including that
-    first one) is linked instead, rather than silently dropping it."""
+    first one) is linked instead, rather than silently dropping it. That
+    fallback list is headed "Attachments:", not "Other Attachments:": with
+    no first attachment actually embedded, calling the rest "other" would
+    misleadingly imply a primary one was shown elsewhere in the post."""
     if not attachments:
         return message_content, None
     merged, used_mxc_uri = await merge_attachment_into_content(
@@ -939,8 +942,17 @@ async def attach_media_to_content(
     extra_names = [a["name"] or a["url"].rsplit("/", 1)[-1] or "attachment" for a in extra]
     extra_urls = [a["url"] for a in extra]
 
+    # "Other" only when these are genuinely additional attachments beyond a
+    # successfully-embedded first one. When the first attachment itself
+    # failed to embed (used_mxc_uri falsy, see the extra= line above), this
+    # list IS the whole attachment set, not "other" ones alongside a
+    # primary that was actually shown (confirmed live 2026-07-25: a
+    # single-image post whose only attachment failed to fetch/upload
+    # rendered as "Other Attachments:" with nothing else in the post at
+    # all, implying a primary attachment that was never there).
+    header = "Other Attachments:" if used_mxc_uri else "Attachments:"
     plain_links = "\n".join(f"[{name}]({url})" for name, url in zip(extra_names, extra_urls))
-    plain_section = f"Other Attachments:\n{plain_links}"
+    plain_section = f"{header}\n{plain_links}"
     body = merged.get("body") or ""
     merged["body"] = f"{body}\n\n{plain_section}" if body else plain_section
 
@@ -948,7 +960,7 @@ async def attach_media_to_content(
         f'<a href="{html.escape(url, quote=True)}">{html.escape(name)}</a>'
         for name, url in zip(extra_names, extra_urls)
     )
-    html_section = f"Other Attachments:<br>{html_links}"
+    html_section = f"{header}<br>{html_links}"
     formatted_body = merged.get("formatted_body")
     if formatted_body is None:
         # No rich content yet -- escape the existing plain body into HTML so
