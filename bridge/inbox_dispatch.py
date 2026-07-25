@@ -96,6 +96,7 @@ from bridge.note_mirroring import (
     find_poll_thread_children,
     import_note,
     import_question,
+    import_video,
     is_silenced,
     maybe_send_poll_end,
     mirror_chat_message,
@@ -1327,6 +1328,34 @@ async def _handle_question_update(request: Request, obj: dict) -> None:
     )
 
 
+async def _resolve_video_remote_room(request: Request, video: dict):
+    """Fall back to a ``Video`` object's own ``attributedTo`` entries
+    (owner ``Person`` + channel ``Group``, real PeerTube convention) to
+    find a Remote User Room, for whichever of the two actors this bridge
+    actually has one for -- see the call site's own comment for why the
+    primary ``activity.actor`` lookup can legitimately miss even for a
+    genuinely relevant video."""
+    repository = request.app.state.repository
+    attributed = video.get("attributedTo")
+    if isinstance(attributed, dict):
+        attributed = [attributed]
+    if not isinstance(attributed, list):
+        return None
+    for entry in attributed:
+        if isinstance(entry, dict):
+            actor_id = entry.get("id")
+        elif isinstance(entry, str):
+            actor_id = entry
+        else:
+            continue
+        if not isinstance(actor_id, str):
+            continue
+        room = await repository.get_remote_actor_room(actor_id)
+        if room is not None:
+            return room
+    return None
+
+
 async def _handle_create(request: Request, username: str, activity: Activity, *, force: bool = False) -> None:
     """Mirror an inbound ``Create(Note)`` into the author's Remote User
     Room -- but only if someone here actually follows them, UNLESS the
@@ -1392,6 +1421,40 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         except RemoteActorFetchError:
             author_doc = {}
         await import_question(request, question=obj, author_actor_id=activity.actor, author_doc=author_doc)
+        return
+
+    if obj.get("type") == "Video":
+        # A followed PeerTube channel's or account's own video upload --
+        # mirrored as a post the same way a followed account's ordinary
+        # Note is (see import_video), not silently dropped the way any
+        # other non-Note object here still is. Same relevance gating as
+        # an ordinary top-level Note below: is_anyone_following, AND a
+        # real Remote User Room already resolved (both checked there too,
+        # just inlined here since Video never reaches that shared code --
+        # see project_peertube_channel_following_scoping). Real PeerTube
+        # sends this Create to the ACCOUNT's own followers, distinct from
+        # the Announce a CHANNEL's followers get instead -- see the
+        # Announce-side handling in _handle_announce_locked below for the
+        # other half of the same choreography.
+        if not force and not await repository.is_anyone_following(activity.actor):
+            logger.info("Dropping Video Create from an actor nobody here follows: %s", activity.actor)
+            return
+        remote_room = await repository.get_remote_actor_room(activity.actor)
+        if remote_room is None:
+            # activity.actor is the OWNER here (see this Create's own
+            # comment above), but ";backfill" run from inside a followed
+            # CHANNEL's own Remote User Room (force=True) fetches that
+            # channel's outbox, which carries these exact Create(Video)
+            # entries -- authored by the owner, not the channel, so the
+            # owner's own room genuinely may not exist even though the
+            # channel's does. Fall back to the video's own attributedTo
+            # (owner Person + channel Group, real PeerTube convention) so
+            # a video lands in whichever of the two was actually followed.
+            remote_room = await _resolve_video_remote_room(request, obj)
+        if remote_room is None:
+            logger.info("No Remote User Room mapped for %s; dropping Video Create", activity.actor)
+            return
+        await import_video(request, video=obj, author_actor_id=activity.actor, remote_room=remote_room)
         return
 
     # A poll vote is wire-identical to a DM in shape (privately addressed to
@@ -2400,7 +2463,26 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
         return  # we don't mirror this reposter at all
 
     obj = await _resolve_object(request, activity.object)
-    if obj is None or obj.get("type") != "Note":
+    if obj is None:
+        logger.info("Could not resolve announced object from %s; dropping repost", activity.actor)
+        return
+
+    if obj.get("type") == "Video":
+        # A followed CHANNEL's own fan-out of one of its videos (see
+        # project_peertube_channel_following_scoping) -- distinct from an
+        # ordinary repost of someone else's Note below: a channel's own
+        # Announce always wraps a video it's associated with, never
+        # actually reposting someone else's unrelated post the way a
+        # Person's Announce does. Real PeerTube sends this to the
+        # CHANNEL's own followers, distinct from the Create an ACCOUNT's
+        # followers get instead -- see the Create-side handling in
+        # _handle_create above for the other half of the same
+        # choreography. remote_room here is already the channel's own
+        # Remote User Room (activity.actor, resolved above).
+        await import_video(request, video=obj, author_actor_id=activity.actor, remote_room=remote_room)
+        return
+
+    if obj.get("type") != "Note":
         logger.info("Could not resolve announced object from %s; dropping repost", activity.actor)
         return
 

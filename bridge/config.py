@@ -241,6 +241,20 @@ class BridgeSection:
     # images this proxy already serves, so only turn this on once you've
     # weighed that cost for your own deployment.
     peertube_channels_enabled: bool = False
+    # How a followed PeerTube channel/account's videos show up as posts:
+    # "link" never downloads the video, always a text/thumbnail card
+    # linking back to the original instance. "embed" tries to download and
+    # re-host the video natively as a real m.video (the same
+    # download-and-reupload path an ordinary post's video attachment
+    # already goes through), falling back to the same link-card behavior
+    # when the file is bigger than follow_video_max_embed_mb. Defaults to
+    # "link" for the same "opt-in for anything with a real bandwidth/
+    # storage cost" reasoning as peertube_channels_enabled itself.
+    follow_video_media_mode: str = "link"
+    # Only consulted in "embed" mode -- checked against the video's own
+    # declared file size (part of the AP object already, no extra request
+    # needed) before ever starting a download.
+    follow_video_max_embed_mb: int = 100
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -411,6 +425,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
             "bridge.msc4503_external_handle must be one of 'off', 'profile', 'events', 'both', "
             f"got {msc4503_external_handle!r}"
         )
+    follow_video_media_mode = bridge_raw.get("follow_video_media_mode", "link")
+    if follow_video_media_mode not in ("link", "embed"):
+        raise ConfigError(
+            f"bridge.follow_video_media_mode must be 'link' or 'embed', got {follow_video_media_mode!r}"
+        )
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -433,6 +452,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         admins=list(bridge_raw.get("admins", []) or []),
         use_synapse_admin_api=bool(bridge_raw.get("use_synapse_admin_api", True)),
         peertube_channels_enabled=bool(bridge_raw.get("peertube_channels_enabled", False)),
+        follow_video_media_mode=follow_video_media_mode,
+        follow_video_max_embed_mb=int(bridge_raw.get("follow_video_max_embed_mb", 100)),
     )
 
     synapse_section = SynapseSection(

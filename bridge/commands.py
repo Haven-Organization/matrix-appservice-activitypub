@@ -3093,17 +3093,55 @@ async def _collect_recent_items(request: Request, collection: dict | str, *, lim
     return items[:limit]
 
 
-def _note_from_item(item: dict, *, fallback_author: str | None) -> dict | None:
+async def _note_from_item(request: Request, item: dict, *, fallback_author: str | None) -> dict | None:
     """Normalize a raw outbox/replies collection item into a ``Create``
     activity JSON dict ready for ``Activity.from_dict``. Items show up as
     either a full ``Create`` activity (typical of an outbox) or a bare
     ``Note`` (typical of a ``replies`` collection) -- wraps the latter.
-    Returns None for anything else (Announces, Questions, ...) -- backfill
-    only ever mirrors the account's own authored posts, same scope as a
-    live ``Create`` delivery."""
+    Returns None for anything else (Questions, ...) -- backfill only ever
+    mirrors the account's own authored posts, same scope as a live
+    ``Create`` delivery.
+
+    A ``Create`` whose object is a ``Video`` is accepted too (see
+    ``project_peertube_channel_following_scoping``): some PeerTube outboxes
+    (an account's own) carry full ``Create(Video)`` entries the same way
+    this bridge's own ``;publish`` does.
+
+    A real PeerTube CHANNEL's outbox, though (confirmed 2026-07-25 against
+    a live instance, not assumed), carries ONLY ``Announce`` entries with a
+    bare video-URL string as their object -- no ``Create`` at all. The
+    earlier assumption that those Announces were a redundant, skippable
+    echo of a Create was wrong for that real-world shape and is why
+    ``;backfill`` on a followed channel returned nothing. So an
+    ``Announce`` whose object resolves (fetching it if it's a bare string)
+    to a ``Video`` is accepted too, synthesizing a ``Create`` around it.
+    This does NOT extend to ``Announce`` of a ``Note`` -- that's a genuine
+    repost of someone else's content and stays out of scope, same as
+    before."""
     if item.get("type") == "Create":
         obj = item.get("object")
-        return item if isinstance(obj, dict) and obj.get("type") == "Note" else None
+        return item if isinstance(obj, dict) and obj.get("type") in ("Note", "Video") else None
+    if item.get("type") == "Announce":
+        obj = item.get("object")
+        if isinstance(obj, str):
+            try:
+                obj = await fetch_actor(request, obj)
+            except RemoteActorFetchError:
+                return None
+        if not isinstance(obj, dict) or obj.get("type") != "Video":
+            return None
+        actor = item.get("actor") or fallback_author
+        if not isinstance(actor, str):
+            return None
+        return {
+            "id": f"{item.get('id', '')}#backfill",
+            "type": "Create",
+            "actor": actor,
+            "object": obj,
+            "published": obj.get("published") or item.get("published"),
+            "to": item.get("to") or obj.get("to") or [],
+            "cc": item.get("cc") or obj.get("cc") or [],
+        }
     if item.get("type") == "Note":
         actor = item.get("attributedTo") or fallback_author
         if not isinstance(actor, str):
@@ -3245,7 +3283,11 @@ async def _mirror_backfilled_notes(
     one-time auto-backfill a brand-new follow's first join triggers
     (``_run_auto_backfill``)."""
     repository = request.app.state.repository
-    notes = [n for n in (_note_from_item(item, fallback_author=fallback_author) for item in raw_items) if n]
+    notes = []
+    for item in raw_items:
+        note = await _note_from_item(request, item, fallback_author=fallback_author)
+        if note:
+            notes.append(note)
     notes.reverse()  # oldest of the collected batch first, closer to true chronological order
 
     imported = 0

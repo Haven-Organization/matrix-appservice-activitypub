@@ -25,6 +25,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import Request
@@ -2271,6 +2272,157 @@ async def import_note(
         return await _import_note_locked(
             request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
         )
+
+
+def _select_video_media_link(url_field: Any) -> dict[str, Any] | None:
+    """Pick the actual playable video/audio ``Link`` entry out of a
+    ``Video`` object's own ``url`` array -- which also typically carries a
+    ``text/html`` Link to the video's watch page, not a playable file.
+    Mirrors this bridge's own outbound ``Video.url`` construction (a
+    video/audio Link plus a text/html one, see
+    ``bridge.activitypub.models.Video.to_dict``), just parsing it back for
+    an inbound object instead of building it."""
+    if isinstance(url_field, dict):
+        url_field = [url_field]
+    if not isinstance(url_field, list):
+        return None
+    for entry in url_field:
+        if not isinstance(entry, dict):
+            continue
+        media_type = entry.get("mediaType") or ""
+        if (media_type.startswith("video/") or media_type.startswith("audio/")) and isinstance(
+            entry.get("href"), str
+        ):
+            return entry
+    return None
+
+
+def _select_video_icon(icon_field: Any) -> dict[str, Any] | None:
+    """Same normalization ``extract_attachments`` already does for a Note's
+    own ``attachment`` field, for a ``Video``'s ``icon`` (a single Image
+    object or a list of them -- PeerTube itself sends several resolutions
+    as a list, see the real ``frankhassle@poast.tv`` channel actor
+    confirmed live 2026-07-25 -- the first usable one is good enough for a
+    post's thumbnail)."""
+    if isinstance(icon_field, dict):
+        return icon_field if isinstance(icon_field.get("url"), str) else None
+    if isinstance(icon_field, list):
+        for entry in icon_field:
+            if isinstance(entry, dict) and isinstance(entry.get("url"), str):
+                return entry
+    return None
+
+
+async def import_video(
+    request: Request, *, video: dict, author_actor_id: str, remote_room: RemoteActorRoom,
+) -> FederatedEvent | None:
+    """Mirror an inbound PeerTube ``Video`` object into ``remote_room`` as a
+    post -- the ``Video``-object counterpart to ``import_note``, for a
+    followed PeerTube channel's or account's own uploads (see
+    ``project_peertube_channel_following_scoping``). Unlike ``import_note``,
+    ``remote_room`` must already be resolved by the caller: both of
+    ``bridge.inbox_dispatch``'s ``Create``/``Announce`` handlers already
+    need it for their own relevance gating before ever reaching here, so
+    there's no reason to re-derive it a second time.
+
+    Whether the video itself gets downloaded and re-hosted as real Matrix
+    media, or just linked back to its original instance as a text/
+    thumbnail card, is controlled by ``bridge.follow_video_media_mode``
+    (falling back to the card if the video's own declared ``size`` is
+    over ``bridge.follow_video_max_embed_mb`` even in "embed" mode) -- see
+    that setting's own docstring in ``bridge/config.py``. Either way this
+    reuses ``attach_media_to_content``, the exact same download-and-
+    reupload path an ordinary post's own image/video attachment already
+    goes through -- just choosing which file (the video itself, or its
+    thumbnail) becomes the embedded attachment.
+
+    Dedups the same way ``import_note`` does: a no-op returning the
+    existing ``FederatedEvent`` if this exact video is already tracked."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+
+    ap_object_id = video.get("id")
+    if isinstance(ap_object_id, str):
+        existing = await repository.get_federated_event_by_ap_object(ap_object_id)
+        if existing is not None:
+            return existing
+
+    name = video.get("name") or "Untitled video"
+    plain_description, safe_description_html = strip_to_matrix_message(
+        video.get("content") or "", media_type=video.get("mediaType"),
+    )
+    src = source_post_url(video)
+
+    media_link = _select_video_media_link(video.get("url"))
+    icon = _select_video_icon(video.get("icon"))
+
+    plain_body = f"\U0001F3AC {name}" + (f"\n\n{plain_description}" if plain_description else "")
+    formatted_body = f"<p><strong>\U0001F3AC {html.escape(name)}</strong></p>"
+    if safe_description_html:
+        formatted_body += safe_description_html
+    message_content: dict = {"msgtype": "m.text", "body": plain_body}
+    if safe_description_html:
+        message_content["format"] = "org.matrix.custom.html"
+        message_content["formatted_body"] = formatted_body
+
+    used_video_embed = False
+    if config.bridge.follow_video_media_mode == "embed" and media_link is not None:
+        size = media_link.get("size")
+        max_bytes = config.bridge.follow_video_max_embed_mb * 1024 * 1024
+        if isinstance(size, (int, float)) and size <= max_bytes:
+            attachment = {
+                "url": media_link["href"], "media_type": media_link.get("mediaType") or "video/mp4", "name": name,
+            }
+            message_content, embed_mxc = await attach_media_to_content(request, message_content, [attachment])
+            used_video_embed = embed_mxc is not None
+
+    if not used_video_embed and icon is not None:
+        icon_attachment = {"url": icon["url"], "media_type": icon.get("mediaType") or "image/jpeg", "name": name}
+        message_content, _ = await attach_media_to_content(request, message_content, [icon_attachment])
+
+    if src:
+        message_content["external_url"] = src
+        if not used_video_embed:
+            # The embedded thumbnail (or, with no icon at all, plain text)
+            # isn't itself playable -- unlike the embed-mode case, where
+            # external_url alone is the same discreet "view original"
+            # affordance an ordinary mirrored post already gets, this is
+            # the PRIMARY way to actually watch, so it needs to be a real
+            # visible link, not just client-dependent external_url UI.
+            domain = urlsplit(src).hostname or src
+            message_content["body"] += f"\n\nWatch on {domain}: {src}"
+            if "formatted_body" not in message_content:
+                message_content["format"] = "org.matrix.custom.html"
+                message_content["formatted_body"] = formatted_body
+            message_content["formatted_body"] += (
+                f'<p><a href="{html.escape(src, quote=True)}">Watch on {html.escape(domain)}</a></p>'
+            )
+
+    max_clock_skew = config.federation.max_clock_skew
+    max_backdate_days = config.federation.max_backdate_days
+    try:
+        event_id = await synapse.send_message_event(
+            remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
+            event_type=mirrored_post_event_type(config),
+            ts=resolve_event_ts(video, max_clock_skew=max_clock_skew, max_backdate_days=max_backdate_days),
+        )
+    except SynapseError:
+        logger.warning("Failed to import video from %s", author_actor_id, exc_info=True)
+        return None
+
+    if not isinstance(ap_object_id, str):
+        return None
+    new_event = FederatedEvent(
+        event_id=event_id, room_id=remote_room.room_id, ap_object_id=ap_object_id, author_actor_id=author_actor_id,
+    )
+    try:
+        await repository.record_federated_event(new_event)
+    except Exception:
+        # Lost a race some caller-side lock didn't catch -- same
+        # best-effort reasoning as _import_note_locked's identical guard.
+        logger.warning("Failed to record federated event for video %s", ap_object_id, exc_info=True)
+    return new_event
 
 
 async def ensure_remote_actor_room(

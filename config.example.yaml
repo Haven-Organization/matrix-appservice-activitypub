@@ -120,6 +120,20 @@ bridge:
   # cost for your own deployment before turning this on.
   # peertube_channels_enabled: false
 
+  # How a followed PeerTube channel/account's videos show up as posts.
+  # "link": always a text/thumbnail card linking back to the original
+  # instance, never downloads the video. "embed": try to download and
+  # re-host the video natively (same path an ordinary post's video
+  # attachment already goes through), falling back to a "link"-style card
+  # when the file is bigger than follow_video_max_embed_mb below. Defaults
+  # to "link" for the same bandwidth/storage reasoning as
+  # peertube_channels_enabled above.
+  # follow_video_media_mode: link
+
+  # Only consulted in "embed" mode -- checked against the video's own
+  # declared file size before ever starting a download.
+  # follow_video_max_embed_mb: 100
+
 synapse:
   # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.
   base_url: http://localhost:8008
