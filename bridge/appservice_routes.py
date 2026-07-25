@@ -66,6 +66,11 @@ from bridge.edit_bridge import maybe_federate_edit
 from bridge.media import ENCRYPTED_ATTACHMENT_WARNING_MARKER, decrypt_and_reupload_encrypted_attachment
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
 from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
+from bridge.peertube import (
+    maybe_handle_channel_avatar_change,
+    maybe_handle_channel_name_change,
+    maybe_handle_channel_topic_change,
+)
 from bridge.profile_posts import (
     maybe_distribute_profile_post,
     maybe_handle_room_avatar_change,
@@ -270,6 +275,15 @@ async def _handle_transaction(
                 continue
             handled_as_avatar_change = await maybe_handle_room_avatar_change(request, event)
             if handled_as_avatar_change:
+                continue
+            handled_as_channel_topic_change = await maybe_handle_channel_topic_change(request, event)
+            if handled_as_channel_topic_change:
+                continue
+            handled_as_channel_name_change = await maybe_handle_channel_name_change(request, event)
+            if handled_as_channel_name_change:
+                continue
+            handled_as_channel_avatar_change = await maybe_handle_channel_avatar_change(request, event)
+            if handled_as_channel_avatar_change:
                 continue
             handled_as_reaction = await maybe_federate_reaction(request, event)
             if handled_as_reaction:

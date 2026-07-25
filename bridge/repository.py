@@ -70,6 +70,39 @@ class ActorRecord:
 
 
 @dataclass(frozen=True)
+class PeerTubeChannelRecord:
+    """A PeerTube-compatible video channel: a ``Group``-typed ActivityPub
+    actor owned by a local Profile, with its own Matrix room, own RSA
+    keypair, and own ActivityPub identity (see ``bridge.commands``'s
+    ``;create channel``).
+
+    Named with the ``PeerTube`` prefix (unlike most record types here)
+    specifically to avoid colliding with this codebase's existing,
+    unrelated ``ChannelRoom``/``GuildChannel`` (Shoot's own guild-channel
+    feature); "channel" alone is already a loaded, ambiguous term here.
+
+    Deliberately its own record/table rather than a reuse of
+    ``ActorRecord``: a channel's identity is keyed by its own username
+    exactly like a profile's, but its "owner" is another local actor's
+    ``username``, not a ``matrix_user_id`` directly, and one profile can
+    own several channels; ``ActorRecord.matrix_user_id`` is uniquely
+    1:1 with a single profile, which a channel's owner relationship
+    doesn't fit without loosening that constraint on a table everything
+    else already depends on.
+    """
+
+    username: str
+    owner_username: str
+    room_id: str
+    public_key_pem: str
+    private_key_pem: str
+    display_name: str = ""
+    summary: str = ""
+    icon_url: str | None = None
+    banner_url: str | None = None
+
+
+@dataclass(frozen=True)
 class ThirdPartyAllowRecord:
     """One admin-granted allowlist entry letting a user/room/homeserver on a
     DIFFERENT Matrix homeserver use the bridge (see the ";allow"/";disallow"/
@@ -354,6 +387,22 @@ class ActorRepository(Protocol):
         username doesn't exist."""
         ...
 
+    async def get_peertube_channel(self, username: str) -> PeerTubeChannelRecord | None: ...
+
+    async def get_peertube_channel_by_room_id(self, room_id: str) -> PeerTubeChannelRecord | None: ...
+
+    async def list_peertube_channels_by_owner(self, owner_username: str) -> list[PeerTubeChannelRecord]:
+        """Every channel ``owner_username`` (a local Profile's own
+        username, never a bare ``matrix_user_id``) owns, current or newly
+        created -- a single profile can own several."""
+        ...
+
+    async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
+        """Create or replace a channel (freshly created, or updated display
+        fields via the same generic actor-field commands a Profile Room
+        already reuses)."""
+        ...
+
     async def list_followers(self, username: str) -> list[str]:
         """Return the AP actor IRIs following ``username``."""
         ...
@@ -631,6 +680,19 @@ class ActorRepository(Protocol):
         ``record_federated_event``'s docstring for what "primary" means."""
         ...
 
+    async def delete_federated_event(self, event_id: str) -> None:
+        """Remove the record tying Matrix event ``event_id`` to whatever AP
+        object it mapped to. Every other feature that creates a
+        ``FederatedEvent`` treats it as permanent (an ordinary post's
+        redaction stays deleted forever, so there's never a reason to
+        un-map it); this exists only for ``;unpublish`` (see
+        ``bridge.commands``), which deliberately does NOT redact the
+        underlying Matrix video message, specifically so the same
+        still-existing message can be cleanly ``;publish``ed again
+        afterward as a fresh AP object. A no-op if ``event_id`` isn't
+        tracked."""
+        ...
+
     async def record_reaction(self, record: ReactionRecord) -> None: ...
 
     async def get_reaction_by_activity_id(self, activity_id: str) -> ReactionRecord | None: ...
@@ -888,10 +950,6 @@ class ActorRepository(Protocol):
 @dataclass
 class _LocalActorState:
     record: ActorRecord
-    followers: set[str] = field(default_factory=set)
-    following: set[str] = field(default_factory=set)
-    blocked: set[str] = field(default_factory=set)
-    muted: set[str] = field(default_factory=set)
 
 
 _MAX_TRACKED_TRANSACTIONS = 10_000
@@ -941,6 +999,21 @@ class InMemoryActorRepository:
         self._channel_rooms: dict[str, ChannelRoom] = {}
         self._channel_rooms_by_room_id: dict[str, ChannelRoom] = {}
         self._channel_room_members: set[tuple[str, str]] = set()
+        self._peertube_channels: dict[str, PeerTubeChannelRecord] = {}
+        self._peertube_channels_by_room_id: dict[str, str] = {}  # room_id -> channel username
+        # Keyed by plain username, independent of ``_actors`` -- matches the
+        # real sqlite/postgres ``followers``/``following``/``blocked_actors``/
+        # ``muted_actors`` tables, which have no foreign key onto
+        # ``local_actors`` either. This is what lets a PeerTubeChannelRecord's
+        # username have its own real followers (a channel is its own
+        # independent Actor, see PeerTubeChannelRecord's docstring) without
+        # needing an ``_actors`` entry to exist, and also matches the real
+        # backends in keeping this state around across an ``unregister_local_actor``
+        # (unlink profile doesn't drop a since-regained identity's followers there either).
+        self._followers: dict[str, set[str]] = {}
+        self._following: dict[str, set[str]] = {}
+        self._blocked: dict[str, set[str]] = {}
+        self._muted: dict[str, set[str]] = {}
 
     async def get_local_actor(self, username: str) -> ActorRecord | None:
         state = self._actors.get(username)
@@ -959,16 +1032,12 @@ class InMemoryActorRepository:
 
     async def register_local_actor(self, record: ActorRecord) -> None:
         existing = self._actors.get(record.username)
-        followers = existing.followers if existing else set()
-        following = existing.following if existing else set()
         # An unlink (room_id cleared) or a room replacement/relink moves
         # which room this actor is bound to -- drop the old reverse mapping
         # so a stale room_id doesn't keep resolving to this actor.
         if existing is not None and existing.record.room_id and existing.record.room_id != record.room_id:
             self._actors_by_room_id.pop(existing.record.room_id, None)
-        self._actors[record.username] = _LocalActorState(
-            record=record, followers=followers, following=following
-        )
+        self._actors[record.username] = _LocalActorState(record=record)
         self._actors_by_matrix_id[record.matrix_user_id] = record.username
         if record.room_id:
             self._actors_by_room_id[record.room_id] = record.username
@@ -986,40 +1055,47 @@ class InMemoryActorRepository:
         if state.record.room_id and self._actors_by_room_id.get(state.record.room_id) == username:
             del self._actors_by_room_id[state.record.room_id]
 
+    async def get_peertube_channel(self, username: str) -> PeerTubeChannelRecord | None:
+        return self._peertube_channels.get(username)
+
+    async def get_peertube_channel_by_room_id(self, room_id: str) -> PeerTubeChannelRecord | None:
+        username = self._peertube_channels_by_room_id.get(room_id) if room_id else None
+        return self._peertube_channels.get(username) if username else None
+
+    async def list_peertube_channels_by_owner(self, owner_username: str) -> list[PeerTubeChannelRecord]:
+        return [c for c in self._peertube_channels.values() if c.owner_username == owner_username]
+
+    async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
+        existing = self._peertube_channels.get(record.username)
+        if existing is not None and existing.room_id and existing.room_id != record.room_id:
+            self._peertube_channels_by_room_id.pop(existing.room_id, None)
+        self._peertube_channels[record.username] = record
+        if record.room_id:
+            self._peertube_channels_by_room_id[record.room_id] = record.username
+
     async def list_followers(self, username: str) -> list[str]:
-        state = self._actors.get(username)
-        return sorted(state.followers) if state else []
+        return sorted(self._followers.get(username, ()))
 
     async def list_following(self, username: str) -> list[str]:
-        state = self._actors.get(username)
-        return sorted(state.following) if state else []
+        return sorted(self._following.get(username, ()))
 
     async def is_following(self, username: str, remote_actor_id: str) -> bool:
-        state = self._actors.get(username)
-        return remote_actor_id in state.following if state else False
+        return remote_actor_id in self._following.get(username, ())
 
     async def is_anyone_following(self, remote_actor_id: str) -> bool:
-        return any(remote_actor_id in state.following for state in self._actors.values())
+        return any(remote_actor_id in following for following in self._following.values())
 
     async def add_follower(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.followers.add(remote_actor_id)
+        self._followers.setdefault(username, set()).add(remote_actor_id)
 
     async def remove_follower(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.followers.discard(remote_actor_id)
+        self._followers.get(username, set()).discard(remote_actor_id)
 
     async def add_following(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.following.add(remote_actor_id)
+        self._following.setdefault(username, set()).add(remote_actor_id)
 
     async def remove_following(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.following.discard(remote_actor_id)
+        self._following.get(username, set()).discard(remote_actor_id)
 
     async def set_followers_hidden(self, username: str, hidden: bool) -> None:
         state = self._actors.get(username)
@@ -1065,32 +1141,22 @@ class InMemoryActorRepository:
         return False
 
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
-        state = self._actors.get(username)
-        return remote_actor_id in state.blocked if state else False
+        return remote_actor_id in self._blocked.get(username, ())
 
     async def add_blocked(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.blocked.add(remote_actor_id)
+        self._blocked.setdefault(username, set()).add(remote_actor_id)
 
     async def remove_blocked(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.blocked.discard(remote_actor_id)
+        self._blocked.get(username, set()).discard(remote_actor_id)
 
     async def is_muted(self, username: str, remote_actor_id: str) -> bool:
-        state = self._actors.get(username)
-        return remote_actor_id in state.muted if state else False
+        return remote_actor_id in self._muted.get(username, ())
 
     async def add_muted(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.muted.add(remote_actor_id)
+        self._muted.setdefault(username, set()).add(remote_actor_id)
 
     async def remove_muted(self, username: str, remote_actor_id: str) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.muted.discard(remote_actor_id)
+        self._muted.get(username, set()).discard(remote_actor_id)
 
     async def get_remote_actor_room(self, actor_id: str) -> RemoteActorRoom | None:
         return self._remote_rooms.get(actor_id)
@@ -1198,6 +1264,11 @@ class InMemoryActorRepository:
 
     async def get_federated_event_by_ap_object(self, ap_object_id: str) -> FederatedEvent | None:
         return self._federated_by_ap_object.get(ap_object_id)
+
+    async def delete_federated_event(self, event_id: str) -> None:
+        record = self._federated_by_matrix_event.pop(event_id, None)
+        if record is not None and self._federated_by_ap_object.get(record.ap_object_id) is record:
+            del self._federated_by_ap_object[record.ap_object_id]
 
     async def has_processed_transaction(self, txn_id: str) -> bool:
         return txn_id in self._processed_txn_ids

@@ -111,6 +111,15 @@ bridge:
   # this off.
   # use_synapse_admin_api: true
 
+  # Let Matrix rooms become real, federating PeerTube-compatible video
+  # channels (;create channel, ;publish, and friends). Off by default:
+  # a real behavior change, not a safely-ignorable additive field. Every
+  # remote view/scrub of a hosted video streams through this bridge's own
+  # media proxy with no caching layer, a much heavier bandwidth pattern
+  # per view than the images that proxy already serves, so weigh that
+  # cost for your own deployment before turning this on.
+  # peertube_channels_enabled: false
+
 synapse:
   # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.
   base_url: http://localhost:8008

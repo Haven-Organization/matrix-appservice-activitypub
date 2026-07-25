@@ -197,7 +197,7 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import Request
 
 from bridge.activitypub.delivery import DeliveryError, deliver_activity
-from bridge.activitypub.models import AS_PUBLIC, Activity, Note
+from bridge.activitypub.models import AS_PUBLIC, VIDEO_JSON_LD_CONTEXT, Activity, Note, Video, VideoIdentifier
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_actor_url,
@@ -234,7 +234,21 @@ from bridge.inbox_dispatch import (
     build_preview_media_content,
 )
 from bridge.matrix_links import matrix_to_link, matrix_to_room_link, room_pill_html
-from bridge.media import fetch_and_upload_media
+from bridge.media import build_ap_attachment, fetch_and_upload_media, resolve_attachment_or_request_confirmation
+from bridge.peertube import (
+    DEFAULT_THUMBNAIL_HEIGHT,
+    DEFAULT_THUMBNAIL_WIDTH,
+    VIDEO_METADATA_STATE_TYPE,
+    VIDEO_MIMETYPE_ALLOWLIST,
+    add_to_video_index,
+    format_video_uuid,
+    parse_key_value_command,
+    remove_from_video_index,
+    resolve_category,
+    resolve_licence,
+    resolve_language,
+    video_media_url,
+)
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.notifications import NOTIFICATIONS_ROOM_NAME as _NOTIFICATIONS_ROOM_NAME
 from bridge.notifications import ensure_bot_dm_invite, notification_actor_html, notify_user, welcome_new_user
@@ -277,7 +291,14 @@ from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
 from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
 from bridge.note_mirroring import SOCIAL_PROFILE_USER_ID_STATE_TYPE, SOCIAL_PROFILE_USER_ID_POWER_LEVEL
 from bridge.note_mirroring import source_post_url as _source_post_url
-from bridge.repository import ActorRecord, FederatedEvent, GhostProfile, PendingGuildFollow, RemoteActorRoom
+from bridge.repository import (
+    ActorRecord,
+    FederatedEvent,
+    GhostProfile,
+    PeerTubeChannelRecord,
+    PendingGuildFollow,
+    RemoteActorRoom,
+)
 from bridge.room_widget import add_bridge_widget
 from bridge.spaces import add_room_to_space
 from bridge.synapse_client import SynapseError
@@ -297,7 +318,7 @@ _COMMAND_PREFIX = ";"
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
     r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help|"
-    r"disallow|allowed|allow|refresh|joinguild|leaveguild"
+    r"disallow|allowed|allow|refresh|joinguild|leaveguild|unpublish|publish|edit"
 )
 
 
@@ -389,7 +410,7 @@ def message_addresses_bot(content: dict, config) -> bool:
 
 # Single-word commands blocked outright for a third-party sender currently
 # effective-Follow-Only, regardless of argument (see _effective_third_party_mode).
-_FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost", "boost"}
+_FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost", "boost", "publish", "unpublish", "edit"}
 
 # (subcommand, lowercased argument) pairs blocked the same way -- these
 # subcommands only actually dispatch to anything when paired with this
@@ -580,6 +601,26 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
                         "third-party accounts in Follow Only mode.",
                     )
                     return True
+                # Same self-service-provisioning concern as ";create profile"
+                # above (mints a brand new federating identity), but can't
+                # join _FOLLOW_ONLY_BLOCKED_EXACT -- unlike "create profile",
+                # "create channel" always carries a variable <id> argument,
+                # never that one exact literal string.
+                if subcommand == "create" and normalized_argument.startswith("channel"):
+                    await _notice(
+                        request, room_id,
+                        f'"{_COMMAND_PREFIX}create channel" is disabled for third-party accounts in Follow Only mode.',
+                    )
+                    return True
+                # Same reasoning, for "replace video" specifically. "Replace
+                # room" (the other "replace" subcommand) is unaffected, it's
+                # already covered by its own _FOLLOW_ONLY_BLOCKED_EXACT entry.
+                if subcommand == "replace" and normalized_argument.startswith("video"):
+                    await _notice(
+                        request, room_id,
+                        f'"{_COMMAND_PREFIX}replace video" is disabled for third-party accounts in Follow Only mode.',
+                    )
+                    return True
 
         if subcommand == "follow":
             await _handle_follow(request, sender=sender, room_id=room_id, handle=argument, content=content)
@@ -597,8 +638,22 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_delete_profile(request, sender=sender, room_id=room_id)
         elif subcommand == "create" and argument.lower() == "profile":
             await _handle_create_profile(request, sender=sender, room_id=room_id)
+        elif subcommand == "create" and (argument.lower() == "channel" or argument.lower().startswith("channel ")):
+            await _handle_create_channel(request, sender=sender, room_id=room_id, argument=argument[len("channel"):].strip())
+        elif subcommand == "publish":
+            await _handle_publish(
+                request, sender=sender, room_id=room_id, content=content, command_event_id=event.get("event_id")
+            )
+        elif subcommand == "unpublish":
+            await _handle_unpublish(request, sender=sender, room_id=room_id, content=content)
+        elif subcommand == "edit":
+            await _handle_edit(request, sender=sender, room_id=room_id, content=content)
         elif subcommand == "replace" and argument.lower() == "room":
             await _handle_replace_room(request, sender=sender, room_id=room_id)
+        elif subcommand == "replace" and (argument.lower() == "video" or argument.lower().startswith("video ")):
+            await _handle_replace_video(
+                request, sender=sender, room_id=room_id, content=content, argument=argument[len("video"):].strip()
+            )
         elif subcommand == "leave" and argument.lower() == "unfollowed":
             await _handle_leave_unfollowed(request, sender=sender, room_id=room_id)
         elif subcommand == "rejoin":
@@ -916,6 +971,39 @@ async def _handle_help(
         (
             f"{_COMMAND_PREFIX}create profile",
             f"Set up a new fediverse identity ({config.bridge.domain}) and Matrix room for you in one step.",
+        ),
+        *(
+            [
+                (
+                    f"{_COMMAND_PREFIX}create channel <id> [display name]",
+                    "Set up a real, federating PeerTube-compatible video channel and Matrix room "
+                    "(requires a linked profile first, which becomes the channel's owner).",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}publish",
+                    'Reply to a video message in one of your channel rooms with this (followed by '
+                    '"name: ..." and any of category/license/language/tags/sensitive/commentsEnabled, '
+                    "then a blank line and a description) to federate it as a real video.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}edit",
+                    'Reply to an already-published video with this (same "key: value" fields as '
+                    f'"{_COMMAND_PREFIX}publish") to change its metadata. Only the fields you include change; '
+                    "the video file itself is untouched.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}replace video [mxc://...]",
+                    "Swap an already-published video's underlying file: reply to the new file with no "
+                    "argument, or reply to the original video naming the new file's mxc:// directly.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}unpublish",
+                    "Reply to an already-published video with this to retract it from the fediverse. The "
+                    "Matrix message itself is left alone, so you can re-publish it later.",
+                ),
+            ]
+            if config.bridge.peertube_channels_enabled
+            else []
         ),
         (
             f"{_COMMAND_PREFIX}follow @user@instance.org",
@@ -2914,6 +3002,39 @@ async def _run_follows_import(
 
 _RUNNING_BACKFILLS: set = set()
 
+_RUNNING_VIDEO_DELIVERIES: set = set()
+
+
+def _deliver_video_activity_in_background(delivery) -> None:
+    """Fire-and-forget wrapper for a ;publish/;unpublish/;edit/;replace
+    video command's federation delivery -- concurrent (asyncio.gather)
+    delivery to a whole follower list still blocks on the SLOWEST single
+    recipient (deliver_to_actor_or_followers's own per-recipient timeout)
+    before returning, and awaiting that before the command's own
+    confirmation notice reads as the bot never responding at all
+    (confirmed live 2026-07-25: a routine ;edit took 141 seconds even
+    after switching to gather, because one of the owner's 37 followers was
+    slow to respond). The confirmation notice now fires the moment our own
+    bridge-side state is durably saved; delivery to the fediverse happens
+    after, same fire-and-track pattern as this module's own
+    _RUNNING_BACKFILLS, so the task isn't garbage-collected mid-flight.
+
+    ``delivery`` is wrapped in a real coroutine before scheduling --
+    production runs on uvloop, whose ``Loop.create_task`` is stricter than
+    stock asyncio's and outright rejects an ``asyncio.gather(...)`` call's
+    own return value (a ``_GatheringFuture``, not a coroutine), raising
+    ``TypeError: a coroutine was expected`` synchronously at the call site
+    (confirmed live 2026-07-25: this silently broke ;edit/;unpublish/
+    ;publish/;replace video entirely -- the exception was swallowed by
+    _handle_transaction's own outer try/except, so neither the state
+    change nor the confirmation notice ever happened)."""
+    async def _run() -> None:
+        await delivery
+
+    task = asyncio.get_running_loop().create_task(_run())
+    _RUNNING_VIDEO_DELIVERIES.add(task)
+    task.add_done_callback(_RUNNING_VIDEO_DELIVERIES.discard)
+
 
 async def _collect_recent_items(request: Request, collection: dict | str, *, limit: int) -> list[dict]:
     """Page through an ActivityPub collection (a remote actor's ``outbox``,
@@ -3490,7 +3611,9 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     # Plain top-level post (no inReplyTo at all, or the reply-chain handling
     # above couldn't resolve/import a parent to thread onto).
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
     message_content: dict = {"msgtype": "m.text", "body": plain}
     if safe_html and safe_html != plain:
         message_content["format"] = "org.matrix.custom.html"
@@ -3562,6 +3685,62 @@ def _reply_target_event_id(content: dict) -> str | None:
         return in_reply_to.get("event_id") or relates_to.get("event_id")
     in_reply_to = relates_to.get("m.in_reply_to") or {}
     return in_reply_to.get("event_id")
+
+
+def _direct_reply_target_event_id(content: dict) -> str | None:
+    """Like ``_reply_target_event_id``, but for ``;publish``/``;unpublish``/
+    ``;edit`` specifically: these need the EXACT message being replied to
+    (the video file itself), never a generic "somewhere in this thread"
+    fallback to the thread root the way ``_reply_target_event_id`` does for
+    ``;boost``/``;repost`` (where that's the right call: an ordinary
+    Matrix thread reply really does relate to the thread's own root Note).
+    Falling back to the thread root here risks resolving to a COMPLETELY
+    UNRELATED piece of tracked content that just happens to share the same
+    thread. Confirmed live 2026-07-25: a ``;publish`` sent as a generic
+    "reply in thread" with no specific ``m.in_reply_to`` target fell back
+    to the thread's own root event, which turned out to already be tracked
+    as an unrelated Chat message's own ``FederatedEvent``, producing a
+    false "already published" for a genuinely fresh video. Always requires
+    a real ``m.in_reply_to.event_id``, regardless of ``rel_type``; returns
+    None (never falls back to anything) if one isn't present."""
+    relates_to = content.get("m.relates_to") or {}
+    return (relates_to.get("m.in_reply_to") or {}).get("event_id")
+
+
+async def _video_reply_target_federated_event(request: Request, content: dict) -> FederatedEvent | None:
+    """Like ``_direct_reply_target_event_id``, but for ``;unpublish``/
+    ``;edit``/``;replace video`` specifically -- these run AFTER a video is
+    already published, so a real thread already exists under it, and an
+    ordinary Matrix client's "reply in thread" sets ``m.in_reply_to`` to
+    the thread's latest event (its own last ``;edit``, the bridge's own
+    confirmation notice, ...), not the thread's root -- unlike
+    ``;boost``/``;repost``, this is expected, everyday usage, not an edge
+    case. Requiring an exact ``m.in_reply_to`` match alone (as
+    ``_direct_reply_target_event_id`` does) rejects that ordinary case
+    outright (confirmed live 2026-07-25: a genuine in-thread ``;edit``
+    reply to the bridge's own prior notice was told to "reply to an
+    already-published video").
+
+    Falls back to the thread's root event ONLY when that root itself
+    resolves to a tracked video ``FederatedEvent`` -- unlike
+    ``_reply_target_event_id``'s unconditional thread-root fallback, this
+    still refuses to match an unrelated tracked event that merely shares
+    the thread (the exact failure mode ``_direct_reply_target_event_id``'s
+    own docstring describes)."""
+    repository = request.app.state.repository
+    relates_to = content.get("m.relates_to") or {}
+    direct = (relates_to.get("m.in_reply_to") or {}).get("event_id")
+    if direct:
+        federated = await repository.get_federated_event_by_matrix_event(direct)
+        if federated is not None and "/videos/" in federated.ap_object_id:
+            return federated
+    if relates_to.get("rel_type") == "m.thread":
+        root = relates_to.get("event_id")
+        if root and root != direct:
+            federated = await repository.get_federated_event_by_matrix_event(root)
+            if federated is not None and "/videos/" in federated.ap_object_id:
+                return federated
+    return None
 
 
 async def _resolve_poll_refresh_target(request: Request, content: dict) -> FederatedEvent | None:
@@ -4204,6 +4383,909 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
         message += " Your followers/following from before are preserved."
         html_message += " Your followers/following from before are preserved."
     await _notice(request, room_id, message, html_message=html_message)
+
+
+async def _handle_create_channel(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;create channel <id> [display name]``: mints a real, federating
+    PeerTube-compatible video channel (see ``PeerTubeChannelRecord``'s own
+    docstring and the agreed design captured in the
+    ``project_peertube_channels_scoping`` memory). Requires ``sender`` to
+    already have a linked Profile: that Profile's own ``username`` becomes
+    the new channel's ``owner_username``, since a channel is never
+    ownerless, though one Profile can own several channels."""
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    owner = await repository.get_local_actor_by_matrix_id(sender)
+    if owner is None or not owner.room_id:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" before creating a channel.',
+        )
+        return
+
+    raw_id, _, rest = argument.partition(" ")
+    channel_id = sanitize_localpart_component(raw_id)
+    display_name = rest.strip() or channel_id
+    if not channel_id:
+        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create channel <id> [display name]".')
+        return
+
+    # Channels and profiles share one global actor-username namespace (see
+    # PeerTubeChannelRecord's docstring; both are ultimately served at
+    # the same /actor/{username} URL shape), so an id already taken by
+    # either kind is rejected here, not just a same-kind duplicate.
+    if await repository.get_local_actor(channel_id) is not None or await repository.get_peertube_channel(channel_id) is not None:
+        await _notice(request, room_id, f"{channel_id}@{config.bridge.domain} is already taken.")
+        return
+
+    bot_mxid = _bot_mxid(config)
+    try:
+        new_room_id = await synapse.create_room(
+            as_user_id=bot_mxid,
+            name=display_name,
+            invite=[sender],
+            room_type=_SOCIAL_PROFILE_ROOM_TYPE,
+            join_rule=_KNOCK_JOIN_RULE,
+            # sender is 99, not 100 -- same reasoning as _handle_create_profile's
+            # identical override: one level below the bot (the room's real
+            # creator under room v12), so sender is never locked out of
+            # moderating their own channel room.
+            power_level_content_override={"users": {sender: 99}},
+        )
+    except SynapseError as exc:
+        logger.warning("Could not create channel room for %s: %s", sender, exc)
+        await _notice(request, room_id, "Could not create a room for that channel.")
+        return
+
+    private_key_pem, public_key_pem = generate_keypair()
+    record = PeerTubeChannelRecord(
+        username=channel_id,
+        owner_username=owner.username,
+        room_id=new_room_id,
+        public_key_pem=public_key_pem,
+        private_key_pem=private_key_pem,
+        display_name=display_name,
+    )
+    await repository.register_peertube_channel(record)
+
+    base = config.bridge.public_base_url
+    await _send_bridge_info(
+        request, room_id=new_room_id, actor_id=actor_url(base, channel_id),
+        display_name=display_name, avatar_mxc=None, as_user_id=bot_mxid,
+    )
+    await add_bridge_widget(request, room_id=new_room_id)
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
+
+    message = (
+        f"Created {new_room_id} as the channel {channel_id}@{config.bridge.domain}, owned by "
+        f"{owner.username}@{config.bridge.domain} -- you've been invited and made admin there. "
+        f'Send a video into the room, then reply to it with "{_COMMAND_PREFIX}publish" to publish it.'
+    )
+    html_message = (
+        f"Created {room_pill_html(new_room_id)} as the channel {channel_id}@{config.bridge.domain}, owned by "
+        f"{owner.username}@{config.bridge.domain} -- you've been invited and made admin there. "
+        f'Send a video into the room, then reply to it with "{_COMMAND_PREFIX}publish" to publish it.'
+    )
+    await _notice(request, room_id, message, html_message=html_message)
+
+
+_TRUTHY_FIELD_VALUES = {"true", "yes", "on", "1"}
+_FALSY_FIELD_VALUES = {"false", "no", "off", "0"}
+
+
+def _parse_bool_field(value: str, *, default: bool) -> bool:
+    lowered = value.strip().lower()
+    if lowered in _TRUTHY_FIELD_VALUES:
+        return True
+    if lowered in _FALSY_FIELD_VALUES:
+        return False
+    return default
+
+
+# ";publish" is real, consequential, and slow (an HTTP delivery round-trip
+# per follower). Confirmed live 2026-07-25: Synapse redelivered the same
+# command event via a second AppService transaction while the first was
+# still mid-delivery, so its OWN early "already published?" check (keyed on
+# the VIDEO's event, only recorded partway through the first run) hadn't
+# been written yet by the time the second run's identical check ran, and
+# the second run's fast "not yet published" path raced ahead of the first
+# run's slow one, replying "already published" BEFORE the first run's own
+# real "Published" notice ("already published" arrived first purely
+# because it did far less work before replying). No actual duplicate
+# content was created (the video-level check still correctly prevented a
+# second video object once the first run's write landed), but the extra,
+# confusing notice is exactly the same "no guard against redelivery"
+# failure mode ``bridge.reaction_bridge.maybe_federate_reaction`` already
+# hit and fixed for reactions (see its own near-identical comment); this
+# is that same fix, for the COMMAND event itself rather than a video.
+_PUBLISH_REDELIVERY_DEDUP_WINDOW_SECONDS = 300.0
+_recent_publish_command_events: dict[str, float] = {}
+
+
+def _is_redelivered_publish_command(command_event_id: str | None) -> bool:
+    if not command_event_id:
+        return False  # no event id to key on at all -- nothing to dedup against, let it proceed
+    now = time.monotonic()
+    seen_at = _recent_publish_command_events.get(command_event_id)
+    _recent_publish_command_events[command_event_id] = now
+    return seen_at is not None and now - seen_at < _PUBLISH_REDELIVERY_DEDUP_WINDOW_SECONDS
+
+
+async def _handle_publish(
+    request: Request, *, sender: str, room_id: str, content: dict, command_event_id: str | None = None,
+) -> None:
+    """``;publish``: reply to a video message inside a channel room to
+    federate it as a real PeerTube-compatible ``Video`` (see the agreed
+    design in the ``project_peertube_channels_scoping`` memory, and
+    ``Video``'s own docstring for the object shape this builds). See
+    ``parse_key_value_command`` for the shared ``;publish``/``;edit`` body
+    syntax this parses ``content["body"]`` with."""
+    if _is_redelivered_publish_command(command_event_id):
+        return  # same command event seen again recently -- see this check's own module-level comment
+
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    channel = await repository.get_peertube_channel_by_room_id(room_id)
+    if channel is None:
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}publish" only works inside a channel room '
+            f'(see "{_COMMAND_PREFIX}create channel").',
+        )
+        return
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != sender:
+        await _notice(request, room_id, "Only the channel's owner can publish to it.")
+        return
+
+    target_event_id = _direct_reply_target_event_id(content)
+    if not target_event_id:
+        await _notice(
+            request, room_id, f'Reply to the video message with "{_COMMAND_PREFIX}publish" to publish it.'
+        )
+        return
+    if await repository.get_federated_event_by_matrix_event(target_event_id) is not None:
+        await _notice(
+            request, room_id,
+            f'That video is already published. Use "{_COMMAND_PREFIX}edit" to change its metadata, or '
+            f'"{_COMMAND_PREFIX}replace video" to swap the file.',
+        )
+        return
+
+    try:
+        target_event = await synapse.get_event(room_id, target_event_id)
+    except SynapseError:
+        await _notice(request, room_id, "Couldn't find that video message.")
+        return
+
+    video_content = target_event.get("content") or {}
+    # Checked directly off msgtype here, NOT via build_ap_attachment: an
+    # ENCRYPTED video (content.file, no top-level content.url) would make
+    # build_ap_attachment return None too, indistinguishable from "not a
+    # video at all" if checked before resolve_attachment_or_request_
+    # confirmation below has a chance to resolve/decrypt it first.
+    if video_content.get("msgtype") != "m.video":
+        await _notice(request, room_id, f'Reply to an actual video file with "{_COMMAND_PREFIX}publish".')
+        return
+    mimetype = (video_content.get("info") or {}).get("mimetype") or ""
+    if mimetype and mimetype.lower() not in VIDEO_MIMETYPE_ALLOWLIST:
+        await _notice(
+            request, room_id,
+            f'"{mimetype}" isn\'t a recognized video format. Make sure it actually plays in your Matrix '
+            "client first.",
+        )
+        return
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=video_content, room_id=room_id, sender=sender, trigger_event_id=target_event_id,
+    ):
+        return  # encrypted; a confirmation request was just sent, nothing to publish yet
+
+    base = config.bridge.public_base_url
+    attachment = build_ap_attachment(base, video_content)
+    if attachment is None:
+        await _notice(request, room_id, "Couldn't resolve that video's media URL.")
+        return
+
+    body = content.get("body") or ""
+    fields, description = parse_key_value_command(body)
+    name = fields.get("name", "").strip()
+    if not name:
+        await _notice(request, room_id, f'"{_COMMAND_PREFIX}publish" needs a "name: ..." field.')
+        return
+
+    category = None
+    if fields.get("category"):
+        category_id = resolve_category(fields["category"])
+        if category_id is None:
+            await _notice(request, room_id, f'"{fields["category"]}" isn\'t a recognized category.')
+            return
+        category = VideoIdentifier(str(category_id), fields["category"])
+
+    licence = None
+    licence_name = fields.get("license") or fields.get("licence")
+    if licence_name:
+        licence_id = resolve_licence(licence_name)
+        if licence_id is None:
+            await _notice(request, room_id, f'"{licence_name}" isn\'t a recognized license.')
+            return
+        licence = VideoIdentifier(str(licence_id), licence_name)
+
+    language = None
+    if fields.get("language"):
+        lang_id, lang_name = resolve_language(fields["language"])
+        language = VideoIdentifier(lang_id, lang_name)
+
+    tags = [t.strip() for t in fields.get("tags", "").split(",") if t.strip()]
+    sensitive = _parse_bool_field(fields.get("sensitive", ""), default=False)
+    comments_enabled = _parse_bool_field(fields.get("commentsenabled", ""), default=True)
+
+    info = video_content.get("info") or {}
+    duration_ms = info.get("duration")
+    duration_seconds = (
+        round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+    )
+
+    thumbnail_mxc = fields.get("thumbnail") or info.get("thumbnail_url")
+    thumbnail_file = info.get("thumbnail_file")
+    if not thumbnail_mxc and isinstance(thumbnail_file, dict):
+        thumbnail_mxc = thumbnail_file.get("url")
+    icon_url = None
+    if thumbnail_mxc:
+        try:
+            icon_url = media_url(base, thumbnail_mxc)
+        except ValueError:
+            icon_url = None
+    thumbnail_info = info.get("thumbnail_info") or {}
+
+    local_video_id = uuid.uuid4().hex
+    video_id = f"{base}/actor/{channel.username}/videos/{local_video_id}"
+    published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    owner_actor_id = actor_url(base, owner.username)
+    channel_actor_id = actor_url(base, channel.username)
+
+    video = Video(
+        id=video_id,
+        uuid=format_video_uuid(local_video_id),
+        name=name,
+        attributed_to=[{"type": "Person", "id": owner_actor_id}, {"type": "Group", "id": channel_actor_id}],
+        published=published,
+        # Same value as published, not left unset -- PeerTube's own remote-
+        # video validator (sanitizeAndCheckVideoTorrentObject, confirmed by
+        # reading their real source 2026-07-25) requires "updated" to be a
+        # valid date UNCONDITIONALLY, not just when a video has actually
+        # been edited; a fresh video with no "updated" field at all fails
+        # that check outright and never imports, one more silent
+        # PeerTube-side rejection in the same family as Video.uuid's own.
+        updated=published,
+        url_html=video_id,
+        media_url=video_media_url(attachment["url"], attachment.get("mediaType") or "video/mp4"),
+        media_type=attachment.get("mediaType") or "video/mp4",
+        duration_seconds=duration_seconds,
+        media_size=info.get("size"),
+        media_width=info.get("w"),
+        media_height=info.get("h"),
+        icon_url=icon_url,
+        icon_width=thumbnail_info.get("w") or DEFAULT_THUMBNAIL_WIDTH,
+        icon_height=thumbnail_info.get("h") or DEFAULT_THUMBNAIL_HEIGHT,
+        content=description or None,
+        category=category,
+        licence=licence,
+        language=language,
+        tags=tags,
+        sensitive=sensitive,
+        comments_enabled=comments_enabled,
+        to=[AS_PUBLIC, channel_actor_id],
+        cc=[followers_url(base, owner.username)],
+        audience=channel_actor_id,
+    )
+
+    create_activity = Activity(
+        id=f"{video_id}/activity", type="Create", actor=owner_actor_id, object=video,
+        published=published, to=video.to, cc=video.cc,
+    )
+    announce_activity = Activity(
+        id=f"{video_id}/announces/{uuid.uuid4().hex}", type="Announce", actor=channel_actor_id, object=video_id,
+        published=published, to=video.to, cc=video.cc,
+    )
+
+    await repository.mark_media_published(video_content["url"])
+    if thumbnail_mxc:
+        await repository.mark_media_published(thumbnail_mxc)
+
+    await repository.record_federated_event(
+        FederatedEvent(
+            event_id=target_event_id, room_id=room_id, ap_object_id=video_id, author_actor_id=owner_actor_id,
+        )
+    )
+    await add_to_video_index(synapse, room_id=room_id, local_video_id=local_video_id)
+
+    await synapse.send_state_event(
+        room_id, VIDEO_METADATA_STATE_TYPE, local_video_id,
+        {
+            "name": name,
+            "category": fields.get("category"),
+            "license": licence_name,
+            "language": fields.get("language"),
+            "tags": tags,
+            "description": description,
+            "sensitive": sensitive,
+            "commentsEnabled": comments_enabled,
+            "thumbnail_mxc": thumbnail_mxc,
+            "published": published,
+        },
+    )
+
+    owner_followers = await repository.list_followers(owner.username)
+    channel_followers = await repository.list_followers(channel.username)
+    # Backgrounded, not awaited -- see _deliver_video_activity_in_background's
+    # own docstring for why even concurrent (gather) delivery still isn't
+    # safe to await before the confirmation notice below.
+    _deliver_video_activity_in_background(asyncio.gather(
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=create_activity.to_dict(),
+                key_id=main_key_id(base, owner.username), private_key_pem=owner.private_key_pem,
+            )
+            for recipient_actor_id in owner_followers
+        ),
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=announce_activity.to_dict(),
+                key_id=main_key_id(base, channel.username), private_key_pem=channel.private_key_pem,
+            )
+            for recipient_actor_id in channel_followers
+        ),
+    ))
+
+    message = f'Published "{name}" to {channel.username}@{config.bridge.domain}.'
+    if not icon_url:
+        message += (
+            f' No thumbnail was found on that video message. You can set one later with '
+            f'"{_COMMAND_PREFIX}edit thumbnail: mxc://...".'
+        )
+    await _notice(request, room_id, message)
+
+
+async def _handle_unpublish(request: Request, *, sender: str, room_id: str, content: dict) -> None:
+    """``;unpublish``: reply to an already-published video to retract it (a
+    real AP ``Delete``) WITHOUT touching the underlying Matrix message,
+    see the agreed design. Clears the ``FederatedEvent`` record tying that
+    Matrix event to its AP video id, which is what makes a clean
+    re-";publish" of the same still-existing message work afterward."""
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
+        return
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    channel = await repository.get_peertube_channel_by_room_id(room_id)
+    if channel is None:
+        await _notice(request, room_id, f'"{_COMMAND_PREFIX}unpublish" only works inside a channel room.')
+        return
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != sender:
+        await _notice(request, room_id, "Only the channel's owner can unpublish from it.")
+        return
+
+    federated = await _video_reply_target_federated_event(request, content)
+    if federated is None:
+        await _notice(
+            request, room_id,
+            f'Reply to an already-published video with "{_COMMAND_PREFIX}unpublish" to retract it.',
+        )
+        return
+
+    base = config.bridge.public_base_url
+    owner_actor_id = actor_url(base, owner.username)
+    channel_actor_id = actor_url(base, channel.username)
+    delete_activity = Activity(
+        id=f"{federated.ap_object_id}/deletes/{uuid.uuid4().hex}",
+        type="Delete",
+        actor=owner_actor_id,
+        object=federated.ap_object_id,
+    )
+    # A separate, independently-signed twin for the channel's OWN followers
+    # (e.g. someone who subscribed to the channel on PeerTube but never
+    # followed the owner personally) -- see _handle_publish's Create+
+    # Announce split for the identical reasoning. Delivering the
+    # owner-signed activity straight to a channel-only follower gets
+    # rejected outright (confirmed live: PeerTube 403 "Invalid signature"
+    # for a recipient that had only ever seen an Accept from the channel
+    # actor, never from the owner).
+    delete_activity_as_channel = Activity(
+        id=f"{federated.ap_object_id}/deletes/{uuid.uuid4().hex}",
+        type="Delete",
+        actor=channel_actor_id,
+        object=federated.ap_object_id,
+    )
+    owner_followers = await repository.list_followers(owner.username)
+    channel_followers = await repository.list_followers(channel.username)
+    # Backgrounded, not awaited -- see _deliver_video_activity_in_background's
+    # own docstring for why even concurrent (gather) delivery still isn't
+    # safe to await before the confirmation notice below.
+    _deliver_video_activity_in_background(asyncio.gather(
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=delete_activity.to_dict(),
+                key_id=main_key_id(base, owner.username), private_key_pem=owner.private_key_pem,
+            )
+            for recipient_actor_id in owner_followers
+        ),
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=delete_activity_as_channel.to_dict(),
+                key_id=main_key_id(base, channel.username), private_key_pem=channel.private_key_pem,
+            )
+            for recipient_actor_id in channel_followers
+        ),
+    ))
+
+    await repository.delete_federated_event(federated.event_id)
+    local_video_id = federated.ap_object_id.rsplit("/", 1)[-1]
+    await remove_from_video_index(synapse, room_id=room_id, local_video_id=local_video_id)
+    await _notice(
+        request, room_id, "Unpublished. The video message itself is untouched, so you can re-publish it later."
+    )
+
+
+async def _handle_edit(request: Request, *, sender: str, room_id: str, content: dict) -> None:
+    """``;edit``: reply to an already-published video to change its
+    metadata ONLY (name/category/license/language/tags/description/
+    sensitive/commentsEnabled/thumbnail); the video FILE is immutable
+    through this command (see ``;replace video``). Sends a real AP
+    ``Update`` on the SAME existing video id. Same key:value syntax as
+    ``;publish`` (see ``parse_key_value_command``), but every field is
+    OPTIONAL here: whatever isn't given is left exactly as it already was."""
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
+        return
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    channel = await repository.get_peertube_channel_by_room_id(room_id)
+    if channel is None:
+        await _notice(request, room_id, f'"{_COMMAND_PREFIX}edit" only works inside a channel room.')
+        return
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != sender:
+        await _notice(request, room_id, "Only the channel's owner can edit its videos.")
+        return
+
+    federated = await _video_reply_target_federated_event(request, content)
+    if federated is None:
+        await _notice(
+            request, room_id,
+            f'Reply to an already-published video with "{_COMMAND_PREFIX}edit" to change its metadata.',
+        )
+        return
+
+    local_video_id = federated.ap_object_id.rsplit("/", 1)[-1]
+    try:
+        existing = await synapse.get_room_state(room_id, VIDEO_METADATA_STATE_TYPE, local_video_id)
+    except SynapseError:
+        existing = {}
+
+    try:
+        video_event = await synapse.get_event(room_id, federated.event_id)
+    except SynapseError:
+        await _notice(request, room_id, "Couldn't find that video's own message anymore.")
+        return
+    video_content = video_event.get("content") or {}
+    base = config.bridge.public_base_url
+    attachment = build_ap_attachment(base, video_content)
+    if attachment is None:
+        await _notice(request, room_id, "Couldn't resolve that video's media URL.")
+        return
+    info = video_content.get("info") or {}
+    duration_ms = info.get("duration")
+    duration_seconds = (
+        round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+    )
+
+    body = content.get("body") or ""
+    fields, description = parse_key_value_command(body)
+
+    name = (fields.get("name") if "name" in fields else existing.get("name")) or ""
+    name = name.strip()
+    if not name:
+        await _notice(request, room_id, f'"{_COMMAND_PREFIX}edit" needs a name (either already set, or given now).')
+        return
+
+    category_name = fields.get("category") if "category" in fields else existing.get("category")
+    category = None
+    if category_name:
+        category_id = resolve_category(category_name)
+        if category_id is None:
+            await _notice(request, room_id, f'"{category_name}" isn\'t a recognized category.')
+            return
+        category = VideoIdentifier(str(category_id), category_name)
+
+    licence_name = (
+        (fields.get("license") or fields.get("licence")) if ("license" in fields or "licence" in fields)
+        else existing.get("license")
+    )
+    licence = None
+    if licence_name:
+        licence_id = resolve_licence(licence_name)
+        if licence_id is None:
+            await _notice(request, room_id, f'"{licence_name}" isn\'t a recognized license.')
+            return
+        licence = VideoIdentifier(str(licence_id), licence_name)
+
+    language_code = fields.get("language") if "language" in fields else existing.get("language")
+    language = VideoIdentifier(*resolve_language(language_code)) if language_code else None
+
+    tags = (
+        [t.strip() for t in fields["tags"].split(",") if t.strip()] if "tags" in fields
+        else list(existing.get("tags") or [])
+    )
+    sensitive = (
+        _parse_bool_field(fields["sensitive"], default=False) if "sensitive" in fields
+        else bool(existing.get("sensitive", False))
+    )
+    comments_enabled = (
+        _parse_bool_field(fields["commentsenabled"], default=True) if "commentsenabled" in fields
+        else bool(existing.get("commentsEnabled", True))
+    )
+    thumbnail_mxc = fields.get("thumbnail") if "thumbnail" in fields else existing.get("thumbnail_mxc")
+    icon_url = None
+    if thumbnail_mxc:
+        try:
+            icon_url = media_url(base, thumbnail_mxc)
+        except ValueError:
+            icon_url = None
+    thumbnail_info = info.get("thumbnail_info") or {}
+    # An empty description here is ambiguous (never sent one at all, vs.
+    # sent a blank line then nothing); parse_key_value_command can't tell
+    # those apart, so this always treats it as "unchanged" rather than
+    # risking silently wiping out a real existing description.
+    final_description = description or existing.get("description", "")
+
+    owner_actor_id = actor_url(base, owner.username)
+    channel_actor_id = actor_url(base, channel.username)
+    published_at = existing.get("published") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    video = Video(
+        id=federated.ap_object_id,
+        uuid=format_video_uuid(local_video_id),
+        name=name,
+        attributed_to=[{"type": "Person", "id": owner_actor_id}, {"type": "Group", "id": channel_actor_id}],
+        published=published_at,
+        updated=updated,
+        url_html=federated.ap_object_id,
+        media_url=video_media_url(attachment["url"], attachment.get("mediaType") or "video/mp4"),
+        media_type=attachment.get("mediaType") or "video/mp4",
+        duration_seconds=duration_seconds,
+        media_size=info.get("size"),
+        media_width=info.get("w"),
+        media_height=info.get("h"),
+        icon_url=icon_url,
+        icon_width=thumbnail_info.get("w") or DEFAULT_THUMBNAIL_WIDTH,
+        icon_height=thumbnail_info.get("h") or DEFAULT_THUMBNAIL_HEIGHT,
+        content=final_description or None,
+        category=category,
+        licence=licence,
+        language=language,
+        tags=tags,
+        sensitive=sensitive,
+        comments_enabled=comments_enabled,
+        to=[AS_PUBLIC, channel_actor_id],
+        cc=[followers_url(base, owner.username)],
+        audience=channel_actor_id,
+    )
+    update_activity = Activity(
+        id=f"{federated.ap_object_id}/updates/{uuid.uuid4().hex}", type="Update", actor=owner_actor_id,
+        object=video, published=updated, to=video.to, cc=video.cc,
+    )
+    # A separate, independently-signed twin for the channel's OWN followers
+    # -- see _handle_publish's Create+Announce split for the identical
+    # reasoning. Delivering the owner-signed activity straight to a
+    # channel-only follower gets rejected outright (confirmed live:
+    # PeerTube 403 "Invalid signature" for a recipient that had only ever
+    # seen an Accept from the channel actor, never from the owner).
+    update_activity_as_channel = Activity(
+        id=f"{federated.ap_object_id}/updates/{uuid.uuid4().hex}", type="Update", actor=channel_actor_id,
+        object=video, published=updated, to=video.to, cc=video.cc,
+    )
+
+    await synapse.send_state_event(
+        room_id, VIDEO_METADATA_STATE_TYPE, local_video_id,
+        {
+            "name": name,
+            "category": category_name,
+            "license": licence_name,
+            "language": language_code,
+            "tags": tags,
+            "description": final_description,
+            "sensitive": sensitive,
+            "commentsEnabled": comments_enabled,
+            "thumbnail_mxc": thumbnail_mxc,
+            "published": published_at,
+        },
+    )
+
+    owner_followers = await repository.list_followers(owner.username)
+    channel_followers = await repository.list_followers(channel.username)
+    # Backgrounded, not awaited -- see _deliver_video_activity_in_background's
+    # own docstring for why even concurrent (gather) delivery still isn't
+    # safe to await before the confirmation notice below.
+    _deliver_video_activity_in_background(asyncio.gather(
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=update_activity.to_dict(),
+                key_id=main_key_id(base, owner.username), private_key_pem=owner.private_key_pem,
+            )
+            for recipient_actor_id in owner_followers
+        ),
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=update_activity_as_channel.to_dict(),
+                key_id=main_key_id(base, channel.username), private_key_pem=channel.private_key_pem,
+            )
+            for recipient_actor_id in channel_followers
+        ),
+    ))
+
+    await _notice(request, room_id, f'Updated "{name}".')
+
+
+async def _handle_replace_video(request: Request, *, sender: str, room_id: str, content: dict, argument: str) -> None:
+    """``;replace video``: swap the underlying file of an already-published
+    video. Sends ``Update`` on the SAME AP video id (not a fresh publish),
+    re-runs the mimetype gate, re-derives duration/dimensions. Two
+    invocation shapes (see the agreed design):
+
+    (a) Bare, replying DIRECTLY to the newly-sent replacement file (which
+        itself sits inside the published video's own thread), resolved
+        by walking to whichever published video that thread belongs to.
+    (b) ``;replace video mxc://server/mediaid``, replying directly to the
+        ORIGINAL published video, explicitly naming the new file."""
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
+        return
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    channel = await repository.get_peertube_channel_by_room_id(room_id)
+    if channel is None:
+        await _notice(request, room_id, f'"{_COMMAND_PREFIX}replace video" only works inside a channel room.')
+        return
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != sender:
+        await _notice(request, room_id, "Only the channel's owner can replace its videos.")
+        return
+
+    base = config.bridge.public_base_url
+    mxc_argument = argument.strip()
+
+    if mxc_argument:
+        # Reply is to the ORIGINAL published video, same as ";edit"/
+        # ";unpublish" -- _video_reply_target_federated_event's thread-root
+        # fallback (only when that root is itself video-shaped) is needed
+        # here for the exact same reason it's needed there: a genuine
+        # Matrix thread reply's m.in_reply_to points at the thread's latest
+        # event, not its root.
+        federated = await _video_reply_target_federated_event(request, content)
+        if federated is None:
+            await _notice(request, room_id, "That reply isn't to an already-published video.")
+            return
+        if not mxc_argument.startswith("mxc://"):
+            await _notice(request, room_id, f'"{mxc_argument}" isn\'t a valid mxc:// URI.')
+            return
+        new_mxc = mxc_argument
+        # No Matrix event carries this mxc's own info block here (nothing
+        # sent it as a real m.video message in view); a real content-type
+        # probe against Synapse's own media API is the only trustworthy way
+        # to get a mimetype for the gate below; width/height/duration stay
+        # unknown for this shape, which Video already treats as optional.
+        try:
+            server_name, media_id = new_mxc.removeprefix("mxc://").split("/", 1)
+            media_download = await synapse.download_media(server_name, media_id)
+        except (SynapseError, ValueError):
+            await _notice(request, room_id, "Couldn't fetch that media; check the mxc:// URI.")
+            return
+        new_mimetype = media_download.content_type
+        new_info: dict = {}
+    else:
+        # Reply is to the newly-sent replacement file itself, not the
+        # published video -- an exact m.in_reply_to match, no thread-root
+        # fallback: this is naturally a direct "reply to the file I just
+        # sent" action, not a reply somewhere inside an existing thread.
+        target_event_id = _direct_reply_target_event_id(content)
+        if not target_event_id:
+            await _notice(
+                request, room_id,
+                f'Reply to the already-published video (with "{_COMMAND_PREFIX}replace video mxc://...") or to '
+                f'the newly-sent replacement file (with bare "{_COMMAND_PREFIX}replace video") to use it.',
+            )
+            return
+        try:
+            new_file_event = await synapse.get_event(room_id, target_event_id)
+        except SynapseError:
+            await _notice(request, room_id, "Couldn't find that replacement file.")
+            return
+        new_file_content = new_file_event.get("content") or {}
+        if new_file_content.get("msgtype") != "m.video":
+            await _notice(
+                request, room_id,
+                f'Reply to an actual video file with bare "{_COMMAND_PREFIX}replace video", or name one '
+                f'explicitly with "{_COMMAND_PREFIX}replace video mxc://...".',
+            )
+            return
+
+        relates_to = new_file_content.get("m.relates_to") or {}
+        candidate_ids: list[str] = []
+        direct = (relates_to.get("m.in_reply_to") or {}).get("event_id")
+        if direct:
+            candidate_ids.append(direct)
+        if relates_to.get("rel_type") == "m.thread":
+            root = relates_to.get("event_id")
+            if root and root not in candidate_ids:
+                candidate_ids.append(root)
+        federated = None
+        for candidate_id in candidate_ids:
+            candidate = await repository.get_federated_event_by_matrix_event(candidate_id)
+            # Only accept a candidate whose tracked object actually IS a
+            # video -- the thread-root fallback (unlike the direct-reply
+            # candidate before it) can land on completely unrelated tracked
+            # content that happens to share the same thread (e.g. a Chat
+            # message's own FederatedEvent), confirmed live 2026-07-25 as
+            # the exact cause of a false "already published"/wrong-target
+            # match elsewhere in this same command family.
+            if candidate is not None and "/videos/" in candidate.ap_object_id:
+                federated = candidate
+                break
+        if federated is None:
+            await _notice(request, room_id, "Couldn't find which published video this replacement belongs to.")
+            return
+
+        mimetype = (new_file_content.get("info") or {}).get("mimetype") or ""
+        if mimetype and mimetype.lower() not in VIDEO_MIMETYPE_ALLOWLIST:
+            await _notice(
+                request, room_id,
+                f'"{mimetype}" isn\'t a recognized video format. Make sure it actually plays in your Matrix '
+                "client first.",
+            )
+            return
+        if not await resolve_attachment_or_request_confirmation(
+            request, content=new_file_content, room_id=room_id, sender=sender, trigger_event_id=target_event_id,
+        ):
+            return
+        attachment = build_ap_attachment(base, new_file_content)
+        if attachment is None:
+            await _notice(request, room_id, "Couldn't resolve that video's media URL.")
+            return
+        new_mxc = new_file_content["url"]
+        new_mimetype = attachment.get("mediaType") or "video/mp4"
+        new_info = new_file_content.get("info") or {}
+
+    local_video_id = federated.ap_object_id.rsplit("/", 1)[-1]
+    try:
+        existing = await synapse.get_room_state(room_id, VIDEO_METADATA_STATE_TYPE, local_video_id)
+    except SynapseError:
+        existing = {}
+    name = (existing.get("name") or "").strip()
+    if not name:
+        await _notice(request, room_id, "Couldn't find that video's existing metadata.")
+        return
+
+    await repository.mark_media_published(new_mxc)
+    new_media_url = video_media_url(media_url(base, new_mxc), new_mimetype)
+
+    duration_ms = new_info.get("duration")
+    duration_seconds = (
+        round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+    )
+
+    category_name = existing.get("category")
+    category = None
+    if category_name:
+        category_id = resolve_category(category_name)
+        category = VideoIdentifier(str(category_id), category_name) if category_id is not None else None
+    licence_name = existing.get("license")
+    licence = None
+    if licence_name:
+        licence_id = resolve_licence(licence_name)
+        licence = VideoIdentifier(str(licence_id), licence_name) if licence_id is not None else None
+    language_code = existing.get("language")
+    language = VideoIdentifier(*resolve_language(language_code)) if language_code else None
+    thumbnail_mxc = existing.get("thumbnail_mxc")
+    icon_url = None
+    if thumbnail_mxc:
+        try:
+            icon_url = media_url(base, thumbnail_mxc)
+        except ValueError:
+            icon_url = None
+
+    owner_actor_id = actor_url(base, owner.username)
+    channel_actor_id = actor_url(base, channel.username)
+    published_at = existing.get("published") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    video = Video(
+        id=federated.ap_object_id,
+        uuid=format_video_uuid(local_video_id),
+        name=name,
+        attributed_to=[{"type": "Person", "id": owner_actor_id}, {"type": "Group", "id": channel_actor_id}],
+        published=published_at,
+        updated=updated,
+        url_html=federated.ap_object_id,
+        media_url=new_media_url,
+        media_type=new_mimetype,
+        duration_seconds=duration_seconds,
+        media_size=new_info.get("size"),
+        media_width=new_info.get("w"),
+        media_height=new_info.get("h"),
+        icon_url=icon_url,
+        icon_width=DEFAULT_THUMBNAIL_WIDTH,
+        icon_height=DEFAULT_THUMBNAIL_HEIGHT,
+        content=existing.get("description") or None,
+        category=category,
+        licence=licence,
+        language=language,
+        tags=list(existing.get("tags") or []),
+        sensitive=bool(existing.get("sensitive", False)),
+        comments_enabled=bool(existing.get("commentsEnabled", True)),
+        to=[AS_PUBLIC, channel_actor_id],
+        cc=[followers_url(base, owner.username)],
+        audience=channel_actor_id,
+    )
+    update_activity = Activity(
+        id=f"{federated.ap_object_id}/updates/{uuid.uuid4().hex}", type="Update", actor=owner_actor_id,
+        object=video, published=updated, to=video.to, cc=video.cc,
+    )
+    # A separate, independently-signed twin for the channel's OWN followers
+    # -- see _handle_publish's Create+Announce split for the identical
+    # reasoning. Delivering the owner-signed activity straight to a
+    # channel-only follower gets rejected outright (confirmed live:
+    # PeerTube 403 "Invalid signature" for a recipient that had only ever
+    # seen an Accept from the channel actor, never from the owner).
+    update_activity_as_channel = Activity(
+        id=f"{federated.ap_object_id}/updates/{uuid.uuid4().hex}", type="Update", actor=channel_actor_id,
+        object=video, published=updated, to=video.to, cc=video.cc,
+    )
+
+    owner_followers = await repository.list_followers(owner.username)
+    channel_followers = await repository.list_followers(channel.username)
+    # Backgrounded, not awaited -- see _deliver_video_activity_in_background's
+    # own docstring for why even concurrent (gather) delivery still isn't
+    # safe to await before the confirmation notice below.
+    _deliver_video_activity_in_background(asyncio.gather(
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=update_activity.to_dict(),
+                key_id=main_key_id(base, owner.username), private_key_pem=owner.private_key_pem,
+            )
+            for recipient_actor_id in owner_followers
+        ),
+        *(
+            deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=update_activity_as_channel.to_dict(),
+                key_id=main_key_id(base, channel.username), private_key_pem=channel.private_key_pem,
+            )
+            for recipient_actor_id in channel_followers
+        ),
+    ))
+
+    await _notice(request, room_id, f'Replaced the file for "{name}".')
 
 
 async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -> None:

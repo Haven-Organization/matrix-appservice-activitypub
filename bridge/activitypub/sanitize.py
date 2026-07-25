@@ -50,6 +50,8 @@ import re
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
+import markdown
+
 _ALLOWED_TAGS = {
     "p", "br", "a", "strong", "b", "em", "i", "ul", "ol", "li", "blockquote", "span", "del", "code", "pre",
 }
@@ -189,8 +191,10 @@ class _SanitizingParser(HTMLParser):
         self._anchor_href = None
 
 
-def strip_to_matrix_message(content_html: str, *, mention_pills: dict[str, str] | None = None) -> tuple[str, str]:
-    """Sanitize an incoming AP Note's ``content`` HTML for use as a Matrix message.
+def strip_to_matrix_message(
+    content_html: str, *, mention_pills: dict[str, str] | None = None, media_type: str | None = None,
+) -> tuple[str, str]:
+    """Sanitize an incoming AP Note's ``content`` for use as a Matrix message.
 
     Returns ``(plain_text, safe_html)``. ``safe_html`` only ever contains tags
     from a small allow-list with ``href`` restricted to http(s)/mailto schemes --
@@ -199,7 +203,24 @@ def strip_to_matrix_message(content_html: str, *, mention_pills: dict[str, str] 
     ``mention_pills``, if given, maps an actor IRI to a Matrix mxid -- see
     ``_SanitizingParser`` for why matching happens on ``href`` rather than
     the mention's own visible text.
+
+    ``media_type``, if given as ``"text/markdown"``, treats ``content_html``
+    as raw markdown SOURCE rather than HTML, converting it to HTML first
+    (via the ``markdown`` library) before running it through the exact same
+    allow-list sanitizer below. This is PeerTube's own convention for a
+    video comment's ``content`` (see ``bridge.peertube``'s module docstring
+    and the agreed design in ``project_peertube_channels_scoping``) --
+    every other sender in this bridge's experience sends HTML directly, so
+    this only ever actually triggers for that case, but the check is
+    generic (any ``mediaType: text/markdown`` Note), not PeerTube-specific
+    itself. The markdown library's own HTML output isn't separately
+    trusted or escaped here; whatever raw HTML it produces (including any
+    it passes through unescaped from the source) hits the SAME sanitizer
+    every other inbound Note's HTML already goes through below, so this
+    adds no new attack surface.
     """
+    if media_type == "text/markdown":
+        content_html = markdown.markdown(content_html)
     parser = _SanitizingParser(mention_pills)
     parser.feed(content_html)
     parser.close()

@@ -119,12 +119,14 @@ from bridge.repository import (
     ActorRecord,
     FederatedEvent,
     GhostProfile,
+    PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
     ReactionRecord,
     RemoteActorRoom,
 )
 from bridge.channel_bridge import ensure_channel_room, maybe_handle_channel_message
+from bridge.peertube import record_video_view
 from bridge.spaces import ensure_guild_space
 from bridge.synapse_client import SynapseError
 
@@ -145,10 +147,17 @@ async def handle_activity(request: Request, username: str, activity: Activity) -
 
 
 async def _handle_follow(request: Request, username: str, activity: Activity) -> None:
-    """A remote actor wants to follow one of our local (Profile Room) actors."""
+    """A remote actor wants to follow one of our local actors -- either an
+    ordinary Profile Room actor, or a PeerTube channel (see
+    ``PeerTubeChannelRecord``'s docstring for why the two share one global
+    username namespace, which is what makes this single lookup-and-branch
+    correct)."""
     repository = request.app.state.repository
     record = await repository.get_local_actor(username)
     if record is None:
+        channel = await repository.get_peertube_channel(username)
+        if channel is not None:
+            await _handle_channel_follow(request, username=username, channel=channel, activity=activity)
         return
 
     if await repository.is_blocked(username, activity.actor):
@@ -266,6 +275,85 @@ async def _announce_new_follower(request: Request, record: ActorRecord, follower
             "body": f"\U0001F464 {handle} is now following you.",
             "format": "org.matrix.custom.html",
             "formatted_body": f"<p>\U0001F464 {actor_html} is now following you.</p>",
+        },
+    )
+
+
+async def _handle_channel_follow(
+    request: Request, *, username: str, channel: PeerTubeChannelRecord, activity: Activity
+) -> None:
+    """Same Follow/Accept handshake as ``_handle_follow`` above, for a
+    PeerTube channel actor instead of a Profile actor. A channel has no
+    block list of its own yet (nothing in the agreed design calls for one),
+    so unlike a Profile every Follow is accepted unconditionally; add one
+    later if a real need for it shows up."""
+    repository = request.app.state.repository
+    already_following = activity.actor in await repository.list_followers(username)
+    await repository.add_follower(username, activity.actor)
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    accept = Activity(
+        id=f"{actor_url(base, username)}/accepts/{uuid.uuid4().hex}",
+        type="Accept",
+        actor=actor_url(base, username),
+        object=activity.to_dict(),
+    )
+    try:
+        inbox = await _resolve_inbox(request, activity.actor)
+        await deliver_activity(
+            request.app.state.http_client,
+            inbox_url=inbox,
+            activity=accept.to_dict(),
+            key_id=main_key_id(base, username),
+            private_key_pem=channel.private_key_pem,
+        )
+    except DeliveryError:
+        logger.warning("Failed to deliver Accept to %s", activity.actor, exc_info=True)
+
+    if not already_following:
+        await _announce_new_channel_follower(request, channel, activity.actor)
+
+
+async def _announce_new_channel_follower(
+    request: Request, channel: PeerTubeChannelRecord, follower_actor_id: str
+) -> None:
+    """Same ghost-invite-plus-owner-DM pattern as ``_announce_new_follower``,
+    for a channel follow. The notification DM goes to the channel's OWNER
+    profile (``channel.owner_username``), since a channel has no
+    ``matrix_user_id`` of its own to notify; see ``PeerTubeChannelRecord``'s
+    docstring on why a channel's owner is a username, not a Matrix user id
+    directly."""
+    resolved = await _resolve_and_invite_ghost(request, follower_actor_id, channel.room_id)
+    if resolved is None:
+        return
+    mxid, actor_doc = resolved
+
+    repository = request.app.state.repository
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None:
+        return
+    if await is_silenced(repository, channel.owner_username, follower_actor_id):
+        return
+
+    domain = urlsplit(follower_actor_id).hostname or ""
+    remote_username = actor_doc.get("preferredUsername") or follower_actor_id.rstrip("/").rsplit("/", 1)[-1]
+    handle = f"@{remote_username}@{domain}"
+    actor_html = notification_actor_html(
+        mxid=mxid, handle=handle, display_name=actor_doc.get("name") or remote_username
+    )
+
+    await notify_user(
+        request,
+        matrix_user_id=owner.matrix_user_id,
+        content={
+            "msgtype": "m.text",
+            "body": f"\U0001F464 {handle} is now following your channel {channel.username}.",
+            "format": "org.matrix.custom.html",
+            "formatted_body": (
+                f"<p>\U0001F464 {actor_html} is now following your channel "
+                f"{html.escape(channel.username)}.</p>"
+            ),
         },
     )
 
@@ -1030,7 +1118,9 @@ async def _quoted_post_render(
                 # ``content`` to hand back either -- m.social.relates_to
                 # won't be attached regardless, per its own required
                 # room_id/event_id.
-                preview_text, _ = strip_to_matrix_message(quoted_obj.get("content") or "")
+                preview_text, _ = strip_to_matrix_message(
+                    quoted_obj.get("content") or "", media_type=quoted_obj.get("mediaType")
+                )
                 if len(preview_text) > _PREVIEW_TEXT_LIMIT:
                     preview_text = preview_text[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
 
@@ -1506,7 +1596,9 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         await _react_repost(request, quoted_target, activity.actor)
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, request.app.state.synapse, repository,
@@ -1824,7 +1916,9 @@ async def _mirror_note_as_reply(
         return None
 
     mentions = await resolve_mention_pills(request, room_id=parent.room_id, note=note)
-    plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        note.get("content") or "", mention_pills=mentions.pills, media_type=note.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, request.app.state.synapse, repository,
@@ -1967,7 +2061,9 @@ async def _echo_reply_in_own_room(
                 )
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=note)
-    plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        note.get("content") or "", mention_pills=mentions.pills, media_type=note.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, request.app.state.synapse, repository,
@@ -2037,6 +2133,7 @@ async def _echo_reply_in_own_room(
 
 
 _DEFAULT_LIKE_EMOJI = "👍"
+_DEFAULT_DISLIKE_EMOJI = "👎"
 
 # MSC4027 (custom images in reactions) -- see _handle_like_or_emoji_react's
 # own reasoning. Element's stable field name; bridge.reaction_bridge (the
@@ -2054,11 +2151,40 @@ _MSC4027_SHORTCODE_FIELD = "shortcode"
 _REPOST_REACTION_KEY = "\U0001F501"
 
 
+async def _handle_view(request: Request, username: str, activity: Activity) -> None:
+    """An inbound AP ``View``: a remote (typically PeerTube) instance
+    reporting a view on one of our published videos. See
+    ``bridge.peertube.record_video_view`` for the durable ``{"count": N}``
+    state event this increments and its own dedup (one counted view per
+    sending actor per video, matching the agreed design's dedup intent for
+    this specific signal; see that function's own docstring for why an
+    inbound View activity's own actor id is the right key, distinct from
+    the request-IP key a public watch-page hit uses instead)."""
+    target_id = activity.object_id()
+    if not target_id or not activity.actor:
+        return
+    repository = request.app.state.repository
+    target = await repository.get_federated_event_by_ap_object(target_id)
+    if target is None:
+        return
+    channel = await repository.get_peertube_channel_by_room_id(target.room_id)
+    if channel is None:
+        return  # not actually one of our videos; an ordinary post has no View concept
+    local_video_id = target_id.rsplit("/", 1)[-1]
+    await record_video_view(
+        request.app.state.synapse, room_id=target.room_id, local_video_id=local_video_id, dedup_key=activity.actor,
+    )
+
+
 async def _handle_like_or_emoji_react(request: Request, username: str, activity: Activity) -> None:
-    """Mirror an inbound Like/EmojiReact as an ``m.reaction`` on whatever
-    Matrix event the target post mirrors -- regardless of who reacted or
-    whether we (or anyone) follow them, since reactions routinely come from
-    accounts nobody here follows, same as replies.
+    """Mirror an inbound Like/Dislike/EmojiReact as an ``m.reaction`` on
+    whatever Matrix event the target post/video mirrors -- regardless of
+    who reacted or whether we (or anyone) follow them, since reactions
+    routinely come from accounts nobody here follows, same as replies.
+    ``Dislike`` is real, distinct AS2 vocabulary PeerTube uses for a video's
+    thumbs-down (see ``bridge.reaction_bridge``'s outbound side); everything
+    below treats it exactly like a Like, just defaulting to 👎 instead of 👍
+    when it carries no explicit ``content`` emoji of its own.
 
     Announce/reposts are handled separately (see ``_handle_announce``): a
     repost isn't really a reaction to one specific message the way a Like is,
@@ -2090,7 +2216,8 @@ async def _handle_like_or_emoji_react(request: Request, username: str, activity:
     # literal unicode character, or a custom-emoji shortcode like
     # ":blobcat:" -- there, and using it as-is for the reaction key satisfies
     # both cases without needing to tell them apart.
-    key = activity.content or _DEFAULT_LIKE_EMOJI
+    default_emoji = _DEFAULT_DISLIKE_EMOJI if activity.type == "Dislike" else _DEFAULT_LIKE_EMOJI
+    key = activity.content or default_emoji
     custom_emoji_mxc = await resolve_custom_emoji_image(
         request.app.state.http_client, request.app.state.synapse, repository, activity.tag, key
     )
@@ -2138,7 +2265,12 @@ async def _handle_like_or_emoji_react(request: Request, username: str, activity:
             )
         )
 
-    verb_phrase = "liked your post" if not activity.content else f"reacted to your post with {key}"
+    if activity.content:
+        verb_phrase = f"reacted to your post with {key}"
+    elif activity.type == "Dislike":
+        verb_phrase = "disliked your video"
+    else:
+        verb_phrase = "liked your post"
     await _notify_post_owner(
         request, target=target, actor_id=activity.actor, actor_doc=actor_doc, verb_phrase=verb_phrase,
         reaction_emoji=key if activity.content else None, reaction_emoji_mxc=custom_emoji_mxc,
@@ -2484,7 +2616,9 @@ async def _build_repost_message(
     # notify_mentioned_locals against; doing it again here would just be a
     # second, redundant notification for the same mention.
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, request.app.state.synapse, request.app.state.repository,
@@ -2705,7 +2839,9 @@ async def _handle_note_update(request: Request, obj: dict) -> None:
     config = request.app.state.config
 
     mentions = await resolve_mention_pills(request, room_id=federated.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, synapse, repository, safe_html, obj.get("tag") or [],
@@ -2787,6 +2923,14 @@ async def _handle_block(request: Request, username: str, activity: Activity) -> 
         return
     record = await repository.get_local_actor(target_username)
     if record is None:
+        # Might be a PeerTube channel instead (see PeerTubeChannelRecord's
+        # own docstring on the shared username namespace) -- same
+        # sever-the-follow behavior, just no "blocked you" DM: there's no
+        # single Matrix user to notify without resolving the channel's
+        # owner, a fairly minor edge case not worth the extra lookup here.
+        channel = await repository.get_peertube_channel(target_username)
+        if channel is not None:
+            await repository.remove_follower(target_username, activity.actor)
         return
 
     # Sever their follow BEFORE the silenced check: the record must go
@@ -2973,7 +3117,9 @@ _HANDLERS = {
     "Create": _handle_create,
     "Update": _handle_update,
     "Like": _handle_like_or_emoji_react,
+    "Dislike": _handle_like_or_emoji_react,
     "EmojiReact": _handle_like_or_emoji_react,
+    "View": _handle_view,
     "Announce": _handle_announce,
     "Block": _handle_block,
     "Delete": _handle_delete,

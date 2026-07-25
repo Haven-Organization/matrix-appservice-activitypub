@@ -68,6 +68,12 @@ logger = logging.getLogger(__name__)
 # is a distinct reaction and should be sent as one instead of being
 # silently collapsed into a generic favorite.
 _THUMBS_UP = "\U0001F44D"
+# Only ever a distinct reaction (a real ``Dislike``, see
+# maybe_federate_reaction) when the target is a PeerTube-channel video.
+# For an ordinary post, a plain thumbs-down still goes out as an EmojiReact
+# same as before, since there's no "dislike a post" concept anywhere else
+# in this bridge or the wider fediverse convention it follows.
+_THUMBS_DOWN = "\U0001F44E"
 _VARIATION_SELECTOR_16 = "️"
 
 # The clockwise-arrows symbol reposts -- a common "retweet/boost" convention
@@ -88,6 +94,12 @@ def _is_favorite_emoji(key: str) -> bool:
     even where it isn't needed), but NOT a skin-toned one, which is its own
     distinct emoji and should go out as an EmojiReact instead."""
     return key.replace(_VARIATION_SELECTOR_16, "") == _THUMBS_UP
+
+
+def _is_thumbs_down_emoji(key: str) -> bool:
+    """Same check as ``_is_favorite_emoji``, for the plain (non-skin-toned)
+    thumbs down."""
+    return key.replace(_VARIATION_SELECTOR_16, "") == _THUMBS_DOWN
 
 
 def _is_repost_emoji(key: str) -> bool:
@@ -524,7 +536,16 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
             tag=[{"type": "Emoji", "name": shortcode, "icon": {"type": "Image", "url": media_url(base, key)}}],
         )
     else:
-        activity_type = "Like" if _is_favorite_emoji(key) else "EmojiReact"
+        if _is_favorite_emoji(key):
+            activity_type = "Like"
+        elif _is_thumbs_down_emoji(key) and await repository.get_peertube_channel_by_room_id(parent.room_id):
+            # A real Dislike: a video-specific special case (see
+            # _THUMBS_DOWN's own comment): only when the reacted-to message
+            # lives in a channel room (so it's a published video, not an
+            # ordinary post), never otherwise.
+            activity_type = "Dislike"
+        else:
+            activity_type = "EmojiReact"
         reaction_activity = Activity(
             id=activity_id,
             type=activity_type,

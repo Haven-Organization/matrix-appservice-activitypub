@@ -43,6 +43,7 @@ from bridge.activitypub.models import (
     ACTIVITY_JSON_CONTENT_TYPE,
     AS_PUBLIC,
     JSON_LD_CONTEXT,
+    VIDEO_JSON_LD_CONTEXT,
     Activity,
     Actor,
     Note,
@@ -68,15 +69,30 @@ from bridge.activitypub.webfinger import build_local_webfinger_document, parse_a
 from bridge.commands import _effective_third_party_mode
 from bridge.inbox_dispatch import handle_activity
 from bridge.media import build_ap_attachment, media_caption
+from bridge.peertube import (
+    VIDEO_METADATA_STATE_TYPE,
+    VIDEO_VIEWS_STATE_TYPE,
+    get_video_index,
+    reconstruct_video_activities,
+    record_video_view,
+    resolve_category,
+    resolve_licence,
+    resolve_language,
+    resolve_media_type,
+)
 from bridge.reply_bridge import derive_in_reply_to
-from bridge.repository import ActorRepository, FederatedEvent
+from bridge.repository import ActorRecord, ActorRepository, FederatedEvent, PeerTubeChannelRecord
 from bridge.synapse_client import SynapseError
 from bridge.web_views import (
     PersonRef,
     PostView,
     ReactionEvent,
+    VideoCardView,
+    VideoView,
+    render_channel_page,
     render_profile_page,
     render_thread_page,
+    render_video_page,
     summarize_reactions,
 )
 
@@ -121,6 +137,23 @@ async def _get_actor_record(request: Request, username: str):
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such actor: {username}")
     return record
+
+
+async def _get_actor_or_channel_record(request: Request, username: str) -> ActorRecord | PeerTubeChannelRecord:
+    """Same as ``_get_actor_record``, but also resolves a PeerTube channel
+    username (see ``PeerTubeChannelRecord``'s docstring on why the two
+    share one global namespace) -- for routes that don't need to build a
+    full Actor document, like ``get_followers``/``get_following``/
+    ``post_inbox``, and so work identically for either kind of local
+    actor."""
+    repository: ActorRepository = request.app.state.repository
+    record = await repository.get_local_actor(username)
+    if record is not None:
+        return record
+    channel = await repository.get_peertube_channel(username)
+    if channel is not None:
+        return channel
+    raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
 
 async def _build_actor(request: Request, record) -> Actor:
@@ -184,7 +217,9 @@ async def _build_actor(request: Request, record) -> Actor:
         followers=followers_url(base, record.username),
         following=following_url(base, record.username),
         icon_url=icon_url,
+        icon_media_type=await resolve_media_type(request, icon_url),
         image_url=banner_url,
+        image_media_type=await resolve_media_type(request, banner_url),
         shared_inbox=shared_inbox_url(base),
         accepts_chat_messages=accepts_chat_messages,
         public_key=PublicKey(
@@ -193,6 +228,111 @@ async def _build_actor(request: Request, record) -> Actor:
             public_key_pem=record.public_key_pem,
         ),
     )
+
+
+async def _build_channel_actor(request: Request, channel: PeerTubeChannelRecord) -> Actor:
+    """Build the served Actor document for a PeerTube channel: a
+    ``Group``-typed actor, unlike ``_build_actor``'s ``Person``. No
+    third-party live-mirroring concept applies here (a channel is never a
+    Follow-Only third-party identity): every field comes straight from the
+    stored ``PeerTubeChannelRecord``, same as a Full-mode local actor."""
+    base = request.app.state.config.bridge.public_base_url
+    display_name = channel.display_name or channel.username
+    summary = plain_text_to_note_html(channel.summary) if channel.summary else channel.summary
+    return Actor(
+        id=actor_url(base, channel.username),
+        type="Group",
+        preferred_username=channel.username,
+        name=display_name,
+        summary=summary,
+        url=actor_url(base, channel.username),
+        inbox=inbox_url(base, channel.username),
+        outbox=outbox_url(base, channel.username),
+        followers=followers_url(base, channel.username),
+        following=following_url(base, channel.username),
+        playlists_url=f"{base}/playlists/{channel.username}",
+        attributed_to_urls=[actor_url(base, channel.owner_username)],
+        discoverable=True,
+        icon_url=channel.icon_url,
+        icon_media_type=await resolve_media_type(request, channel.icon_url),
+        image_url=channel.banner_url,
+        image_media_type=await resolve_media_type(request, channel.banner_url),
+        shared_inbox=shared_inbox_url(base),
+        public_key=PublicKey(
+            id=main_key_id(base, channel.username),
+            owner=actor_url(base, channel.username),
+            public_key_pem=channel.public_key_pem,
+        ),
+    )
+
+
+def _iso_published_display(iso_or_matrix_ts: str | int | None) -> str:
+    """A short "Jul 25, 2026" display date, from either a stored ISO 8601
+    ``published`` string (see ``bridge.peertube``'s metadata state event)
+    or a raw Matrix ``origin_server_ts`` (milliseconds), whichever a
+    caller happens to have on hand."""
+    if isinstance(iso_or_matrix_ts, str) and iso_or_matrix_ts:
+        try:
+            dt = datetime.strptime(iso_or_matrix_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+        return dt.strftime("%b %-d, %Y")
+    if isinstance(iso_or_matrix_ts, int) and iso_or_matrix_ts:
+        return datetime.fromtimestamp(iso_or_matrix_ts / 1000, tz=timezone.utc).strftime("%b %-d, %Y")
+    return ""
+
+
+async def _build_channel_video_cards(request: Request, *, channel: PeerTubeChannelRecord) -> list[VideoCardView]:
+    """One ``VideoCardView`` per currently-published video in ``channel``'s
+    room, for ``render_channel_page``'s video grid. Reads each video's own
+    metadata + view-count state events (see ``bridge.peertube``) on top of
+    ``_list_channel_video_events``'s own index lookup."""
+    synapse = request.app.state.synapse
+    base = request.app.state.config.bridge.public_base_url
+    cards: list[VideoCardView] = []
+    for federated in await _list_channel_video_events(request, channel=channel):
+        local_video_id = federated.ap_object_id.rsplit("/", 1)[-1]
+        try:
+            metadata = await synapse.get_room_state(channel.room_id, VIDEO_METADATA_STATE_TYPE, local_video_id)
+        except SynapseError:
+            continue
+        name = (metadata.get("name") or "").strip()
+        if not name:
+            continue
+        thumbnail_mxc = metadata.get("thumbnail_mxc")
+        thumbnail_url = None
+        if thumbnail_mxc:
+            try:
+                thumbnail_url = media_url(base, thumbnail_mxc)
+            except ValueError:
+                thumbnail_url = None
+        video_event: dict | None = None
+        try:
+            video_event = await synapse.get_event(federated.room_id, federated.event_id)
+        except SynapseError:
+            pass
+        duration_ms = (((video_event or {}).get("content") or {}).get("info") or {}).get("duration")
+        duration_seconds = (
+            round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+        )
+        try:
+            views_state = await synapse.get_room_state(channel.room_id, VIDEO_VIEWS_STATE_TYPE, local_video_id)
+            views = int(views_state.get("count", 0))
+        except SynapseError:
+            views = 0
+        published_source = metadata.get("published") or (video_event or {}).get("origin_server_ts")
+        cards.append(
+            VideoCardView(
+                video_id=local_video_id,
+                name=name,
+                watch_url=f"/actor/{channel.username}/videos/{local_video_id}",
+                thumbnail_url=thumbnail_url,
+                duration_seconds=duration_seconds,
+                views=views,
+                published_display=_iso_published_display(published_source),
+            )
+        )
+    return cards
 
 
 @router.get("/.well-known/webfinger")
@@ -221,14 +361,19 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
                 status_code=400, detail=f"Not a well-formed acct: URI or a known actor URL: {resource!r}"
             )
 
-    record = await request.app.state.repository.get_local_actor(username)
-    if record is None:
+    repository: ActorRepository = request.app.state.repository
+    record = await repository.get_local_actor(username)
+    resolved_username = record.username if record is not None else None
+    if resolved_username is None:
+        channel = await repository.get_peertube_channel(username)
+        resolved_username = channel.username if channel is not None else None
+    if resolved_username is None:
         raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
     document = build_local_webfinger_document(
-        username=record.username,
+        username=resolved_username,
         bridge_domain=config.bridge.domain,
-        actor_url=actor_url(config.bridge.public_base_url, record.username),
+        actor_url=actor_url(config.bridge.public_base_url, resolved_username),
     )
     return JSONResponse(content=document, media_type="application/jrd+json")
 
@@ -240,10 +385,47 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
 # delivery ever followed) once this returned 405.
 @router.api_route("/actor/{username}", methods=["GET", "HEAD"])
 async def get_actor(request: Request, username: str) -> Response:
-    record = await _get_actor_record(request, username)
+    repository: ActorRepository = request.app.state.repository
+    record = await repository.get_local_actor(username)
+    if record is None:
+        channel = await repository.get_peertube_channel(username)
+        if channel is None:
+            raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+        if _prefers_html(request):
+            config = request.app.state.config
+            owner = await repository.get_local_actor(channel.owner_username)
+            owner_display_name = (owner.display_name or owner.username) if owner else channel.owner_username
+            owner_handle = f"@{channel.owner_username}@{config.bridge.domain}"
+            owner_url = actor_url(config.bridge.public_base_url, channel.owner_username)
+
+            follower_ids = await repository.list_followers(username)
+            following_ids = await repository.list_following(username)
+            followers = [await _resolve_person_ref(request, actor_id) for actor_id in follower_ids]
+            following = [await _resolve_person_ref(request, actor_id) for actor_id in following_ids]
+            videos = await _build_channel_video_cards(request, channel=channel)
+
+            html_doc = render_channel_page(
+                display_name=channel.display_name or channel.username,
+                handle=f"@{channel.username}@{config.bridge.domain}",
+                summary_html=plain_text_to_note_html(channel.summary) if channel.summary else "",
+                avatar_url=channel.icon_url,
+                banner_url=channel.banner_url,
+                owner_display_name=owner_display_name,
+                owner_handle=owner_handle,
+                owner_url=owner_url,
+                videos=videos,
+                followers_count=len(follower_ids),
+                followers_hidden=False,
+                followers=followers,
+                following_count=len(following_ids),
+                following_hidden=False,
+                following=following,
+            )
+            return HTMLResponse(html_doc)
+        actor = await _build_channel_actor(request, channel)
+        return _activity_json(actor.to_dict())
     if _prefers_html(request):
         config = request.app.state.config
-        repository: ActorRepository = request.app.state.repository
         from_token = request.query_params.get("before") or None
         posts, next_token = await _build_profile_post_views(request, record, from_token=from_token)
         older_posts_url = f"/actor/{username}?before={quote(next_token, safe='')}" if next_token else None
@@ -372,26 +554,41 @@ def _prefers_html(request: Request) -> bool:
     is a plain browser rather than an AP-speaking client dereferencing the
     same URL for its JSON.
 
-    Walks the ``Accept`` header in order (ignoring q-values, which is good
-    enough in practice: a browser always lists ``text/html`` before any
-    JSON type it also accepts, and every AP implementation observed sends
-    an explicit ``application/activity+json``/``application/ld+json``,
-    never bare ``text/html``) and returns on the first decisive entry.
-    Defaults to HTML for a missing/wildcard-only header, since a real AP
-    fetcher reliably states its own preference explicitly -- see e.g.
-    Mastodon's/Pleroma's own webfinger and actor documents, which do the
-    same -- while a bare ``curl`` or browser navigation typically doesn't.
+    Scans every ``Accept`` header entry (ignoring q-values, which is good
+    enough in practice) for a DECISIVE media type: an explicit AP type
+    anywhere in the header wins even if a bare ``*/*`` appears earlier in
+    it, and likewise for an explicit HTML type. This scans the whole
+    header rather than stopping at the first entry the way this used to,
+    which matters now that ``*/*`` alone is treated as merely ambiguous
+    (see below) instead of an immediate "yes".
+
+    Falls back to sniffing ``User-Agent`` for "mozilla" (present in
+    essentially every real browser's UA string for historical reasons, and
+    essentially never in a server-side HTTP client's) when the Accept
+    header is missing, empty, or contains nothing more decisive than a
+    bare ``*/*``. Confirmed live 2026-07-25: this used to default straight
+    to HTML for that case on the theory that "a real AP fetcher reliably
+    states its own preference explicitly", but PeerTube's own "resolve a
+    remote URL" search feature does exactly this (no decisive Accept
+    header at all), so a real channel actor could never actually be
+    resolved by anyone searching for it from another PeerTube instance:
+    this bridge served its own HTML page back instead of the AP JSON
+    PeerTube needed, which PeerTube (correctly, from its own side) then
+    treated as "not an ActivityPub actor at all".
     """
     accept = request.headers.get("accept", "")
-    if not accept:
-        return True
     for part in accept.split(","):
         media_type = part.split(";", 1)[0].strip().lower()
-        if media_type in _HTML_MEDIA_TYPES or media_type == "*/*":
-            return True
         if media_type in _AP_MEDIA_TYPES:
             return False
-    return True
+        if media_type in _HTML_MEDIA_TYPES:
+            return True
+        # A bare "*/*" is ambiguous, not decisive, unlike before: this no
+        # longer returns True on the spot, but keeps scanning the rest of
+        # the header for a real decisive entry, then falls through to the
+        # User-Agent tiebreaker below if none ever shows up.
+    user_agent = request.headers.get("user-agent", "").lower()
+    return "mozilla" in user_agent
 
 
 async def _resolve_post_author(request: Request, actor_id: str) -> tuple[str, str, str, str | None, str | None]:
@@ -937,12 +1134,72 @@ async def _fetch_room_outbox_notes(
     return notes
 
 
+async def _list_channel_video_events(request: Request, *, channel) -> list[FederatedEvent]:
+    """Every currently-published video in ``channel``'s own room, newest
+    first. Reads ``bridge.peertube``'s own video index (a small, rarely
+    written state event only ``;publish``/``;unpublish`` ever touch) rather
+    than scanning room history the way the ordinary Note-outbox does. See
+    ``VIDEO_INDEX_STATE_TYPE``'s own comment for why: a channel room's
+    timeline gets a brand new event on every single VIEW-COUNT write (a
+    Matrix state update is always ALSO a new timeline event, with no way to
+    update "in place"), which silently pushed a real published video's own
+    message out of any shallow, most-recent-N timeline scan long before its
+    view count could plausibly matter. Confirmed live 2026-07-25 on a
+    genuinely published video whose own channel page had gone right back to
+    showing "No videos published yet." Shared by the channel's own outbox
+    (``_fetch_channel_outbox_items``) and its HTML video grid
+    (``_build_channel_video_cards``), so both always agree on exactly which
+    videos currently count as published."""
+    repository: ActorRepository = request.app.state.repository
+    synapse = request.app.state.synapse
+    events: list[FederatedEvent] = []
+    for local_video_id in await get_video_index(synapse, room_id=channel.room_id):
+        video_id = f"{request.app.state.config.bridge.public_base_url}/actor/{channel.username}/videos/{local_video_id}"
+        federated = await repository.get_federated_event_by_ap_object(video_id)
+        if federated is not None:
+            events.append(federated)
+    return events
+
+
+async def _fetch_channel_outbox_items(request: Request, *, channel, base: str) -> list[dict]:
+    """A PeerTube channel's outbox: every currently-published video in its
+    room, each reconstructed as its own Create+Announce activity pair (see
+    ``bridge.peertube.reconstruct_video_activities`` for why that's the
+    right shape here, unlike the bare-Note convention ``get_outbox`` uses
+    for an ordinary Profile Room below)."""
+    repository: ActorRepository = request.app.state.repository
+    synapse = request.app.state.synapse
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None:
+        return []
+
+    items: list[dict] = []
+    for federated in await _list_channel_video_events(request, channel=channel):
+        reconstructed = await reconstruct_video_activities(
+            synapse, base=base, channel=channel, owner=owner, federated=federated,
+        )
+        if reconstructed is None:
+            continue
+        create_activity, announce_activity = reconstructed
+        items.append(create_activity.to_dict())
+        items.append(announce_activity.to_dict())
+    return items
+
+
 @router.get("/outbox/{username}")
 async def get_outbox(request: Request, username: str) -> JSONResponse:
     config = request.app.state.config
     base = config.bridge.public_base_url
-    record = await _get_actor_record(request, username)
     repository: ActorRepository = request.app.state.repository
+    record = await repository.get_local_actor(username)
+    if record is None:
+        channel = await repository.get_peertube_channel(username)
+        if channel is None:
+            raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+        items = await _fetch_channel_outbox_items(request, channel=channel, base=base)
+        collection = OrderedCollection(id=outbox_url(base, username), items=items, embed_first=False)
+        return _collection_or_page(request, collection)
+
     dated_notes: list[tuple[int, Note]] = []
 
     if record.room_id:
@@ -969,7 +1226,7 @@ async def get_outbox(request: Request, username: str) -> JSONResponse:
 
     items = [note.to_dict() for _, note in dated_notes]
     collection = OrderedCollection(id=outbox_url(base, username), items=items)
-    return _activity_json(collection.to_dict())
+    return _collection_or_page(request, collection)
 
 
 @router.get("/actor/{username}/notes/{note_id}")
@@ -1117,6 +1374,201 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     return _activity_json({"@context": JSON_LD_CONTEXT, **note.to_dict()})
 
 
+async def _build_video_view(
+    request: Request, *, channel: PeerTubeChannelRecord, owner, federated: FederatedEvent,
+) -> VideoView | None:
+    """Resolve a published video's ``FederatedEvent`` into a ``VideoView``
+    for ``render_video_page``: same two sources
+    ``bridge.peertube.reconstruct_video_activities`` reads (the video's own
+    Matrix message for media info, its ``VIDEO_METADATA_STATE_TYPE`` state
+    event for name/category/etc.), plus display-formatted category/licence/
+    language names, the real Like/Dislike counts already mirrored as
+    ``m.reaction``s on the video's own Matrix event (see
+    ``bridge.reaction_bridge``'s outbound Dislike support), and its
+    comments (ordinary AP reply Notes threaded off it, see
+    ``_build_post_view``)."""
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    synapse = request.app.state.synapse
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        video_event = await synapse.get_event(federated.room_id, federated.event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return None
+    video_content = video_event.get("content") or {}
+    attachment = build_ap_attachment(base, video_content)
+    if attachment is None:
+        return None
+
+    local_video_id = federated.ap_object_id.rsplit("/", 1)[-1]
+    try:
+        metadata = await synapse.get_room_state(channel.room_id, VIDEO_METADATA_STATE_TYPE, local_video_id)
+    except SynapseError:
+        return None
+    name = (metadata.get("name") or "").strip()
+    if not name:
+        return None
+
+    info = video_content.get("info") or {}
+    duration_ms = info.get("duration")
+    duration_seconds = (
+        round(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+    )
+    thumbnail_mxc = metadata.get("thumbnail_mxc")
+    thumbnail_url = None
+    if thumbnail_mxc:
+        try:
+            thumbnail_url = media_url(base, thumbnail_mxc)
+        except ValueError:
+            thumbnail_url = None
+
+    raw_category = metadata.get("category")
+    category_name = raw_category if raw_category and resolve_category(raw_category) is not None else None
+    raw_licence = metadata.get("license")
+    licence_name = raw_licence if raw_licence and resolve_licence(raw_licence) is not None else None
+    language_code = metadata.get("language")
+    language_name = resolve_language(language_code)[1] if language_code else None
+
+    try:
+        views_state = await synapse.get_room_state(channel.room_id, VIDEO_VIEWS_STATE_TYPE, local_video_id)
+        views = int(views_state.get("count", 0))
+    except SynapseError:
+        views = 0
+
+    try:
+        reaction_events = await synapse.get_relations(
+            federated.room_id, federated.event_id, rel_type="m.annotation", event_type="m.reaction",
+            as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        reaction_events = []
+    like_count = 0
+    dislike_count = 0
+    for reaction_event in reaction_events:
+        key = ((reaction_event.get("content") or {}).get("m.relates_to") or {}).get("key") or ""
+        normalized = key.replace("️", "")
+        if normalized == "\U0001F44D":
+            like_count += 1
+        elif normalized == "\U0001F44E":
+            dislike_count += 1
+
+    comments = await _build_video_comments(request, federated)
+
+    owner_display_name = owner.display_name or owner.username
+    owner_handle = f"@{owner.username}@{config.bridge.domain}"
+    channel_display_name = channel.display_name or channel.username
+    channel_handle = f"@{channel.username}@{config.bridge.domain}"
+    published_at = metadata.get("published") or _matrix_ts_to_iso(video_event.get("origin_server_ts"))
+
+    return VideoView(
+        video_id=local_video_id,
+        name=name,
+        description_html=plain_text_to_note_html(metadata.get("description")) if metadata.get("description") else "",
+        media_url=attachment["url"],
+        media_type=attachment.get("mediaType") or "video/mp4",
+        thumbnail_url=thumbnail_url,
+        duration_seconds=duration_seconds,
+        views=views,
+        channel_display_name=channel_display_name,
+        channel_handle=channel_handle,
+        channel_url=actor_url(base, channel.username),
+        channel_avatar_url=channel.icon_url,
+        owner_display_name=owner_display_name,
+        owner_handle=owner_handle,
+        owner_url=actor_url(base, owner.username),
+        published_display=_iso_published_display(published_at),
+        category_name=category_name,
+        licence_name=licence_name,
+        language_name=language_name,
+        tags=list(metadata.get("tags") or []),
+        sensitive=bool(metadata.get("sensitive", False)),
+        like_count=like_count,
+        dislike_count=dislike_count,
+        comments=comments,
+        comments_enabled=bool(metadata.get("commentsEnabled", True)),
+    )
+
+
+async def _build_video_comments(request: Request, federated: FederatedEvent) -> list[PostView]:
+    """Every comment (an ordinary AP reply Note) on a published video, oldest
+    first: same Matrix-thread-relations lookup ``_build_thread_post_views``
+    uses for an ordinary post's own replies, but EXCLUDING the video's own
+    root event (never itself a ``PostView``; ``_build_post_view`` expects
+    Note-shaped content, not a video message)."""
+    config = request.app.state.config
+    repository: ActorRepository = request.app.state.repository
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        related = await request.app.state.synapse.get_relations(
+            federated.room_id, federated.event_id, rel_type="m.thread", as_user_id=bot_mxid
+        )
+    except SynapseError:
+        related = []
+    comments: list[PostView] = []
+    for related_event in related:
+        event_id = related_event.get("event_id")
+        if not event_id:
+            continue
+        fe = await repository.get_federated_event_by_matrix_event(event_id)
+        if fe is None:
+            continue
+        view = await _build_post_view(request, fe)
+        if view is not None:
+            comments.append(view)
+    comments.sort(key=lambda p: p.origin_server_ts)
+    return comments
+
+
+@router.get("/actor/{username}/videos/{video_id}")
+async def get_video(request: Request, username: str, video_id: str) -> Response:
+    """Serves a published video: the real AP ``Video`` object to an
+    AP-speaking caller, or the tube-style watch page (``render_video_page``)
+    to a plain browser, same content-negotiation pattern as ``get_note``."""
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    repository: ActorRepository = request.app.state.repository
+    channel = await repository.get_peertube_channel(username)
+    if channel is None:
+        raise HTTPException(status_code=404, detail=f"No such channel: {username}")
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    ap_object_id = f"{base}/actor/{username}/videos/{video_id}"
+    federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if federated is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if _prefers_html(request):
+        video = await _build_video_view(request, channel=channel, owner=owner, federated=federated)
+        if video is None:
+            raise HTTPException(status_code=410, detail="Gone")
+        # The watch page's own hit is one of the two signals the agreed
+        # design counts a view from (the other is an inbound AP View
+        # activity, see bridge.inbox_dispatch._handle_view), only here,
+        # in the HTML branch: a plain JSON/AP fetch of this same URL (a
+        # remote server resolving the object, not a human watching it) is
+        # not a view. request.client can be None behind some proxy setups,
+        # in which case there's no real per-viewer signal to dedup against
+        # at all, so this just skips counting rather than false-sharing one
+        # dedup bucket across every such visitor.
+        if request.client is not None:
+            await record_video_view(
+                request.app.state.synapse, room_id=channel.room_id, local_video_id=video_id,
+                dedup_key=request.client.host,
+            )
+        return HTMLResponse(render_video_page(video))
+
+    reconstructed = await reconstruct_video_activities(
+        request.app.state.synapse, base=base, channel=channel, owner=owner, federated=federated,
+    )
+    if reconstructed is None:
+        raise HTTPException(status_code=410, detail="Gone")
+    create_activity, _announce_activity = reconstructed
+    video_dict = create_activity.to_dict()["object"]
+    return _activity_json({"@context": VIDEO_JSON_LD_CONTEXT, **video_dict})
+
+
 def _collection_or_page(request: Request, collection: OrderedCollection) -> JSONResponse:
     """Serves ``collection`` itself (with its member IRIs embedded as
     ``first``), unless a ``?page=`` query param is present -- in which case
@@ -1135,24 +1587,50 @@ def _collection_or_page(request: Request, collection: OrderedCollection) -> JSON
 @router.get("/followers/{username}")
 async def get_followers(request: Request, username: str) -> JSONResponse:
     base = request.app.state.config.bridge.public_base_url
-    record = await _get_actor_record(request, username)
+    record = await _get_actor_or_channel_record(request, username)
     repository: ActorRepository = request.app.state.repository
     followers = await repository.list_followers(username)
     # Owner hid the list (see bridge.commands's `hide followers`) -- the
-    # count stays real and public, only the member list is withheld.
-    items = [] if record.hide_followers else followers
-    collection = OrderedCollection(id=followers_url(base, username), items=items, total_items=len(followers))
+    # count stays real and public, only the member list is withheld. A
+    # PeerTubeChannelRecord has no such toggle (nothing in the agreed
+    # design calls for one), so a channel's list is never hidden.
+    items = [] if getattr(record, "hide_followers", False) else followers
+    collection = OrderedCollection(
+        id=followers_url(base, username), items=items, total_items=len(followers),
+        embed_first=not isinstance(record, PeerTubeChannelRecord),
+    )
     return _collection_or_page(request, collection)
 
 
 @router.get("/following/{username}")
 async def get_following(request: Request, username: str) -> JSONResponse:
     base = request.app.state.config.bridge.public_base_url
-    record = await _get_actor_record(request, username)
+    record = await _get_actor_or_channel_record(request, username)
     repository: ActorRepository = request.app.state.repository
     following = await repository.list_following(username)
-    items = [] if record.hide_following else following
-    collection = OrderedCollection(id=following_url(base, username), items=items, total_items=len(following))
+    items = [] if getattr(record, "hide_following", False) else following
+    collection = OrderedCollection(
+        id=following_url(base, username), items=items, total_items=len(following),
+        embed_first=not isinstance(record, PeerTubeChannelRecord),
+    )
+    return _collection_or_page(request, collection)
+
+
+@router.get("/playlists/{username}")
+async def get_playlists(request: Request, username: str) -> JSONResponse:
+    """A PeerTube channel's playlists collection: permanently empty for
+    v1 (see the agreed design in project_peertube_channels_scoping).
+    Playlists are a fully separate, optional, curated-list feature,
+    unrelated to video discovery (that's the channel's own outbox, see
+    ``get_outbox`` above). Served at all, rather than 404ing, purely so
+    a real PeerTube instance that checks for this collection's existence
+    doesn't treat its absence as an error; only a Profile/channel username
+    resolves here, same 404 as everywhere else for anything else."""
+    record = await _get_actor_or_channel_record(request, username)
+    base = request.app.state.config.bridge.public_base_url
+    collection = OrderedCollection(
+        id=f"{base}/playlists/{username}", items=[], embed_first=not isinstance(record, PeerTubeChannelRecord),
+    )
     return _collection_or_page(request, collection)
 
 
@@ -1199,7 +1677,7 @@ async def _verify_and_parse_activity(request: Request) -> Activity:
 
 @router.post("/inbox/{username}")
 async def post_inbox(request: Request, username: str) -> Response:
-    await _get_actor_record(request, username)
+    await _get_actor_or_channel_record(request, username)
     activity = await _verify_and_parse_activity(request)
     # One INFO line per verified delivery -- the receive-side counterpart
     # of delivery logging. Successful processing is otherwise completely
@@ -1300,7 +1778,7 @@ def _apply_range(content: bytes, range_header: str | None) -> tuple[bytes, int, 
     )
 
 
-@router.api_route("/media/{server_name}/{media_id}", methods=["GET", "HEAD"])
+@router.api_route("/media/{server_name}/{media_id}", methods=["GET", "HEAD", "OPTIONS"])
 async def get_media(request: Request, server_name: str, media_id: str) -> Response:
     """Public, unauthenticated proxy for Matrix media -- see module docstring.
 
@@ -1317,13 +1795,44 @@ async def get_media(request: Request, server_name: str, media_id: str) -> Respon
 
     Explicitly handles HEAD (FastAPI does not derive it from a GET route
     automatically) -- some AP implementations probe with HEAD before fetching.
+
+    Also explicitly handles OPTIONS, answered directly here rather than via
+    a global CORS middleware (this is the only route in the whole app that's
+    ever fetched cross-origin by a browser rather than server-to-server, so
+    scoping it here avoids touching CORS behavior anywhere else). A browser
+    <video> element sends a CORS preflight OPTIONS before any cross-origin
+    Range GET -- confirmed live 2026-07-25: this route previously had no
+    OPTIONS handler at all, so that preflight got a bare 405 with no CORS
+    headers, and the browser silently discarded the follow-up GET entirely.
+    A remote PeerTube page loading one of this bridge's videos saw that as
+    "no compatible source", even though the file itself, and a plain
+    same-origin fetch of it, were both completely fine.
     """
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": "Range",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+
+    # A video file's own URL carries a real file extension (see
+    # bridge.peertube.video_media_url's docstring for why) that isn't part
+    # of the underlying Matrix media id -- stripped back off here before
+    # any lookup, recognized by suffix rather than a fixed set of video
+    # extensions specifically, since this route serves every media type
+    # (avatars, banners, thumbnails, attachments), not just videos.
+    real_media_id = media_id.rsplit(".", 1)[0] if "." in media_id else media_id
+
     repository: ActorRepository = request.app.state.repository
-    if not await repository.is_media_published(f"mxc://{server_name}/{media_id}"):
+    if not await repository.is_media_published(f"mxc://{server_name}/{real_media_id}"):
         raise HTTPException(status_code=404, detail="Media not found")
 
     try:
-        result = await request.app.state.synapse.download_media(server_name, media_id)
+        result = await request.app.state.synapse.download_media(server_name, real_media_id)
     except SynapseError as exc:
         raise HTTPException(status_code=404, detail="Media not found") from exc
 

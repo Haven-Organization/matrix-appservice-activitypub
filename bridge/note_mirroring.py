@@ -61,6 +61,7 @@ from bridge.media import (
     matrix_msgtype_for_mimetype,
 )
 from bridge.notifications import notification_actor_html, notify_user
+from bridge.peertube import resolve_media_type
 from bridge.repository import ActorRecord, ActorRepository, FederatedEvent, GhostProfile, RemoteActorRoom
 from bridge.room_widget import add_bridge_widget
 from bridge.synapse_client import SynapseError
@@ -1128,11 +1129,23 @@ async def resolve_old_remote_actor_room(request: Request, room_id: str) -> Remot
     ``send_bridge_info``, never touched again) only for a room old enough
     to predate that table -- no ``ghost_profiles`` row for a local (not
     fediverse) actor_id naturally makes this fall through instead of
-    misidentifying a Profile Room, which also carries ``m.bridge`` state."""
+    misidentifying a Profile Room, which also carries ``m.bridge`` state.
+
+    A ghost DM/Chat room's own ``m.bridge`` state names the exact same
+    remote actor a genuine Remote User Room for them would, so the state-
+    scan fallback below is guarded against ``resolve_old_ghost_room_owner``
+    first: without it, a Chat room predating (or simply missing) its own
+    history row gets misidentified as a Remote User Room too, and ends up
+    wrongly receiving that room kind's own join-time notices (confirmed
+    live: a Chat room getting a spurious, and doubled, "not following"
+    notice never meant for it)."""
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
     if remote_room is not None:
         return remote_room
+
+    if await resolve_old_ghost_room_owner(request, room_id) is not None:
+        return None
 
     actor_id = await repository.get_remote_actor_room_history_actor_id(room_id)
     if actor_id is None:
@@ -1256,7 +1269,9 @@ async def push_profile_update(request: Request, actor_record: ActorRecord) -> No
         followers=followers_url(base, actor_record.username),
         following=following_url(base, actor_record.username),
         icon_url=actor_record.icon_url,
+        icon_media_type=await resolve_media_type(request, actor_record.icon_url),
         image_url=actor_record.banner_url,
+        image_media_type=await resolve_media_type(request, actor_record.banner_url),
         shared_inbox=shared_inbox_url(base),
         public_key=PublicKey(
             id=main_key_id(base, actor_record.username),
@@ -1293,6 +1308,22 @@ async def push_profile_update(request: Request, actor_record: ActorRecord) -> No
             logger.warning("Failed to deliver profile update to %s", follower_actor_id, exc_info=True)
 
 
+# Caps how many deliveries (actor-inbox resolves + signed POSTs, each its
+# own outbound HTTPS connection) run at once across the WHOLE app, not per
+# call -- callers like bridge.commands's ;publish/;edit/etc. already fan
+# out concurrently (asyncio.gather) over every one of a popular owner's
+# followers, and firing dozens of simultaneous outbound connections at once
+# turned out to saturate this host's own network/DNS resolution capacity
+# rather than any single remote server actually being down: confirmed live
+# 2026-07-25, a burst of httpx.ConnectTimeout across a dozen COMPLETELY
+# UNRELATED remote hosts within the same one-second window, including the
+# one delivery that actually mattered to the user's own report. A bounded
+# semaphore keeps the "don't block the confirmation notice" benefit of
+# concurrent delivery while queueing the rest instead of firing them all at
+# once.
+_DELIVERY_SEMAPHORE = asyncio.Semaphore(8)
+
+
 async def deliver_to_actor_or_followers(
     request: Request, *, target_actor_id: str, activity: dict, key_id: str, private_key_pem: str
 ) -> None:
@@ -1323,20 +1354,21 @@ async def deliver_to_actor_or_followers(
     recipients = await repository.list_followers(local_username) if local_username is not None else [target_actor_id]
 
     for recipient_actor_id in recipients:
-        inbox = await resolve_actor_inbox(request, recipient_actor_id)
-        if inbox is None:
-            logger.warning("No inbox known for %s; skipping delivery", recipient_actor_id)
-            continue
-        try:
-            await deliver_activity(
-                request.app.state.http_client,
-                inbox_url=inbox,
-                activity=activity,
-                key_id=key_id,
-                private_key_pem=private_key_pem,
-            )
-        except DeliveryError:
-            logger.warning("Failed to deliver to %s", recipient_actor_id, exc_info=True)
+        async with _DELIVERY_SEMAPHORE:
+            inbox = await resolve_actor_inbox(request, recipient_actor_id)
+            if inbox is None:
+                logger.warning("No inbox known for %s; skipping delivery", recipient_actor_id)
+                continue
+            try:
+                await deliver_activity(
+                    request.app.state.http_client,
+                    inbox_url=inbox,
+                    activity=activity,
+                    key_id=key_id,
+                    private_key_pem=private_key_pem,
+                )
+            except DeliveryError:
+                logger.warning("Failed to deliver to %s", recipient_actor_id, exc_info=True)
 
 
 async def _inviter_for_room(request: Request, room_id: str) -> str:
@@ -1956,7 +1988,9 @@ async def mirror_direct_message(
     # of the recipient themselves (the actual bug this fixes) still pills
     # correctly either way, since that branch never touches ghosts at all.
     mentions = await resolve_mention_pills(request, room_id=dm_room_id, note=note, allow_remote=False)
-    plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        note.get("content") or "", mention_pills=mentions.pills, media_type=note.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, synapse, repository, safe_html, note.get("tag") or [], subject_id=ap_object_id
@@ -2106,7 +2140,7 @@ async def mirror_chat_message(
     if chat_room_id is None:
         return None
 
-    plain, safe_html = strip_to_matrix_message(chat_message.get("content") or "")
+    plain, safe_html = strip_to_matrix_message(chat_message.get("content") or "", media_type=chat_message.get("mediaType"))
     message_content: dict = {"msgtype": "m.text", "body": plain}
     if safe_html and safe_html != plain:
         message_content["format"] = "org.matrix.custom.html"
@@ -2393,7 +2427,9 @@ async def _import_note_locked(
         return ImportedNote(federated_event=None)
 
     mentions = await resolve_mention_pills(request, room_id=remote_room.room_id, note=note)
-    plain, safe_html = strip_to_matrix_message(note.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        note.get("content") or "", mention_pills=mentions.pills, media_type=note.get("mediaType"),
+    )
     if safe_html:
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, synapse, repository, safe_html, note.get("tag") or [], subject_id=ap_object_id
@@ -2543,7 +2579,7 @@ async def _import_question_locked(
     if remote_room is None:
         return ImportedNote(federated_event=None)
 
-    question_text, _ = strip_to_matrix_message(question.get("content") or "")
+    question_text, _ = strip_to_matrix_message(question.get("content") or "", media_type=question.get("mediaType"))
     options_raw = question.get("oneOf") or question.get("anyOf") or []
     multi = bool(question.get("anyOf"))
     answers = [

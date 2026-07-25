@@ -55,6 +55,13 @@ JSON_LD_CONTEXT: list[str | dict[str, str]] = [
         "quoteUri": "as:quoteUrl",
         "quoteUrl": "as:quoteUrl",
         "_misskey_quote": "misskey:_misskey_quote",
+        # Mastodon's own extension namespace, also declared by real PeerTube
+        # actor documents (confirmed live 2026-07-25 against a real channel
+        # actor) -- only actually used on a PeerTube channel's own Actor
+        # (see Actor.discoverable below), harmless/unused everywhere else.
+        "toot": "http://joinmastodon.org/ns#",
+        "discoverable": "toot:discoverable",
+        "indexable": "toot:indexable",
     },
 ]
 
@@ -98,7 +105,20 @@ class Actor:
     summary: str | None = None
     url: str | None = None
     icon_url: str | None = None
+    # PeerTube's own remote-actor-image importer (getImagesInfoFromObject,
+    # confirmed by reading their real source 2026-07-25) needs a mediaType
+    # to know what to save an avatar/banner as, falling back to sniffing a
+    # file extension off the URL only when it's absent -- and this bridge's
+    # own media URLs are opaque Matrix media ids with no extension at all,
+    # so omitting this silently drops the image entirely on their end, the
+    # same failure mode as Video.uuid's own docstring describes for a video
+    # missing its uuid. Every other AP implementation this bridge has been
+    # tested against (Mastodon/Pleroma/Akkoma) tolerates an extensionless,
+    # mediaType-less icon URL fine, which is why this went unnoticed until
+    # specifically checked against PeerTube's own channel/profile pages.
+    icon_media_type: str | None = None
     image_url: str | None = None
+    image_media_type: str | None = None
     shared_inbox: str | None = None
     # Pleroma/Akkoma extension advertising that this actor accepts
     # ChatMessage (see ChatMessage below) -- their own UI (and any other
@@ -111,10 +131,28 @@ class Actor:
     # double-checking against a real Pleroma/Akkoma instance if the "Chat"
     # option doesn't show up as expected.
     accepts_chat_messages: bool = False
+    # PeerTube's own extension: a Group-typed channel actor's playlists
+    # collection (see bridge.activitypub.routes.get_playlists, a
+    # permanently-empty stub for v1 per the agreed design). Never set for
+    # an ordinary Person profile, which has no such concept.
+    playlists_url: str | None = None
+    # A channel's owning account actor id(s) -- confirmed live 2026-07-25
+    # against a real PeerTube channel actor, which always carries this
+    # (pointing back at the Person that owns it). Never set for an
+    # ordinary Person profile, which has no owner of its own to name.
+    attributed_to_urls: list[str] | None = None
+    # Mastodon's toot:discoverable/toot:indexable extension (see
+    # JSON_LD_CONTEXT's own comment) -- also confirmed live on that same
+    # real channel actor, both true. Plausibly load-bearing for whether a
+    # remote PeerTube instance's own search/resolve treats an unfamiliar
+    # Group actor as a real, discoverable channel at all, rather than
+    # something to silently ignore; set for channels, left unset (and so
+    # omitted entirely) for an ordinary Person profile.
+    discoverable: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         icon = (
-            {"type": "Image", "url": self.icon_url}
+            _without_none({"type": "Image", "url": self.icon_url, "mediaType": self.icon_media_type})
             if self.icon_url
             else None
         )
@@ -122,7 +160,7 @@ class Actor:
         # picture -- distinct from "icon" (the avatar). Absent entirely
         # (rather than present-but-null) when there isn't one, same as icon.
         image = (
-            {"type": "Image", "url": self.image_url}
+            _without_none({"type": "Image", "url": self.image_url, "mediaType": self.image_media_type})
             if self.image_url
             else None
         )
@@ -141,6 +179,10 @@ class Actor:
                 "outbox": self.outbox,
                 "followers": self.followers,
                 "following": self.following,
+                "playlists": self.playlists_url,
+                "attributedTo": self.attributed_to_urls,
+                "discoverable": self.discoverable,
+                "indexable": self.discoverable,
                 "publicKey": self.public_key.to_dict(),
                 "icon": icon,
                 "image": image,
@@ -345,7 +387,7 @@ class Activity:
 
     def to_dict(self) -> dict[str, Any]:
         obj: Any
-        if isinstance(self.object, (Activity, Note, ChatMessage, Question)):
+        if isinstance(self.object, (Activity, Note, ChatMessage, Question, Video)):
             obj = self.object.to_dict()
         else:
             obj = self.object
@@ -438,11 +480,27 @@ class OrderedCollection:
     # public, only the list itself is withheld. ``None`` (the default) just
     # falls back to ``len(items)``, as before.
     total_items: int | None = None
+    # Whether ``first`` below is the full ``OrderedCollectionPage`` embedded
+    # inline (the default, confirmed live against Pleroma/Akkoma, see this
+    # class's own docstring) or a bare URL string a caller is expected to
+    # fetch separately (at the same ``?page=1``, still served by
+    # ``bridge.activitypub.routes._collection_or_page`` either way). Real
+    # PeerTube needs the bare-URL form instead. Confirmed live 2026-07-25
+    # against a real channel outbox (framatube.org): its own ``first`` is a
+    # plain string, never an embedded object, and our channel outbox
+    # embedding one instead meant a real PeerTube instance importing the
+    # channel saw a ``first`` shape it didn't recognize as a fetchable page
+    # at all, and so imported zero videos despite the channel itself
+    # resolving correctly. Set False for the channel's own outbox/followers/
+    # following (``bridge.commands``'s ``;create channel`` and friends);
+    # left True (unchanged) for every ordinary Profile Room collection.
+    embed_first: bool = True
 
     def first_page_dict(self) -> dict[str, Any]:
-        """The ``OrderedCollectionPage`` embedded as ``first`` below, and
-        also served standalone at ``?page=1`` -- see this class's own
-        docstring for why both need to exist."""
+        """The ``OrderedCollectionPage`` embedded as ``first`` when
+        ``embed_first`` is True, and also served standalone at ``?page=1``
+        regardless. See this class's own docstring for why both need to
+        exist."""
         return {
             "id": f"{self.id}?page=1",
             "type": "OrderedCollectionPage",
@@ -456,5 +514,177 @@ class OrderedCollection:
             "id": self.id,
             "type": self.type,
             "totalItems": len(self.items) if self.total_items is None else self.total_items,
-            "first": self.first_page_dict(),
+            "first": self.first_page_dict() if self.embed_first else f"{self.id}?page=1",
         }
+
+
+# PeerTube's own extension namespace, verified live 2026-07-25 against a
+# real video object (framatube.org). Deliberately trimmed to only the terms
+# this bridge actually emits below; the real thing also declares live-
+# broadcast, subtitle, storyboard, and multi-resolution/torrent terms this
+# bridge has no use for, since it never transcodes and only ever serves one
+# progressive-MP4 Link (see Video's own docstring).
+VIDEO_JSON_LD_CONTEXT: list[str | dict[str, Any]] = [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1",
+    {
+        "pt": "https://joinpeertube.org/ns#",
+        "sc": "http://schema.org/",
+        "Hashtag": "as:Hashtag",
+        "category": "sc:category",
+        "licence": "sc:license",
+        "sensitive": "as:sensitive",
+        "language": "sc:inLanguage",
+        "identifier": "sc:identifier",
+        "views": {"@type": "sc:Number", "@id": "pt:views"},
+        "state": {"@type": "sc:Number", "@id": "pt:state"},
+        "size": {"@type": "sc:Number", "@id": "pt:size"},
+        "commentsPolicy": {"@type": "sc:Number", "@id": "pt:commentsPolicy"},
+        "downloadEnabled": {"@type": "sc:Boolean", "@id": "pt:downloadEnabled"},
+        "waitTranscoding": {"@type": "sc:Boolean", "@id": "pt:waitTranscoding"},
+    },
+]
+
+
+@dataclass(frozen=True)
+class VideoIdentifier:
+    """PeerTube's ``ActivityIdentifierObject``: the shared shape ``Video``
+    uses for its ``category``/``licence``/``language`` fields below (an
+    ``identifier`` plus an optional human-readable ``name``)."""
+
+    identifier: str
+    name: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _without_none({"identifier": self.identifier, "name": self.name})
+
+
+@dataclass(frozen=True)
+class Video:
+    """A PeerTube-compatible ActivityStreams ``Video`` object (see
+    ``bridge.peertube`` for the category/licence constants and resolver
+    helpers that fill in ``category``/``licence``/``language`` below, and
+    the ``project_peertube_channels_scoping`` memory for the full agreed
+    design). This bridge never transcodes, so this deliberately omits
+    everything about PeerTube's own multi-resolution HLS/BitTorrent/
+    storyboard/subtitle machinery: a single progressive-MP4 ``Link`` in
+    ``url`` was confirmed (via PeerTube's own docs during scoping) to be
+    sufficient for remote playback on its own.
+
+    ``state``/``waitTranscoding`` are hardcoded rather than exposed as
+    fields: this bridge's videos are always immediately, fully available
+    the moment they're published (nothing queued, nothing to wait for), so
+    they're always "published" (``state=1``) and never
+    ``waitTranscoding=True``, unlike a real PeerTube upload, which
+    federates a placeholder Video immediately and flips both fields once
+    its own transcoding pipeline finishes."""
+
+    id: str
+    name: str
+    attributed_to: list[dict[str, str]]
+    published: str
+    url_html: str
+    # PeerTube-specific extension, but a REQUIRED one on their receiving
+    # end, not just informational: PeerTube's own AP video importer
+    # (APVideoCreator/getVideoAttributesFromObject, confirmed by reading
+    # their real source 2026-07-25) maps this straight into its Video
+    # table's own NOT-NULL ``uuid`` column, and silently discards the
+    # entire video (caught, logged, no video created, no error surfaced
+    # anywhere) if it's missing -- exactly the failure mode confirmed live
+    # across three separate real PeerTube instances: Follow/Accept and
+    # delivery all succeeded, but a published video never once appeared
+    # in any of their catalogs. Callers must pass a real (dashed, RFC
+    # 4122-shaped) UUID string, not this bridge's own internal hex id.
+    uuid: str
+    media_url: str
+    media_type: str
+    duration_seconds: int | None = None
+    media_size: int | None = None
+    media_width: int | None = None
+    media_height: int | None = None
+    icon_url: str | None = None
+    icon_width: int | None = None
+    icon_height: int | None = None
+    # Sent as raw markdown (mediaType text/markdown), matching PeerTube's own
+    # video-description convention exactly (confirmed live 2026-07-25).
+    # Unlike an ordinary mirrored post's Note.content, which this bridge
+    # always sends as HTML, a Video is PeerTube-shaped vocabulary that only
+    # PeerTube-compatible software consumes at all, so matching its own
+    # literal expected format here (rather than the wider fediverse's HTML
+    # convention) is what keeps a description from rendering as raw
+    # asterisks on the receiving end.
+    content: str | None = None
+    category: VideoIdentifier | None = None
+    licence: VideoIdentifier | None = None
+    language: VideoIdentifier | None = None
+    tags: list[str] = field(default_factory=list)
+    sensitive: bool = False
+    comments_enabled: bool = True
+    views: int = 0
+    # Confirmed live 2026-07-25 against a real video object (framatube.org):
+    # unlike an ordinary Note (AS_PUBLIC alone in `to`, the author's own
+    # followers in `cc`), a real PeerTube Video additionally names its OWNING
+    # CHANNEL directly in `to` (not just via attributedTo) and in `audience`,
+    # while `cc` carries only the posting ACCOUNT's followers, not the
+    # channel's own. Construction sites should pass both `to` and
+    # `audience` explicitly to match, not rely on the bare-AS_PUBLIC default
+    # below (kept only as a fallback for a caller that genuinely has no
+    # channel actor id on hand).
+    to: list[str] = field(default_factory=lambda: [AS_PUBLIC])
+    cc: list[str] = field(default_factory=list)
+    audience: str | None = None
+    updated: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        icon = (
+            _without_none(
+                {
+                    "type": "Image",
+                    "url": self.icon_url,
+                    "mediaType": "image/jpeg",
+                    "width": self.icon_width,
+                    "height": self.icon_height,
+                }
+            )
+            if self.icon_url
+            else None
+        )
+        media_link = _without_none(
+            {
+                "type": "Link",
+                "mediaType": self.media_type,
+                "href": self.media_url,
+                "height": self.media_height,
+                "width": self.media_width,
+                "size": self.media_size,
+            }
+        )
+        return _without_none(
+            {
+                "id": self.id,
+                "type": "Video",
+                "uuid": self.uuid,
+                "name": self.name,
+                "duration": f"PT{self.duration_seconds}S" if self.duration_seconds is not None else None,
+                "views": self.views,
+                "sensitive": self.sensitive,
+                "waitTranscoding": False,
+                "state": 1,
+                "commentsPolicy": 1 if self.comments_enabled else 2,
+                "downloadEnabled": True,
+                "published": self.published,
+                "updated": self.updated,
+                "mediaType": "text/markdown" if self.content else None,
+                "content": self.content,
+                "category": self.category.to_dict() if self.category else None,
+                "licence": self.licence.to_dict() if self.licence else None,
+                "language": self.language.to_dict() if self.language else None,
+                "tag": [{"type": "Hashtag", "name": t} for t in self.tags],
+                "icon": [icon] if icon else None,
+                "url": [{"type": "Link", "mediaType": "text/html", "href": self.url_html}, media_link],
+                "to": self.to,
+                "cc": self.cc,
+                "audience": self.audience,
+                "attributedTo": self.attributed_to,
+            }
+        )

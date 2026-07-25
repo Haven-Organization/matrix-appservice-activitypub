@@ -231,6 +231,16 @@ class BridgeSection:
     # turning this off -- don't just assume it works the same as the
     # Synapse-backed path.
     use_synapse_admin_api: bool = True
+    # Whether Matrix rooms can be turned into PeerTube-compatible video
+    # channels at all (;create channel, ;publish, and friends). Off by
+    # default: this is a real, substantial behavior change, not a purely
+    # additive field a client without the feature just ignores. Every
+    # remote view/scrub of a hosted video streams through this bridge's
+    # own media proxy straight from Synapse with no caching layer, a much
+    # heavier and more sustained bandwidth pattern per view than the
+    # images this proxy already serves, so only turn this on once you've
+    # weighed that cost for your own deployment.
+    peertube_channels_enabled: bool = False
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -422,6 +432,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         poll_default_duration_days=int(bridge_raw.get("poll_default_duration_days", 7)),
         admins=list(bridge_raw.get("admins", []) or []),
         use_synapse_admin_api=bool(bridge_raw.get("use_synapse_admin_api", True)),
+        peertube_channels_enabled=bool(bridge_raw.get("peertube_channels_enabled", False)),
     )
 
     synapse_section = SynapseSection(

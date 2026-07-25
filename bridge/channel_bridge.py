@@ -270,7 +270,9 @@ async def maybe_handle_channel_message(request: Request, activity: Activity) -> 
         await repository.record_channel_member(channel_room.room_id, author_actor_id)
 
     mentions = await resolve_mention_pills(request, room_id=channel_room.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(obj.get("content") or "", mention_pills=mentions.pills)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
     if not plain and not safe_html:
         return True
 

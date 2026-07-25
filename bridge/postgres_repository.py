@@ -32,6 +32,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
     ReactionRecord,
@@ -449,6 +450,24 @@ _SCHEMA_STATEMENTS = [
     SELECT room_id, actor_id, matrix_user_id, TRUE FROM ghost_chat_rooms
     ON CONFLICT (room_id) DO NOTHING
     """,
+    # A PeerTube-compatible video channel (see PeerTubeChannelRecord's own
+    # docstring for why this is a separate table from local_actors, and why
+    # it's named with the "peertube_" prefix rather than bare "channels";
+    # channel_rooms/guild_channels above are Shoot's own, unrelated concept).
+    """
+    CREATE TABLE IF NOT EXISTS peertube_channels (
+        username TEXT PRIMARY KEY,
+        owner_username TEXT NOT NULL,
+        room_id TEXT NOT NULL UNIQUE,
+        public_key_pem TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        icon_url TEXT,
+        banner_url TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_peertube_channels_owner ON peertube_channels (owner_username)",
 ]
 
 _TRANSACTION_RETENTION_SECONDS = 7 * 24 * 3600
@@ -592,6 +611,60 @@ class PostgresActorRepository:
             hide_followers=row["hide_followers"],
             hide_following=row["hide_following"],
             is_third_party=row["is_third_party"],
+        )
+
+    # -- PeerTube channels ----------------------------------------------------
+
+    @staticmethod
+    def _row_to_peertube_channel(row: asyncpg.Record) -> PeerTubeChannelRecord:
+        return PeerTubeChannelRecord(
+            username=row["username"],
+            owner_username=row["owner_username"],
+            room_id=row["room_id"],
+            public_key_pem=row["public_key_pem"],
+            private_key_pem=row["private_key_pem"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
+        )
+
+    async def get_peertube_channel(self, username: str) -> PeerTubeChannelRecord | None:
+        row = await self._pool.fetchrow("SELECT * FROM peertube_channels WHERE username = $1", username)
+        return self._row_to_peertube_channel(row) if row else None
+
+    async def get_peertube_channel_by_room_id(self, room_id: str) -> PeerTubeChannelRecord | None:
+        if not room_id:
+            return None
+        row = await self._pool.fetchrow("SELECT * FROM peertube_channels WHERE room_id = $1", room_id)
+        return self._row_to_peertube_channel(row) if row else None
+
+    async def list_peertube_channels_by_owner(self, owner_username: str) -> list[PeerTubeChannelRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM peertube_channels WHERE owner_username = $1 ORDER BY username", owner_username
+        )
+        return [self._row_to_peertube_channel(row) for row in rows]
+
+    async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO peertube_channels
+                (username, owner_username, room_id, public_key_pem, private_key_pem,
+                 display_name, summary, icon_url, banner_url)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (username) DO UPDATE SET
+                owner_username = EXCLUDED.owner_username,
+                room_id = EXCLUDED.room_id,
+                public_key_pem = EXCLUDED.public_key_pem,
+                private_key_pem = EXCLUDED.private_key_pem,
+                display_name = EXCLUDED.display_name,
+                summary = EXCLUDED.summary,
+                icon_url = EXCLUDED.icon_url,
+                banner_url = EXCLUDED.banner_url
+            """,
+            record.username, record.owner_username, record.room_id,
+            record.public_key_pem, record.private_key_pem,
+            record.display_name, record.summary, record.icon_url, record.banner_url,
         )
 
     # -- followers / following ----------------------------------------------
@@ -863,6 +936,9 @@ class PostgresActorRepository:
             "SELECT * FROM federated_events WHERE ap_object_id = $1 AND is_primary_event = TRUE", ap_object_id
         )
         return self._row_to_federated_event(row) if row else None
+
+    async def delete_federated_event(self, event_id: str) -> None:
+        await self._pool.execute("DELETE FROM federated_events WHERE event_id = $1", event_id)
 
     @staticmethod
     def _row_to_federated_event(row: asyncpg.Record) -> FederatedEvent:

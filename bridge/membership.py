@@ -122,23 +122,41 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
         # A ghost invited into a room we don't already have SOME tracked
         # relationship with (its own Remote User Room, a local user's
         # Profile Room it's being invited into for reply-mirroring, an
-        # existing DM, an existing chat) is a prospective NEW ActivityPub
-        # "Chat" (see bridge.chat_bridge) -- a plain Matrix-native DM
-        # invite sent directly to a ghost's own mxid is one of the two ways
-        # to start one (the other being the `chat` bot command, which
-        # registers the room itself before ever inviting the ghost, so
-        # it's already "known" by the time this invite arrives and skips
-        # this branch entirely). Gated on the inviter actually being a
-        # genuine local bridge user with a linked profile -- otherwise
-        # there'd be no signing identity to ever send a chat message back
-        # with, so silently joining would just leave the ghost sitting in
-        # a room it can never actually be used from.
+        # existing DM, an existing chat, a PeerTube channel or Shoot guild
+        # channel room it's being invited into to display a comment/
+        # reaction/message) is a prospective NEW ActivityPub "Chat" (see
+        # bridge.chat_bridge) -- a plain Matrix-native DM invite sent
+        # directly to a ghost's own mxid is one of the two ways to start
+        # one (the other being the `chat` bot command, which registers the
+        # room itself before ever inviting the ghost, so it's already
+        # "known" by the time this invite arrives and skips this branch
+        # entirely). Gated on the inviter actually being a genuine local
+        # bridge user with a linked profile -- otherwise there'd be no
+        # signing identity to ever send a chat message back with, so
+        # silently joining would just leave the ghost sitting in a room it
+        # can never actually be used from.
+        #
+        # Confirmed live 2026-07-25: a PeerTube channel room wasn't covered
+        # by any of these checks, so the bot auto-inviting a commenter's/
+        # reactor's ghost into a channel room (for perfectly ordinary
+        # comment/reaction display) got misread as "starting a brand new
+        # chat", registering the CHANNEL ROOM ITSELF as a ghost chat room
+        # with the BOT (the actual inviter in that flow) as the "chat
+        # partner." That single bad row then made every message sent in
+        # the channel room, including the video upload that ";publish"
+        # needed, get ALSO federated out as a bogus outbound ChatMessage,
+        # whose own FederatedEvent recording collided with the video's own
+        # under the same Matrix event id, causing a persistent false
+        # "already published" for a video that was never actually published
+        # at all.
         repository = request.app.state.repository
         already_known = (
             await repository.get_remote_actor_room_by_room_id(room_id) is not None
             or await repository.get_local_actor_by_room_id(room_id) is not None
             or await repository.is_ghost_dm_room(room_id)
             or await repository.is_ghost_chat_room(room_id)
+            or await repository.get_peertube_channel_by_room_id(room_id) is not None
+            or await repository.get_channel_room_by_room_id(room_id) is not None
         )
         if not already_known:
             inviter = event.get("sender", "")

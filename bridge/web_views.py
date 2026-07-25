@@ -184,6 +184,51 @@ class PostView:
     reactions: ReactionSummary
 
 
+@dataclass
+class VideoCardView:
+    """One thumbnail card in a channel's video grid (see ``render_channel_page``)."""
+
+    video_id: str
+    name: str
+    watch_url: str
+    thumbnail_url: str | None
+    duration_seconds: int | None
+    views: int
+    published_display: str
+
+
+@dataclass
+class VideoView:
+    """Everything a video watch page needs to render, already resolved --
+    see ``bridge.activitypub.routes._build_video_view``."""
+
+    video_id: str
+    name: str
+    description_html: str
+    media_url: str
+    media_type: str
+    thumbnail_url: str | None
+    duration_seconds: int | None
+    views: int
+    channel_display_name: str
+    channel_handle: str
+    channel_url: str
+    channel_avatar_url: str | None
+    owner_display_name: str
+    owner_handle: str
+    owner_url: str
+    published_display: str
+    category_name: str | None = None
+    licence_name: str | None = None
+    language_name: str | None = None
+    tags: list[str] = field(default_factory=list)
+    sensitive: bool = False
+    like_count: int = 0
+    dislike_count: int = 0
+    comments: list[PostView] = field(default_factory=list)
+    comments_enabled: bool = True
+
+
 def _fmt_timestamp(origin_server_ts: int) -> str:
     if not origin_server_ts:
         return ""
@@ -532,10 +577,58 @@ img.person-row-emoji { width: 22px; height: 22px; object-fit: contain; }
 .tab-panel { display: none; }
 .tab-radio-likes:checked ~ .likes-panel { display: block; }
 .tab-radio-reactions:checked ~ .reactions-panel { display: block; }
+
+/* Channel/video "tube" pages (render_channel_page/render_video_page):
+   same theme (colors/font/card styling) as the profile/post pages above,
+   just wider and shaped for a grid of thumbnails / a prominent player
+   instead of a single-column timeline. See bridge.commands's
+   ";create channel"/";publish" and the agreed design in
+   project_peertube_channels_scoping for the feature this renders. */
+.page-wide { max-width: 1100px; }
+.channel-banner { width: 100%; height: 220px; background-size: cover; background-position: center; background-color: var(--border); }
+.channel-header { display: flex; align-items: center; gap: 16px; padding: 16px; border-bottom: 1px solid var(--border); }
+.channel-header .avatar-lg { margin-top: -64px; }
+.channel-header-ident { flex: 1; min-width: 0; }
+.channel-header h1 { margin: 0; font-size: 22px; }
+.channel-header .handle { color: var(--text-dim); }
+.channel-owned-by { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+.channel-owned-by a { color: inherit; text-decoration: underline; }
+.channel-summary { padding: 0 16px 16px; white-space: pre-wrap; }
+.channel-summary p { margin: 0 0 8px; }
+.video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px; padding: 16px; }
+.video-card { display: block; color: inherit; }
+.video-card:hover { text-decoration: none; }
+.video-card:hover .video-card-title { color: var(--accent); }
+.video-thumb-wrap { position: relative; border-radius: 12px; overflow: hidden; background: var(--bg-elevated); aspect-ratio: 16 / 9; }
+.video-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.video-thumb-fallback { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 32px; color: var(--text-dim); }
+.video-duration { position: absolute; right: 6px; bottom: 6px; background: rgba(0,0,0,0.75); color: #fff; font-size: 12px; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
+.video-card-title { margin: 8px 0 2px; font-size: 15px; font-weight: 600; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.video-card-meta { color: var(--text-dim); font-size: 13px; }
+.watch-player-wrap { background: #000; }
+.watch-player-wrap video { width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
+.watch-body { padding: 16px; }
+.watch-title { margin: 0 0 8px; font-size: 20px; }
+.watch-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.watch-views { color: var(--text-dim); font-size: 14px; }
+.watch-reactions { display: flex; gap: 8px; }
+.watch-reaction-pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; background: var(--bg-elevated); border: 1px solid var(--border); font-size: 14px; color: var(--text); }
+.watch-channel-row { display: flex; align-items: center; gap: 10px; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.watch-channel-ident { flex: 1; min-width: 0; }
+.watch-channel-name { font-weight: 700; }
+.watch-channel-owner { color: var(--text-dim); font-size: 13px; }
+.watch-details { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; }
+.watch-tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.watch-tag { font-size: 13px; color: var(--accent); }
+.watch-details-meta { color: var(--text-dim); font-size: 13px; margin-top: 8px; }
+.sensitive-badge { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--text-dim); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; margin-left: 8px; vertical-align: middle; }
+.comments-section { padding: 0 16px 16px; }
+.comments-section h2 { font-size: 16px; }
 """
 
 
-def _page_shell(*, title: str, body: str) -> str:
+def _page_shell(*, title: str, body: str, wide: bool = False) -> str:
+    page_class = "page page-wide" if wide else "page"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -545,7 +638,7 @@ def _page_shell(*, title: str, body: str) -> str:
 <style>{_BASE_CSS}</style>
 </head>
 <body>
-<div class="page">
+<div class="{page_class}">
 {body}
 </div>
 </body>
@@ -661,3 +754,179 @@ def render_thread_page(
 
     body = f'<div class="timeline">{cards}</div>\n{pagination}\n<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     return _page_shell(title=title, body=body)
+
+
+def _duration_display(duration_seconds: int | None) -> str | None:
+    if not duration_seconds or duration_seconds <= 0:
+        return None
+    hours, remainder = divmod(int(duration_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _fmt_views(views: int) -> str:
+    return f"{views:,} view" + ("" if views == 1 else "s")
+
+
+def _video_card_html(video: VideoCardView) -> str:
+    watch_url = html.escape(video.watch_url, quote=True)
+    if video.thumbnail_url:
+        thumb = f'<img src="{html.escape(video.thumbnail_url, quote=True)}" loading="lazy" alt="">'
+    else:
+        thumb = '<div class="video-thumb-fallback">\U0001F3AC</div>'
+    duration = _duration_display(video.duration_seconds)
+    duration_html = f'<span class="video-duration">{html.escape(duration)}</span>' if duration else ""
+    return f"""
+<a class="video-card" href="{watch_url}">
+  <div class="video-thumb-wrap">{thumb}{duration_html}</div>
+  <div class="video-card-title">{html.escape(video.name)}</div>
+  <div class="video-card-meta">{html.escape(_fmt_views(video.views))} &middot; {html.escape(video.published_display)}</div>
+</a>
+""".strip()
+
+
+def render_channel_page(
+    *, display_name: str, handle: str, summary_html: str, avatar_url: str | None, banner_url: str | None,
+    owner_display_name: str, owner_handle: str, owner_url: str,
+    videos: list[VideoCardView],
+    followers_count: int = 0, followers_hidden: bool = True, followers: list[PersonRef] | None = None,
+    following_count: int = 0, following_hidden: bool = True, following: list[PersonRef] | None = None,
+) -> str:
+    """A PeerTube-channel "tube" page: same theming as ``render_profile_page``
+    (banner/avatar/handle/stats, reusing the exact same helpers), reshaped
+    below the header into a grid of video thumbnail cards instead of a
+    single-column post timeline. See the user's own explicit instruction
+    (this session) that channel/video pages should look cohesive with the
+    rest of the bridge's pages while reading as "tube"-shaped."""
+    banner_style = f' style="background-image:url(\'{html.escape(banner_url, quote=True)}\')"' if banner_url else ""
+    followers_stat = _follow_stat_html(
+        label="Followers", count=followers_count, dialog_id=None if followers_hidden else "followers-modal"
+    )
+    following_stat = _follow_stat_html(
+        label="Following", count=following_count, dialog_id=None if following_hidden else "following-modal"
+    )
+    owner_url_html = html.escape(owner_url, quote=True)
+    header = f"""
+<div class="channel-banner"{banner_style}></div>
+<div class="channel-header">
+  {_avatar_html(display_name, avatar_url, css_class="avatar-lg")}
+  <div class="channel-header-ident">
+    <h1>{html.escape(display_name)}</h1>
+    <div class="handle">{html.escape(handle)}</div>
+    <div class="channel-owned-by">Channel by <a href="{owner_url_html}">{html.escape(owner_display_name)} ({html.escape(owner_handle)})</a></div>
+    <div class="profile-stats">{followers_stat}{following_stat}</div>
+  </div>
+</div>
+<div class="channel-summary">{summary_html}</div>
+""".strip()
+
+    dialogs = ""
+    if not followers_hidden:
+        dialogs += _person_list_dialog_html(
+            "followers-modal", title="Followers", people=followers or [], empty_message="No followers yet."
+        )
+    if not following_hidden:
+        dialogs += _person_list_dialog_html(
+            "following-modal", title="Following", people=following or [], empty_message="Not following anyone yet."
+        )
+
+    if videos:
+        grid = '<div class="video-grid">' + "".join(_video_card_html(v) for v in videos) + "</div>"
+    else:
+        grid = '<div class="empty-state">No videos published yet.</div>'
+
+    body = (
+        f"{header}\n{dialogs}\n{grid}"
+        + '<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
+    )
+    return _page_shell(title=f"{display_name} ({handle})", body=body, wide=True)
+
+
+def render_video_page(video: VideoView) -> str:
+    """A PeerTube-style video watch page: player, title, view count, real
+    Like/Dislike counts (see ``bridge.reaction_bridge``'s outbound side),
+    an expandable-in-spirit (kept simple: always-visible) description box
+    with tags/category/license/language, and the video's own comments
+    (ordinary AP replies threaded off it, see the agreed design) rendered
+    with the exact same ``_post_card_html`` used for an ordinary post's
+    own replies, automatically matching styling with zero duplication."""
+    media_type = video.media_type or ""
+    if media_type.startswith("audio/"):
+        player = f'<audio src="{html.escape(video.media_url, quote=True)}" controls preload="metadata" style="width:100%"></audio>'
+    else:
+        poster_attr = f' poster="{html.escape(video.thumbnail_url, quote=True)}"' if video.thumbnail_url else ""
+        player = f'<video src="{html.escape(video.media_url, quote=True)}"{poster_attr} controls preload="metadata"></video>'
+
+    sensitive_badge = '<span class="sensitive-badge">Sensitive</span>' if video.sensitive else ""
+    reactions_html = ""
+    if video.like_count or video.dislike_count:
+        reactions_html = (
+            '<div class="watch-reactions">'
+            f'<span class="watch-reaction-pill">\U0001F44D {video.like_count}</span>'
+            f'<span class="watch-reaction-pill">\U0001F44E {video.dislike_count}</span>'
+            "</div>"
+        )
+
+    channel_url_html = html.escape(video.channel_url, quote=True)
+    owner_url_html = html.escape(video.owner_url, quote=True)
+    channel_row = f"""
+<div class="watch-channel-row">
+  {_avatar_html(video.channel_display_name, video.channel_avatar_url, css_class="avatar")}
+  <div class="watch-channel-ident">
+    <div class="watch-channel-name"><a href="{channel_url_html}">{html.escape(video.channel_display_name)}</a></div>
+    <div class="watch-channel-owner">by <a href="{owner_url_html}">{html.escape(video.owner_display_name)} ({html.escape(video.owner_handle)})</a></div>
+  </div>
+</div>
+""".strip()
+
+    meta_bits = []
+    if video.category_name:
+        meta_bits.append(f"Category: {html.escape(video.category_name)}")
+    if video.licence_name:
+        meta_bits.append(f"License: {html.escape(video.licence_name)}")
+    if video.language_name:
+        meta_bits.append(f"Language: {html.escape(video.language_name)}")
+    details_meta = f'<div class="watch-details-meta">{" &middot; ".join(meta_bits)}</div>' if meta_bits else ""
+    tags_html = ""
+    if video.tags:
+        tags_html = '<div class="watch-tags">' + "".join(
+            f'<span class="watch-tag">#{html.escape(tag)}</span>' for tag in video.tags
+        ) + "</div>"
+    details = f"""
+<div class="watch-details">
+  {video.description_html or '<p class="handle">No description.</p>'}
+  {tags_html}
+  {details_meta}
+</div>
+""".strip()
+
+    if video.comments:
+        comments_html = "".join(_post_card_html(c, i) for i, c in enumerate(video.comments))
+    elif video.comments_enabled:
+        comments_html = '<div class="empty-state">No comments yet.</div>'
+    else:
+        comments_html = '<div class="empty-state">Comments are disabled for this video.</div>'
+    comments_section = f"""
+<div class="comments-section">
+  <h2>Comments</h2>
+  {comments_html}
+</div>
+""".strip()
+
+    body = f"""
+<div class="watch-player-wrap">{player}</div>
+<div class="watch-body">
+  <h1 class="watch-title">{html.escape(video.name)}{sensitive_badge}</h1>
+  <div class="watch-meta-row">
+    <div class="watch-views">{html.escape(_fmt_views(video.views))} &middot; {html.escape(video.published_display)}</div>
+    {reactions_html}
+  </div>
+  {channel_row}
+  {details}
+</div>
+{comments_section}
+<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>
+""".strip()
+    return _page_shell(title=f"{video.name} - {video.channel_display_name}", body=body, wide=True)
