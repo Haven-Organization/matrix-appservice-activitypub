@@ -32,6 +32,12 @@ voluntary leave and ``bridge.commands``'s ``unfollow`` command, which just
 kicks the sender and lets this react to the resulting membership event,
 rather than duplicating the Undo logic.
 
+Following another LOCAL user (``bridge.commands._follow_local_actor``) is
+the same relationship, minus the HTTP round-trip -- so leaving (or being
+kicked from) their Profile Room, as a follower rather than its owner, drops
+that following relationship the same way, just without an ``Undo`` to send
+anywhere.
+
 Also keeps each human's personal "Fediverse" space (``bridge.spaces``) in
 sync with which bridge-managed rooms they're actually in: joining one (their
 own linked Profile Room -- current or a past one they've since moved on
@@ -77,6 +83,7 @@ from urllib.parse import urlsplit
 
 from fastapi import Request
 
+from bridge.activitypub.urls import actor_url
 from bridge.commands import _COMMAND_PREFIX, _RUNNING_BACKFILLS, _run_auto_backfill
 from bridge.matrix_links import matrix_to_room_link
 from bridge.note_mirroring import resolve_old_ghost_room_owner, resolve_old_remote_actor_room, unfollow_remote_actor
@@ -695,8 +702,9 @@ async def _welcome_to_profile_room(request: Request, *, room_id: str, joined_use
 
 async def maybe_handle_leave(request: Request, event: dict) -> bool:
     """Returns True if this event was a human user leaving/being kicked from a
-    Remote User Room (handled -- see module docstring for the unfollow logic
-    this triggers)."""
+    Remote User Room, or from another local user's Profile Room they merely
+    followed (not their own) -- handled either way (see module docstring for
+    the unfollow logic this triggers)."""
     if event.get("type") != "m.room.member":
         return False
     content = event.get("content") or {}
@@ -726,7 +734,36 @@ async def maybe_handle_leave(request: Request, event: dict) -> bool:
                 request, guild_actor_id=channel_room.guild_actor_id, child_room_id=room_id
             )
             return True
-        return False  # not a Remote User Room or a Channel room
+
+        # A Profile Room has no per-room follow relationship to undo
+        # either -- UNLESS left_user isn't its owner, but a local-to-local
+        # follower instead (see bridge.commands._follow_local_actor, which
+        # records this exact relationship entirely in-process, with no
+        # HTTP Follow/Undo round-trip to ever react to -- this leave IS
+        # the only signal there is that it ended). Confirmed live
+        # 2026-07-29: without this, that `following` row survived forever
+        # and made a repeat ";follow" a permanent dead end (see
+        # _follow_local_actor's own re-invite fix for the other half of
+        # that same bug). get_profile_room_owner survives a `replace
+        # room`, so this also correctly unfollows on leaving an OLD,
+        # since-replaced Profile Room they still followed. The owner
+        # leaving their OWN (current or past) Profile Room is a separate,
+        # unrelated case this doesn't touch -- profile_owner_mxid ==
+        # left_user guards against exactly that.
+        profile_owner_mxid = await repository.get_profile_room_owner(room_id)
+        if profile_owner_mxid is not None and profile_owner_mxid != left_user:
+            left_actor_record = await repository.get_local_actor_by_matrix_id(left_user)
+            owner_record = await repository.get_local_actor_by_matrix_id(profile_owner_mxid)
+            if left_actor_record is not None and owner_record is not None:
+                base = config.bridge.public_base_url
+                owner_actor_id = actor_url(base, owner_record.username)
+                if await repository.is_following(left_actor_record.username, owner_actor_id):
+                    await repository.remove_following(left_actor_record.username, owner_actor_id)
+                    await repository.remove_follower(
+                        owner_record.username, actor_url(base, left_actor_record.username)
+                    )
+            return True
+        return False  # not a Remote User Room, Channel room, or someone else's Profile Room
 
     # Space removal happens for ANY human leaving a Remote User Room,
     # independent of whether they even had a linked profile/were

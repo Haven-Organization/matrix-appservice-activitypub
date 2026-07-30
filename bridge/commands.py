@@ -1540,6 +1540,20 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             return
 
     if await repository.is_following(actor_record.username, remote_actor_id):
+        # Same re-invite reasoning as _follow_local_actor's identical
+        # branch: a `following` row can outlive actual room membership
+        # (left the Remote User Room, was kicked, an earlier invite
+        # silently failed, ...), and without this "already following" was
+        # a dead end -- ";follow" refused to help, and self-service
+        # recovery (";rejoin"/knocking) already covers this exact room
+        # kind, so there's no reason this couldn't too.
+        remote_room = await repository.get_remote_actor_room(remote_actor_id)
+        if remote_room is not None:
+            try:
+                await synapse.invite_user(remote_room.room_id, sender, as_user_id=remote_room.ghost_user_id)
+            except SynapseError as exc:
+                if exc.errcode != "M_FORBIDDEN":
+                    logger.warning("Could not invite %s to %s: %s", sender, remote_room.room_id, exc)
         await _notice(request, room_id, f"You're already following {handle}.")
         return
 
@@ -1705,7 +1719,9 @@ async def _follow_local_actor(
     ``resolve_and_invite_ghost``'s docstring). Records the relationship
     both ways (following/follower) and notifies ``target`` via DM, the same
     as a genuinely remote follow would via ``bridge.inbox_dispatch``'s
-    ``_announce_new_follower``."""
+    ``_announce_new_follower``. Already-following re-invites too (see that
+    branch's own comment) rather than being a silent no-op, so a follow
+    that survived leaving/losing access to the room isn't a dead end."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     repository = request.app.state.repository
@@ -1729,6 +1745,22 @@ async def _follow_local_actor(
 
     target_actor_id = actor_url(base, target.username)
     if await repository.is_following(actor_record.username, target_actor_id):
+        # Re-invite even here, best-effort -- confirmed live 2026-07-28: a
+        # `following` row can outlive actual room membership (e.g. leaving
+        # a local-followed Profile Room doesn't clear it the way leaving a
+        # Remote User Room does -- there's no per-room unfollow trigger for
+        # a room that isn't one, see bridge.membership.maybe_handle_leave),
+        # and without this, "already following" was a permanent dead end:
+        # `;follow` refused to do anything, and there was no other
+        # self-service way back in (";rejoin"/knock auto-accept only cover
+        # your OWN Profile Room or a Remote User Room, never someone
+        # else's Profile Room you merely follow).
+        if target.room_id:
+            try:
+                await request.app.state.synapse.invite_user(target.room_id, sender, as_user_id=bot_mxid)
+            except SynapseError as exc:
+                if exc.errcode != "M_FORBIDDEN":
+                    logger.warning("Could not invite %s to %s: %s", sender, target.room_id, exc)
         if not quiet:
             await _notice(request, room_id, f"You're already following {handle}.")
         return None  # already following -- success as far as any caller cares
