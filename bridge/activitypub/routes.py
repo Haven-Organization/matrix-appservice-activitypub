@@ -69,6 +69,7 @@ from bridge.activitypub.webfinger import build_local_webfinger_document, parse_a
 from bridge.commands import _effective_third_party_mode
 from bridge.inbox_dispatch import handle_activity
 from bridge.media import build_ap_attachment, media_caption
+from bridge.mentions import reconstruct_note_mentions
 from bridge.peertube import (
     VIDEO_METADATA_STATE_TYPE,
     VIDEO_VIEWS_STATE_TYPE,
@@ -1111,11 +1112,28 @@ async def _fetch_room_outbox_notes(
         federated = await repository.get_federated_event_by_matrix_event(matrix_event_id)
         if federated is None:
             continue
+        # Same raw-vs-effective split as get_note: m.mentions/m.relates_to
+        # are original-event-only fields an edit's m.new_content never
+        # carries (see _effective_event_content's own docstring), so both
+        # derive_in_reply_to and reconstruct_note_mentions need the RAW
+        # content specifically, not the latest-edit one the body/HTML below
+        # is otherwise correctly rendered from.
+        raw_event_content = matrix_event.get("content") or {}
         event_content = _effective_event_content(matrix_event)
         attachment = build_ap_attachment(base, event_content)
         body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
         if not body and attachment is None:
             continue
+        in_reply_to = await derive_in_reply_to(repository, raw_event_content)
+
+        note_tags: list[dict] = []
+        if not federated.reposted_object_id and body:
+            body, note_tags, mention_links = await reconstruct_note_mentions(
+                request, body=body, event_content=raw_event_content,
+                in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
+            )
+            content_html = plain_text_to_note_html(body, mention_links)
+
         origin_server_ts = matrix_event.get("origin_server_ts") or 0
         note = Note(
             id=federated.ap_object_id,
@@ -1126,8 +1144,9 @@ async def _fetch_room_outbox_notes(
             cc=[followers_url(base, username)],
             # Without this, a reply reconstructed here reads as a standalone
             # post to anyone fetching it -- see derive_in_reply_to.
-            in_reply_to=await derive_in_reply_to(repository, event_content),
+            in_reply_to=in_reply_to,
             attachment=[attachment] if attachment else [],
+            tag=note_tags,
             quote_uri=quote_uri,
         )
         notes.append((origin_server_ts, note))
@@ -1336,13 +1355,32 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     if not _body and attachment is None:
         raise HTTPException(status_code=410, detail="Gone")
 
+    # Without this, a fetched copy of a reply reads as a standalone post --
+    # the delivered Create had inReplyTo but this reconstruction didn't.
+    # See derive_in_reply_to. Computed once here (rather than inline below,
+    # its previous spot) since reconstruct_note_mentions also needs it, to
+    # carry over the parent's own participants the same way a live send does.
+    in_reply_to = await derive_in_reply_to(repository, raw_event_content)
+
     note_tags: list[dict] = []
+    mention_links: dict[str, str] = {}
+    if not federated.reposted_object_id and _body:
+        # A repost echo's content is entirely synthetic (build_repost_note_
+        # content, via _reconstruct_note_body's own repost branch above) --
+        # never real user-typed text with mentions of its own to resolve.
+        _body, note_tags, mention_links = await reconstruct_note_mentions(
+            request, body=_body, event_content=raw_event_content,
+            in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
+        )
+        content_html = plain_text_to_note_html(_body, mention_links)
+
     guest_mention = await _guest_post_owner_mention(request, federated)
     if guest_mention is not None:
         owner_handle, owner_actor_id = guest_mention
         tacked_body = _body if owner_handle in _body else f"{owner_handle} {_body}".strip()
         if tacked_body:
-            content_html = plain_text_to_note_html(tacked_body, {owner_handle: owner_actor_id})
+            mention_links = {**mention_links, owner_handle: owner_actor_id}
+            content_html = plain_text_to_note_html(tacked_body, mention_links)
         note_tags.append({"type": "Mention", "href": owner_actor_id, "name": owner_handle})
 
     note = Note(
@@ -1352,10 +1390,7 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
         published=_matrix_ts_to_iso(matrix_event.get("origin_server_ts")),
         to=[AS_PUBLIC],
         cc=[followers_url(base, username)],
-        # Without this, a fetched copy of a reply reads as a standalone
-        # post -- the delivered Create had inReplyTo but this
-        # reconstruction didn't. See derive_in_reply_to.
-        in_reply_to=await derive_in_reply_to(repository, raw_event_content),
+        in_reply_to=in_reply_to,
         attachment=[attachment] if attachment else [],
         tag=note_tags,
         quote_uri=quote_uri,

@@ -301,16 +301,67 @@ async def resolve_plaintext_mentions(
         if key in already_tagged or key in seen:
             continue
         seen.add(key)
+        # The tag's own `name` keeps the EXACT casing as typed (match.group(0),
+        # not the lowercased `key` used only for dedup/already_tagged above)
+        # -- confirmed live 2026-07-31: plain_text_to_note_html's own anchor
+        # insertion does a literal (case-sensitive) substring match against
+        # the original body text, so a lowercased name like "@BadFediPosts"
+        # typed but "@badfediposts" tagged silently never matched anything,
+        # leaving the mention un-linked in content even though the Mention
+        # tag itself was otherwise entirely correct.
+        original_handle = match.group(0)
         try:
             actor_id = await resolve_remote_actor_id(http_client, key)
         except WebfingerUnreachableError:
             logger.info("Could not reach %r to resolve via WebFinger; linking a guessed profile URL", key)
-            tags.append({"type": "Mention", "href": f"https://{domain}/@{username}", "name": f"@{key}"})
+            tags.append({"type": "Mention", "href": f"https://{domain}/@{username}", "name": original_handle})
             continue
         except WebfingerError:
             logger.info("Could not resolve plaintext mention %r via WebFinger; leaving as text", key)
             continue
-        tags.append({"type": "Mention", "href": actor_id, "name": f"@{key}"})
+        tags.append({"type": "Mention", "href": actor_id, "name": original_handle})
         extra_cc.append(actor_id)
 
     return tags, extra_cc
+
+
+async def reconstruct_note_mentions(
+    request: Request, *, body: str, event_content: dict, in_reply_to: str | None, sender_actor_id: str,
+) -> tuple[str, list[dict], dict[str, str]]:
+    """Re-derive the ``Mention`` tag array (and the anchors it implies in
+    ``content``) a Note's ORIGINAL delivery had, for a caller reconstructing
+    it fresh from its Matrix event instead of trusting a previously pushed
+    copy -- ``bridge.activitypub.routes``' ``get_note``/``get_outbox`` both
+    need this: their own ``_reconstruct_note_body`` never carries any
+    mentions at all (see its own docstring), so a served copy silently
+    dropped every mention a real fediverse client already rendered once --
+    confirmed live 2026-07-31 against Pleroma, which showed a hand-typed
+    ``@user@instance`` as inert text and "Replying to poast" (its own
+    no-real-mentions-found fallback) on refetch, despite the original
+    ``Create`` delivery having gone out with a real tag for it.
+
+    Mirrors ``bridge.reply_bridge.maybe_federate_reply``'s own pipeline
+    exactly -- pill mentions, then hand-typed handles, then (for a reply)
+    the parent's own participants -- just fed from the Matrix event's
+    stored ``body``/``m.mentions`` instead of one a live send already
+    consumed. Returns ``(rewritten_body, tags, mention_links)``:
+    ``rewritten_body`` is ``body`` with any pill mention's display name/mxid
+    swapped for its real handle (see ``resolve_pill_mentions``), and
+    ``mention_links`` is ready for ``plain_text_to_note_html``. Best-effort
+    throughout, same as every function it calls -- never raises."""
+    body, tags, _ = await resolve_pill_mentions(request, body, event_content)
+    already_tagged = {tag["name"].lstrip("@").lower() for tag in tags if tag.get("name")}
+    plaintext_tags, _ = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
+    tags += plaintext_tags
+
+    if in_reply_to:
+        participant_tags, _ = await collect_reply_participants(
+            request,
+            in_reply_to,
+            exclude_actor_ids={sender_actor_id, *(tag["href"] for tag in tags if tag.get("href"))},
+            already_tagged={tag["name"].lstrip("@").lower() for tag in tags if tag.get("name")},
+        )
+        tags += participant_tags
+
+    mention_links = {tag["name"]: tag["href"] for tag in tags if tag.get("name") and tag.get("href")}
+    return body, tags, mention_links
