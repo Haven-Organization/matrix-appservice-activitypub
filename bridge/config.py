@@ -94,6 +94,13 @@ class BridgeSection:
     # doesn't understand it yet -- an operator should turn this on only
     # once they know their users' clients support it.
     msc4027_custom_reactions: bool = False
+    # Whether a message the bridge sends as itself but on behalf of a local
+    # user's own identity (currently just send_repost's "you reposted"
+    # card) carries a real MSC4144 com.beeper.per_message_profile
+    # (id/displayname/avatar_url), so it visually reads as the room
+    # owner's own action instead of the generic bridge bot. On by default;
+    # purely additive, ignored by a client that's never heard of MSC4144.
+    msc4144_per_message_profiles: bool = True
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
     # same convention as Matrix's own m.relates_to) on every mirrored repost
     # (Announce), quote-post, and cross-posted reply echo -- see
@@ -441,6 +448,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", False)),
         msc4503_external_handle=msc4503_external_handle,
         msc4027_custom_reactions=bool(bridge_raw.get("msc4027_custom_reactions", False)),
+        msc4144_per_message_profiles=bool(bridge_raw.get("msc4144_per_message_profiles", True)),
         set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,

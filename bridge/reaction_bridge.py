@@ -203,6 +203,47 @@ async def note_msc4501_native_repost(
         logger.warning("Failed to redact redundant repost card %s", card_event_id, exc_info=True)
 
 
+_PER_MESSAGE_PROFILE_FIELD = "com.beeper.per_message_profile"
+
+
+async def _build_per_message_profile(request: Request, actor_record: ActorRecord) -> dict | None:
+    """MSC4144 ``com.beeper.per_message_profile`` (unstable prefix, since
+    the MSC isn't accepted yet) for a message the bridge sends as itself
+    on behalf of ``actor_record``'s own identity, like ``send_repost``'s
+    "you reposted" card. Reads the Profile Room's live
+    ``m.room.name``/``m.room.avatar`` state, so it always matches their
+    real profile. ``id`` is their real MXID, per the MSC's own grouping
+    semantics.
+
+    Returns None if the setting is off or ``actor_record`` has no room.
+    Best-effort otherwise: a failed state fetch just omits that field."""
+    config = request.app.state.config
+    if not config.bridge.msc4144_per_message_profiles or not actor_record.room_id:
+        return None
+
+    synapse = request.app.state.synapse
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    profile: dict = {"id": actor_record.matrix_user_id}
+
+    try:
+        name_state = await synapse.get_room_state(actor_record.room_id, "m.room.name", "", as_user_id=bot_mxid)
+    except SynapseError:
+        name_state = {}
+    name = name_state.get("name")
+    if name:
+        profile["displayname"] = name
+
+    try:
+        avatar_state = await synapse.get_room_state(actor_record.room_id, "m.room.avatar", "", as_user_id=bot_mxid)
+    except SynapseError:
+        avatar_state = {}
+    avatar_mxc = avatar_state.get("url")
+    if avatar_mxc:
+        profile["avatar_url"] = avatar_mxc
+
+    return profile
+
+
 async def send_repost(
     request: Request,
     *,
@@ -228,7 +269,10 @@ async def send_repost(
     regardless of which room the repost was actually triggered from --
     reacting with the emoji happens wherever the post itself lives (often
     someone else's Remote User Room), which isn't the reposter's own
-    timeline and has none of their own followers watching it.
+    timeline and has none of their own followers watching it. That card
+    also carries a real MSC4144 per-message profile (see
+    ``_build_per_message_profile``), so it reads as ``actor_record``'s own
+    action rather than the generic bridge bot.
 
     Both of those -- ``matrix_event_id`` AND this Profile Room rendering's
     own event id -- are recorded together as a SINGLE ``ReactionRecord``
@@ -369,6 +413,9 @@ async def send_repost(
             formatted_caption=formatted_caption,
             preview_image=preview_image, preview_video=preview_video,
         )
+        per_message_profile = await _build_per_message_profile(request, actor_record)
+        if per_message_profile is not None:
+            notice_content[_PER_MESSAGE_PROFILE_FIELD] = per_message_profile
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
         try:
             notice_event_id = await request.app.state.synapse.send_message_event(

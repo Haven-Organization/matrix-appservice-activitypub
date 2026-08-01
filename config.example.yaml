@@ -75,6 +75,11 @@ bridge:
   # custom-emoji EmojiReact regardless of this setting.
   # msc4027_custom_reactions: false
 
+  # Adds MSC4144 per-message profile data (id/displayname/avatar_url from
+  # the user's Profile Room) to bridge-sent messages acting on their
+  # behalf, like the repost card. On by default; other clients ignore it.
+  # msc4144_per_message_profiles: true
+
   # Set org.matrix.msc4501.social.relates_to on every mirrored repost,
   # quote-post, and cross-posted reply echo. On by default -- purely
   # additive content a non-MSC4501 client just ignores.
