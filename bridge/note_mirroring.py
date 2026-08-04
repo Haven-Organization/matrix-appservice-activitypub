@@ -888,6 +888,15 @@ async def merge_attachment_into_content(
     merged["info"] = info
     raw_filename = attachment["name"] or attachment["url"].rsplit("/", 1)[-1] or "attachment"
     merged["filename"] = filename_with_extension(raw_filename, attachment["media_type"])
+    # A caption-less attachment (the common case for a plain image/video
+    # post) otherwise leaves `body` blank -- real clients (confirmed
+    # against Element's own outbound convention) always fall back to the
+    # filename there instead, since a blank body renders as nothing at
+    # all in a timeline preview/notification/any client that doesn't
+    # specifically know to look at `filename` (MSC2529, not part of the
+    # stable spec).
+    if not merged.get("body"):
+        merged["body"] = merged["filename"]
     return merged, mxc_uri
 
 
