@@ -1492,8 +1492,10 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     # broken/inaccessible ancestor, or one deeper than
     # _resolve_ancestor_chain's own max_depth) -- (parent_handle,
     # parent_author_html, external_link) for the "⤵️ Reply to" header the
-    # ordinary top-level path below adds in that case. See its own
-    # assignment further down for why this exists at all.
+    # ordinary top-level path below adds in that case. Filled in from a
+    # live fetch of the immediate parent when that succeeds, or (if even
+    # THAT 404s) from this post's own Mention tags instead -- see the two
+    # assignments further down.
     unresolved_reply_context: tuple[str, str, str] | None = None
 
     in_reply_to_ap = obj.get("inReplyTo")
@@ -1568,6 +1570,29 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                 parent_handle, parent_author_html = await actor_html_with_avatar(request, immediate_parent_author_id)
                 external_link = _source_post_url(immediate_parent_note) or in_reply_to_ap
                 unresolved_reply_context = (parent_handle, parent_author_html, external_link)
+        else:
+            # The immediate parent itself is unreachable too (confirmed
+            # live 2026-08-05: a genuine 404, not just some older ancestor
+            # further up) -- no object to read attributedTo from. Real
+            # fediverse convention (Mastodon/Pleroma/Misskey alike; see
+            # collect_reply_participants's identical reasoning) is that a
+            # reply's own tag array names its parent's author, so fall
+            # back to reading THIS post's own Mention tags instead of
+            # giving up on a header entirely. Matched by host against
+            # in_reply_to_ap, not just "first tag", so an unrelated CC'd
+            # mention on a different domain is never mistaken for the
+            # parent author. actor_html_with_avatar needs no live fetch
+            # either way -- a real ghost pill if one's on file, else a
+            # plain @user@domain derived straight from the href.
+            in_reply_to_host = urlsplit(in_reply_to_ap).hostname
+            for tag in obj.get("tag") or []:
+                if not isinstance(tag, dict) or tag.get("type") != "Mention":
+                    continue
+                href = tag.get("href")
+                if isinstance(href, str) and urlsplit(href).hostname == in_reply_to_host:
+                    parent_handle, parent_author_html = await actor_html_with_avatar(request, href)
+                    unresolved_reply_context = (parent_handle, parent_author_html, in_reply_to_ap)
+                    break
 
     # Extracted early (not just where it's used for rendering, below) since
     # a quote of a post we already track is itself a relevance signal --
