@@ -709,7 +709,7 @@ def _follow_stat_html(*, label: str, count: int, dialog_id: str | None) -> str:
 
 def render_profile_page(
     *, display_name: str, handle: str, summary_html: str, avatar_url: str | None, banner_url: str | None,
-    posts: list[PostView], older_posts_url: str | None = None,
+    posts: list[PostView], older_posts_url: str | None = None, newer_posts_url: str | None = None,
     followers_count: int = 0, followers_hidden: bool = True, followers: list[PersonRef] | None = None,
     following_count: int = 0, following_hidden: bool = True, following: list[PersonRef] | None = None,
     rss_url: str | None = None,
@@ -755,9 +755,16 @@ def render_profile_page(
         timeline = '<div class="empty-state">No posts yet.</div>'
 
     pagination = ""
-    if older_posts_url:
-        url = html.escape(older_posts_url, quote=True)
-        pagination = f'<div class="pagination"><span class="pagination-spacer"></span><a class="pagination-link" href="{url}">Older posts &rarr;</a></div>'
+    if older_posts_url or newer_posts_url:
+        newer_link = (
+            f'<a class="pagination-link" href="{html.escape(newer_posts_url, quote=True)}">&larr; Newer posts</a>'
+            if newer_posts_url else '<span class="pagination-spacer"></span>'
+        )
+        older_link = (
+            f'<a class="pagination-link" href="{html.escape(older_posts_url, quote=True)}">Older posts &rarr;</a>'
+            if older_posts_url else '<span class="pagination-spacer"></span>'
+        )
+        pagination = f'<div class="pagination">{newer_link}{older_link}</div>'
 
     body = (
         f"{header}\n{dialogs}\n{timeline}\n{pagination}"

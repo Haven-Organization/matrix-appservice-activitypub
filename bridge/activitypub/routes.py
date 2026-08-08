@@ -467,7 +467,21 @@ async def get_actor(request: Request, username: str) -> Response:
         config = request.app.state.config
         from_token = request.query_params.get("before") or None
         posts, next_token = await _build_profile_post_views(request, record, from_token=from_token)
-        older_posts_url = f"/actor/{username}?before={quote(next_token, safe='')}" if next_token else None
+        # newer=<token> threads the CURRENT page's own from_token through to
+        # the next page's "Newer posts" link, so paging forward N times and
+        # then back N times returns to exactly where you started -- a plain
+        # "go to page 1" link wouldn't for anyone more than one page deep.
+        newer_token = request.query_params.get("newer") or None
+        older_posts_url = (
+            f"/actor/{username}?before={quote(next_token, safe='')}"
+            f"&newer={quote(from_token, safe='') if from_token else ''}"
+            if next_token else None
+        )
+        newer_posts_url = None
+        if from_token:
+            newer_posts_url = (
+                f"/actor/{username}?before={quote(newer_token, safe='')}" if newer_token else f"/actor/{username}"
+            )
 
         # Same "count always real, list withheld when hidden" split as the
         # public AP collection endpoints (get_followers/get_following) --
@@ -494,6 +508,7 @@ async def get_actor(request: Request, username: str) -> Response:
             banner_url=record.banner_url,
             posts=posts,
             older_posts_url=older_posts_url,
+            newer_posts_url=newer_posts_url,
             followers_count=len(follower_ids),
             followers_hidden=record.hide_followers,
             followers=followers,
