@@ -42,6 +42,14 @@ def _is_custom_emoji_shortcode(key: str) -> bool:
     return len(key) > 2 and key.startswith(":") and key.endswith(":")
 
 
+def _is_mxc_uri(key: str) -> bool:
+    """Whether ``key`` is a real MSC4027 custom-image reaction's key -- a
+    Matrix client (Element confirmed) sends the image's own ``mxc://...``
+    URI directly as the key, no separate shortcode/fallback field at all,
+    unlike a mirrored AP custom-emoji reaction's ``:shortcode:``."""
+    return key.startswith("mxc://")
+
+
 @dataclass
 class PersonRef:
     """A resolved (avatar/name/profile-link) identity for anyone shown in a
@@ -114,11 +122,20 @@ def summarize_reactions(
     """Groups already-resolved ``ReactionEvent``s into a like count (with
     each liker's identity) and one ``EmojiReaction`` per distinct emoji/
     custom-emoji (each with every person who used it) -- ``custom_emoji_by_event``
-    (from ``ActorRepository.get_custom_emoji_by_reaction_event_ids``, keyed
-    by each reaction event's own ``event_id``) resolves a custom emoji
-    shortcode to its actual image URL, grouped by THAT (not shortcode text
+    (keyed by each reaction event's own ``event_id``) resolves a custom
+    emoji to its actual image URL, grouped by THAT (not the key text
     alone, since the same shortcode means different images on different
     remote instances -- see ``bridge.inbox_dispatch._resolve_custom_emoji_image``).
+    Covers two distinct origins the caller pre-resolves into this same
+    dict: a mirrored AP custom-emoji reaction (``:shortcode:``, resolved
+    via ``ActorRepository.get_custom_emoji_by_reaction_event_ids``) and a
+    real MSC4027 reaction a Matrix client sent directly (``key`` is
+    already the image's own ``mxc://...`` URI -- see ``_is_mxc_uri``,
+    resolved by the caller with a plain URL conversion, no lookup
+    needed). Checked ahead of the key's own shape either way, so it's the
+    dict membership -- not what the key merely looks like -- that decides
+    whether this is a custom-image reaction.
+
     A redacted reaction event has its content stripped to ``{}`` by Matrix's
     own redaction rules, so it naturally never reaches here as a
     ``ReactionEvent`` in the first place (see
@@ -135,14 +152,18 @@ def summarize_reactions(
             like_count += 1
             likers.append(reaction.person)
             continue
-        if _is_custom_emoji_shortcode(key):
-            image_url = custom_emoji_by_event.get(reaction.event_id)
-            if not image_url:
-                continue  # image never resolved (fetch failed, or a redelivered/stale event) -- nothing to show
+        image_url = custom_emoji_by_event.get(reaction.event_id)
+        if image_url:
             group_key = f"custom:{image_url}"
             if group_key not in groups:
-                groups[group_key] = EmojiReaction(key=key, image_url=image_url)
+                # No human-readable shortcode at all for an mxc://-keyed
+                # reaction (see _is_mxc_uri) -- a generic label beats
+                # showing the raw mxc:// URI as alt/title text.
+                display_key = "Custom emoji" if _is_mxc_uri(key) else key
+                groups[group_key] = EmojiReaction(key=display_key, image_url=image_url)
                 order.append(group_key)
+        elif _is_custom_emoji_shortcode(key) or _is_mxc_uri(key):
+            continue  # image never resolved (fetch failed, or a redelivered/stale event) -- nothing to show
         else:
             group_key = f"emoji:{key}"
             if group_key not in groups:

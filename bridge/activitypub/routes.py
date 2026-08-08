@@ -918,10 +918,21 @@ async def _build_post_view(
         sender = reaction_event.get("sender")
         if not isinstance(key, str) or not key or not sender:
             continue
+        event_id = reaction_event.get("event_id") or ""
+        if event_id and key.startswith("mxc://") and event_id not in custom_emoji_url_by_event:
+            # A real MSC4027 reaction a Matrix client sent directly -- key
+            # IS the image's own mxc:// URI already, no shortcode/DB
+            # lookup needed to resolve it (see bridge.web_views._is_mxc_uri).
+            # Already marked published at reaction-time by
+            # bridge.reaction_bridge.maybe_federate_reaction (needed to
+            # federate it out as a real EmojiReact icon), so nothing to
+            # mark here either -- same reasoning as the shortcode case above.
+            try:
+                custom_emoji_url_by_event[event_id] = media_url(base, key)
+            except ValueError:
+                pass
         person = await _resolve_reactor(request, sender)
-        resolved_reaction_events.append(
-            ReactionEvent(key=key, event_id=reaction_event.get("event_id") or "", person=person)
-        )
+        resolved_reaction_events.append(ReactionEvent(key=key, event_id=event_id, person=person))
 
     source_url = event_content.get("external_url") or federated.ap_object_id
 
