@@ -540,6 +540,40 @@ def build_ap_attachment(base_url: str, content: dict) -> dict | None:
     return attachment
 
 
+async def resolve_reconstructed_attachment(request: Request, content: dict) -> dict | None:
+    """``build_ap_attachment``, extended to also recognize an encrypted
+    attachment that was already confirmed and decrypted once before (see
+    ``decrypt_and_reupload_encrypted_attachment``) -- for a route
+    reconstructing a Note fresh from its Matrix event (``get_note``/
+    ``get_outbox``/``_build_post_view``) instead of trusting a previously
+    pushed copy. The Matrix event's own ``content.file`` never changes
+    (events are immutable), so without this, reconstructing a post whose
+    attachment was confirmed and federated successfully the first time
+    still only ever saw the still-encrypted shape on every later refetch,
+    and rendered no attachment at all -- confirmed live 2026-08-07 on a
+    real confirmed encrypted video, whose post fell back to showing its
+    raw Matrix ``body`` (just a bare filename, see
+    ``merge_attachment_into_content``'s own fallback) with nothing
+    playable shown at all.
+
+    Best-effort: an encrypted attachment nobody ever confirmed (still
+    genuinely unresolved) returns None, same as ``build_ap_attachment``
+    already does for any other unrecognized message -- there's truly
+    nothing servable to show for that case either."""
+    base_url = request.app.state.config.bridge.public_base_url
+    attachment = build_ap_attachment(base_url, content)
+    if attachment is not None:
+        return attachment
+    encrypted_mxc = unresolvable_encrypted_attachment_mxc(content)
+    if encrypted_mxc is None:
+        return None
+    repository: ActorRepository = request.app.state.repository
+    decrypted_mxc = await repository.get_custom_emoji_mxc(encrypted_mxc)
+    if not decrypted_mxc:
+        return None
+    return build_ap_attachment(base_url, {**content, "url": decrypted_mxc})
+
+
 # Encrypted attachments (content.file, not a plain content.url).
 #
 # A message like this is never itself an `m.room.encrypted` EVENT. That's

@@ -68,7 +68,7 @@ from bridge.activitypub.urls import (
 from bridge.activitypub.webfinger import build_local_webfinger_document, parse_acct
 from bridge.commands import _effective_third_party_mode
 from bridge.inbox_dispatch import handle_activity
-from bridge.media import build_ap_attachment, media_caption
+from bridge.media import media_caption, resolve_reconstructed_attachment
 from bridge.mentions import reconstruct_note_mentions
 from bridge.peertube import (
     VIDEO_METADATA_STATE_TYPE,
@@ -873,7 +873,7 @@ async def _build_post_view(
             return None
 
     event_content = _effective_event_content(matrix_event)
-    attachment = build_ap_attachment(base, event_content)
+    attachment = await resolve_reconstructed_attachment(request, event_content)
     body, content_html, _quote_uri = _reconstruct_note_body(federated, event_content, attachment)
     # Guest posts re-tack the room owner's mention here too -- see
     # _guest_post_owner_mention; without this, the HTML views show the
@@ -1170,7 +1170,7 @@ async def _fetch_room_outbox_notes(
         # is otherwise correctly rendered from.
         raw_event_content = matrix_event.get("content") or {}
         event_content = _effective_event_content(matrix_event)
-        attachment = build_ap_attachment(base, event_content)
+        attachment = await resolve_reconstructed_attachment(request, event_content)
         body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
         if not body and attachment is None:
             continue
@@ -1384,7 +1384,7 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     # _effective_event_content's docstring).
     raw_event_content = matrix_event.get("content") or {}
     event_content = _effective_event_content(matrix_event)
-    attachment = build_ap_attachment(base, event_content)
+    attachment = await resolve_reconstructed_attachment(request, event_content)
     _body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
 
     # A redaction empties a Matrix event's `content` (Synapse still serves
@@ -1481,7 +1481,7 @@ async def _build_video_view(
     except SynapseError:
         return None
     video_content = video_event.get("content") or {}
-    attachment = build_ap_attachment(base, video_content)
+    attachment = await resolve_reconstructed_attachment(request, video_content)
     if attachment is None:
         return None
 
