@@ -92,6 +92,7 @@ from bridge.web_views import (
     VideoView,
     render_channel_page,
     render_profile_page,
+    render_profile_rss,
     render_thread_page,
     render_video_page,
     summarize_reactions,
@@ -379,6 +380,43 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
     return JSONResponse(content=document, media_type="application/jrd+json")
 
 
+# Declared BEFORE the plain /actor/{username} route below -- Starlette
+# matches routes in declaration order, and {username} alone would
+# otherwise swallow "q.rss" as the username itself (dots are ordinary
+# path-segment characters, not a route boundary), so the more specific
+# pattern has to come first or this route is never reached at all.
+# Also explicitly handles HEAD -- FastAPI does not derive it from a GET
+# route automatically (see get_media/get_actor's identical handling right
+# below), so without this a HEAD request falls through to the generic
+# /actor/{username} route instead, treating "q.rss" as a literal username
+# and 404ing. Confirmed live 2026-08-08: Thunderbird's feed subscriber
+# HEAD-probes a feed URL before GETting it, and truncated the imported
+# feed to a single item once this returned 404, same class of bug as the
+# Misskey HEAD-probe incident below.
+@router.api_route("/actor/{username}.rss", methods=["GET", "HEAD"])
+async def get_actor_rss(request: Request, username: str) -> Response:
+    """RSS 2.0 feed of a local actor's own public posts -- the same
+    ``/@user.rss`` convention real fediverse software (Mastodon
+    confirmed) already serves by appending ``.rss`` to a profile's own
+    URL. See ``bridge.web_views.render_profile_rss`` for the actual feed
+    shape. PeerTube channels don't get one of these -- a video feed isn't
+    the same shape as a post feed, and nothing's asked for that yet."""
+    repository: ActorRepository = request.app.state.repository
+    record = await repository.get_local_actor(username)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+    config = request.app.state.config
+    posts, _next_token = await _build_profile_post_views(request, record)
+    xml = render_profile_rss(
+        display_name=record.display_name or record.username,
+        handle=f"@{record.username}@{config.bridge.domain}",
+        profile_url=actor_url(config.bridge.public_base_url, record.username),
+        avatar_url=record.icon_url,
+        posts=posts,
+    )
+    return Response(content=xml, media_type="application/rss+xml; charset=utf-8")
+
+
 # Explicitly handles HEAD (FastAPI does not derive it from a GET route
 # automatically, same reasoning as get_media's identical handling).
 # Confirmed live 2026-07-24: Misskey HEAD-probes an actor URL as part of
@@ -462,6 +500,7 @@ async def get_actor(request: Request, username: str) -> Response:
             following_count=len(following_ids),
             following_hidden=record.hide_following,
             following=following,
+            rss_url=f"/actor/{username}.rss",
         )
         return HTMLResponse(html_doc)
     actor = await _build_actor(request, record)

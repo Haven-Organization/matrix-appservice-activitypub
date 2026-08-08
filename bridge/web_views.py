@@ -18,11 +18,25 @@ guarantee every mirrored post already relies on.
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import formatdate
 
 _VARIATION_SELECTOR_16 = "️"
 _THUMBS_UP = "\U0001F44D"
+
+# The standard RSS feed symbol (a quarter-circle broadcast icon plus a
+# dot) -- fill="currentColor" so .rss-link's own CSS color (including its
+# :hover swap to the conventional RSS orange) controls it, same as any
+# other inline icon here.
+_RSS_ICON_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">'
+    '<circle cx="5" cy="19" r="2.5"/>'
+    '<path d="M3 9.5a11.5 11.5 0 0 1 11.5 11.5h-3A8.5 8.5 0 0 0 3 12.5v-3Z"/>'
+    '<path d="M3 3a17 17 0 0 1 17 17h-3A14 14 0 0 0 3 6V3Z"/>'
+    '</svg>'
+)
 
 
 def _is_like_key(key: str) -> bool:
@@ -511,7 +525,17 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .page { max-width: 640px; margin: 0 auto; min-height: 100vh; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 .banner { width: 100%; height: 200px; background-size: cover; background-position: center; background-color: var(--border); }
-.profile-header { padding: 0 16px 16px; border-bottom: 1px solid var(--border); }
+/* padding-top: 1px (not 0) is deliberate -- blocks margin collapsing.
+   .avatar-lg's own -48px top margin (it deliberately overlaps the banner
+   above) otherwise collapses straight through a zero-padding parent,
+   pulling .profile-header's OWN top edge up into the banner by the same
+   48px -- which .rss-link's `top: 12px` (correctly anchored to that
+   edge) then inherited, landing it in the banner instead of the bio box
+   below it. Confirmed live 2026-08-07. */
+.profile-header { position: relative; padding: 1px 16px 16px; border-bottom: 1px solid var(--border); }
+.rss-link { position: absolute; top: 12px; right: 16px; color: var(--text-dim); line-height: 0; }
+.rss-link:hover { color: #ee802f; }
+.rss-link svg { width: 20px; height: 20px; display: block; }
 .avatar-lg { width: 96px; height: 96px; border-radius: 50%; border: 4px solid var(--bg-elevated); margin-top: -48px; object-fit: cover; display: block; background: var(--bg-elevated); }
 .avatar-lg.avatar-fallback { display: flex; align-items: center; justify-content: center; font-size: 36px; font-weight: 700; color: var(--text-dim); }
 .profile-header h1 { margin: 12px 0 0; font-size: 20px; }
@@ -688,6 +712,7 @@ def render_profile_page(
     posts: list[PostView], older_posts_url: str | None = None,
     followers_count: int = 0, followers_hidden: bool = True, followers: list[PersonRef] | None = None,
     following_count: int = 0, following_hidden: bool = True, following: list[PersonRef] | None = None,
+    rss_url: str | None = None,
 ) -> str:
     banner_style = f' style="background-image:url(\'{html.escape(banner_url, quote=True)}\')"' if banner_url else ""
     followers_stat = _follow_stat_html(
@@ -696,9 +721,14 @@ def render_profile_page(
     following_stat = _follow_stat_html(
         label="Following", count=following_count, dialog_id=None if following_hidden else "following-modal"
     )
+    rss_link = (
+        f'<a class="rss-link" href="{html.escape(rss_url, quote=True)}" title="RSS feed" aria-label="RSS feed">{_RSS_ICON_SVG}</a>'
+        if rss_url else ""
+    )
     header = f"""
 <div class="banner"{banner_style}></div>
 <div class="profile-header">
+  {rss_link}
   {_avatar_html(display_name, avatar_url, css_class="avatar-lg")}
   <h1>{html.escape(display_name)}</h1>
   <div class="handle">{html.escape(handle)}</div>
@@ -734,6 +764,101 @@ def render_profile_page(
         + '<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     )
     return _page_shell(title=f"{display_name} ({handle})", body=body)
+
+
+# Matches Mastodon's own /@user.rss convention exactly (confirmed against
+# its actual RSS builder source, not guessed): RSS 2.0 with these same
+# two namespaces, in this same order.
+_RSS_NAMESPACES = 'xmlns:webfeeds="http://webfeeds.org/rss/1.0" xmlns:media="http://search.yahoo.com/mrss/"'
+_RSS_ATTACHMENT_MEDIUM = {"Image": "image", "Video": "video", "Audio": "audio"}
+_RSS_TITLE_ATTACHMENT_FALLBACK = {"Image": "Photo", "Video": "Video", "Audio": "Audio"}
+_RSS_TAG_RE = re.compile(r"<[^>]+>")
+_RSS_TITLE_MAX_LEN = 100
+
+
+def _rss_item_title(post: PostView) -> str:
+    """RSS 2.0 requires every item to carry a non-empty ``title`` or
+    ``description`` -- a caption-less media post (``content_html`` empty)
+    has neither otherwise, since ``description`` below is that same
+    ``content_html``. Confirmed live 2026-08-08: Thunderbird's feed reader
+    only kept one item out of a feed entirely made of caption-less media
+    posts, almost certainly for exactly this reason."""
+    plain = " ".join(html.unescape(_RSS_TAG_RE.sub("", post.content_html)).split())
+    if plain:
+        return plain if len(plain) <= _RSS_TITLE_MAX_LEN else plain[: _RSS_TITLE_MAX_LEN - 1] + "…"
+    if post.attachment:
+        return _RSS_TITLE_ATTACHMENT_FALLBACK.get(post.attachment.get("type"), "Post")
+    return "Post"
+
+
+def _rss_item_xml(post: PostView) -> str:
+    link = html.escape(post.source_url, quote=True)
+    pub_date = formatdate(post.origin_server_ts / 1000, usegmt=True)
+    title = html.escape(_rss_item_title(post))
+    # RSS <description> carries HTML as ESCAPED text (entities, not a CDATA
+    # section) -- what every real RSS reader expects to unescape and render
+    # as HTML, and what Mastodon's own Ox-based builder produces too.
+    description = html.escape(post.content_html)
+    media = ""
+    if post.attachment and post.attachment.get("url"):
+        url = html.escape(str(post.attachment["url"]), quote=True)
+        medium = _RSS_ATTACHMENT_MEDIUM.get(post.attachment.get("type"))
+        medium_attr = f' medium="{medium}"' if medium else ""
+        media_type = post.attachment.get("mediaType")
+        type_attr = f' type="{html.escape(str(media_type), quote=True)}"' if media_type else ""
+        media = f'<media:content url="{url}"{type_attr}{medium_attr}/>\n'
+    return (
+        "<item>\n"
+        f"<title>{title}</title>\n"
+        f'<guid isPermaLink="true">{link}</guid>\n'
+        f"<link>{link}</link>\n"
+        f"<pubDate>{pub_date}</pubDate>\n"
+        f"<description>{description}</description>\n"
+        f"{media}"
+        "</item>\n"
+    )
+
+
+def render_profile_rss(
+    *, display_name: str, handle: str, profile_url: str, avatar_url: str | None, posts: list[PostView],
+) -> str:
+    """RSS 2.0 feed of a profile's own public posts -- the same
+    ``/@user.rss`` convention real fediverse software already serves
+    (confirmed against Mastodon's actual RSS builder source): same two
+    namespaces, channel ``image``/``webfeeds:icon`` set to the avatar, one
+    ``<item>`` per post with a permalink ``guid``, an RFC 822 ``pubDate``,
+    the post's own HTML as ``description``, and an MRSS ``media:content``
+    for any attachment."""
+    channel_link = html.escape(profile_url, quote=True)
+    title = html.escape(display_name)
+
+    image_block = ""
+    if avatar_url:
+        avatar = html.escape(avatar_url, quote=True)
+        image_block = (
+            f"<image><url>{avatar}</url><title>{title}</title><link>{channel_link}</link></image>\n"
+            f"<webfeeds:icon>{avatar}</webfeeds:icon>\n"
+        )
+    last_build_date = (
+        f"<lastBuildDate>{formatdate(posts[0].origin_server_ts / 1000, usegmt=True)}</lastBuildDate>\n"
+        if posts else ""
+    )
+    items = "".join(_rss_item_xml(p) for p in posts)
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f"<rss version=\"2.0\" {_RSS_NAMESPACES}>\n"
+        "<channel>\n"
+        f"<title>{title}</title>\n"
+        f"<description>Public posts from {html.escape(handle)}</description>\n"
+        f"<link>{channel_link}</link>\n"
+        f"{image_block}"
+        f"{last_build_date}"
+        "<generator>matrix-appservice-activitypub</generator>\n"
+        f"{items}"
+        "</channel>\n"
+        "</rss>\n"
+    )
 
 
 def render_thread_page(
