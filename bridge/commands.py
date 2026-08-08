@@ -194,6 +194,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from fastapi import Request
 
 from bridge.activitypub.delivery import DeliveryError, deliver_activity
@@ -3268,15 +3269,103 @@ class _BackfillSourceError(Exception):
         self.notice = notice
 
 
+def _item_ap_object_id(item: dict) -> str | None:
+    """The AP object id a raw backfill collection item actually names --
+    ``object.id`` for a ``Create``, the item's own ``id`` for a bare Note
+    (the two shapes ``_note_from_item`` itself accepts). Used to dedupe
+    against ``_discover_mastodon_api_reply_notes``'s own discoveries."""
+    if item.get("type") == "Create":
+        obj = item.get("object")
+        return obj.get("id") if isinstance(obj, dict) else None
+    return item.get("id") if isinstance(item.get("id"), str) else None
+
+
+async def _discover_mastodon_api_reply_notes(
+    request: Request, *, root_ap_object_id: str, limit: int, already_seen: set[str],
+) -> list[dict]:
+    """Best-effort fallback for a thread root whose own AP ``replies``
+    collection under-reports -- confirmed live 2026-08-07 against a real
+    poa.st/Pleroma thread: the collection itself said ``totalItems: 0``
+    while a real remote reply existed and showed up fine through
+    Pleroma's own Mastodon-API ``/context`` endpoint. Pleroma/Akkoma's AP
+    replies collection is a known-unreliable source for this.
+
+    Uses the Mastodon API purely to DISCOVER which posts reply to this
+    one (search by the object's own URL to find its local status id, then
+    ``/statuses/{id}/context`` for descendants) -- every discovered post
+    is then fetched for real via the ordinary signed ``fetch_actor``, so
+    the Note content this bridge actually imports always comes from
+    ActivityPub itself, never parsed out of the Mastodon API response.
+    Both calls are unauthenticated (confirmed live: works for a public
+    thread, no bearer token needed).
+
+    ``already_seen`` are AP object ids the caller already has from the
+    native replies collection -- skipped, so this only adds what that
+    collection missed. Best-effort throughout: non-Mastodon-API software,
+    an unreachable/malformed response, or no match at all just returns an
+    empty list, exactly as if this fallback didn't exist. Returns
+    newest-first, matching ``_collect_recent_items``'s own contract."""
+    http_client = request.app.state.http_client
+    parsed = urlsplit(root_ap_object_id)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    try:
+        search_response = await http_client.get(
+            f"{origin}/api/v1/search", params={"q": root_ap_object_id, "type": "statuses"},
+        )
+        search_response.raise_for_status()
+        statuses = search_response.json().get("statuses") or []
+    except (httpx.HTTPError, ValueError):
+        return []
+    status_id = next(
+        (
+            status.get("id") for status in statuses
+            if isinstance(status, dict) and root_ap_object_id in (status.get("uri"), status.get("url"))
+        ),
+        None,
+    )
+    if not status_id:
+        return []
+
+    try:
+        context_response = await http_client.get(f"{origin}/api/v1/statuses/{status_id}/context")
+        context_response.raise_for_status()
+        descendants = context_response.json().get("descendants") or []
+    except (httpx.HTTPError, ValueError):
+        return []
+
+    discovered_uris: list[str] = []
+    for status in descendants:
+        uri = status.get("uri") if isinstance(status, dict) else None
+        if isinstance(uri, str) and uri not in already_seen and uri not in discovered_uris:
+            discovered_uris.append(uri)
+
+    notes: list[dict] = []
+    for uri in discovered_uris:
+        if len(notes) >= limit:
+            break
+        try:
+            note = await fetch_actor(request, uri)
+        except RemoteActorFetchError:
+            continue
+        if note.get("type") == "Note":
+            notes.append(note)
+    notes.reverse()  # /context's descendants arrive oldest-first
+    return notes
+
+
 async def _resolve_backfill_source(
     request: Request, *, remote_room: RemoteActorRoom, count: int, thread_root_event_id: str | None,
 ) -> tuple[list[dict], str | None]:
     """Fetches and pages whichever collection this backfill draws from --
     the thread root's own ``replies`` (thread mode) or the actor's
     ``outbox`` (the ordinary case) -- and returns ``(raw_items,
-    fallback_author)`` ready for ``_mirror_backfilled_notes``. Raises
-    ``_BackfillSourceError`` with a ready-to-send notice for anything that
-    stops backfilling before it can even start."""
+    fallback_author)`` ready for ``_mirror_backfilled_notes``. Thread mode
+    also falls back to ``_discover_mastodon_api_reply_notes`` when the AP
+    replies collection comes up short, since that's a known-unreliable
+    source on Pleroma/Akkoma. Raises ``_BackfillSourceError`` with a
+    ready-to-send notice for anything that stops backfilling before it
+    can even start."""
     repository = request.app.state.repository
     http_client = request.app.state.http_client
 
@@ -3291,9 +3380,20 @@ async def _resolve_backfill_source(
         except RemoteActorFetchError as exc:
             raise _BackfillSourceError(f"Couldn't fetch that thread's post: {exc}") from exc
         replies = root_note.get("replies")
-        if not replies:
-            raise _BackfillSourceError("That post doesn't expose a replies collection to backfill from.")
-        raw_items = await _collect_recent_items(request, replies, limit=count)
+        raw_items = await _collect_recent_items(request, replies, limit=count) if replies else []
+        if len(raw_items) < count:
+            # The AP replies collection is either missing or came up
+            # short -- see _discover_mastodon_api_reply_notes's own
+            # docstring for why that alone isn't trustworthy (Pleroma/
+            # Akkoma in particular). Only ever ADDS to raw_items, never
+            # replaces it, and never duplicates what's already there.
+            already_seen = {aid for item in raw_items if (aid := _item_ap_object_id(item))}
+            raw_items = raw_items + await _discover_mastodon_api_reply_notes(
+                request, root_ap_object_id=root_event.ap_object_id,
+                limit=count - len(raw_items), already_seen=already_seen,
+            )
+        if not raw_items:
+            raise _BackfillSourceError("Couldn't find any replies to backfill from.")
         return raw_items, None
 
     try:
