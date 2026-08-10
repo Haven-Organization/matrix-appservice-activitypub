@@ -1363,12 +1363,12 @@ async def deliver_to_actor_or_followers(
     local_username = username_from_actor_url(base, target_actor_id)
     recipients = await repository.list_followers(local_username) if local_username is not None else [target_actor_id]
 
-    for recipient_actor_id in recipients:
+    async def _deliver_one(recipient_actor_id: str) -> None:
         async with _DELIVERY_SEMAPHORE:
             inbox = await resolve_actor_inbox(request, recipient_actor_id)
             if inbox is None:
                 logger.warning("No inbox known for %s; skipping delivery", recipient_actor_id)
-                continue
+                return
             try:
                 await deliver_activity(
                     request.app.state.http_client,
@@ -1379,6 +1379,19 @@ async def deliver_to_actor_or_followers(
                 )
             except DeliveryError:
                 logger.warning("Failed to deliver to %s", recipient_actor_id, exc_info=True)
+
+    # Fanned out (bounded by _DELIVERY_SEMAPHORE) rather than one recipient
+    # at a time -- a sequential loop here made this function's own total
+    # wall-clock time scale linearly with follower count, easily exceeding
+    # Synapse's AS-transaction retry timeout for a popular local actor (38
+    # followers, confirmed live 2026-08-10) and causing the SAME
+    # transaction to be redelivered and reprocessed mid-flight -- see
+    # ActorRepository.claim_reaction's docstring for the duplicate-Announce
+    # symptom that produced. Every OTHER multi-recipient caller in this
+    # bridge (e.g. bridge.commands's video publish/edit) already gathers
+    # concurrently instead of awaiting this function in a loop themselves;
+    # this just makes that the default here too, for every caller.
+    await asyncio.gather(*(_deliver_one(recipient_actor_id) for recipient_actor_id in recipients))
 
 
 async def _inviter_for_room(request: Request, room_id: str) -> str:

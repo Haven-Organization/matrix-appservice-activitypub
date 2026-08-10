@@ -1011,6 +1011,22 @@ class PostgresActorRepository:
             record.custom_emoji_mxc,
         )
 
+    async def claim_reaction(self, record: ReactionRecord) -> bool:
+        claimed_event_id = await self._pool.fetchval(
+            """
+            INSERT INTO reactions
+                (activity_id, room_id, event_id, target_ap_object_id,
+                 reactor_ghost_mxid, reactor_matrix_user_id, secondary_event_id, custom_emoji_mxc)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+            """,
+            record.activity_id, record.room_id, record.event_id, record.target_ap_object_id,
+            record.reactor_ghost_mxid, record.reactor_matrix_user_id, record.secondary_event_id,
+            record.custom_emoji_mxc,
+        )
+        return claimed_event_id is not None
+
     async def get_reaction_by_activity_id(self, activity_id: str) -> ReactionRecord | None:
         row = await self._pool.fetchrow("SELECT * FROM reactions WHERE activity_id = $1", activity_id)
         return self._row_to_reaction(row) if row else None

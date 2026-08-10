@@ -1265,6 +1265,27 @@ class SqliteActorRepository:
     async def record_reaction(self, record: ReactionRecord) -> None:
         await self._run(self._record_reaction, record)
 
+    def _claim_reaction(self, record: ReactionRecord) -> bool:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO reactions
+                (activity_id, room_id, event_id, target_ap_object_id,
+                 reactor_ghost_mxid, reactor_matrix_user_id, secondary_event_id, custom_emoji_mxc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (
+                record.activity_id, record.room_id, record.event_id, record.target_ap_object_id,
+                record.reactor_ghost_mxid, record.reactor_matrix_user_id, record.secondary_event_id,
+                record.custom_emoji_mxc,
+            ),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    async def claim_reaction(self, record: ReactionRecord) -> bool:
+        return await self._run(self._claim_reaction, record)
+
     def _get_reaction_by_activity_id(self, activity_id: str) -> ReactionRecord | None:
         row = self._conn.execute(
             "SELECT * FROM reactions WHERE activity_id = ?", (activity_id,)

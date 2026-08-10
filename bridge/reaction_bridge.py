@@ -327,6 +327,22 @@ async def send_repost(
 
     own_actor_id = actor_url(base, actor_record.username)
     activity_id = f"{own_actor_id}/announces/{uuid.uuid4().hex}"
+
+    # Claimed HERE, before any of the slow work below (delivery to a
+    # many-follower reposter can take minutes -- see
+    # deliver_to_actor_or_followers), not just recorded at the end --
+    # see ActorRepository.claim_reaction's own docstring for the
+    # duplicate-Announce race this closes. matrix_event_id is always set
+    # by both real callers (the reaction event itself, or the ;repost
+    # command message), so this is never skipped.
+    if matrix_event_id and not await repository.claim_reaction(
+        ReactionRecord(
+            activity_id=activity_id, room_id=room_id, event_id=matrix_event_id,
+            target_ap_object_id=target_object_id, reactor_matrix_user_id=reactor_matrix_user_id,
+        )
+    ):
+        return ""
+
     announce_activity = Activity(
         id=activity_id,
         type="Announce",
@@ -560,6 +576,23 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
     base = config.bridge.public_base_url
     own_actor_id = actor_url(base, actor_record.username)
     activity_id = f"{own_actor_id}/reacts/{uuid.uuid4().hex}"
+
+    # Claimed before delivery, not just recorded after -- same
+    # duplicate-Announce race send_repost's own identical claim guards
+    # against (see ActorRepository.claim_reaction's docstring):
+    # deliver_to_actor_or_followers below fans out to every follower
+    # whenever target_author_actor_id turns out to be another LOCAL
+    # actor, which is exactly the slow case a Synapse transaction retry
+    # can race against.
+    matrix_event_id = event.get("event_id")
+    if matrix_event_id and not await repository.claim_reaction(
+        ReactionRecord(
+            activity_id=activity_id, room_id=room_id, event_id=matrix_event_id,
+            target_ap_object_id=target_object_id, reactor_matrix_user_id=sender,
+        )
+    ):
+        return True
+
     if _is_custom_image_reaction_key(key):
         # An MSC4027 custom-image reaction -- never a bare Like (there's no
         # "favorite" analog for an arbitrary image pack sticker), always an
@@ -609,7 +642,6 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         private_key_pem=actor_record.private_key_pem,
     )
 
-    matrix_event_id = event.get("event_id")
     if matrix_event_id:
         # target_object_id, not parent.ap_object_id -- for a mirrored
         # repost this is the reposted post's own id (see above), so a later

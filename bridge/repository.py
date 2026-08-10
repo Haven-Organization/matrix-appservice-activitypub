@@ -695,6 +695,26 @@ class ActorRepository(Protocol):
 
     async def record_reaction(self, record: ReactionRecord) -> None: ...
 
+    async def claim_reaction(self, record: ReactionRecord) -> bool:
+        """Atomically inserts ``record`` iff no row for its ``event_id``
+        exists yet -- True if this call won the claim, False if one
+        already exists (a concurrent or Synapse-retried duplicate got
+        there first). Callers with slow work between "decide to federate
+        this reaction" and their own eventual ``record_reaction`` call
+        (delivery to many followers can take minutes -- see
+        ``bridge.reaction_bridge.send_repost``) should call this FIRST,
+        before doing any of that work, and bail out entirely on a False
+        return -- a plain check-then-``record_reaction``-later has a race
+        exactly as wide as that slow work, confirmed live 2026-08-10 (a
+        single 🔁 produced two duplicate Announces/repost cards, exactly
+        the failure mode ``maybe_federate_reaction``'s own existing
+        redelivery guard was supposed to prevent, undermined by how late
+        its ``record_reaction`` call happened). The caller's own final
+        ``record_reaction`` call (attaching ``secondary_event_id`` etc.
+        once known) then just updates the already-claimed row, matching
+        on the same ``activity_id``."""
+        ...
+
     async def get_reaction_by_activity_id(self, activity_id: str) -> ReactionRecord | None: ...
 
     async def get_reaction_by_matrix_event(self, event_id: str) -> ReactionRecord | None:
@@ -1290,6 +1310,12 @@ class InMemoryActorRepository:
         self._reactions_by_matrix_event[record.event_id] = record
         if record.secondary_event_id:
             self._reactions_by_matrix_event[record.secondary_event_id] = record
+
+    async def claim_reaction(self, record: ReactionRecord) -> bool:
+        if record.event_id in self._reactions_by_matrix_event:
+            return False
+        await self.record_reaction(record)
+        return True
 
     async def get_reaction_by_activity_id(self, activity_id: str) -> ReactionRecord | None:
         return self._reactions_by_activity.get(activity_id)
