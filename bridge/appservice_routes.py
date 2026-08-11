@@ -188,11 +188,27 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
     if original_event.get("sender") != sender:
         return True  # someone else's file, claimed (never falls through to ordinary handling), but ignored
 
+    repository = request.app.state.repository
+    if await repository.get_federated_event_by_matrix_event(original_event_id) is not None:
+        # Already confirmed and dispatched by an earlier processing of this
+        # SAME "confirm" reply -- a Synapse-retried AS transaction, same
+        # underlying cause as ActorRepository.claim_reaction's own
+        # docstring (decrypt_and_reupload_encrypted_attachment/
+        # _dispatch_outbound_send below can easily take long enough to
+        # trigger one). _dispatch_outbound_send's own downstream dedup
+        # (e.g. maybe_distribute_profile_post's identical
+        # get_federated_event_by_matrix_event check) already stops the
+        # file being posted to the fediverse a second time, but nothing
+        # stopped THIS function from re-running its own "Sent." notice on
+        # every retry -- confirmed live 2026-08-10, two duplicate "Sent."
+        # notices ~17s apart for one confirmed video.
+        return True
+
     original_content = original_event.get("content") or {}
     new_content = original_content.get("m.new_content")
     effective_content = new_content if isinstance(new_content, dict) else original_content
     resolved_mxc = await decrypt_and_reupload_encrypted_attachment(
-        request.app.state.http_client, synapse, request.app.state.repository, effective_content,
+        request.app.state.http_client, synapse, repository, effective_content,
     )
     if resolved_mxc is None:
         try:
