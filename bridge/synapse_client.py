@@ -742,3 +742,21 @@ class SynapseClient:
             "GET", f"/_synapse/admin/v1/users/{user_id}/joined_rooms", token=self._admin_token
         )
         return result.get("joined_rooms") or []
+
+    async def admin_list_federation_destinations(self) -> list[dict[str, Any]]:
+        """Every remote homeserver Synapse has ever tried to federate with,
+        with its own outbound delivery health (``failure_ts``/``retry_last_ts``/
+        ``retry_interval``, all ms epoch or 0/None) -- used by
+        ``bridge.outage_recovery`` to detect OUR OWN network being down (many
+        unrelated destinations all failing within the same tight window can't
+        be explained by them, only by us). Fetched in one page (confirmed
+        live 2026-08-13: ~9000 destinations, well under a second) rather than
+        paginating via ``next_token`` -- ``order_by=failure_ts`` was tried
+        first and returned malformed room-ID-shaped ``destination`` values on
+        this Synapse version, so this deliberately fetches everything
+        unsorted and leaves ordering to the caller."""
+        result = await self._request(
+            "GET", "/_synapse/admin/v1/federation/destinations",
+            token=self._admin_token, params={"limit": 20000},
+        )
+        return result.get("destinations") or []

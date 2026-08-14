@@ -26,6 +26,7 @@ from bridge.activitypub.urls import main_key_id
 from bridge.appservice_routes import router as appservice_router
 from bridge.config import BridgeConfig, ConfigError
 from bridge.ghosts import ensure_ghost_user
+from bridge.outage_recovery import outage_recovery_loop
 from bridge.repository import ActorRepository
 from bridge.service_actor import load_or_create_service_actor
 from bridge.sqlite_repository import SqliteActorRepository
@@ -191,12 +192,18 @@ def create_app(
                 )
 
         sync_task = asyncio.create_task(third_party_profile_sync_loop(app))
+        outage_task = asyncio.create_task(outage_recovery_loop(app))
         try:
             yield
         finally:
             sync_task.cancel()
+            outage_task.cancel()
             try:
                 await sync_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await outage_task
             except asyncio.CancelledError:
                 pass
             await http_client.aclose()

@@ -138,6 +138,16 @@ CREATE TABLE IF NOT EXISTS published_media (
     published_at REAL NOT NULL
 );
 
+-- Append-only log of automatic outage-recovery sweeps -- see
+-- bridge.outage_recovery. detected_at (this bridge's own wall-clock time)
+-- is what the recovery loop's cooldown checks against.
+CREATE TABLE IF NOT EXISTS outage_recoveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at REAL NOT NULL,
+    outage_started_at INTEGER NOT NULL,
+    destinations_affected INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reactions (
     activity_id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL,
@@ -890,6 +900,13 @@ class SqliteActorRepository:
     async def list_third_party_records(self) -> list[ActorRecord]:
         return await self._run(self._list_third_party_records)
 
+    def _list_local_usernames(self) -> list[str]:
+        rows = self._conn.execute("SELECT username FROM local_actors WHERE room_id != ''").fetchall()
+        return [row["username"] for row in rows]
+
+    async def list_local_usernames(self) -> list[str]:
+        return await self._run(self._list_local_usernames)
+
     def _is_blocked(self, username: str, remote_actor_id: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM blocked_actors WHERE username = ? AND remote_actor_id = ?",
@@ -1235,6 +1252,26 @@ class SqliteActorRepository:
 
     async def mark_media_published(self, mxc_uri: str) -> None:
         await self._run(self._mark_media_published, mxc_uri)
+
+    def _get_last_outage_recovery_at(self) -> float | None:
+        row = self._conn.execute("SELECT max(detected_at) FROM outage_recoveries").fetchone()
+        return row[0] if row else None
+
+    async def get_last_outage_recovery_at(self) -> float | None:
+        return await self._run(self._get_last_outage_recovery_at)
+
+    def _record_outage_recovery(self, detected_at: float, outage_started_at: int, destinations_affected: int) -> None:
+        self._conn.execute(
+            "INSERT INTO outage_recoveries (detected_at, outage_started_at, destinations_affected) "
+            "VALUES (?, ?, ?)",
+            (detected_at, outage_started_at, destinations_affected),
+        )
+        self._conn.commit()
+
+    async def record_outage_recovery(
+        self, *, detected_at: float, outage_started_at: int, destinations_affected: int
+    ) -> None:
+        await self._run(self._record_outage_recovery, detected_at, outage_started_at, destinations_affected)
 
     # -- reactions -----------------------------------------------------------
 

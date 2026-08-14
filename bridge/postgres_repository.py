@@ -150,6 +150,20 @@ _SCHEMA_STATEMENTS = [
         published_at DOUBLE PRECISION NOT NULL
     )
     """,
+    # Append-only log of automatic outage-recovery sweeps -- see
+    # bridge.outage_recovery. detected_at (this bridge's own wall-clock
+    # time) is what the recovery loop's cooldown checks against, so a
+    # detected outage cluster never triggers a second sweep within the
+    # cooldown window even if the destinations bookkeeping this reads
+    # from wobbles slightly between checks.
+    """
+    CREATE TABLE IF NOT EXISTS outage_recoveries (
+        id BIGSERIAL PRIMARY KEY,
+        detected_at DOUBLE PRECISION NOT NULL,
+        outage_started_at BIGINT NOT NULL,
+        destinations_affected INTEGER NOT NULL
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS reactions (
         activity_id TEXT PRIMARY KEY,
@@ -731,6 +745,13 @@ class PostgresActorRepository:
         )
         return [self._row_to_actor(row) for row in rows]
 
+    async def list_local_usernames(self) -> list[str]:
+        # room_id != '' -- a genuine local user with a real Profile Room and
+        # matrix_user_id, not a Follow-Only third-party placeholder (see
+        # list_third_party_records's identical room_id filter, inverted).
+        rows = await self._pool.fetch("SELECT username FROM local_actors WHERE room_id != ''")
+        return [row["username"] for row in rows]
+
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
         row = await self._pool.fetchrow(
             "SELECT 1 FROM blocked_actors WHERE username = $1 AND remote_actor_id = $2", username, remote_actor_id
@@ -986,6 +1007,20 @@ class PostgresActorRepository:
         await self._pool.execute(
             "INSERT INTO published_media (mxc_uri, published_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             mxc_uri, time.time(),
+        )
+
+    # -- outage recovery -------------------------------------------------------
+
+    async def get_last_outage_recovery_at(self) -> float | None:
+        return await self._pool.fetchval("SELECT max(detected_at) FROM outage_recoveries")
+
+    async def record_outage_recovery(
+        self, *, detected_at: float, outage_started_at: int, destinations_affected: int
+    ) -> None:
+        await self._pool.execute(
+            "INSERT INTO outage_recoveries (detected_at, outage_started_at, destinations_affected) "
+            "VALUES ($1, $2, $3)",
+            detected_at, outage_started_at, destinations_affected,
         )
 
     # -- reactions -----------------------------------------------------------

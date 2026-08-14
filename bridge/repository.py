@@ -451,6 +451,12 @@ class ActorRepository(Protocol):
         (see ``ActorRecord.is_third_party``'s docstring)."""
         ...
 
+    async def list_local_usernames(self) -> list[str]:
+        """Every genuine local user with a real Profile Room (``room_id``
+        set) -- the inverse filter of ``list_third_party_records``. Used by
+        ``bridge.outage_recovery`` to find who to DM a summary to."""
+        ...
+
     async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
         """Grant third-party access to ``value`` (an MXID, room ID, or
         homeserver domain depending on ``rule_type``). Idempotent -- granting
@@ -806,6 +812,17 @@ class ActorRepository(Protocol):
 
     async def mark_media_published(self, mxc_uri: str) -> None: ...
 
+    async def get_last_outage_recovery_at(self) -> float | None:
+        """Wall-clock ``time.time()`` this bridge process last recorded an
+        automatic outage-recovery sweep (see ``bridge.outage_recovery``), or
+        None if it never has. The recovery loop's own cooldown check against
+        this, not the detected outage's own timing -- see that module."""
+        ...
+
+    async def record_outage_recovery(
+        self, *, detected_at: float, outage_started_at: int, destinations_affected: int
+    ) -> None: ...
+
     async def get_ghost_profile(self, actor_id: str) -> GhostProfile | None:
         """The display name/avatar URL last synced to this actor's ghost, or
         None if we've never synced one (a brand new ghost)."""
@@ -997,6 +1014,7 @@ class InMemoryActorRepository:
         self._processed_txn_ids: set[str] = set()
         self._processed_txn_order: deque[str] = deque()
         self._published_media: set[str] = set()
+        self._outage_recoveries: list[tuple[float, int, int]] = []
         self._reactions_by_activity: dict[str, ReactionRecord] = {}
         self._reactions_by_matrix_event: dict[str, ReactionRecord] = {}
         self._poll_votes_by_activity: dict[str, PollVoteRecord] = {}
@@ -1133,6 +1151,9 @@ class InMemoryActorRepository:
             for state in self._actors.values()
             if state.record.is_third_party and not state.record.room_id
         ]
+
+    async def list_local_usernames(self) -> list[str]:
+        return [username for username, state in self._actors.items() if state.record.room_id]
 
     async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
         self._third_party_allows[(rule_type, value)] = ThirdPartyAllowRecord(
@@ -1304,6 +1325,14 @@ class InMemoryActorRepository:
 
     async def mark_media_published(self, mxc_uri: str) -> None:
         self._published_media.add(mxc_uri)
+
+    async def get_last_outage_recovery_at(self) -> float | None:
+        return max((row[0] for row in self._outage_recoveries), default=None)
+
+    async def record_outage_recovery(
+        self, *, detected_at: float, outage_started_at: int, destinations_affected: int
+    ) -> None:
+        self._outage_recoveries.append((detected_at, outage_started_at, destinations_affected))
 
     async def record_reaction(self, record: ReactionRecord) -> None:
         self._reactions_by_activity[record.activity_id] = record
