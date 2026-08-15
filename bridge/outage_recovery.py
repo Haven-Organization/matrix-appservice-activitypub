@@ -74,7 +74,21 @@ def _find_outage_cluster(failure_timestamps_ms: list[int]) -> tuple[int, int] | 
 async def check_for_outage_and_recover(app: FastAPI) -> None:
     """One check: look for a recent mass-failure cluster in Synapse's own
     federation bookkeeping, and if one hasn't already been handled recently,
-    sweep every followed account's outbox for anything missed."""
+    sweep every followed account's outbox for anything missed.
+
+    Entirely a no-op when ``bridge.use_synapse_admin_api`` is off -- unlike
+    the OTHER admin-API-gated features (see that setting's own docstring,
+    ``bridge.commands._list_bridge_managed_rooms``), there's no slower
+    bridge-side fallback available here: federation delivery bookkeeping
+    (who's failing to receive from us, and since when) is inherently
+    Synapse-internal state with no Client-Server API equivalent at all, not
+    something this bridge could reconstruct another way. A homeserver that
+    doesn't grant the Admin API (or isn't Synapse at all) just never gets
+    automatic outage detection -- the one-time manual sweep this was built
+    from (``;backfill`` per followed account) still works regardless."""
+    config = app.state.config
+    if not config.bridge.use_synapse_admin_api:
+        return
     repository = app.state.repository
     synapse = app.state.synapse
 
