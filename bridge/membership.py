@@ -432,6 +432,16 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     content = event.get("content") or {}
     if content.get("membership") != "join":
         return False
+    prev_content = (event.get("unsigned") or {}).get("prev_content") or {}
+    if prev_content.get("membership") == "join":
+        # An in-room profile update (avatar_url/displayname), not an actual
+        # join -- Matrix reuses m.room.member's own "join" membership value
+        # for both, since a per-room profile snapshot lives on the same
+        # event. Without this check, changing your avatar in your own
+        # Profile Room re-triggered the whole first-join flow (space
+        # add, "Welcome to the fediverse!" notice, etc.) every time --
+        # confirmed live 2026-08-16.
+        return False
 
     room_id = event.get("room_id", "")
     joined_user = event.get("state_key", "")
