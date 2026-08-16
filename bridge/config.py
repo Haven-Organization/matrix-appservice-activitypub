@@ -49,17 +49,19 @@ class BridgeSection:
     # override this with an explicit argument; anyone else always gets this
     # default.
     backfill_default_count: int = 15
-    # Whether to set org.matrix.msc4501.social.profile_room_id (MSC4133
+    # Whether to set org.matrix.msc4501.social.profile_room (MSC4133
     # Extensible Profiles) on every ghost, pointing at its Remote User
-    # Room -- see bridge.note_mirroring.set_ghost_profile_room_id. Off by
+    # Room -- see bridge.note_mirroring.set_ghost_profile_room. Off by
     # default, matching Synapse's own default for MSC4133 itself: it
     # requires experimental_features.msc4133_enabled: true in
     # homeserver.yaml (confirmed against Synapse's own source, 2026-07-08)
     # -- not set by default even there, so a fresh bridge deployment
     # shouldn't eat a guaranteed-failing request on every ghost
     # registration until the operator has actually opted into MSC4133 on
-    # the homeserver side too. Turn on once that's done.
-    set_msc4501_profile_room_id: bool = False
+    # the homeserver side too. Turn on once that's done. Renamed from
+    # set_msc4501_profile_room_id 2026-08-15, matching the field's own
+    # rename (now a {room_id, via} block, not a bare room-id string).
+    set_msc4501_profile_room: bool = False
     # Whether/where to set org.matrix.msc4503.external_handle (MSC4503,
     # "External Protocol Handles") on every ghost -- carrying the actual
     # ActivityPub handle (e.g. "@alice@mastodon.social") a display name and
@@ -69,13 +71,13 @@ class BridgeSection:
     # event_external_handle_content):
     #   - "profile": an MSC4133 profile field on the ghost's own Matrix
     #     account, kept current -- needs the homeserver's own MSC4133
-    #     support (same as set_msc4501_profile_room_id above; not on by
+    #     support (same as set_msc4501_profile_room above; not on by
     #     default even there).
     #   - "events": a point-in-time snapshot on every event the ghost
     #     sends -- no such dependency, always safe/additive.
     #   - "both": both of the above.
     #   - "off" (default): neither -- same off-by-default reasoning as
-    #     set_msc4501_profile_room_id, since at least the "profile" half
+    #     set_msc4501_profile_room, since at least the "profile" half
     #     needs an explicit homeserver opt-in first.
     msc4503_external_handle: str = "off"
     # Whether an inbound Like/EmojiReact whose custom-emoji shortcode
@@ -445,7 +447,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         internal_base_url=internal_base_url.rstrip("/") if internal_base_url else None,
         accept_federated_knocks=bool(bridge_raw.get("accept_federated_knocks", False)),
         backfill_default_count=int(bridge_raw.get("backfill_default_count", 15)),
-        set_msc4501_profile_room_id=bool(bridge_raw.get("set_msc4501_profile_room_id", False)),
+        set_msc4501_profile_room=bool(bridge_raw.get("set_msc4501_profile_room", False)),
         msc4503_external_handle=msc4503_external_handle,
         msc4027_custom_reactions=bool(bridge_raw.get("msc4027_custom_reactions", False)),
         msc4144_per_message_profiles=bool(bridge_raw.get("msc4144_per_message_profiles", True)),

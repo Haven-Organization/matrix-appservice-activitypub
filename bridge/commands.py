@@ -288,7 +288,7 @@ from bridge.note_mirroring import (
     unfollow_remote_actor,
 )
 from bridge.note_mirroring import send_bridge_info as _send_bridge_info
-from bridge.note_mirroring import set_ghost_profile_room_id as _set_ghost_profile_room_id
+from bridge.note_mirroring import set_ghost_profile_room as _set_ghost_profile_room
 from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
 from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
 from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
@@ -1688,7 +1688,7 @@ async def _establish_remote_follow(
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
-        await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(request, mxid=mxid, handle=handle, profile_url=extract_actor_url(actor_doc))
         await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
         if banner_mxc:
@@ -3810,7 +3810,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
-        await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(
             request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc),
         )
@@ -4392,7 +4392,7 @@ async def _handle_repost(
     preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
         request, preview_target
     )
-    post_link = matrix_to_link(preview_target.room_id, preview_target.event_id)
+    post_link = matrix_to_link(preview_target.room_id, preview_target.event_id, via=[config.synapse.server_name])
 
     # preview_text alongside preview media means the post had BOTH media
     # and a real caption (_fetch_post_preview only returns caption-worthy
@@ -4427,6 +4427,7 @@ async def _handle_repost(
             SOCIAL_REL_TYPE_REPOST,
             event_id=preview_target.event_id, room_id=preview_target.room_id,
             sender=original_sender, displayname=original_displayname, content=preview_full_content,
+            via=[config.synapse.server_name],
         )
         # A compliant client's replacement for body/formatted_body: just the
         # reposter's OWN caption, without the "🔁 reposted X's post: ..."
@@ -6459,7 +6460,7 @@ async def _replace_remote_actor_room(
         display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
-    await _set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+    await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
     await set_ghost_external_handle(
         request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(actor_doc)
     )

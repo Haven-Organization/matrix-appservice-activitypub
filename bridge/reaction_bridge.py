@@ -386,7 +386,7 @@ async def send_repost(
         preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
             request, preview_target
         )
-        post_link = matrix_to_link(preview_target.room_id, preview_target.event_id)
+        post_link = matrix_to_link(preview_target.room_id, preview_target.event_id, via=[config.synapse.server_name])
 
         # preview_text alongside preview media means the post had BOTH
         # media and a real caption (_fetch_post_preview only returns

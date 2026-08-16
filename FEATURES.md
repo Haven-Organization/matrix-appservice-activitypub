@@ -53,7 +53,7 @@
 
 - Linking or creating a profile mints an ActivityPub `Actor` document with its own RSA keypair. Your room's name, topic, and avatar map to the actor's name, bio, and icon, pushed live as `Update` on every change.
 - `;banner` sets the actor's header image via `m.room.banner` (MSC4221, currently under its own unstable prefix since Matrix has no stable room banner concept yet).
-- MSC4501 discoverability: a linked Profile Room gets `m.social.profile_user_id` (asserting who it actually belongs to, since the bridge's bot is always its technical creator) with a power level requiring the room's owner to change it, and a ghost's Remote User Room gets `m.social.profile_room_id` set on their own Matrix profile pointing back at it. Both stay in sync across a `;replace room`.
+- MSC4501 discoverability: a linked Profile Room gets `m.social.profile_user_id` (asserting who it actually belongs to, since the bridge's bot is always its technical creator) with a power level requiring the room's owner to change it, and a ghost's Remote User Room gets `m.social.profile_room` (a `{room_id, via}` block) set on their own Matrix profile pointing back at it. Both stay in sync across a `;replace room`.
 - An incoming profile change (`Update{Person}`) syncs the Remote User Room's name/avatar/banner and the ghost's own Matrix profile.
 - `;replace room` recreates the Matrix room behind any identity (Profile Room, Remote User Room, DM, or Chat room) to pick up newer bridge features. It's entirely Matrix-side; nothing is sent over ActivityPub, since the identity itself doesn't change.
 - `;delete profile` is a confirmation-gated, irreversible account deletion. It sends a signed `Delete` to every follower, then erases the local identity.

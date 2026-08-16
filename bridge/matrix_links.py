@@ -7,10 +7,21 @@ can format matrix.to links back to a specific event.
 from __future__ import annotations
 
 import html as _html
+from urllib.parse import urlencode
 
 
-def matrix_to_link(room_id: str, event_id: str) -> str:
-    return f"https://matrix.to/#/{room_id}/{event_id}"
+def matrix_to_link(room_id: str, event_id: str, *, via: list[str] | None = None) -> str:
+    """A matrix.to permalink to a specific event. ``via`` (a list of
+    servers to try when resolving ``room_id``, MSC1704/the Matrix spec's
+    own routing convention -- room IDs aren't independently routable)
+    appends a repeated ``?via=`` query param per server, same shape a real
+    ``matrix.to`` link with routing hints already uses elsewhere on the
+    web -- e.g. MSC4501's own repost-permalink convention (see
+    ``bridge.note_mirroring.social_relates_to``'s identical ``via``)."""
+    link = f"https://matrix.to/#/{room_id}/{event_id}"
+    if via:
+        link += "?" + urlencode([("via", server) for server in via])
+    return link
 
 
 def matrix_to_room_link(room_id: str) -> str:

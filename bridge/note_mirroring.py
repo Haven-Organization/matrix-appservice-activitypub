@@ -91,7 +91,16 @@ SOCIAL_PROFILE_ROOM_TYPE = "org.matrix.msc4501.social.profile"
 # set, not this bridge's to puppet on their behalf, and per MSC4501 itself
 # a local user may deliberately want a different room entirely as their
 # general Matrix-wide social profile.
-SOCIAL_PROFILE_ROOM_ID_FIELD = "org.matrix.msc4501.social.profile_room_id"
+#
+# Renamed from "...profile_room_id" (a bare room-id string) to
+# "...profile_room" (2026-08-15): the MSC now specifies this as a BLOCK,
+# {"room_id": ..., "via": [...]} -- see set_ghost_profile_room's own
+# docstring for why `via` matters here specifically (a room ID alone isn't
+# routable). Still under the unstable "org.matrix.msc4501." prefix -- see
+# SOCIAL_PROFILE_USER_ID_STATE_TYPE's own comment on why this bridge keeps
+# using that instead of the MSC's own eventual stable name until it's
+# actually merged.
+SOCIAL_PROFILE_ROOM_FIELD = "org.matrix.msc4501.social.profile_room"
 
 # MSC4503 (External Protocol Handles) -- a ghost's actual ActivityPub
 # handle (e.g. "@alice@mastodon.social"), which neither displayname (their
@@ -123,11 +132,11 @@ async def set_ghost_external_handle(
 ) -> None:
     """Point ``mxid`` (a ghost) at ``handle`` as its MSC4503
     ``m.external_handle`` profile field -- same MSC4133 mechanism, same
-    best-effort/off-by-default reasoning, as ``set_ghost_profile_room_id``
+    best-effort/off-by-default reasoning, as ``set_ghost_profile_room``
     right above (see ``bridge.config.BridgeSection.msc4503_external_handle``,
     "profile"/"both"). Call this every time a ghost's Remote User Room is
     registered or changes (a first follow, a mention-triggered import, or
-    a ``;replace room``), same call sites as set_ghost_profile_room_id --
+    a ``;replace room``), same call sites as set_ghost_profile_room --
     a handle essentially never changes short of the account itself moving,
     which this bridge has no separate signal for anyway."""
     if request.app.state.config.bridge.msc4503_external_handle not in ("profile", "both"):
@@ -180,7 +189,7 @@ async def event_external_handle_content(request: Request, actor_id: str) -> dict
     return _external_handle_value(request.app.state.config, handle=ghost_profile.handle)
 
 
-# The inverse of SOCIAL_PROFILE_ROOM_ID_FIELD: a room-level state event
+# The inverse of SOCIAL_PROFILE_ROOM_FIELD: a room-level state event
 # (state_key "", content {"user_id": "@alice:example.org"}) asserting
 # which Matrix user a Profile Room actually belongs to -- added to
 # MSC4501 specifically for a case this bridge hits on every single
@@ -257,6 +266,7 @@ def social_relates_to(
     content: dict | None = None,
     content_inline: bool = False,
     displayname: str | None = None,
+    via: list[str] | None = None,
 ) -> dict:
     """Builds a ``SOCIAL_RELATES_TO_FIELD`` value -- shared by every mirrored
     event that relates to another one this way (a repost, a quote-post,
@@ -266,7 +276,13 @@ def social_relates_to(
     ``resolve_actor_matrix_identity``) -- there's no meaningful placeholder
     for a required field. ``displayname`` is the MSC's RECOMMENDED (not
     mandatory) snapshot of the referenced author's display name, included
-    when the caller already has one on hand.
+    when the caller already has one on hand. ``via`` is the MSC's OTHER
+    RECOMMENDED field, added 2026-08-15: the servers to try when resolving
+    ``room_id`` (same convention as ``m.space.child``) -- every caller in
+    this bridge references a room it created itself, so this is always
+    ``[config.synapse.server_name]``; still a caller-supplied param rather
+    than computed here, since this function stays a pure data builder with
+    no ``request``/``config`` of its own.
 
     ``content_inline`` and ``content`` are mutually exclusive:
     ``content_inline=True`` takes precedence and omits ``content`` entirely,
@@ -286,6 +302,8 @@ def social_relates_to(
     value = {"rel_type": rel_type, "event_id": event_id, "room_id": room_id, "sender": sender}
     if displayname:
         value["displayname"] = displayname
+    if via:
+        value["via"] = via
     if content_inline:
         value["content_inline"] = True
     elif content is not None:
@@ -1034,29 +1052,37 @@ async def send_bridge_info(
             logger.info("Could not set %s state event in %s", event_type, room_id, exc_info=True)
 
 
-async def set_ghost_profile_room_id(request: Request, *, mxid: str, room_id: str) -> None:
+async def set_ghost_profile_room(request: Request, *, mxid: str, room_id: str) -> None:
     """Point ``mxid`` (a ghost, never a local user -- see
-    SOCIAL_PROFILE_ROOM_ID_FIELD's docstring) at ``room_id`` as its
-    MSC4501 ``social.profile_room_id`` profile field. Best-effort, same as
-    the rest of the bridge's room bookkeeping -- silently does nothing
-    useful on a homeserver without MSC4133 support enabled, which is NOT
-    the default even on this bridge's own target, Synapse (requires
+    SOCIAL_PROFILE_ROOM_FIELD's docstring) at ``room_id`` as its MSC4501
+    ``social.profile_room`` profile field -- a block, not a bare string,
+    ``{"room_id": room_id, "via": [our own server_name]}``: room IDs
+    aren't independently routable, so without `via` a viewer whose
+    homeserver has never seen this room has no path to actually resolve
+    it. Every room this sets `via` for is one this bridge itself created
+    on its own homeserver, so that's always the one (and only) server
+    worth listing. Best-effort, same as the rest of the bridge's room
+    bookkeeping -- silently does nothing useful on a homeserver without
+    MSC4133 support enabled, which is NOT the default even on this
+    bridge's own target, Synapse (requires
     experimental_features.msc4133_enabled: true in homeserver.yaml,
     confirmed against Synapse's own source 2026-07-08) -- see
-    ``bridge.config.BridgeSection.set_msc4501_profile_room_id``, which
-    lets that be turned off entirely rather than eating a guaranteed-
-    failing request every time on a deployment that hasn't opted in yet.
+    ``bridge.config.BridgeSection.set_msc4501_profile_room``, which lets
+    that be turned off entirely rather than eating a guaranteed-failing
+    request every time on a deployment that hasn't opted in yet.
     Call this every time a ghost's Remote User Room is registered or
     changes (a first follow, a mention-triggered import, or a
     ``;replace room``), so the field never points at a stale,
     already-superseded room."""
-    if not request.app.state.config.bridge.set_msc4501_profile_room_id:
+    config = request.app.state.config
+    if not config.bridge.set_msc4501_profile_room:
         return
     synapse = request.app.state.synapse
+    value = {"room_id": room_id, "via": [config.synapse.server_name]}
     try:
-        await synapse.set_profile_field(mxid, SOCIAL_PROFILE_ROOM_ID_FIELD, room_id)
+        await synapse.set_profile_field(mxid, SOCIAL_PROFILE_ROOM_FIELD, value)
     except SynapseError:
-        logger.info("Could not set %s for %s", SOCIAL_PROFILE_ROOM_ID_FIELD, mxid, exc_info=True)
+        logger.info("Could not set %s for %s", SOCIAL_PROFILE_ROOM_FIELD, mxid, exc_info=True)
 
 
 async def set_ghost_room_banner(
@@ -2556,7 +2582,7 @@ async def ensure_remote_actor_room(
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
-        await set_ghost_profile_room_id(request, mxid=mxid, room_id=new_room_id)
+        await set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(
             request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc)
         )

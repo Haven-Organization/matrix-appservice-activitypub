@@ -51,16 +51,16 @@ bridge:
   # poll's endTime instead.
   # poll_default_duration_days: 7
 
-  # Set org.matrix.msc4501.social.profile_room_id (MSC4133 Extensible
+  # Set org.matrix.msc4501.social.profile_room (MSC4133 Extensible
   # Profiles) on every ghost. Off by default -- needs
   # experimental_features.msc4133_enabled: true in homeserver.yaml first.
-  # set_msc4501_profile_room_id: false
+  # set_msc4501_profile_room: false
 
   # Set org.matrix.msc4503.external_handle (MSC4503) on every ghost, carrying
   # its actual ActivityPub handle (e.g. "@alice@mastodon.social"). One of:
   #   - "off" (default)
   #   - "profile": an MSC4133 profile field (needs the same homeserver
-  #     support as set_msc4501_profile_room_id above)
+  #     support as set_msc4501_profile_room above)
   #   - "events": a snapshot on every event the ghost sends instead
   #   - "both"
   # An admin can force an existing ghost's field into line with a new value via ";refresh".

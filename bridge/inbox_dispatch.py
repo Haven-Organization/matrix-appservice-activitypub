@@ -1092,11 +1092,12 @@ async def _quoted_post_render(
     preview_video: dict[str, object] | None = None
     quoted_author_id: str | None = None
     quoted_ref: tuple[str, str] | None = None
+    via = [request.app.state.config.synapse.server_name]
     post_link = quote_uri
     if existing is not None:
         preview_text, full_content, preview_image, preview_video = await _fetch_post_preview(request, existing)
         quoted_author_id = existing.author_actor_id
-        post_link = matrix_to_link(existing.room_id, existing.event_id)
+        post_link = matrix_to_link(existing.room_id, existing.event_id, via=via)
         quoted_ref = (existing.room_id, existing.event_id)
     else:
         try:
@@ -1110,7 +1111,7 @@ async def _quoted_post_render(
                 preview_text, full_content, preview_image, preview_video = await _fetch_post_preview(
                     request, imported_event
                 )
-                post_link = matrix_to_link(imported_event.room_id, imported_event.event_id)
+                post_link = matrix_to_link(imported_event.room_id, imported_event.event_id, via=via)
                 quoted_ref = (imported_event.room_id, imported_event.event_id)
             else:
                 # Not imported (policy said no, or the import itself
@@ -1761,6 +1762,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             room_id=quoted_room_id,
             sender=quote_render.quoted_sender,
             displayname=quote_render.quoted_displayname,
+            via=[request.app.state.config.synapse.server_name],
             content=quote_render.full_content,
         )
         # A compliant client's replacement for body/formatted_body: just the
@@ -2119,7 +2121,9 @@ async def _echo_reply_in_own_room(
         return
 
     root_event_id = reply_event.thread_root_event_id or parent.event_id
-    thread_link = matrix_to_link(reply_event.room_id, root_event_id)
+    thread_link = matrix_to_link(
+        reply_event.room_id, root_event_id, via=[request.app.state.config.synapse.server_name]
+    )
     parent_handle, parent_author_html = await actor_html_with_avatar(request, parent.author_actor_id)
 
     reply_relates_to: dict | None = None
@@ -2140,6 +2144,7 @@ async def _echo_reply_in_own_room(
                     room_id=parent.room_id,
                     sender=parent_sender,
                     displayname=parent_displayname,
+                    via=[config.synapse.server_name],
                     content=parent_event.get("content") or {},
                 )
             except SynapseError:
@@ -2544,7 +2549,10 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
         imported_attachment_width = imported.first_attachment_width
         imported_attachment_height = imported.first_attachment_height
         if imported.federated_event is not None:
-            imported_link = matrix_to_link(imported.federated_event.room_id, imported.federated_event.event_id)
+            imported_link = matrix_to_link(
+                imported.federated_event.room_id, imported.federated_event.event_id,
+                via=[request.app.state.config.synapse.server_name],
+            )
             imported_ref = (imported.federated_event.room_id, imported.federated_event.event_id)
             if reposted_target is None:
                 # Wasn't already tracked at the top of this function (the
@@ -2792,6 +2800,7 @@ async def _build_repost_message(
             SOCIAL_REL_TYPE_REPOST,
             event_id=quoted_event_id, room_id=quoted_room_id,
             sender=original_sender, displayname=original_displayname,
+            via=[request.app.state.config.synapse.server_name],
             content_inline=content_inline, content=None if content_inline else reposted_content,
         )
         # A compliant client's replacement for body/formatted_body: the
