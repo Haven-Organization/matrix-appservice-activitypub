@@ -72,13 +72,25 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
     """Get-or-create the Matrix room mirroring a Shoot Channel: bot-created/
     owned (not a ghost -- a channel has many different member-ghost
     speakers, not one, unlike a Remote User Room), added as a child of its
-    guild's Space, with every CURRENT local member of that guild invited
-    (``guild_memberships``' own small list -- not Shoot's guild membership,
-    which would need parsing its custom ``Role`` objects, deliberately
-    never done here or anywhere else in this feature -- see this module's
-    own docstring). Returns the existing record unchanged if the room
-    already exists. Best-effort, same as the rest of the bridge's room
-    bookkeeping -- returns None only if room creation itself failed.
+    guild's Space, with its join rule RESTRICTED to that Space (MSC3083 --
+    see ``SynapseClient.create_room``'s own ``restricted_to_room_id``
+    docstring): any current member of the guild's Space can join freely,
+    with no invite needed, and can freely leave and rejoin later, rather
+    than this bridge maintaining its own parallel invite list (the
+    previous approach -- explicitly inviting every ``guild_memberships``
+    row on every channel's first creation -- only ever covered whoever
+    happened to be a guild member AT THAT MOMENT; anyone joining the guild
+    afterward got no path into already-existing channels at all, confirmed
+    live 2026-08-17). The guild's own Space is always created before its
+    first channel room (``bridge.inbox_dispatch._handle_guild_accept``),
+    so ``space_room_id`` below should never actually be missing -- if it
+    somehow is, this logs a warning and still creates the room (falling
+    back to the ordinary invite-only preset default, with no one on the
+    invite list at all -- a genuinely exceptional state at that point, not
+    something worth inventing a second fallback mechanism for). Returns the existing
+    record unchanged if the room already exists. Best-effort, same as the
+    rest of the bridge's room bookkeeping -- returns None only if room
+    creation itself failed.
     """
     repository = request.app.state.repository
     existing = await repository.get_channel_room(channel_actor_id)
@@ -94,21 +106,19 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
         channel_doc = {}
     display_name = channel_doc.get("name") or channel_doc.get("preferredUsername") or "channel"
 
-    # list_guild_members returns local actor USERNAMES (guild_memberships'
-    # own key), not full Matrix user IDs -- create_room's invite= needs the
-    # latter.
-    member_usernames = await repository.list_guild_members(guild_actor_id)
-    invite_mxids = []
-    for member_username in member_usernames:
-        actor_record = await repository.get_local_actor(member_username)
-        if actor_record is not None:
-            invite_mxids.append(actor_record.matrix_user_id)
+    space_room_id = await repository.get_guild_space(guild_actor_id)
+    if space_room_id is None:
+        logger.warning(
+            "No guild space on record for %s while creating a channel room -- %s will be created invite-only "
+            "with no one invited",
+            guild_actor_id, channel_actor_id,
+        )
 
     try:
         room_id = await request.app.state.synapse.create_room(
             as_user_id=bot_mxid,
             name=display_name,
-            invite=invite_mxids,
+            restricted_to_room_id=space_room_id,
         )
     except SynapseError:
         logger.warning("Could not create channel room for %s", channel_actor_id, exc_info=True)

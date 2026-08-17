@@ -265,6 +265,7 @@ class SynapseClient:
         room_version: str | None = None,
         predecessor: dict[str, Any] | None = None,
         join_rule: str | None = None,
+        restricted_to_room_id: str | None = None,
         power_level_content_override: dict[str, Any] | None = None,
         additional_creators: list[str] | None = None,
     ) -> str:
@@ -322,6 +323,17 @@ class SynapseClient:
         ``initial_state`` entry for a given event type takes priority over
         whatever the preset would otherwise have generated for it.
 
+        ``restricted_to_room_id``, if given, is a dedicated convenience for
+        the one ``join_rule: "restricted"`` shape this bridge actually
+        needs (MSC3083, stable since room v9): anyone already a MEMBER of
+        ``restricted_to_room_id`` (typically a Space) can join this room
+        with no invite at all, and can freely leave and rejoin later --
+        Matrix re-checks the condition on every join attempt, it isn't a
+        one-time grant. Sets both ``join_rule`` and the required ``allow``
+        condition together, since a bare ``"restricted"`` join_rule with no
+        ``allow`` list is meaningless (falls back to invite-only per spec).
+        Mutually exclusive with ``join_rule`` above -- pass at most one.
+
         ``power_level_content_override`` is applied on top of the preset's
         normally-computed ``m.room.power_levels`` content (per the C-S API
         spec), not a full replacement -- e.g. ``{"users": {mxid: 99}}``
@@ -369,7 +381,15 @@ class SynapseClient:
         initial_state: list[dict[str, Any]] = []
         if avatar_mxc:
             initial_state.append({"type": "m.room.avatar", "state_key": "", "content": {"url": avatar_mxc}})
-        if join_rule:
+        if restricted_to_room_id:
+            initial_state.append({
+                "type": "m.room.join_rules", "state_key": "",
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": restricted_to_room_id}],
+                },
+            })
+        elif join_rule:
             initial_state.append({"type": "m.room.join_rules", "state_key": "", "content": {"join_rule": join_rule}})
         if initial_state:
             body["initial_state"] = initial_state
