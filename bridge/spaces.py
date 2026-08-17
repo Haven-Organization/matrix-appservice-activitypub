@@ -178,12 +178,17 @@ async def ensure_guild_space(
     is strictly per Matrix user), holding that guild's Channel rooms as
     children (see ``bridge.channel_bridge``). Invites
     ``invite_matrix_user_id`` (whichever local member is joining right now)
-    at 99, same power-level convention as ``ensure_user_space``; the bot is
-    the room's creator/admin throughout. A second local member later
-    joining the SAME guild reuses the existing space and just gets invited
-    into it -- always call this get-or-create, never only on first-ever
-    creation. Returns the space's room ID, or None if creation failed --
-    best-effort, same as the rest of the bridge's room bookkeeping."""
+    at the ordinary default power level -- deliberately NOT
+    ``ensure_user_space``'s 99 override (confirmed live 2026-08-17 as a
+    real bug, not a deliberate choice: this space is shared by every local
+    member who joins the same guild, unlike a per-user space, so whoever
+    happened to join first was left able to kick/ban/redact/rename a space
+    everyone else would eventually share too). The bot is the room's
+    creator/admin throughout. A second local member later joining the SAME
+    guild reuses the existing space and just gets invited into it -- always
+    call this get-or-create, never only on first-ever creation. Returns the
+    space's room ID, or None if creation failed -- best-effort, same as the
+    rest of the bridge's room bookkeeping."""
     repository = request.app.state.repository
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
@@ -204,10 +209,6 @@ async def ensure_guild_space(
             name=guild_name,
             invite=[invite_matrix_user_id],
             room_type=_SPACE_ROOM_TYPE,
-            # Same reasoning as ensure_user_space's identical override --
-            # bot_mxid (the creator) deliberately omitted, see that
-            # function's own comment.
-            power_level_content_override={"users": {invite_matrix_user_id: 99}},
         )
     except SynapseError:
         logger.warning("Could not create guild space for %s", guild_actor_id, exc_info=True)
