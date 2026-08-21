@@ -5766,11 +5766,26 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
     return True
 
 
+class _RoomListingUnreliable(Exception):
+    """Raised by ``_list_bridge_managed_rooms`` when ``bridge.use_synapse_admin_api``
+    is on but the one Admin API call it depends on failed -- e.g. a stale
+    ``synapse.admin_token``. Distinct from that setting being OFF (a
+    deliberate, fully-reliable slower path) and from an individual room's
+    ``get_joined_members`` failing (already tolerated as best-effort,
+    since skipping ONE room doesn't invalidate the rest of the list) --
+    this means the ENTIRE result is untrustworthy, not just incomplete, so
+    callers should say so rather than silently act on an empty/partial
+    list as if it were a genuine answer."""
+
+
 async def _list_bridge_managed_rooms(request: Request, sender: str) -> list[str]:
     """Every bridge-managed room (Remote User Room, ghost DM/Chat room)
     ``sender`` -- a real local Matrix user, never a ghost/the bot -- is
     CURRENTLY a member of. Shared by ``_execute_delete_profile``'s room
-    sweep and ``_list_unfollowed_ghost_rooms``.
+    sweep and ``_list_unfollowed_ghost_rooms``. Raises
+    ``_RoomListingUnreliable`` if ``bridge.use_synapse_admin_api`` is on
+    but its one Admin API call fails -- see that exception's own
+    docstring for why this can't just return a partial/empty list instead.
 
     Ghost DM/Chat rooms are found directly and exactly, straight from this
     bridge's own repository (each row already records its one owning
@@ -5826,9 +5841,20 @@ async def _list_bridge_managed_rooms(request: Request, sender: str) -> list[str]
     if config.bridge.use_synapse_admin_api:
         try:
             joined_rooms = await synapse.admin_list_joined_rooms(sender)
-        except SynapseError:
-            logger.warning("Could not list rooms for %s via Admin API", sender, exc_info=True)
-            joined_rooms = []
+        except SynapseError as exc:
+            # Deliberately NOT the same "best-effort, just skip it" treatment
+            # as an individual room's get_joined_members failing below --
+            # this ONE call stands in for sender's ENTIRE Remote User Room
+            # membership, so silently treating a failure here as "0 rooms"
+            # previously made ;leave unfollowed confidently report "nothing
+            # to leave" and _execute_delete_profile silently skip its whole
+            # room-kick sweep, both indistinguishable from a real empty
+            # result -- confirmed live 2026-08-21 (a stale admin_token, not
+            # a logic bug, but the caller had no way to tell the
+            # difference). Raised so each caller can decide how to be
+            # honest about it instead.
+            logger.error("Could not list rooms for %s via Admin API", sender, exc_info=True)
+            raise _RoomListingUnreliable(str(exc)) from exc
         for candidate_room_id in joined_rooms:
             if await repository.get_remote_actor_room_by_room_id(candidate_room_id) is not None:
                 rooms.append(candidate_room_id)
@@ -5896,7 +5922,19 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
     # the end to land in) or their Fediverse space (kicked separately,
     # next, since it isn't one of these room *kinds* at all).
     space_room_id = await repository.get_user_space(sender)
-    for other_room_id in await _list_bridge_managed_rooms(request, sender):
+    # The identity is already gone from the fediverse's own perspective
+    # (step 1, above) by this point -- there's no "abort the deletion"
+    # option left if this listing turns out unreliable (see
+    # _RoomListingUnreliable's own docstring), only "proceed best-effort
+    # and be honest about what might have been missed" in the final
+    # notice below.
+    room_sweep_incomplete = False
+    try:
+        other_room_ids = await _list_bridge_managed_rooms(request, sender)
+    except _RoomListingUnreliable:
+        other_room_ids = []
+        room_sweep_incomplete = True
+    for other_room_id in other_room_ids:
         if other_room_id in (profile_room_id, space_room_id):
             continue
         try:
@@ -5943,18 +5981,24 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
     # a room both the bot and sender are already in. Otherwise, same as
     # before: post in the profile room itself, still theirs to leave
     # whenever they like, just no longer tied to anything on the fediverse.
+    sweep_caveat = (
+        " (A bridge-side error meant I couldn't reliably remove you from every other room you might have "
+        "been in for this identity -- let the operator know if you're still in some you'd expect to have "
+        "left.)" if room_sweep_incomplete else ""
+    )
     if profile_room_id:
         deletion_notice_content: dict = {
             "msgtype": "m.text",
             "body": f"Your fediverse identity ({record.username}@{config.bridge.domain}) has been "
             "deleted, and this room is no longer associated with ActivityPub. You can safely leave "
-            "it whenever you like.",
+            f"it whenever you like.{sweep_caveat}",
         }
         notice_room_id = profile_room_id
     else:
         deletion_notice_content = {
             "msgtype": "m.text",
-            "body": f"Your fediverse identity ({record.username}@{config.bridge.domain}) has been deleted.",
+            "body": f"Your fediverse identity ({record.username}@{config.bridge.domain}) has been "
+            f"deleted.{sweep_caveat}",
         }
         notice_room_id = room_id
     relates_to = _command_relates_to_var.get()
@@ -5979,9 +6023,12 @@ async def _list_unfollowed_ghost_rooms(
     because they unfollowed), and various on-demand imports (a mention, a
     reply's ancestor chain, someone else's repost) can land a user in a
     Remote User Room's membership without them ever having run ``;follow``
-    there at all. Best-effort against listing itself failing; a room this
-    can't even enumerate just doesn't show up rather than erroring the
-    whole command out."""
+    there at all. Best-effort against an INDIVIDUAL room failing to
+    enumerate; propagates ``_RoomListingUnreliable`` unchanged if the
+    listing itself is entirely untrustworthy (see that exception's own
+    docstring) rather than silently returning an empty/partial list --
+    ``_handle_leave_unfollowed`` is what turns that into an honest
+    message instead of a false "nothing to leave"."""
     repository = request.app.state.repository
     unfollowed: list[tuple[str, str, str]] = []
     for candidate_room_id in await _list_bridge_managed_rooms(request, sender):
@@ -6018,7 +6065,16 @@ async def _handle_leave_unfollowed(request: Request, *, sender: str, room_id: st
         )
         return
 
-    unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+    try:
+        unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+    except _RoomListingUnreliable:
+        await _notice(
+            request, room_id,
+            "Couldn't reliably check your rooms just now (a bridge-side error, not anything about your account) "
+            "-- try again in a bit, or let the operator know if it keeps happening.",
+            relates_to=relates_to,
+        )
+        return
     if not unfollowed:
         await _notice(
             request, room_id,
