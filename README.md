@@ -65,6 +65,16 @@ Running on other homeservers is untested, experimental territory as of this writ
    .venv/bin/python -m bridge.appservice config.yaml appservice-registration.yaml
    ```
 
+   In Docker, this is a one-off run of the same module with the entrypoint overridden (see step 4 below for the mounts this assumes):
+
+   ```sh
+   docker run --rm --entrypoint python \
+     -v $(pwd)/config.yaml:/config/config.yaml:ro \
+     -v bridge-data:/data \
+     ghcr.io/haven-organization/matrix-appservice-activitypub:latest \
+     -m bridge.appservice /config/config.yaml /data/appservice-registration.yaml
+   ```
+
    Add the resulting file's path to your homeserver's own application-service registration config (`app_service_config_files` in `homeserver.yaml`, if you're running Synapse), then restart it.
 
 4. Run the bridge, natively or in Docker:
@@ -80,6 +90,8 @@ Running on other homeservers is untested, experimental territory as of this writ
    **In Docker:** the `Dockerfile` runs the exact same code, so every feature and both storage backends work identically -- it's just a different way to run it. Two settings in `config.yaml` need a container-specific value first, both confirmed live:
    - `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1` -- otherwise nothing outside the container's own network namespace can reach it, even with the port published.
    - If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`) -- that's the volume the image actually creates and can write to as its non-root user.
+
+   The container runs as a fixed, non-root `bridge` user, UID/GID `999:999`. A named volume (like `bridge-data` in the examples above) is chowned automatically and needs nothing extra. A bind mount instead of a named volume needs the host directory owned by that same UID/GID first (`chown -R 999:999 ./data`) -- permission alone (even `chmod 777`) isn't enough on a host running SELinux in enforcing mode (common on Fedora/RHEL/CentOS/Rocky); add the `:z` suffix to that mount instead (`-v ./data:/data:z`, or the same in compose) to relabel it for container access.
 
    A prebuilt multi-arch image (amd64/arm64) is published to `ghcr.io/haven-organization/matrix-appservice-activitypub` on every push to `main`. Simplest form, standalone:
 
