@@ -75,6 +75,7 @@ Opt-in (`bridge.peertube_channels_enabled`, off by default -- every remote view/
 - Channel messages mirror bidirectionally: an incoming channel message is attributed to whichever guild member actually wrote it (never the channel actor itself), and an outgoing Matrix message sent in a channel room federates back out the same way.
 - `;leaveguild`, run inside one of that guild's own channel rooms, sends a real `Undo(Follow)` and drops the bridge's own local membership tracking.
 - `;refresh guild` re-syncs a guild's channel list by hand -- Shoot doesn't federate channel-creation events at all, so a channel created after the guild was joined is otherwise only discovered once someone actually posts in it.
+- `;refresh guild invite CODE@domain` (admin-only) stores an invite code on the guild's own Space. From then on, a local Matrix user who joins that Space or any of its Channel rooms is automatically joined to the guild over ActivityPub too, with no `;joinguild` needed -- an unlinked user is DMed to link a profile first instead of silently failing, and a failed auto-join (bad/expired code, unreachable guild) is DMed rather than dropped. Running it also immediately resyncs any current Space member who's missing a real accepted Follow, covering both a stale code being replaced and anyone who joined before a code was ever set.
 
 ## Discovery and federation plumbing
 

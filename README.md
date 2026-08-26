@@ -16,6 +16,8 @@ Every ActivityPub identity or conversation the bridge manages is backed by an or
 - **Ghost Chat room**: a private 1:1 room carrying ActivityPub `ChatMessage`s (Pleroma/Akkoma's separate instant-messaging concept). Deliberately never the same room as a DM, even between the same two parties.
 - **Notification room**: a private 1:1 room between a local user and the bridge bot itself, named "Fediverse Notifications". Notification messages for new followers, mentions, reposts, and likes/reactions land here.
 - **PeerTube Channel room** (opt-in, `bridge.peertube_channels_enabled`): a Matrix room turned into a real, federating PeerTube-compatible video channel with its own ActivityPub identity, owned by a linked Profile. Posting a video here and running `;publish` federates it to the fediverse.
+- **Guild Space**: a Matrix Space representing a joined Shoot guild (an `Organization` actor), created once the guild's `Accept` for a `;joinguild` (or auto-join) comes back.
+- **Guild Channel room**: one of that guild's text channels, mirrored into a child room under its Guild Space -- created for a channel already known when the guild was joined, or the first time anyone posts in a newer one otherwise.
 
 Every remote account you interact with gets a deterministic "ghost" Matrix user (`@ap_user_instance:yourdomain`) that posts, reacts, and DMs on their behalf inside Matrix. Its display name, avatar, and (for a Remote User Room) banner stay in sync with their real ActivityPub profile.
 
@@ -30,7 +32,7 @@ Every remote account you interact with gets a deterministic "ghost" Matrix user 
 - Follows and moderation
 - Profile and identity
 - PeerTube video channels, publishing and following
-- Guilds and channels (Shoot), joined via invite code
+- Guilds and channels (Shoot), joined via invite code or automatically by joining a Matrix room
 - Discovery and federation plumbing
 
 See [FEATURES.md](FEATURES.md) for a breakdown of how each of these is actually bridged.

@@ -37,6 +37,10 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [`;backfill`](#backfill-n)
 - [`;refresh poll`](#refresh-poll-reply-to-a-poll-or-anything-in-its-thread)
+- [`;joinguild`](#joinguild-codeguildexamplecom)
+- [`;leaveguild`](#leaveguild)
+- [`;refresh guild`](#refresh-guild)
+- [`;refresh guild invite`](#refresh-guild-invite-codedomain)
 - [`;widget`](#widget)
 - [`;allow`](#allow-mxidroomhomeserver-value)
 - [`;disallow`](#disallow-mxidroomhomeserver-value)
@@ -335,6 +339,50 @@ Bare `;refresh` checks for poll-thread context FIRST, before falling back to the
 **Who can run it:** Any local user -- unlike the admin-only `;refresh [@user@instance.org]` below, despite sharing the same keyword.
 
 **Notes:** Best-effort -- if the poll is no longer reachable (deleted, network error), you'll get a notice saying so instead of a silent no-op.
+
+---
+
+## `;joinguild CODE@guild.example.com`
+
+**Syntax:** `;joinguild CODE@guild.example.com`. The code is the bare invite code -- a leading `invite:` is stripped automatically if present.
+
+**What it does:** Joins a Shoot guild (an `Organization` actor) using an invite code, per FEP-bebd. Unlike `;follow`, this can't resolve synchronously: the guild's `Accept`/`Reject` arrives later over its inbox, so this only sends and records the join request -- the notice deliberately doesn't say "Joined," since the code might be invalid or expired. Once accepted, the guild gets its own Matrix Space, with each of its text channels mirrored into a child Channel room.
+
+**Who can run it:** Requires a linked profile.
+
+**Notes:** Fails with a clear notice if you've already joined that guild, the code can't be resolved, or the guild's own actor document can't be fetched. If an admin has already stored an invite code on the guild's Space or Channel rooms (`;refresh guild invite`), you don't need this command at all -- just joining the Space or any Channel room auto-joins you to the guild over ActivityPub, with a DM if you don't have a linked profile yet or the attempt fails.
+
+---
+
+## `;leaveguild`
+
+**Syntax:** `;leaveguild`, no argument, run inside one of that guild's own Channel rooms.
+
+**What it does:** Sends a real `Undo(Follow)` and drops the bridge's own local membership tracking for that guild. The Undo is sent even though Shoot itself doesn't currently act on it, both because it's free and because it's correct behavior for any other implementation that does honor it.
+
+**Who can run it:** Requires a linked profile, run inside one of that guild's Channel rooms.
+
+---
+
+## `;refresh guild`
+
+**Syntax:** `;refresh guild`, run inside one of a joined guild's own Channel rooms.
+
+**What it does:** Re-fetches the guild's live channel list right now and creates a Matrix room for any channel added since it was joined (or since the last refresh). Shoot doesn't federate channel-creation events at all, so a newly-created channel is otherwise only discovered the first time someone actually posts in it.
+
+**Who can run it:** Any local user, from inside one of that guild's Channel rooms -- being present there at all already means the bot invited you as a recorded guild member, the same trust level extended elsewhere in the bridge (e.g. a Profile Room's own topic/name/avatar).
+
+---
+
+## `;refresh guild invite CODE@domain`
+
+**Syntax:** `;refresh guild invite CODE@guild.example.com`, run inside a joined guild's own Space or one of its Channel rooms.
+
+**What it does:** Stores `CODE@domain` on the guild's Space so that a Matrix user who joins the Space, or any of its Channel rooms, from then on is automatically joined to the guild over ActivityPub too -- no `;joinguild` needed from them. Also immediately resyncs: any current Matrix member of the Space who doesn't yet have their own accepted guild Follow gets one sent right away with this code, rather than waiting for them to leave and rejoin. Use this to set a guild's invite code for the first time, or to replace one that's gone stale or expired.
+
+**Who can run it:** Matrix server admins only -- unlike bare `;refresh guild` above, this drives a real federated side effect (a Follow, for every future joiner) rather than just a re-fetch.
+
+**Notes:** A user with no linked profile who joins the Space/a Channel room is DMed instead of silently skipped, telling them to `;link profile` and then `;joinguild` themselves. Anyone the immediate resync couldn't join (e.g. the code turned out to be bad) is reported in the summary count and needs to run `;joinguild` by hand too.
 
 ---
 
