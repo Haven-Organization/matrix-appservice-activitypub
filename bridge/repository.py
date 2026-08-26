@@ -615,6 +615,14 @@ class ActorRepository(Protocol):
         yet."""
         ...
 
+    async def get_guild_by_space_room_id(self, space_room_id: str) -> str | None:
+        """The inverse of ``get_guild_space`` -- which guild (if any)
+        ``space_room_id`` is the Matrix Space for. Used by
+        ``bridge.membership.maybe_handle_join`` to recognize a guild
+        Space's own join event (as opposed to one of its Channel rooms',
+        already resolved separately via ``get_channel_room_by_room_id``)."""
+        ...
+
     async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
         """Cache ``guild_actor_id``'s own ``channels`` collection (each a
         ``(channel_actor_id, name)`` pair) -- see ``_handle_guild_accept``.
@@ -1269,6 +1277,12 @@ class InMemoryActorRepository:
 
     async def get_guild_space(self, guild_actor_id: str) -> str | None:
         return self._guild_spaces.get(guild_actor_id)
+
+    async def get_guild_by_space_room_id(self, space_room_id: str) -> str | None:
+        for guild_actor_id, room_id in self._guild_spaces.items():
+            if room_id == space_room_id:
+                return guild_actor_id
+        return None
 
     async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
         for channel_actor_id, name in channels:

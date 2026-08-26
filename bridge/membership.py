@@ -84,7 +84,13 @@ from urllib.parse import urlsplit
 from fastapi import Request
 
 from bridge.activitypub.urls import actor_url
-from bridge.commands import _COMMAND_PREFIX, _RUNNING_BACKFILLS, _run_auto_backfill
+from bridge.commands import (
+    _COMMAND_PREFIX,
+    _RUNNING_BACKFILLS,
+    _RUNNING_GUILD_AUTO_JOINS,
+    _run_auto_backfill,
+    handle_guild_auto_join,
+)
 from bridge.matrix_links import matrix_to_room_link
 from bridge.note_mirroring import resolve_old_ghost_room_owner, resolve_old_remote_actor_room, unfollow_remote_actor
 from bridge.notifications import notification_actor_html
@@ -459,19 +465,29 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     dm_room_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
     channel_room = await repository.get_channel_room_by_room_id(room_id)
     is_notification_room = await repository.get_bot_dm_room_owner(room_id) == joined_user
+    # A guild's own Space -- distinct from a Channel room (below), which
+    # already resolves its guild via channel_room.guild_actor_id. Neither
+    # kind was in this gate at all before the guild-invite-code auto-join
+    # feature (see below): joining a guild's Space specifically used to
+    # just fall straight through this whole function as unhandled.
+    guild_space_actor_id = await repository.get_guild_by_space_room_id(room_id)
     if (
         remote_room is None and not is_profile_room and dm_room_actor_id is None
-        and channel_room is None and not is_notification_room
+        and channel_room is None and not is_notification_room and guild_space_actor_id is None
     ):
         return False  # not a room the bridge manages for this specific user
 
-    # A Channel room belongs to its GUILD's own Space, not the joining
-    # user's personal Fediverse space -- these are two different space
-    # trees (see bridge.spaces.ensure_guild_space's docstring).
+    # A Channel room (or a guild's own Space) belongs to its GUILD's own
+    # Space tree, not the joining user's personal Fediverse space -- see
+    # bridge.spaces.ensure_guild_space's docstring. The Space itself needs
+    # no add_*_to_space call at all here: it's already the top of its own
+    # tree, not a child of anything.
     if channel_room is not None:
         await add_channel_room_to_guild_space(
             request, guild_actor_id=channel_room.guild_actor_id, child_room_id=room_id
         )
+    elif guild_space_actor_id is not None:
+        pass
     elif is_profile_room:
         await add_room_to_space(
             request, matrix_user_id=joined_user, child_room_id=room_id, order=PROFILE_ROOM_SPACE_ORDER
@@ -482,6 +498,24 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
         )
     else:
         await add_room_to_space(request, matrix_user_id=joined_user, child_room_id=room_id)
+
+    # Joining a guild's Space OR any one of its Channel rooms both count --
+    # a user might land directly in a specific channel (e.g. following a
+    # shared room link) without ever separately "joining the Space" as
+    # its own event, per Matrix's restricted-join mechanics (see
+    # bridge.channel_bridge.ensure_channel_room). Backgrounded, same
+    # "don't block AS-transaction processing on a slow network round trip"
+    # reasoning as the backfill trigger right below -- send_guild_join_follow
+    # involves a real WebFinger lookup, actor fetch, and signed delivery.
+    auto_join_guild_actor_id = (
+        channel_room.guild_actor_id if channel_room is not None else guild_space_actor_id
+    )
+    if auto_join_guild_actor_id is not None:
+        task = asyncio.get_running_loop().create_task(
+            handle_guild_auto_join(request, guild_actor_id=auto_join_guild_actor_id, matrix_user_id=joined_user)
+        )
+        _RUNNING_GUILD_AUTO_JOINS.add(task)
+        task.add_done_callback(_RUNNING_GUILD_AUTO_JOINS.discard)
 
     if remote_room is not None:
         await _notify_if_not_following(request, room_id=room_id, joined_user=joined_user, remote_room=remote_room)

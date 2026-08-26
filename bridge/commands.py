@@ -303,7 +303,13 @@ from bridge.repository import (
     RemoteActorRoom,
 )
 from bridge.room_widget import add_bridge_widget
-from bridge.spaces import NOTIFICATIONS_ROOM_SPACE_ORDER, PROFILE_ROOM_SPACE_ORDER, add_room_to_space
+from bridge.spaces import (
+    NOTIFICATIONS_ROOM_SPACE_ORDER,
+    PROFILE_ROOM_SPACE_ORDER,
+    add_room_to_space,
+    get_guild_invite_code,
+    set_guild_invite_code,
+)
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -1850,52 +1856,47 @@ async def _ensure_following(
     return True
 
 
-async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argument: str) -> None:
-    """Join a Shoot guild (an ``Organization`` actor) using an invite code,
-    per FEP-bebd. ``argument`` is ``CODE@guild.example.com`` -- the bare
-    form, not the ``invite:CODE@domain`` WebFinger resource string itself,
-    which this prepends automatically (see ``resolve_invite_code``).
+class GuildJoinError(Exception):
+    """Raised by ``send_guild_join_follow`` for any reason a guild join
+    couldn't even be sent -- carries a human-readable ``notice`` (same
+    convention as ``_BackfillSourceError``), left to the caller to decide
+    how to surface: a direct command reply for ``;joinguild``, vs. a
+    best-effort log + DM for an auto-triggered join (see
+    ``bridge.membership``)."""
 
-    Unlike ``;follow``, this can't resolve synchronously: the guild's
-    ``Accept``/``Reject`` arrives later over the inbox (see
-    ``bridge.inbox_dispatch``'s ``_handle_accept``/``_handle_reject``), so
-    this only ever sends the join request and records it as pending --
-    the notice deliberately doesn't say "Joined", since the invite code
-    might turn out to be invalid/expired.
-    """
+    def __init__(self, notice: str) -> None:
+        super().__init__(notice)
+        self.notice = notice
+
+
+async def send_guild_join_follow(
+    request: Request, *, actor_record: ActorRecord, code: str, domain: str,
+) -> tuple[str, str]:
+    """Resolves ``CODE@domain`` (the bare form, not the ``invite:CODE@domain``
+    WebFinger resource string itself -- see ``resolve_invite_code``) to a
+    real Shoot guild, sends the FEP-bebd join ``Follow`` signed as
+    ``actor_record``, and records it as pending. Returns ``(guild_actor_id,
+    guild_name)`` once the Follow has actually been sent -- NOT once the
+    guild has actually accepted; that arrives later over the inbox (see
+    ``bridge.inbox_dispatch``'s ``_handle_accept``/``_handle_reject``).
+    Raises ``GuildJoinError`` for any reason it couldn't even be sent (bad/
+    unreachable invite code, a guild we're already a member of, a
+    delivery failure, ...) -- never partially completes: the
+    ``pending_guild_follows`` row is rolled back on any failure after it's
+    recorded. Shared by ``;joinguild`` (``_handle_joinguild``) and the
+    auto-join-on-room-join path (``bridge.membership``)."""
     config = request.app.state.config
     repository = request.app.state.repository
     base = config.bridge.public_base_url
 
-    argument = argument.strip()
-    if "@" not in argument:
-        await _notice(
-            request, room_id, f"Usage: {_COMMAND_PREFIX}joinguild CODE@guild.example.com",
-        )
-        return
-    code, domain = argument.split("@", 1)
-    code = code.removeprefix("invite:")
-
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
-    if actor_record is None:
-        await _notice(
-            request, room_id,
-            f'You need a linked profile before joining a guild -- run "{_COMMAND_PREFIX}link profile" '
-            "in your own room first.",
-        )
-        return
-
     try:
         invite_code_doc, qualified_mention = await resolve_invite_code(request, code, domain)
     except WebfingerNotFoundError:
-        await _notice(request, room_id, f"That invite code wasn't found on {domain} -- check it and try again.")
-        return
+        raise GuildJoinError(f"That invite code wasn't found on {domain} -- check it and try again.") from None
     except WebfingerUnreachableError:
-        await _notice(request, room_id, f"Couldn't reach {domain} right now -- try again in a bit.")
-        return
+        raise GuildJoinError(f"Couldn't reach {domain} right now -- try again in a bit.") from None
     except WebfingerError as exc:
-        await _notice(request, room_id, f"Could not resolve that invite code: {exc}")
-        return
+        raise GuildJoinError(f"Could not resolve that invite code: {exc}") from exc
 
     guild_actor_id = invite_code_doc.get("attributedTo")
     # Confirmed live 2026-07-14: Shoot's own InviteCode embeds the full
@@ -1905,22 +1906,31 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
     if isinstance(guild_actor_id, dict):
         guild_actor_id = guild_actor_id.get("id")
     if not guild_actor_id:
-        await _notice(request, room_id, "That invite code's own object is missing required fields.")
-        return
+        raise GuildJoinError("That invite code's own object is missing required fields.")
 
-    if await repository.is_guild_member(guild_actor_id):
-        await _notice(request, room_id, "This bridge has already joined that guild.")
-        return
+    # Per-USER, not is_guild_member's whole-bridge "has ANYONE joined"
+    # check (correct for its own actual callers -- see that method's own
+    # docstring -- but wrong here): each local user needs their OWN real
+    # Follow accepted by the guild for Shoot to recognize THEM specifically
+    # as a member, same as any other federated action -- one person's
+    # Follow doesn't vouch for a second, unrelated local actor. Confirmed
+    # live 2026-08-25: this gate used to check is_guild_member instead,
+    # meaning only the very first local user to ever ;joinguild a given
+    # guild got a real Follow at all -- everyone else joining the same
+    # guild's Space/Channels afterward had messages signed and delivered
+    # (bridge.channel_bridge.maybe_distribute_channel_message has no
+    # per-user membership check of its own either) to a guild that had
+    # never actually accepted a Follow from them.
+    if await repository.get_guild_membership(actor_record.username, guild_actor_id) is not None:
+        raise GuildJoinError("You've already joined that guild.")
 
     try:
         guild_doc = await fetch_actor(request, guild_actor_id)
     except RemoteActorFetchError as exc:
-        await _notice(request, room_id, f"Could not fetch the guild's own actor document: {exc}")
-        return
+        raise GuildJoinError(f"Could not fetch the guild's own actor document: {exc}") from exc
     guild_inbox = guild_doc.get("inbox")
     if not guild_inbox:
-        await _notice(request, room_id, "The guild's own actor document has no inbox.")
-        return
+        raise GuildJoinError("The guild's own actor document has no inbox.")
 
     follow_id = f"{actor_url(base, actor_record.username)}/follows/{uuid.uuid4().hex}"
     follow_activity = Activity(
@@ -1944,7 +1954,7 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
     await repository.record_pending_guild_follow(
         PendingGuildFollow(
             follow_id=follow_id, guild_actor_id=guild_actor_id, username=actor_record.username,
-            matrix_user_id=sender, invite_code=code, created_at=time.time(),
+            matrix_user_id=actor_record.matrix_user_id, invite_code=code, created_at=time.time(),
         )
     )
     try:
@@ -1957,10 +1967,50 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
         )
     except DeliveryError as exc:
         await repository.remove_pending_guild_follow(follow_id)
-        await _notice(request, room_id, f"Could not send the join request: {exc}")
-        return
+        raise GuildJoinError(f"Could not send the join request: {exc}") from exc
 
     guild_name = guild_doc.get("name") or guild_doc.get("preferredUsername") or domain
+    return guild_actor_id, guild_name
+
+
+async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """Join a Shoot guild (an ``Organization`` actor) using an invite code,
+    per FEP-bebd. ``argument`` is ``CODE@guild.example.com``.
+
+    Unlike ``;follow``, this can't resolve synchronously: the guild's
+    ``Accept``/``Reject`` arrives later over the inbox, so this only ever
+    sends the join request and records it as pending -- the notice
+    deliberately doesn't say "Joined", since the invite code might turn
+    out to be invalid/expired. See ``send_guild_join_follow`` for the
+    actual mechanics, shared with the auto-join-on-room-join path."""
+    repository = request.app.state.repository
+
+    argument = argument.strip()
+    if "@" not in argument:
+        await _notice(
+            request, room_id, f"Usage: {_COMMAND_PREFIX}joinguild CODE@guild.example.com",
+        )
+        return
+    code, domain = argument.split("@", 1)
+    code = code.removeprefix("invite:")
+
+    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    if actor_record is None:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile before joining a guild -- run "{_COMMAND_PREFIX}link profile" '
+            "in your own room first.",
+        )
+        return
+
+    try:
+        _guild_actor_id, guild_name = await send_guild_join_follow(
+            request, actor_record=actor_record, code=code, domain=domain,
+        )
+    except GuildJoinError as exc:
+        await _notice(request, room_id, exc.notice)
+        return
+
     await _notice(
         request, room_id, f"Join request sent to {guild_name} -- you'll be notified once it's confirmed.",
     )
@@ -3037,6 +3087,13 @@ async def _run_follows_import(
 
 _RUNNING_BACKFILLS: set = set()
 
+# Same "strong reference until done" purpose as _RUNNING_BACKFILLS, kept
+# separate since it's a genuinely different class of background task --
+# see bridge.membership.maybe_handle_join, which backgrounds
+# handle_guild_auto_join the same way it already backgrounds
+# _run_auto_backfill right next to it.
+_RUNNING_GUILD_AUTO_JOINS: set = set()
+
 _RUNNING_VIDEO_DELIVERIES: set = set()
 
 
@@ -4060,6 +4117,12 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
         await _handle_refresh_guild(request, room_id=room_id)
         return
 
+    if argument.strip().lower().startswith("guild invite "):
+        await _handle_refresh_guild_invite(
+            request, sender=sender, room_id=room_id, argument=argument.strip()[len("guild invite "):],
+        )
+        return
+
     if not argument.strip():
         poll_target = await _resolve_poll_refresh_target(request, content)
         if poll_target is not None:
@@ -4232,6 +4295,159 @@ async def _handle_refresh_guild(request: Request, *, room_id: str) -> None:
         await _notice(request, room_id, f"Refreshed -- {len(channels)} channel(s) known now.")
     else:
         await _notice(request, room_id, "Couldn't refresh that guild's channel list -- it may not be reachable.")
+
+
+async def _handle_refresh_guild_invite(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;refresh guild invite CODE@domain``, run inside a joined guild's
+    own Space or one of its Channel rooms (admin-only, unlike bare
+    ``;refresh guild`` above -- this drives a real federated side effect
+    for every future joiner, not just a re-fetch): stores ``CODE@domain``
+    on the guild's Space (``bridge.spaces.set_guild_invite_code``) so a
+    Matrix user joining the Space or any of its Channel rooms afterward
+    is automatically joined to the guild over ActivityPub too (see
+    ``bridge.membership.maybe_handle_join``) -- no ``;joinguild`` needed
+    from them.
+
+    Also resyncs right now: any CURRENT local member of the guild's Space
+    who doesn't already have their own accepted Follow gets one sent with
+    this code immediately (see ``_resync_guild_members``), rather than
+    waiting for them to leave and rejoin -- covers both a stale/expired
+    code being replaced, and anyone who joined before an invite code was
+    ever stored at all."""
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can set a guild's invite code.")
+        return
+
+    repository = request.app.state.repository
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    guild_actor_id = (
+        channel_room.guild_actor_id if channel_room is not None
+        else await repository.get_guild_by_space_room_id(room_id)
+    )
+    if guild_actor_id is None:
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}refresh guild invite" only works inside a joined guild\'s own Space or one '
+            "of its Channel rooms.",
+        )
+        return
+
+    argument = argument.strip()
+    if "@" not in argument:
+        await _notice(request, room_id, f"Usage: {_COMMAND_PREFIX}refresh guild invite CODE@guild.example.com")
+        return
+    code, domain = argument.split("@", 1)
+    code = code.removeprefix("invite:")
+
+    space_room_id = await repository.get_guild_space(guild_actor_id)
+    if space_room_id is None:
+        await _notice(request, room_id, "This guild has no Matrix Space on record -- something's gone wrong.")
+        return
+
+    await set_guild_invite_code(request, space_room_id=space_room_id, code=code, domain=domain)
+
+    joined, failed = await _resync_guild_members(
+        request, guild_actor_id=guild_actor_id, space_room_id=space_room_id, code=code, domain=domain,
+    )
+    summary = "Invite code set for this guild."
+    if joined or failed:
+        summary += f" Resynced {joined} member(s) who hadn't joined over ActivityPub yet"
+        if failed:
+            summary += f" ({failed} couldn't be joined -- they'll need to run {_COMMAND_PREFIX}joinguild themselves)"
+        summary += "."
+    await _notice(request, room_id, summary)
+
+
+async def _resync_guild_members(
+    request: Request, *, guild_actor_id: str, space_room_id: str, code: str, domain: str,
+) -> tuple[int, int]:
+    """Sends a fresh guild-join Follow (``send_guild_join_follow``) for
+    every CURRENT Matrix member of ``space_room_id`` who has a linked
+    profile but no accepted membership for ``guild_actor_id`` yet -- the
+    bot and any ghost are skipped (never real candidates), same as
+    everywhere else this bridge distinguishes a genuine local Matrix user
+    from either of those. Returns ``(sent, failed)`` counts. Best-effort
+    per member: one failure doesn't stop the sweep, matching the rest of
+    this bridge's own bulk operations."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    try:
+        member_mxids = await synapse.get_joined_members(space_room_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return 0, 0
+
+    sent = 0
+    failed = 0
+    for mxid in member_mxids:
+        if mxid == bot_mxid or mxid.startswith(f"@{config.appservice.user_prefix}"):
+            continue
+        actor_record = await repository.get_local_actor_by_matrix_id(mxid)
+        if actor_record is None:
+            continue  # no linked profile -- can't join them over ActivityPub at all
+        if await repository.get_guild_membership(actor_record.username, guild_actor_id) is not None:
+            continue  # already a real member
+        try:
+            await send_guild_join_follow(request, actor_record=actor_record, code=code, domain=domain)
+            sent += 1
+        except GuildJoinError:
+            failed += 1
+    return sent, failed
+
+
+async def handle_guild_auto_join(request: Request, *, guild_actor_id: str, matrix_user_id: str) -> None:
+    """Background half of the invite-code-driven auto-join (see
+    ``bridge.membership.maybe_handle_join``, ``bridge.spaces.set_guild_invite_code``):
+    joins ``matrix_user_id`` to ``guild_actor_id`` over ActivityPub using
+    whatever invite code is currently stored on its Space, the moment
+    they join that Space or one of its Channel rooms themselves -- no
+    ``;joinguild`` needed from them.
+
+    Nobody explicitly asked for THIS particular attempt (it's triggered
+    by an ordinary room join, not a command), so failures are DMed rather
+    than posted as a room notice -- same reasoning ``_run_auto_backfill``'s
+    own docstring gives for its own failures. Silently returns (no DM at
+    all) once already a real member -- covers a redelivered/duplicate
+    join event racing this same check twice, and anyone this bridge's own
+    ``_resync_guild_members`` sweep already caught up separately."""
+    repository = request.app.state.repository
+    actor_record = await repository.get_local_actor_by_matrix_id(matrix_user_id)
+    if actor_record is None:
+        await notify_user(
+            request, matrix_user_id=matrix_user_id,
+            content={
+                "msgtype": "m.text",
+                "body": "You joined a bridged Shoot guild, but without a linked fediverse profile your "
+                f'messages there won\'t reach Shoot at all. Run "{_COMMAND_PREFIX}link profile" and then '
+                f'"{_COMMAND_PREFIX}joinguild CODE@domain" yourself to fix that.',
+            },
+        )
+        return
+    if await repository.get_guild_membership(actor_record.username, guild_actor_id) is not None:
+        return
+
+    space_room_id = await repository.get_guild_space(guild_actor_id)
+    if space_room_id is None:
+        return  # shouldn't happen -- the caller only resolves guild_actor_id via an already-known Space
+    invite = await get_guild_invite_code(request, space_room_id)
+    if invite is None:
+        return  # no invite code stored on this guild's Space -- nothing to auto-join with
+    code, domain = invite
+
+    try:
+        await send_guild_join_follow(request, actor_record=actor_record, code=code, domain=domain)
+    except GuildJoinError as exc:
+        logger.info("Auto-join to guild %s failed for %s: %s", guild_actor_id, matrix_user_id, exc.notice)
+        await notify_user(
+            request, matrix_user_id=matrix_user_id,
+            content={
+                "msgtype": "m.text",
+                "body": f"Couldn't automatically join you to that guild ({exc.notice}) -- run "
+                f'"{_COMMAND_PREFIX}joinguild CODE@domain" yourself with a current invite code.',
+            },
+        )
 
 
 async def _handle_repost(

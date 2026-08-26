@@ -219,6 +219,50 @@ async def ensure_guild_space(
     return space_room_id
 
 
+# A Shoot guild invite code, stored on the guild's own Space so a Matrix
+# user joining it (or one of its Channel rooms -- both resolve back to the
+# same Space, see bridge.membership.maybe_handle_join) can be joined to
+# the guild over ActivityPub automatically, without running ;joinguild
+# themselves. Set via ";refresh guild invite CODE@domain"
+# (bridge.commands), admin-gated: this drives a real federated side
+# effect (a signed Follow) for every future joiner, not just cosmetic
+# room state, so it shouldn't be settable by just anyone in the room.
+GUILD_INVITE_CODE_STATE_TYPE = "software.haven.activitypub.guild.invite_code"
+
+
+async def set_guild_invite_code(request: Request, *, space_room_id: str, code: str, domain: str) -> None:
+    """Store ``code``/``domain`` on ``space_room_id`` as its
+    ``GUILD_INVITE_CODE_STATE_TYPE`` -- see that constant's own docstring.
+    Best-effort, same as the rest of this bridge's room bookkeeping."""
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        await request.app.state.synapse.send_state_event(
+            space_room_id, GUILD_INVITE_CODE_STATE_TYPE, "", {"code": code, "domain": domain}, as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        logger.warning("Could not set guild invite code on %s", space_room_id, exc_info=True)
+
+
+async def get_guild_invite_code(request: Request, space_room_id: str) -> tuple[str, str] | None:
+    """The ``(code, domain)`` currently stored on ``space_room_id`` via
+    ``set_guild_invite_code``, or None if nothing's ever been set --
+    Synapse reports that as a plain 404, indistinguishable from (and
+    treated the same as) any other lookup failure here."""
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        content = await request.app.state.synapse.get_room_state(
+            space_room_id, GUILD_INVITE_CODE_STATE_TYPE, as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        return None
+    code, domain = content.get("code"), content.get("domain")
+    if not code or not domain:
+        return None
+    return code, domain
+
+
 async def add_channel_room_to_guild_space(request: Request, *, guild_actor_id: str, child_room_id: str) -> None:
     """The per-guild counterpart of ``add_room_to_space`` -- adds
     ``child_room_id`` (a Channel room, see ``bridge.channel_bridge``) as a

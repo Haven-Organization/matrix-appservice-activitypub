@@ -1661,6 +1661,15 @@ class SqliteActorRepository:
     async def get_guild_space(self, guild_actor_id: str) -> str | None:
         return await self._run(self._get_guild_space, guild_actor_id)
 
+    def _get_guild_by_space_room_id(self, space_room_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT guild_actor_id FROM guild_spaces WHERE space_room_id = ?", (space_room_id,)
+        ).fetchone()
+        return row["guild_actor_id"] if row else None
+
+    async def get_guild_by_space_room_id(self, space_room_id: str) -> str | None:
+        return await self._run(self._get_guild_by_space_room_id, space_room_id)
+
     def _record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
         for channel_actor_id, name in channels:
             self._conn.execute(

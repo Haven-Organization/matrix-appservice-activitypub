@@ -1291,6 +1291,10 @@ class PostgresActorRepository:
         row = await self._pool.fetchrow("SELECT space_room_id FROM guild_spaces WHERE guild_actor_id = $1", guild_actor_id)
         return row["space_room_id"] if row else None
 
+    async def get_guild_by_space_room_id(self, space_room_id: str) -> str | None:
+        row = await self._pool.fetchrow("SELECT guild_actor_id FROM guild_spaces WHERE space_room_id = $1", space_room_id)
+        return row["guild_actor_id"] if row else None
+
     async def record_guild_channels(self, guild_actor_id: str, channels: list[tuple[str, str]]) -> None:
         for channel_actor_id, name in channels:
             await self._pool.execute(
