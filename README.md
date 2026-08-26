@@ -81,22 +81,23 @@ Running on other homeservers is untested, experimental territory as of this writ
    - `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1` -- otherwise nothing outside the container's own network namespace can reach it, even with the port published.
    - If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`) -- that's the volume the image actually creates and can write to as its non-root user.
 
-   Simplest form, standalone:
+   A prebuilt multi-arch image (amd64/arm64) is published to `ghcr.io/haven-organization/matrix-appservice-activitypub` on every push to `main`. Simplest form, standalone:
 
    ```sh
-   docker build -t matrix-appservice-activitypub .
    docker run -d --name matrix-appservice-activitypub \
      -p 8090:8090 \
      -v $(pwd)/config.yaml:/config/config.yaml:ro \
      -v bridge-data:/data \
-     matrix-appservice-activitypub
+     ghcr.io/haven-organization/matrix-appservice-activitypub:latest
    ```
 
    Or copy `docker-compose.example.yml` to `docker-compose.yml` and adjust it to your setup (it bundles a Postgres container and wires in an existing containerized Synapse via an external network -- see the file's own comments for both), then:
 
    ```sh
-   docker compose up -d --build
+   docker compose up -d
    ```
+
+   To build from your own checkout instead of pulling the published image (e.g. to test an unreleased change), `docker build -t matrix-appservice-activitypub .` and use that tag in place of the `ghcr.io/...` one above, or swap `docker-compose.example.yml`'s `image:` line for `build: .`.
 
 5. Optionally, verify end-to-end:
 

@@ -5,7 +5,14 @@
 # and you'd rather reach it via the host, e.g. network_mode: host on Linux).
 services:
   bridge:
-    build: .
+    # Prebuilt multi-arch image (amd64/arm64), published on every push to
+    # main by .github/workflows/docker-publish.yml -- pin to a specific
+    # tag (a short git sha, or a "vX.Y.Z" release tag) instead of "latest"
+    # for anything you care about staying put. Swap this for `build: .`
+    # instead if you'd rather build from your own local checkout (e.g. to
+    # test an unreleased change, or on a platform the published image
+    # doesn't cover).
+    image: ghcr.io/haven-organization/matrix-appservice-activitypub:latest
     restart: unless-stopped
     environment:
       BRIDGE_CONFIG: /config/config.yaml
