@@ -67,13 +67,36 @@ Running on other homeservers is untested, experimental territory as of this writ
 
    Add the resulting file's path to your homeserver's own application-service registration config (`app_service_config_files` in `homeserver.yaml`, if you're running Synapse), then restart it.
 
-4. Run the bridge:
+4. Run the bridge, natively or in Docker:
+
+   **Natively:**
 
    ```sh
    .venv/bin/python main.py
    ```
 
    Or install `deploy/matrix-appservice-activitypub.service` to run it under systemd (see that file for the expected user/paths). `deploy/nginx.conf.example` shows a reverse-proxy config for exposing the ActivityPub surface on the same public domain as your homeserver. That's recommended, since it's what makes a user's Matrix ID and fediverse handle the exact same string (`@alice:example.org` == `@alice@example.org`).
+
+   **In Docker:** the `Dockerfile` runs the exact same code, so every feature and both storage backends work identically -- it's just a different way to run it. Two settings in `config.yaml` need a container-specific value first, both confirmed live:
+   - `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1` -- otherwise nothing outside the container's own network namespace can reach it, even with the port published.
+   - If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`) -- that's the volume the image actually creates and can write to as its non-root user.
+
+   Simplest form, standalone:
+
+   ```sh
+   docker build -t matrix-appservice-activitypub .
+   docker run -d --name matrix-appservice-activitypub \
+     -p 8090:8090 \
+     -v $(pwd)/config.yaml:/config/config.yaml:ro \
+     -v bridge-data:/data \
+     matrix-appservice-activitypub
+   ```
+
+   Or copy `docker-compose.example.yml` to `docker-compose.yml` and adjust it to your setup (it bundles a Postgres container and wires in an existing containerized Synapse via an external network -- see the file's own comments for both), then:
+
+   ```sh
+   docker compose up -d --build
+   ```
 
 5. Optionally, verify end-to-end:
 
