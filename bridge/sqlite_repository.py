@@ -348,8 +348,34 @@ class SqliteActorRepository:
 
     def __init__(self, db_path: str | Path) -> None:
         path = Path(db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError as exc:
+            # Confirmed live: a Docker deployment that leaves storage.data_dir
+            # at its relative "./data" default resolves this against the
+            # container's WORKDIR (/app, root-owned) instead of the /data
+            # volume it may well have mounted correctly -- the bare
+            # PermissionError alone gives no hint that data_dir itself is
+            # the thing to check, so name it explicitly here.
+            raise PermissionError(
+                f"Cannot create '{path.parent}' -- storage.data_dir must point somewhere this "
+                "process can actually write. In Docker, that's the /data volume declared in the "
+                "Dockerfile (set storage.data_dir: /data in config.yaml), not the relative default."
+            ) from exc
+        try:
+            self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        except sqlite3.OperationalError as exc:
+            # The directory can already exist (skipping the mkdir above
+            # entirely, via exist_ok) while still being unwritable -- e.g. a
+            # Docker bind mount whose host directory Docker (or the user)
+            # created as root, never chowned to the container's own user.
+            # sqlite3 reports that as a bare, equally unhelpful
+            # "unable to open database file" with no path or reason.
+            raise sqlite3.OperationalError(
+                f"Cannot open '{path}' -- {exc}. Check that '{path.parent}' is actually writable "
+                "by this process, not just that it exists (a Docker bind mount keeps its host "
+                "directory's original ownership; chown it to this container's UID/GID, 999:999)."
+            ) from exc
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.execute("PRAGMA journal_mode=WAL")
