@@ -1,0 +1,62 @@
+# Example compose stack for a bridge + its own Postgres, on the SAME
+# docker network as an externally-managed Synapse (also containerized,
+# on network "synapse_net" -- adjust to match your actual Synapse setup,
+# or delete the Synapse-network wiring entirely if Synapse runs natively
+# and you'd rather reach it via the host, e.g. network_mode: host on Linux).
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    environment:
+      BRIDGE_CONFIG: /config/config.yaml
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      # Only needed if storage.backend is sqlite in config.yaml -- omit
+      # entirely if using postgresql below. Confirmed live: config.yaml's
+      # storage.data_dir MUST be set to "/data" (not left at its "./data"
+      # default) for sqlite to actually land on this volume -- "./data"
+      # resolves against the container's WORKDIR (/app), which the
+      # non-root "bridge" user can't write to, and startup fails outright.
+      - bridge-data:/data
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        # Plain `depends_on: [postgres]` only waits for the container to
+        # start, not for Postgres to actually accept connections -- confirmed
+        # live: on a fresh volume, Postgres's own first-run initdb takes a
+        # few seconds AFTER the container starts, and the bridge has no
+        # connection retry of its own (unlike its Synapse-readiness wait),
+        # so it crashed outright on `docker compose up` every time. This
+        # condition makes it wait for the healthcheck below instead.
+        condition: service_healthy
+    networks:
+      - default
+      - synapse_net
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: bridge
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  bridge-data:
+  postgres-data:
+
+networks:
+  # External: the network your existing Synapse container(s) are on.
+  # `docker network ls` to find its real name, or `docker compose` will
+  # create one from Synapse's own compose project by default (usually
+  # "<project>_default").
+  synapse_net:
+    external: true
