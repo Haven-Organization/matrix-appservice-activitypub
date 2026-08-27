@@ -5723,6 +5723,59 @@ async def _handle_replace_video(request: Request, *, sender: str, room_id: str, 
     await _notice(request, room_id, f'Replaced the file for "{name}".')
 
 
+async def _room_already_bridged_as(request: Request, room_id: str) -> str | None:
+    """A short description of what ``room_id`` is ALREADY being used for by
+    this bridge, or ``None`` if it isn't recognized as any of them yet.
+    Confirmed live 2026-08-27: ``;link profile`` used to skip this check
+    entirely, so a user merely invited into a guild's own Shoot Channel
+    room could ``;link profile`` there and get it registered as BOTH a
+    Profile Room and a Channel room at once -- corrupting bridge state
+    while leaving channel messages bridging as if nothing had happened.
+    Checked here for every kind of room this bridge tracks by room_id,
+    not just the one that was actually hit, since the same hijack shape
+    applies to all of them identically."""
+    repository = request.app.state.repository
+
+    if await repository.get_local_actor_by_room_id(room_id) is not None:
+        return "someone's linked Profile Room"
+    if await repository.get_remote_actor_room_by_room_id(room_id) is not None:
+        return "a Remote User Room"
+    if await repository.get_channel_room_by_room_id(room_id) is not None:
+        return "a Shoot guild's Channel room"
+    if await repository.get_guild_by_space_room_id(room_id) is not None:
+        return "a Shoot guild's Space"
+    if await repository.get_peertube_channel_by_room_id(room_id) is not None:
+        return "a PeerTube Channel room"
+    if await repository.is_ghost_dm_room(room_id):
+        return "a DM room"
+    if await repository.is_ghost_chat_room(room_id):
+        return "a Chat room"
+    if await repository.get_bot_dm_room_owner(room_id) is not None:
+        return "a Notifications room"
+    return None
+
+
+async def _sender_controls_room(request: Request, *, room_id: str, sender: str) -> bool:
+    """Whether ``sender`` actually has enough power in ``room_id`` right now
+    to be trusted with linking it as their own fediverse identity --
+    concretely, whether Matrix's own power_levels would let them set
+    m.room.name themselves, the same state event ``;link profile`` itself
+    tries to set. Fails CLOSED (False) if power_levels can't even be read
+    -- unlike the room name/avatar sync later in this function, which is
+    best-effort and fine to silently skip, this is the actual security
+    gate, so an unverifiable room must never be treated as controlled."""
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    try:
+        power_levels = await synapse.get_room_state(room_id, "m.room.power_levels", as_user_id=_bot_mxid(config))
+    except SynapseError:
+        return False
+    users_default = power_levels.get("users_default", 0)
+    sender_level = power_levels.get("users", {}).get(sender, users_default)
+    required_level = power_levels.get("events", {}).get("m.room.name", power_levels.get("state_default", 50))
+    return sender_level >= required_level
+
+
 async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -> None:
     repository = request.app.state.repository
     config = request.app.state.config
@@ -5738,6 +5791,26 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
                 f"{html.escape(sender)} is already linked as {existing.username}@{config.bridge.domain} "
                 f"(room {room_pill_html(existing.room_id)})."
             ),
+        )
+        return
+
+    already_used_as = await _room_already_bridged_as(request, room_id)
+    if already_used_as is not None:
+        await _notice(
+            request, room_id,
+            f"This room is already {already_used_as} -- it can't also become your Profile Room. "
+            f'Run "{_COMMAND_PREFIX}create profile" instead for a fresh room of your own, or '
+            f'"{_COMMAND_PREFIX}link profile" in a different room you actually control.',
+        )
+        return
+
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}link profile" needs you to actually control this room -- high enough '
+            "power to set its name/avatar yourself -- not just be a member of it. Give yourself (or "
+            f'have an admin give you) a higher power level here, or run "{_COMMAND_PREFIX}create '
+            'profile" instead for a fresh room the bot makes you the owner of.',
         )
         return
 
