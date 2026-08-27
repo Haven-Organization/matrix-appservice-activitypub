@@ -68,7 +68,9 @@ from bridge.synapse_client import SynapseError
 logger = logging.getLogger(__name__)
 
 
-async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_actor_id: str) -> ChannelRoom | None:
+async def ensure_channel_room(
+    request: Request, *, channel_actor_id: str, guild_actor_id: str
+) -> tuple[ChannelRoom | None, bool]:
     """Get-or-create the Matrix room mirroring a Shoot Channel: bot-created/
     owned (not a ghost -- a channel has many different member-ghost
     speakers, not one, unlike a Remote User Room), added as a child of its
@@ -87,11 +89,19 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
     somehow is, this logs a warning and still creates the room (falling
     back to the ordinary invite-only preset default, with no one on the
     invite list at all -- a genuinely exceptional state at that point, not
-    something worth inventing a second fallback mechanism for). Returns the existing
-    record unchanged if the room already exists. Best-effort, same as the
-    rest of the bridge's room bookkeeping -- returns None only if room
-    creation itself failed.
-    """
+    something worth inventing a second fallback mechanism for).
+
+    Returns ``(record, added_to_space)``. ``record`` is the existing room
+    unchanged if it already exists (and isn't tombstoned -- see below), or
+    ``None`` if room creation itself failed. ``added_to_space`` reports
+    whether THIS call actually confirmed/re-confirmed the room is wired
+    into the guild's Space -- ``True`` for an already-existing, untouched
+    room (assumed still fine, not re-verified every call) and for a
+    freshly created/healed one that was added successfully; ``False`` only
+    when a fresh/healed room's own ``add_channel_room_to_guild_space`` call
+    actually failed. Confirmed live 2026-08-27: that failure used to be
+    silently swallowed with nothing surfaced to ``;refresh guild``'s own
+    caller beyond a channel count -- see ``sync_guild_channels``."""
     repository = request.app.state.repository
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
@@ -112,7 +122,7 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
         try:
             await request.app.state.synapse.get_room_state(existing.room_id, "m.room.tombstone", as_user_id=bot_mxid)
         except SynapseError:
-            return existing
+            return existing, True
         else:
             logger.warning(
                 "Channel room %s for %s is tombstoned -- recreating a fresh one instead of reusing it",
@@ -141,19 +151,19 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
         )
     except SynapseError:
         logger.warning("Could not create channel room for %s", channel_actor_id, exc_info=True)
-        return None
+        return None, False
 
     record = ChannelRoom(
         channel_actor_id=channel_actor_id, room_id=room_id, guild_actor_id=guild_actor_id,
         display_name=display_name,
     )
     await repository.register_channel_room(record)
-    await add_channel_room_to_guild_space(request, guild_actor_id=guild_actor_id, child_room_id=room_id)
+    added_to_space = await add_channel_room_to_guild_space(request, guild_actor_id=guild_actor_id, child_room_id=room_id)
     await add_bridge_widget(request, room_id=room_id)
-    return record
+    return record, added_to_space
 
 
-async def sync_guild_channels(request: Request, guild_actor_id: str) -> list[tuple[str, str]]:
+async def sync_guild_channels(request: Request, guild_actor_id: str) -> tuple[list[tuple[str, str]], list[str]]:
     """Re-fetch ``guild_actor_id``'s own ``channels`` collection fresh and
     re-cache it (``record_guild_channels`` REPLACES the whole cached list
     for this guild -- see its own docstring -- so this always re-fetches
@@ -166,17 +176,23 @@ async def sync_guild_channels(request: Request, guild_actor_id: str) -> list[tup
     notice and predates this function), lazily whenever an inbound channel
     message names a channel actor that isn't cached yet (see
     ``_resolve_guild_channel``), and from the ``;refresh guild`` command
-    (``bridge.commands._handle_refresh_guild``). Returns the fresh
-    ``(channel_actor_id, name)`` list, or an empty one if the guild couldn't
-    be fetched at all."""
+    (``bridge.commands._handle_refresh_guild``, the only caller that
+    actually surfaces ``problems`` to a human -- see its own docstring).
+
+    Returns ``(channels, problems)``: the fresh ``(channel_actor_id, name)``
+    list (empty if the guild couldn't be fetched at all), and a list of
+    one-line human-readable descriptions of anything ``ensure_channel_room``
+    reported going wrong for a specific channel (room creation failing, or
+    a room existing but not actually ending up wired into the guild's
+    Space) -- empty when everything went cleanly."""
     repository = request.app.state.repository
     try:
         guild_doc = await fetch_actor(request, guild_actor_id)
     except RemoteActorFetchError:
-        return []
+        return [], []
     channels_url = guild_doc.get("channels")
     if not channels_url:
-        return []
+        return [], []
 
     # Deferred: bridge.commands already imports plenty from feature modules
     # like this one, so importing _collect_recent_items from there at
@@ -192,12 +208,20 @@ async def sync_guild_channels(request: Request, guild_actor_id: str) -> list[tup
         if isinstance(item, dict) and item.get("id")
     ]
     if not channels:
-        return []
+        return [], []
 
     await repository.record_guild_channels(guild_actor_id, channels)
-    for channel_actor_id, _name in channels:
-        await ensure_channel_room(request, channel_actor_id=channel_actor_id, guild_actor_id=guild_actor_id)
-    return channels
+    problems: list[str] = []
+    for channel_actor_id, name in channels:
+        record, added_to_space = await ensure_channel_room(
+            request, channel_actor_id=channel_actor_id, guild_actor_id=guild_actor_id,
+        )
+        label = name or channel_actor_id
+        if record is None:
+            problems.append(f"{label}: couldn't create its Matrix room")
+        elif not added_to_space:
+            problems.append(f"{label}: room exists but couldn't be added to the guild's Space")
+    return channels, problems
 
 
 async def _resolve_guild_channel(request: Request, actor_id: str) -> str | None:
@@ -268,7 +292,9 @@ async def maybe_handle_channel_message(request: Request, activity: Activity) -> 
     if not isinstance(author_actor_id, str):
         return True
 
-    channel_room = await ensure_channel_room(request, channel_actor_id=activity.actor, guild_actor_id=guild_actor_id)
+    channel_room, _added_to_space = await ensure_channel_room(
+        request, channel_actor_id=activity.actor, guild_actor_id=guild_actor_id,
+    )
     if channel_room is None:
         return True
 

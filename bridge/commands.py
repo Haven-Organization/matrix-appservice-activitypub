@@ -4307,11 +4307,15 @@ async def _handle_refresh_guild(request: Request, *, sender: str, room_id: str) 
     # module level here would be circular.
     from bridge.channel_bridge import sync_guild_channels
 
-    channels = await sync_guild_channels(request, guild_actor_id)
-    if channels:
-        await _notice(request, room_id, f"Refreshed -- {len(channels)} channel(s) known now.")
-    else:
+    channels, problems = await sync_guild_channels(request, guild_actor_id)
+    if not channels:
         await _notice(request, room_id, "Couldn't refresh that guild's channel list -- it may not be reachable.")
+        return
+
+    summary = f"Refreshed -- {len(channels)} channel(s) known now."
+    if problems:
+        summary += " But " + "; ".join(problems) + "."
+    await _notice(request, room_id, summary)
 
 
 async def _handle_refresh_guild_invite(request: Request, *, sender: str, room_id: str, argument: str) -> None:

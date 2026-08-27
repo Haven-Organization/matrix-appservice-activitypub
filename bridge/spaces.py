@@ -87,7 +87,7 @@ async def ensure_user_space(request: Request, *, matrix_user_id: str) -> str | N
 
 async def _set_space_child(
     request: Request, *, space_room_id: str, child_room_id: str, add: bool, order: str | None = None
-) -> None:
+) -> bool:
     """Shared body for adding/removing ``child_room_id`` as a space child of
     ``space_room_id`` -- used by both the per-user Fediverse space
     (``add_room_to_space``/``remove_room_from_space``) and the per-guild
@@ -100,7 +100,17 @@ async def _set_space_child(
     content, not a special "delete" operation. ``order`` (see
     ``PROFILE_ROOM_SPACE_ORDER``/``NOTIFICATIONS_ROOM_SPACE_ORDER``) is
     ignored when ``add`` is False -- a removed child has no ordering left
-    to carry."""
+    to carry.
+
+    Returns whether the ``m.space.child`` write itself succeeded --
+    confirmed live 2026-08-27: this used to be silently best-effort with no
+    way for a caller like ``;refresh guild`` to tell a real member "this
+    room didn't actually end up in the space" apart from it just quietly
+    not showing up, discoverable (if at all) only by turning logging up
+    from this project's ERROR-level production default. The
+    ``m.space.parent`` follow-up below stays best-effort/unreported either
+    way -- it's cosmetic breadcrumb metadata, not what makes a room
+    actually show up as a space child."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     synapse = request.app.state.synapse
@@ -118,10 +128,10 @@ async def _set_space_child(
             "Could not %s %s %s space %s", "add" if add else "remove", child_room_id,
             "to" if add else "from", space_room_id, exc_info=True,
         )
-        return
+        return False
 
     if not add:
-        return
+        return True
     # Not required for the space to show its children (that's the
     # m.space.child above) -- this is the child room's own "which space is
     # this canonically part of" pointer, which some clients use for
@@ -134,6 +144,7 @@ async def _set_space_child(
         )
     except SynapseError:
         logger.info("Could not set m.space.parent on %s", child_room_id, exc_info=True)
+    return True
 
 
 async def add_room_to_space(
@@ -263,17 +274,19 @@ async def get_guild_invite_code(request: Request, space_room_id: str) -> tuple[s
     return code, domain
 
 
-async def add_channel_room_to_guild_space(request: Request, *, guild_actor_id: str, child_room_id: str) -> None:
+async def add_channel_room_to_guild_space(request: Request, *, guild_actor_id: str, child_room_id: str) -> bool:
     """The per-guild counterpart of ``add_room_to_space`` -- adds
     ``child_room_id`` (a Channel room, see ``bridge.channel_bridge``) as a
-    child of ``guild_actor_id``'s Matrix Space. A no-op if that guild has no
-    Space yet (shouldn't happen -- ``_handle_guild_accept`` creates it
-    before any Channel room can exist)."""
+    child of ``guild_actor_id``'s Matrix Space. A no-op (returns ``False``)
+    if that guild has no Space yet (shouldn't happen -- ``_handle_guild_accept``
+    creates it before any Channel room can exist). Returns whether the room
+    actually ended up wired into the Space -- see ``_set_space_child``'s own
+    docstring for why this is reported rather than silently swallowed."""
     repository = request.app.state.repository
     space_room_id = await repository.get_guild_space(guild_actor_id)
     if space_room_id is None:
-        return
-    await _set_space_child(request, space_room_id=space_room_id, child_room_id=child_room_id, add=True)
+        return False
+    return await _set_space_child(request, space_room_id=space_room_id, child_room_id=child_room_id, add=True)
 
 
 async def remove_channel_room_from_guild_space(request: Request, *, guild_actor_id: str, child_room_id: str) -> None:
