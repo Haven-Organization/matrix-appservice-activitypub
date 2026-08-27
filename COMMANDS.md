@@ -366,11 +366,11 @@ Bare `;refresh` checks for poll-thread context FIRST, before falling back to the
 
 ## `;refresh guild`
 
-**Syntax:** `;refresh guild`, run inside one of a joined guild's own Channel rooms.
+**Syntax:** `;refresh guild`, run inside a joined guild's own Space or one of its Channel rooms.
 
-**What it does:** Re-fetches the guild's live channel list right now and creates a Matrix room for any channel added since it was joined (or since the last refresh). Shoot doesn't federate channel-creation events at all, so a newly-created channel is otherwise only discovered the first time someone actually posts in it.
+**What it does:** Re-fetches the guild's live channel list right now and creates a Matrix room for any channel added since it was joined (or since the last refresh). Shoot doesn't federate channel-creation events at all, so a newly-created channel is otherwise only discovered the first time someone actually posts in it. Also the way to recover a Channel room the bridge finds tombstoned (its own mapping self-heals into a freshly created room) -- since most Matrix clients won't even let you type into a tombstoned room to ask, run it from the guild's Space instead, which is always still a live, postable room.
 
-**Who can run it:** Matrix server admins only, from inside one of that guild's Channel rooms -- a Channel room isn't "owned" by anyone on the Matrix side, and (unlike, say, a Profile Room) Channel rooms use restricted joins that any current guild Space member can use freely with no elevated power needed, so being present in one isn't a meaningful trust signal.
+**Who can run it:** Matrix server admins only -- a Channel room (or the guild's Space) isn't "owned" by anyone on the Matrix side, and (unlike, say, a Profile Room) Channel rooms use restricted joins that any current guild Space member can use freely with no elevated power needed, so being present in one isn't a meaningful trust signal.
 
 ---
 

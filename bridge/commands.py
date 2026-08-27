@@ -4266,16 +4266,20 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
 
 
 async def _handle_refresh_guild(request: Request, *, sender: str, room_id: str) -> None:
-    """``;refresh guild``, run inside one of a joined guild's own Channel
-    rooms -- re-fetches that guild's live ``channels`` collection right now
-    and creates a Matrix room for any channel added since it was joined (or
-    since the last refresh), rather than waiting for a new channel's first
-    message to trigger lazy discovery (see
+    """``;refresh guild``, run inside a joined guild's own Space or one of
+    its Channel rooms -- re-fetches that guild's live ``channels``
+    collection right now and creates a Matrix room for any channel added
+    since it was joined (or since the last refresh), rather than waiting
+    for a new channel's first message to trigger lazy discovery (see
     ``bridge.channel_bridge.maybe_handle_channel_message``'s own docstring
     on why that's the only OTHER way this bridge ever finds out -- Shoot
     itself never federates channel creation at all, confirmed by reading
     its own source). Useful specifically for an empty new channel nobody's
-    posted in yet, which lazy discovery alone would never surface.
+    posted in yet, which lazy discovery alone would never surface -- also
+    the way to recover a Channel room ensure_channel_room finds tombstoned
+    (see its own docstring) if that Channel room's client won't even let
+    you type a message into it to ask, which most won't; the guild's Space
+    is always still a live, postable room to run this from instead.
 
     Admin-gated -- see ``_handle_refresh``'s own docstring for why being
     present in a Channel room isn't a meaningful trust signal here."""
@@ -4285,10 +4289,15 @@ async def _handle_refresh_guild(request: Request, *, sender: str, room_id: str) 
 
     repository = request.app.state.repository
     channel_room = await repository.get_channel_room_by_room_id(room_id)
-    if channel_room is None:
+    guild_actor_id = (
+        channel_room.guild_actor_id if channel_room is not None
+        else await repository.get_guild_by_space_room_id(room_id)
+    )
+    if guild_actor_id is None:
         await _notice(
             request, room_id,
-            f'"{_COMMAND_PREFIX}refresh guild" only works inside one of that guild\'s own Channel rooms.',
+            f'"{_COMMAND_PREFIX}refresh guild" only works inside a joined guild\'s own Space or one of '
+            "its Channel rooms.",
         )
         return
 
@@ -4298,7 +4307,7 @@ async def _handle_refresh_guild(request: Request, *, sender: str, room_id: str) 
     # module level here would be circular.
     from bridge.channel_bridge import sync_guild_channels
 
-    channels = await sync_guild_channels(request, channel_room.guild_actor_id)
+    channels = await sync_guild_channels(request, guild_actor_id)
     if channels:
         await _notice(request, room_id, f"Refreshed -- {len(channels)} channel(s) known now.")
     else:
