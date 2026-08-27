@@ -93,12 +93,31 @@ async def ensure_channel_room(request: Request, *, channel_actor_id: str, guild_
     creation itself failed.
     """
     repository = request.app.state.repository
-    existing = await repository.get_channel_room(channel_actor_id)
-    if existing is not None:
-        return existing
-
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    existing = await repository.get_channel_room(channel_actor_id)
+    if existing is not None:
+        # Confirmed live 2026-08-27: a room can end up registered as BOTH a
+        # Channel room and something else (the exact ;link profile hijack
+        # bug this bridge now blocks -- see _room_already_bridged_as in
+        # bridge.commands), and running ;replace room on it then tombstones
+        # it as if it were only ever that other thing, orphaning this
+        # mapping -- get_channel_room would otherwise keep returning that
+        # same dead, tombstoned room forever, with no self-service way to
+        # recover short of editing the database directly. A tombstoned room
+        # is treated as gone: fall through and create a genuinely fresh one,
+        # re-registering (register_channel_room upserts on channel_actor_id)
+        # rather than leaving two rows or requiring a delete first.
+        try:
+            await request.app.state.synapse.get_room_state(existing.room_id, "m.room.tombstone", as_user_id=bot_mxid)
+        except SynapseError:
+            return existing
+        else:
+            logger.warning(
+                "Channel room %s for %s is tombstoned -- recreating a fresh one instead of reusing it",
+                existing.room_id, channel_actor_id,
+            )
 
     try:
         channel_doc = await fetch_actor(request, channel_actor_id)
