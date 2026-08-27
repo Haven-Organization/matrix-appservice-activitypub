@@ -1982,7 +1982,20 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
     sends the join request and records it as pending -- the notice
     deliberately doesn't say "Joined", since the invite code might turn
     out to be invalid/expired. See ``send_guild_join_follow`` for the
-    actual mechanics, shared with the auto-join-on-room-join path."""
+    actual mechanics, shared with the auto-join-on-room-join path.
+
+    Resolves the code itself first (duplicating a little of
+    ``send_guild_join_follow``'s own resolution -- cheap, and only on this
+    already-a-member path, not the common case) rather than calling
+    straight into it, so an ALREADY-a-real-member sender can be re-invited
+    to the guild's Space instead of just told "already joined" and left
+    stuck outside it. Confirmed live 2026-08-27: leaving a guild's Space is
+    a purely local Matrix action that never touches the real ActivityPub
+    Follow at all, so ``get_guild_membership`` (and therefore
+    ``send_guild_join_follow``'s own gate) stays truthy forever after --
+    with nothing anywhere re-inviting them back in, ``;joinguild`` with a
+    perfectly good fresh code was a permanent dead end for anyone who'd
+    left."""
     repository = request.app.state.repository
 
     argument = argument.strip()
@@ -2004,6 +2017,29 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
         return
 
     try:
+        invite_code_doc, _qualified_mention = await resolve_invite_code(request, code, domain)
+    except WebfingerNotFoundError:
+        await _notice(request, room_id, f"That invite code wasn't found on {domain} -- check it and try again.")
+        return
+    except WebfingerUnreachableError:
+        await _notice(request, room_id, f"Couldn't reach {domain} right now -- try again in a bit.")
+        return
+    except WebfingerError as exc:
+        await _notice(request, room_id, f"Could not resolve that invite code: {exc}")
+        return
+
+    guild_actor_id = invite_code_doc.get("attributedTo")
+    if isinstance(guild_actor_id, dict):
+        guild_actor_id = guild_actor_id.get("id")
+    if not guild_actor_id:
+        await _notice(request, room_id, "That invite code's own object is missing required fields.")
+        return
+
+    if await repository.get_guild_membership(actor_record.username, guild_actor_id) is not None:
+        await _reinvite_to_guild_space(request, guild_actor_id=guild_actor_id, matrix_user_id=sender, room_id=room_id)
+        return
+
+    try:
         _guild_actor_id, guild_name = await send_guild_join_follow(
             request, actor_record=actor_record, code=code, domain=domain,
         )
@@ -2013,6 +2049,45 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
 
     await _notice(
         request, room_id, f"Join request sent to {guild_name} -- you'll be notified once it's confirmed.",
+    )
+
+
+async def _reinvite_to_guild_space(request: Request, *, guild_actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    """Re-invites ``matrix_user_id`` to ``guild_actor_id``'s Matrix Space --
+    the recovery path for ``;handle_joinguild``'s already-a-member branch
+    above. Channel rooms don't need their own re-invite: they're MSC3083
+    RESTRICTED to the Space (see ``bridge.channel_bridge.ensure_channel_room``),
+    so any current Space member can join one freely on their own once back
+    in the Space."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+
+    space_room_id = await repository.get_guild_space(guild_actor_id)
+    if space_room_id is None:
+        await _notice(
+            request, room_id,
+            "You're already a member of that guild, but it has no Matrix Space on record -- "
+            "something's gone wrong; contact a Matrix server admin.",
+        )
+        return
+
+    try:
+        await synapse.invite_user(space_room_id, matrix_user_id, as_user_id=_bot_mxid(config))
+    except SynapseError as exc:
+        await _notice(
+            request, room_id, f"You're already a member of that guild, but couldn't re-invite you to its Space: {exc}",
+        )
+        return
+
+    await _notice(
+        request, room_id,
+        "You're already a member of that guild -- you've been re-invited to its Space. Channel rooms "
+        "there can be joined freely once you're back in.",
+        html_message=(
+            "You're already a member of that guild -- you've been re-invited to its "
+            f"{room_pill_html(space_room_id)}. Channel rooms there can be joined freely once you're back in."
+        ),
     )
 
 

@@ -350,7 +350,7 @@ Bare `;refresh` checks for poll-thread context FIRST, before falling back to the
 
 **Who can run it:** Requires a linked profile.
 
-**Notes:** Fails with a clear notice if you've already joined that guild, the code can't be resolved, or the guild's own actor document can't be fetched. If an admin has already stored an invite code on the guild's Space or Channel rooms (`;refresh guild invite`), you don't need this command at all -- just joining the Space or any Channel room auto-joins you to the guild over ActivityPub, with a DM if you don't have a linked profile yet or the attempt fails.
+**Notes:** Fails with a clear notice if the code can't be resolved or the guild's own actor document can't be fetched. If you're already a real member (a Follow the guild already accepted -- this survives leaving its Matrix Space entirely, since that's a purely local action), this re-invites you to the guild's Space instead of erroring out -- the way back in if you ever left it, no admin needed. If an admin has already stored an invite code on the guild's Space or Channel rooms (`;refresh guild invite`), you don't need this command at all -- just joining the Space or any Channel room auto-joins you to the guild over ActivityPub, with a DM if you don't have a linked profile yet or the attempt fails.
 
 ---
 
