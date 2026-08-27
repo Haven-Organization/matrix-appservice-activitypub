@@ -4107,14 +4107,15 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
 
     ``;refresh guild``, run inside one of that guild's own Channel rooms,
     re-syncs its live channel list instead -- see ``_handle_refresh_guild``.
-    Also not admin-gated: being present in a Channel room at all already
-    means the bot invited you as a recorded guild member (see
-    ``bridge.channel_bridge.ensure_channel_room``), same trust level this
-    bridge already extends anyone sufficiently-powered in a room elsewhere
-    (e.g. a Profile Room's topic/name/avatar).
+    Admin-gated, same as ``;refresh guild invite`` below: a Channel room
+    isn't "owned" by anyone on the Matrix side the way a Profile Room is,
+    and Channel rooms use MSC3083 RESTRICTED joins (see
+    ``bridge.channel_bridge.ensure_channel_room``) -- any current member of
+    the guild's Space can join one freely, no elevated power needed at all,
+    so being present in one is a much weaker signal of trust than it looks.
     """
     if argument.strip() == "guild":
-        await _handle_refresh_guild(request, room_id=room_id)
+        await _handle_refresh_guild(request, sender=sender, room_id=room_id)
         return
 
     if argument.strip().lower().startswith("guild invite "):
@@ -4264,7 +4265,7 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     await _notice(request, room_id, f"Refreshed {handle_str}.")
 
 
-async def _handle_refresh_guild(request: Request, *, room_id: str) -> None:
+async def _handle_refresh_guild(request: Request, *, sender: str, room_id: str) -> None:
     """``;refresh guild``, run inside one of a joined guild's own Channel
     rooms -- re-fetches that guild's live ``channels`` collection right now
     and creates a Matrix room for any channel added since it was joined (or
@@ -4274,7 +4275,14 @@ async def _handle_refresh_guild(request: Request, *, room_id: str) -> None:
     on why that's the only OTHER way this bridge ever finds out -- Shoot
     itself never federates channel creation at all, confirmed by reading
     its own source). Useful specifically for an empty new channel nobody's
-    posted in yet, which lazy discovery alone would never surface."""
+    posted in yet, which lazy discovery alone would never surface.
+
+    Admin-gated -- see ``_handle_refresh``'s own docstring for why being
+    present in a Channel room isn't a meaningful trust signal here."""
+    if not await _is_matrix_admin(request, sender):
+        await _notice(request, room_id, "Only a Matrix server admin can refresh a guild's channel list.")
+        return
+
     repository = request.app.state.repository
     channel_room = await repository.get_channel_room_by_room_id(room_id)
     if channel_room is None:
@@ -6514,6 +6522,35 @@ async def _handle_replace_room(request: Request, *, sender: str, room_id: str) -
     fediverse account) requires a Matrix server admin.
     """
     repository = request.app.state.repository
+
+    # Defense in depth against the exact corruption class issue #6 reported:
+    # a room double-registered as BOTH a Profile Room AND a Channel room
+    # (from the now-fixed ;link profile hijack bug) got ;replace room'd as
+    # if it were only ever the Profile Room, tombstoning it while leaving
+    # the Channel room mapping silently pointing at the now-dead room.
+    # Neither a Channel room nor a guild Space is ever a valid target for
+    # THIS command on its own (there's no _replace_channel_room/
+    # _replace_guild_space -- Shoot itself is authoritative for a
+    # Channel/guild's own identity, not this bridge), so a room resolving
+    # as either means something's already wrong -- refuse outright here
+    # rather than silently falling through to whichever OTHER type it also
+    # happens to match and compounding the corruption further.
+    if await repository.get_channel_room_by_room_id(room_id) is not None:
+        await _notice(
+            request, room_id,
+            "This room is registered as a Shoot guild's Channel room -- it can't be replaced this way. "
+            "If it's showing up as something else too, that's a bug -- contact a Matrix server admin "
+            "instead of running this command.",
+        )
+        return
+    if await repository.get_guild_by_space_room_id(room_id) is not None:
+        await _notice(
+            request, room_id,
+            "This room is a Shoot guild's own Space -- it can't be replaced this way. If it's showing "
+            "up as something else too, that's a bug -- contact a Matrix server admin instead of "
+            "running this command.",
+        )
+        return
 
     actor_record = await repository.get_local_actor_by_room_id(room_id)
     remote_room = None if actor_record is not None else await repository.get_remote_actor_room_by_room_id(room_id)

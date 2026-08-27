@@ -370,7 +370,7 @@ Bare `;refresh` checks for poll-thread context FIRST, before falling back to the
 
 **What it does:** Re-fetches the guild's live channel list right now and creates a Matrix room for any channel added since it was joined (or since the last refresh). Shoot doesn't federate channel-creation events at all, so a newly-created channel is otherwise only discovered the first time someone actually posts in it.
 
-**Who can run it:** Any local user, from inside one of that guild's Channel rooms -- being present there at all already means the bot invited you as a recorded guild member, the same trust level extended elsewhere in the bridge (e.g. a Profile Room's own topic/name/avatar).
+**Who can run it:** Matrix server admins only, from inside one of that guild's Channel rooms -- a Channel room isn't "owned" by anyone on the Matrix side, and (unlike, say, a Profile Room) Channel rooms use restricted joins that any current guild Space member can use freely with no elevated power needed, so being present in one isn't a meaningful trust signal.
 
 ---
 
