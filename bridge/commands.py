@@ -217,6 +217,7 @@ from bridge.activitypub.webfinger import (
     resolve_invite_code,
     resolve_remote_actor_id,
 )
+from bridge.config import BridgeConfig
 from bridge.crypto import generate_keypair
 from bridge.ghosts import (
     ensure_ghost_user,
@@ -542,10 +543,7 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
     try:
         if subcommand == "help":
-            help_arg = argument.strip().lower()
-            await _handle_help(
-                request, room_id=room_id, sender=sender, show_all=help_arg == "all", show_admin=help_arg == "admin",
-            )
+            await _handle_help(request, room_id=room_id, sender=sender, argument=argument)
             return True
 
         # Every other command mints identities or triggers signed federation
@@ -926,67 +924,155 @@ async def _mark_room_replaced(request: Request, *, old_room_id: str, as_user_id:
         logger.info("Could not rename replaced room %s", old_room_id, exc_info=True)
 
 
-async def _handle_help(
-    request: Request, *, room_id: str, sender: str, show_all: bool = False, show_admin: bool = False,
-) -> None:
-    """Sent as an ordinary ``m.text`` message, not ``m.notice`` -- someone
-    asking what the bot can do should get an answer that stands out, not
-    one muted into whatever quieter styling (or, per
-    ``.m.rule.suppress_notices``, no notification at all) a client gives
-    notices. Each command's own invocation is bolded in the HTML rendering,
-    set apart from its description below it -- a plain, unstyled wall of
-    "command\\n  description" pairs is hard to scan for the one command
-    you're actually looking for.
-
-    Three tiers, each hidden from the ones "below" it: ``show_all``
-    (``;help all``) additionally lists the room-maintenance/advanced
-    commands -- hidden from the ordinary ``;help`` since they're one-off
-    account/room-recovery operations (or things like ``;refresh poll``)
-    almost nobody needs day to day, not things a new user scanning "how do
-    I follow someone" should have to scroll past. ``show_admin``
-    (``;help admin``) instead lists ONLY the commands that are actually
-    gated to a Matrix server admin (``;allow``/``;disallow``/``;allowed``/
-    ``;refresh``)
-    -- kept out of ``;help all`` entirely, since they're not "advanced
-    user" features, they're admin-only and irrelevant to (can't even be
-    run by) everyone else. Deliberately no combined "all + admin" view --
-    each tier answers one specific "what can I do" question.
-
-    ``show_admin`` is refused outright (with its own notice, nothing listed)
-    for anyone ``_is_matrix_admin`` doesn't recognize -- the admin tier lists
-    real capabilities a non-admin literally cannot use, not just
-    "advanced"/inconvenient ones, so exposing it is a real (if minor)
-    information leak, not just clutter. The pointer to ``;help admin`` in
-    the other two tiers' own outro is hidden the same way, for the same
-    reason -- a non-admin has no use for it and no way to act on it, so
-    advertising it at all is pointless at best."""
-    config = request.app.state.config
-    bot_mxid = _bot_mxid(config)
-    is_admin = await _is_matrix_admin(request, sender)
-    if show_admin and not is_admin:
-        await _notice(request, room_id, "Only a Matrix server admin can use this.")
-        return
-    intro = (
-        f'Hi, I\'m the fediverse bridge! Start a message with "{_COMMAND_PREFIX}" to give me a command '
-        f'(e.g. "{_COMMAND_PREFIX}help"). You can also tag me in place of "{_COMMAND_PREFIX}":'
-    )
-    intro_html = (
-        f"Hi, I'm the fediverse bridge! Start a message with <code>{html.escape(_COMMAND_PREFIX)}</code> to give "
-        f"me a command (e.g. <code>{html.escape(_COMMAND_PREFIX)}help</code>). You can also tag me in place of "
-        f"<code>{html.escape(_COMMAND_PREFIX)}</code>:"
-    )
-    commands = [
-        (f"{_COMMAND_PREFIX}help", "Show this message."),
-        (
-            f"{_COMMAND_PREFIX}create profile",
-            f"Set up a new fediverse identity ({config.bridge.domain}) and Matrix room for you in one step.",
+def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple[str, str]]]]:
+    """Every ``;help`` section, keyed by the word that selects it
+    (``;help <key>``) -- ``(display name, one-line blurb, [(command, description), ...])``.
+    Built fresh per-request since a couple of descriptions embed live config
+    (``bridge.domain``, ``bridge.backfill_default_count``) and the PeerTube
+    section only exists at all when ``bridge.peertube_channels_enabled`` is
+    on. Matches COMMANDS.md's own section breakdown 1:1 -- keep both in
+    sync when adding/moving a command."""
+    sections: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
+        "profile": (
+            "Profile",
+            "Setting up and maintaining your own linked fediverse identity.",
+            [
+                (
+                    f"{_COMMAND_PREFIX}create profile",
+                    f"Set up a new fediverse identity ({config.bridge.domain}) and Matrix room for you in "
+                    "one step.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}import follows",
+                    "Import a follows list exported from another fediverse account: upload the CSV "
+                    "(Pleroma/Akkoma data export, or Mastodon's follows CSV) to a room I'm in, then reply "
+                    "to that upload with this command. Already-followed accounts are skipped; a summary "
+                    "with any failures follows when it finishes.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}banner mxc://server/mediaid",
+                    "Set your fediverse profile's banner image from already-uploaded Matrix media.",
+                ),
+            ],
         ),
-        *(
+        "general": (
+            "General",
+            "Following, messaging, and everyday commands.",
+            [
+                (f"{_COMMAND_PREFIX}help", "Show this message, or run with a section name to see its commands."),
+                (
+                    f"{_COMMAND_PREFIX}follow @user@instance.org",
+                    "Follow a fediverse account, creating or reusing a room for their posts "
+                    f'(requires a linked profile first). Undo it with "{_COMMAND_PREFIX}unfollow".',
+                ),
+                (f"{_COMMAND_PREFIX}following", "List every fediverse account you're following."),
+                (
+                    f"{_COMMAND_PREFIX}dm @user@instance.org",
+                    "Start or reuse a private direct-message room with a fediverse account.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}chat @user@instance.org",
+                    "Start or reuse an ActivityPub Chat with a fediverse account.",
+                ),
+                (f"{_COMMAND_PREFIX}import <url>", "Fetch and mirror a single fediverse post by its URL."),
+                (
+                    f"{_COMMAND_PREFIX}repost [<caption>]",
+                    "Reply to a fediverse post with this to repost it -- bare, a plain repost (same as "
+                    "reacting with 🔁); with a caption, a new post of your own quoting the original with "
+                    "your added commentary.",
+                ),
+            ],
+        ),
+        "advanced": (
+            "Advanced/Maintenance",
+            "One-off account/room-recovery operations and other things almost nobody needs day to day.",
+            [
+                (
+                    f"{_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id]",
+                    "Force an invite into a room the bridge manages, e.g. to recover from a lockout.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}leave unfollowed",
+                    "Leave every Remote User Room you're a member of but no longer (or never actually) "
+                    "follow. Shows a count and asks for confirmation first.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}refresh poll",
+                    "Reply to a poll (or anything in its thread) to actively re-fetch its current "
+                    "tallies/closed state right now, rather than waiting for the remote server to push an "
+                    "update (some, like Pleroma/Akkoma, never do). Any local user -- unlike the admin-only "
+                    f'"{_COMMAND_PREFIX}refresh" in the Admin section.',
+                ),
+                (
+                    f"{_COMMAND_PREFIX}hide followers",
+                    'Hide your followers list from remote viewers (also works with "following"; your '
+                    f'counts stay public either way). Undo it with "{_COMMAND_PREFIX}show" (visible by '
+                    "default).",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}block @user@instance.org",
+                    "Block an account (or run with no argument inside the room representing them): cuts "
+                    "any existing follow, kicks you from their room/DM/chat, declines future follows, and "
+                    f'silences them like "{_COMMAND_PREFIX}mute" below. "{_COMMAND_PREFIX}unblock" undoes it.',
+                ),
+                (
+                    f"{_COMMAND_PREFIX}mute @user@instance.org",
+                    "Mute an account (or run with no argument inside their room): no notifications about "
+                    "them, and no auto-invites into a DM/chat/mention room because of them. "
+                    f'"{_COMMAND_PREFIX}unmute" undoes it.',
+                ),
+                (
+                    f"{_COMMAND_PREFIX}backfill [N]",
+                    f"Pull that account's latest {config.bridge.backfill_default_count} posts into this "
+                    "room (already-mirrored ones are skipped). Run as a reply inside a Matrix thread "
+                    "mirroring a fediverse conversation to backfill that thread's replies instead. Only a "
+                    "Matrix server admin can pass a custom N.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}widget",
+                    "Add a room widget with buttons for most of these commands, for clients that support "
+                    "Matrix widgets.",
+                ),
+            ],
+        ),
+        "guild": (
+            "Guild",
+            "Shoot guild and channel commands (FEP-bebd).",
+            [
+                (
+                    f"{_COMMAND_PREFIX}joinguild CODE@guild.example.com",
+                    "Join a Shoot guild using an invite code. If you're already a member (e.g. you left "
+                    "its Space and want back in), this re-invites you instead of erroring out.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}leaveguild",
+                    "Run inside one of that guild's Channel rooms: sends a real Undo(Follow) and drops "
+                    "this bridge's own membership tracking for it.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}refresh guild",
+                    "Run inside a joined guild's Space or one of its Channel rooms: re-fetches its live "
+                    "channel list right now, and self-heals a Channel room the bridge finds tombstoned. "
+                    "Matrix server admins only.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}refresh guild invite CODE@domain",
+                    "Run inside a joined guild's Space or one of its Channel rooms: stores an invite code "
+                    "so joining the Space/a Channel room afterward auto-joins the guild over ActivityPub, "
+                    "no ;joinguild needed. Matrix server admins only.",
+                ),
+            ],
+        ),
+        "peertube": (
+            "PeerTube",
+            "Publishing and managing a PeerTube-compatible video channel"
+            + ("" if config.bridge.peertube_channels_enabled else " (not enabled on this bridge)")
+            + ".",
             [
                 (
                     f"{_COMMAND_PREFIX}create channel <id> [display name]",
-                    "Set up a real, federating PeerTube-compatible video channel and Matrix room "
-                    "(requires a linked profile first, which becomes the channel's owner).",
+                    "Set up a real, federating PeerTube-compatible video channel and Matrix room (requires "
+                    "a linked profile first, which becomes the channel's owner).",
                 ),
                 (
                     f"{_COMMAND_PREFIX}publish",
@@ -997,8 +1083,8 @@ async def _handle_help(
                 (
                     f"{_COMMAND_PREFIX}edit",
                     'Reply to an already-published video with this (same "key: value" fields as '
-                    f'"{_COMMAND_PREFIX}publish") to change its metadata. Only the fields you include change; '
-                    "the video file itself is untouched.",
+                    f'"{_COMMAND_PREFIX}publish") to change its metadata. Only the fields you include '
+                    "change; the video file itself is untouched.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}replace video [mxc://...]",
@@ -1010,164 +1096,143 @@ async def _handle_help(
                     "Reply to an already-published video with this to retract it from the fediverse. The "
                     "Matrix message itself is left alone, so you can re-publish it later.",
                 ),
-            ]
-            if config.bridge.peertube_channels_enabled
-            else []
+            ],
         ),
-        (
-            f"{_COMMAND_PREFIX}follow @user@instance.org",
-            "Follow a fediverse account, creating or reusing a room for their posts "
-            f'(requires a linked profile first). Undo it with "{_COMMAND_PREFIX}unfollow".',
+        "admin": (
+            "Admin",
+            "Bridge-wide access control and maintenance, gated to a Matrix server admin.",
+            [
+                (
+                    f"{_COMMAND_PREFIX}allow mxid|room|homeserver <value>",
+                    "Let a user on a DIFFERENT homeserver (an exact MXID, anyone in a room, or a whole "
+                    "homeserver's users) use this bridge -- in whatever mode bridge.third_party_access_mode "
+                    f'currently configures. Whitelisting a homeserver asks for confirmation first. '
+                    f'"{_COMMAND_PREFIX}disallow" undoes any of these.',
+                ),
+                (f"{_COMMAND_PREFIX}allowed", "List every current third-party access grant."),
+                (
+                    f"{_COMMAND_PREFIX}refresh [@user@instance.org]",
+                    "Re-fetch a ghost's live profile right now and bring their display name/avatar, their "
+                    "room's name/avatar/banner, and their MSC4503 external-handle profile field (set or "
+                    "removed, matching whatever bridge.msc4503_external_handle currently allows) all up to "
+                    "date immediately. The handle can be omitted when run inside that account's own room.",
+                ),
+            ],
         ),
-        (
-            f"{_COMMAND_PREFIX}following",
-            "List every fediverse account you're following.",
+        "danger": (
+            "⚠️ Danger Zone",
+            "Commands that can leave a bridged identity in a bugged state, or cause irreversible damage, "
+            "if used without understanding them. Each sends a warning and requires a \"confirm\" reply "
+            "before anything actually happens.",
+            [
+                (
+                    f"{_COMMAND_PREFIX}link profile",
+                    f"Bind this room to your fediverse identity ({config.bridge.domain}) instead of "
+                    "creating a new one -- a lasting change to what this room IS, not a one-off action.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}unlink profile",
+                    "Detach this room from your identity without notifying the fediverse. Relinking (even "
+                    "in a different room) reattaches the same identity, but this room is immediately open "
+                    "to becoming a DIFFERENT identity in the meantime.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}replace room",
+                    "Replace this room with a freshly-created one for the same identity, fixing missing "
+                    "features.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}delete profile",
+                    "Permanently delete your identity and notify your followers. Irreversible -- unlike "
+                    "everything else in this section.",
+                ),
+            ],
         ),
-        (
-            f"{_COMMAND_PREFIX}dm @user@instance.org",
-            "Start or reuse a private direct-message room with a fediverse account.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}chat @user@instance.org",
-            "Start or reuse an ActivityPub Chat with a fediverse account.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}import <url>",
-            "Fetch and mirror a single fediverse post by its URL.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}repost [<caption>]",
-            "Reply to a fediverse post with this to repost it -- bare, a plain repost (same as reacting with "
-            "🔁); with a caption, a new post of your own quoting the original with your added commentary.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}banner mxc://server/mediaid",
-            "Set your fediverse profile's banner image from already-uploaded Matrix media.",
-        ),
-    ]
-    # Advanced/maintenance commands -- one-off account/room recovery, not
-    # day-to-day use -- only shown for "help all", appended after the
-    # regular ones so they still read as a coherent single table.
-    advanced_commands = [
-        (
-            f"{_COMMAND_PREFIX}link profile",
-            f"Bind this room to your fediverse identity ({config.bridge.domain}) instead of creating a new one.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}unlink profile",
-            "Detach this room from your identity without notifying the fediverse. "
-            "Relinking (even in a different room) reattaches the same identity.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}delete profile",
-            "Permanently delete your identity and notify your followers. Irreversible.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}replace room",
-            "Replace this room with a freshly-created one for the same identity, fixing missing features.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id]",
-            "Force an invite into a room the bridge manages, e.g. to recover from a lockout.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}leave unfollowed",
-            "Leave every Remote User Room you're a member of but no longer (or never actually) follow. "
-            "Shows a count and asks for confirmation first.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}refresh poll",
-            "Reply to a poll (or anything in its thread) to actively re-fetch its current tallies/closed "
-            "state right now, rather than waiting for the remote server to push an update (some, like "
-            "Pleroma/Akkoma, never do). Any local user -- unlike the admin-only ;refresh below.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}hide followers",
-            'Hide your followers list from remote viewers (also works with "following"; your counts stay '
-            f'public either way). Undo it with "{_COMMAND_PREFIX}show" (visible by default).',
-        ),
-        (
-            f"{_COMMAND_PREFIX}block @user@instance.org",
-            "Block an account (or run with no argument inside the room representing them): cuts any existing "
-            f'follow, kicks you from their room/DM/chat, declines future follows, and silences them like '
-            f'"{_COMMAND_PREFIX}mute" below. "{_COMMAND_PREFIX}unblock" undoes it.',
-        ),
-        (
-            f"{_COMMAND_PREFIX}import follows",
-            "Import a follows list exported from another fediverse account: upload the CSV "
-            "(Pleroma/Akkoma data export, or Mastodon's follows CSV) to a room I'm in, then reply to "
-            "that upload with this command. Already-followed accounts are skipped; a summary with any "
-            "failures follows when it finishes.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}mute @user@instance.org",
-            "Mute an account (or run with no argument inside their room): no notifications about them, and "
-            f'no auto-invites into a DM/chat/mention room because of them. "{_COMMAND_PREFIX}unmute" undoes it.',
-        ),
-        (
-            f"{_COMMAND_PREFIX}backfill [N]",
-            f"Pull that account's latest {config.bridge.backfill_default_count} posts into this room "
-            "(already-mirrored ones are skipped). Run as a reply inside a Matrix thread mirroring a "
-            "fediverse conversation to backfill that thread's replies instead. Only a Matrix server admin "
-            "can pass a custom N.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}widget",
-            "Add a room widget with buttons for most of these commands, for clients that support "
-            "Matrix widgets.",
-        ),
-    ]
-    # Commands actually GATED to a Matrix server admin -- nobody else can
-    # run these at all, as opposed to advanced_commands above (one-off
-    # account/room-recovery operations any user can run for their own
-    # stuff). Its own tier ("help admin"), never folded into "help all".
-    admin_commands = [
-        (
-            f"{_COMMAND_PREFIX}allow mxid|room|homeserver <value>",
-            "Let a user on a DIFFERENT homeserver (an exact MXID, anyone in a room, or a whole homeserver's "
-            "users) use this bridge -- in whatever mode bridge.third_party_access_mode currently configures. "
-            f'Whitelisting a homeserver asks for confirmation first. "{_COMMAND_PREFIX}disallow" undoes any '
-            "of these.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}allowed",
-            "List every current third-party access grant.",
-        ),
-        (
-            f"{_COMMAND_PREFIX}refresh [@user@instance.org]",
-            "Re-fetch a ghost's live profile right now and bring their display name/avatar, their room's "
-            "name/avatar/banner, and their MSC4503 external-handle profile field (set or removed, matching "
-            "whatever bridge.msc4503_external_handle currently allows) all up to date immediately. The handle "
-            "can be omitted when run inside that account's own room.",
-        ),
-    ]
-    if show_all:
-        commands = commands + advanced_commands
-    elif show_admin:
-        commands = commands + admin_commands
+    }
+    if not config.bridge.peertube_channels_enabled:
+        del sections["peertube"]
+    return sections
 
+
+def _render_help_table(intro: str, intro_html: str, commands: list[tuple[str, str]]) -> tuple[str, str]:
+    """Shared plain-text/HTML rendering for a help table -- either the
+    section overview or one section's own command list, both just a list
+    of (left column, right column) rows under an intro paragraph. Each
+    command's own invocation is bolded in the HTML rendering, set apart
+    from its description below it -- a plain, unstyled wall of
+    "command\\n  description" pairs is hard to scan for the one command
+    you're actually looking for."""
     body = intro + "\n\n" + "\n\n".join(f"{cmd}\n  - {desc}" for cmd, desc in commands)
     formatted_body = (
         f"<p>{intro_html}</p>"
         "<table><thead><tr><th>Command</th><th>Description</th></tr></thead>"
         f"<tbody>{''.join(f'<tr><td>{html.escape(cmd)}</td><td>{html.escape(desc)}</td></tr>' for cmd, desc in commands)}</tbody></table>"
     )
-    if not show_all:
-        outro = f'Advanced/maintenance commands are hidden here -- use "{_COMMAND_PREFIX}help all" to see them too.'
-        outro_html = (
-            f"Advanced/maintenance commands are hidden here -- use "
-            f"<code>{html.escape(_COMMAND_PREFIX)}help all</code> to see them too."
+    return body, formatted_body
+
+
+async def _handle_help(request: Request, *, room_id: str, sender: str, argument: str = "") -> None:
+    """Sent as an ordinary ``m.text`` message, not ``m.notice`` -- someone
+    asking what the bot can do should get an answer that stands out, not
+    one muted into whatever quieter styling (or, per
+    ``.m.rule.suppress_notices``, no notification at all) a client gives
+    notices.
+
+    Two-level browsing, added live 2026-08-29 in place of the old flat
+    ``;help``/``;help all``/``;help admin`` tiers -- the full command set
+    had grown too large for a single scrollable list to stay scannable.
+    Bare ``;help`` (or an unrecognized ``argument``) shows a table of
+    SECTION names with a one-line blurb each; ``;help <section>`` (e.g.
+    ``;help profile``, ``;help danger``) shows that section's own command
+    table, in the same rich format the old flat list used. ``;help all``
+    is kept as a convenience flattening every section but ``admin`` into
+    one table (unchanged from before: deliberately never combined with the
+    admin tier, which lists real capabilities a non-admin literally cannot
+    use, not just "advanced"/inconvenient ones -- exposing it to anyone
+    else is a real, if minor, information leak). ``;help admin`` -- now
+    just this model's normal ``<section>`` argument, "admin" being a
+    section like any other -- keeps its own separate admin check: refused
+    outright (with its own notice, nothing listed) for anyone
+    ``_is_matrix_admin`` doesn't recognize."""
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    sections = _help_sections(config)
+    key = argument.strip().lower()
+
+    intro = (
+        f'Hi, I\'m the fediverse bridge! Start a message with "{_COMMAND_PREFIX}" to give me a command '
+        f'(e.g. "{_COMMAND_PREFIX}help"). You can also tag me in place of "{_COMMAND_PREFIX}":'
+    )
+    intro_html = (
+        f"Hi, I'm the fediverse bridge! Start a message with <code>{html.escape(_COMMAND_PREFIX)}</code> to give "
+        f"me a command (e.g. <code>{html.escape(_COMMAND_PREFIX)}help</code>). You can also tag me in place of "
+        f"<code>{html.escape(_COMMAND_PREFIX)}</code>:"
+    )
+
+    if key == "admin":
+        if not await _is_matrix_admin(request, sender):
+            await _notice(request, room_id, "Only a Matrix server admin can use this.")
+            return
+        _name, _blurb, commands = sections["admin"]
+        body, formatted_body = _render_help_table(intro, intro_html, commands)
+    elif key == "all":
+        combined: list[tuple[str, str]] = []
+        for section_key, (_name, _blurb, commands) in sections.items():
+            if section_key != "admin":
+                combined.extend(commands)
+        body, formatted_body = _render_help_table(intro, intro_html, combined)
+    elif key in sections and key != "admin":
+        _name, _blurb, commands = sections[key]
+        body, formatted_body = _render_help_table(intro, intro_html, commands)
+    else:
+        section_rows = [(f"{_COMMAND_PREFIX}help {key}", blurb) for key, (_name, blurb, _cmds) in sections.items()]
+        overview_intro = intro + f'\n\nRun "{_COMMAND_PREFIX}help <section>" to see a section\'s own commands.'
+        overview_intro_html = (
+            intro_html + f'</p><p>Run <code>{html.escape(_COMMAND_PREFIX)}help &lt;section&gt;</code> to see a '
+            "section's own commands."
         )
-        body += f"\n\n{outro}"
-        formatted_body += f"<p>{outro_html}</p>"
-    if not show_admin and is_admin:
-        outro = f'Matrix server admin commands are hidden here -- use "{_COMMAND_PREFIX}help admin" to see them.'
-        outro_html = (
-            f"Matrix server admin commands are hidden here -- use "
-            f"<code>{html.escape(_COMMAND_PREFIX)}help admin</code> to see them."
-        )
-        body += f"\n\n{outro}"
-        formatted_body += f"<p>{outro_html}</p>"
+        body, formatted_body = _render_help_table(overview_intro, overview_intro_html, section_rows)
+
     help_content: dict = {
         "msgtype": "m.text",
         "body": body,
