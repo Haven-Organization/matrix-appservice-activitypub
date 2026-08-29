@@ -15,9 +15,6 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 - [`;help` / `;help all` / `;help admin`](#help--help-all--help-admin)
 - [`;create profile`](#create-profile)
-- [`;link profile`](#link-profile)
-- [`;unlink profile`](#unlink-profile)
-- [`;delete profile`](#delete-profile)
 - [`;follow`](#follow-userinstanceorg)
 - [`;unfollow`](#unfollow-userinstanceorg)
 - [`;following`](#following)
@@ -31,7 +28,6 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;chat`](#chat-userinstanceorg)
 - [`;import <url>`](#import-url)
 - [`;import follows`](#import-follows-or-import-following)
-- [`;replace room`](#replace-room)
 - [`;rejoin`](#rejoin-room_id-othermatrixid)
 - [`;leave unfollowed`](#leave-unfollowed)
 - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
@@ -47,6 +43,11 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [`;allowed`](#allowed)
 - [`;refresh`](#refresh-userinstanceorg)
 - [Widget vs. commands](#widget-vs-commands)
+- [**Danger Zone**](#danger-zone)
+  - [`;link profile`](#link-profile)
+  - [`;unlink profile`](#unlink-profile)
+  - [`;replace room`](#replace-room)
+  - [`;delete profile`](#delete-profile)
 
 ---
 
@@ -71,44 +72,6 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 **Who can run it:** Any local Matrix user without an already-linked profile. If you already have one, this just reports its room and does nothing further.
 
 **Notes:** Reattaching an unlinked identity preserves its followers and following exactly as before. If room creation fails, you're told you can make your own room and use `;link profile` instead.
-
----
-
-## `;link profile`
-
-**Syntax:** `;link profile`, run inside whichever room you want to bind your identity to.
-
-**What it does:** Binds your identity to the room the command was run in, minting a new actor if you don't have one, or reattaching a previously-unlinked one. Sets the room's name/avatar to match your current Matrix profile (best-effort, needs the bot to have enough power in the room). If the room already has a topic and this is a brand-new identity, that topic becomes your bio.
-
-**Who can run it:** Any local user without an already-linked profile.
-
-**Notes:** Unlike `;create profile`, this doesn't make a room for you. You need to already own or control one and have invited the bot with sufficient power. It's the option for people who'd rather use a room they already have.
-
----
-
-## `;unlink profile`
-
-**Syntax:** `;unlink profile`.
-
-**What it does:** Detaches your current room from your identity without telling the fediverse anything. No `Delete` is sent, and your followers, following, and keys are all preserved untouched. This is how you move your profile to a different room: unlink here, then `;link profile`/`;create profile` in the new room to reattach the exact same identity.
-
-**Who can run it:** Any local user with a currently-linked profile.
-
-**Notes:** Fully reversible, since the identity itself survives. Contrast with `;delete profile`, which is not.
-
----
-
-## `;delete profile`
-
-**Syntax:** `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated.
-
-**What it does:**
-1. `;delete profile` alone sends an itemized warning of exactly what will happen, and nothing else yet.
-2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion: sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room you're in (except the Profile Room itself), kicks you from your Fediverse space, unlinks the room, renames it to add "(Deleted)", and permanently erases the identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
-
-**Who can run it:** Any local user with a currently-linked profile. It always acts on whoever sends "confirm" and their own profile, never someone else's.
-
-**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message.
 
 ---
 
@@ -261,21 +224,6 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 **Who can run it:** Requires a linked profile.
 
 **Notes:** Long-running and asynchronous. The summary may arrive minutes later. The widget's equivalent accepts the file directly, without needing it to already be an upload you're replying to.
-
----
-
-## `;replace room`
-
-**Syntax:** `;replace room`, run inside the room to be replaced.
-
-**What it does:** Creates a new room representing the exact same identity the current one does (a linked Profile Room, a Remote User Room, a ghost DM/Chat room, or your Notifications DM), bringing it up to date with anything the bridge has added since the old room was created (current room type/version, bridge tagging, the bot always being invited, and so on). Sets a proper `predecessor` link and tombstones the old room, renaming it with a "(Replaced ...)" suffix. This is entirely a local Matrix operation. Nothing goes out over ActivityPub, since the underlying identity isn't changing. For a Profile Room or Remote User Room, other local (non-ghost) members are automatically re-invited into the new room too, not just whoever ran the command.
-
-**Who can run it:**
-- Your own linked Profile Room: you, or a Matrix server admin.
-- Someone else's Remote User Room: admin only.
-- A DM/Chat/Notifications room: that room's owner, or an admin.
-
-**Notes:** Anyone not automatically re-invited is left in the retired room, which stays around, just tombstoned. Nobody's forced out of it.
 
 ---
 
@@ -451,3 +399,70 @@ Bare `;refresh` checks for poll-thread context FIRST, before falling back to the
 The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the `hide`/`show` toggle, and a read-only following list.
 
 It deliberately omits `;repost`, `;rejoin`, `;leave unfollowed`, and `;allow`/`;disallow`/`;allowed`. None fit a simple button: repost needs a specific post to reply to, rejoin is a rare recovery tool, leave-unfollowed is a rare cleanup one, and the allowlist commands are admin-only bridge-wide configuration, not something to expose in an ordinary room widget -- several of these also need a confirmation step the widget doesn't have a flow for. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.
+
+---
+
+## Danger Zone
+
+The four commands below directly manipulate the binding between a Matrix room and a fediverse identity -- what room an identity lives in, or whether it exists at all. Used on the wrong room, or without understanding exactly what they do, they **can leave a bridged identity in a bugged/inconsistent state, or cause irreversible damage**. **Make sure you fully understand what a command does before using it.** Every command here is confirmation-gated for exactly this reason: running it alone only sends a warning explaining what's about to happen and asks you to reply "confirm" to a specific message -- nothing actually happens until you do.
+
+Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` permanently binds a room, ran it in a room that was already serving another purpose (a Shoot guild's Channel room), leaving the bridge's own bookkeeping registered as both at once -- then running `;replace room` on that already-corrupted room compounded the damage further, tombstoning it as if it had only ever been the one thing. Read the warning each of these sends. If you're not sure what it means, ask before confirming.
+
+---
+
+## `;link profile`
+
+**Syntax:** `;link profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. Run inside whichever room you want to bind your identity to.
+
+**What it does:**
+1. `;link profile` alone checks you're actually allowed to link this room -- you don't already have a linked profile, this room isn't already used by the bridge for something else, and you have enough power here to control it -- then sends a warning that this makes the room your permanent fediverse profile. Nothing is linked yet.
+2. Replying "confirm" to that specific message binds your identity to the room, minting a new actor if you don't have one, or reattaching a previously-unlinked one. Sets the room's name/avatar to match your current Matrix profile (best-effort, needs the bot to have enough power in the room). If the room already has a topic and this is a brand-new identity, that topic becomes your bio.
+
+**Who can run it:** Any local user without an already-linked profile, on a room they actually control that isn't already used by the bridge for something else -- both checked before the warning is even sent.
+
+**Notes:** Unlike `;create profile`, this doesn't make a room for you. You need to already own or control one and have invited the bot with sufficient power. It's the option for people who'd rather use a room they already have. This isn't a one-off action -- it's a lasting change to what the room IS.
+
+---
+
+## `;unlink profile`
+
+**Syntax:** `;unlink profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated.
+
+**What it does:**
+1. `;unlink profile` alone sends a warning that this room stops publishing for your identity immediately, and becomes linkable as a DIFFERENT identity by anyone with enough power here. Nothing is unlinked yet.
+2. Replying "confirm" detaches your current room from your identity without telling the fediverse anything. No `Delete` is sent, and your followers, following, and keys are all preserved untouched. This is how you move your profile to a different room: unlink here, then `;link profile`/`;create profile` in the new room to reattach the exact same identity.
+
+**Who can run it:** Any local user with a currently-linked profile.
+
+**Notes:** The identity itself survives, so it's reversible in that sense -- but the room is immediately left open to becoming a completely different identity the moment anyone with enough power runs `;link profile` in it, so don't unlink until you're actually ready to relink somewhere. Contrast with `;delete profile`, which erases the identity itself and is not reversible at all.
+
+---
+
+## `;replace room`
+
+**Syntax:** `;replace room` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. Run inside the room to be replaced.
+
+**What it does:**
+1. `;replace room` alone works out what kind of room this is and whether you're allowed to replace it, then sends a warning naming that kind (e.g. "your linked Profile Room"). Nothing is replaced yet.
+2. Replying "confirm" creates a new room representing the exact same identity the current one does (a linked Profile Room, a Remote User Room, a ghost DM/Chat room, or your Notifications DM), bringing it up to date with anything the bridge has added since the old room was created (current room type/version, bridge tagging, the bot always being invited, and so on). Sets a proper `predecessor` link and tombstones the old room, renaming it with a "(Replaced ...)" suffix. This is entirely a local Matrix operation. Nothing goes out over ActivityPub, since the underlying identity isn't changing. For a Profile Room or Remote User Room, other local (non-ghost) members are automatically re-invited into the new room too, not just whoever ran the command.
+
+**Who can run it:**
+- Your own linked Profile Room: you, or a Matrix server admin.
+- Someone else's Remote User Room: admin only.
+- A DM/Chat/Notifications room: that room's owner, or an admin.
+
+**Notes:** Anyone not automatically re-invited is left in the retired room, which stays around, just tombstoned. Nobody's forced out of it. Refuses outright, with no warning shown at all, if the room turns out to be ambiguously registered as more than one kind at once -- that means something's already wrong (a bug, not a normal state), and this command isn't the way to fix it; contact a Matrix server admin instead.
+
+---
+
+## `;delete profile`
+
+**Syntax:** `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated.
+
+**What it does:**
+1. `;delete profile` alone sends an itemized warning of exactly what will happen, and nothing else yet.
+2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion: sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room you're in (except the Profile Room itself), kicks you from your Fediverse space, unlinks the room, renames it to add "(Deleted)", and permanently erases the identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
+
+**Who can run it:** Any local user with a currently-linked profile. It always acts on whoever sends "confirm" and their own profile, never someone else's.
+
+**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message. Of everything in this Danger Zone, this is the only one that can't be undone by any other command -- `;link`/`;unlink`/`;replace` all leave the underlying identity itself intact.
