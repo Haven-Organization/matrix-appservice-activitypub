@@ -5872,7 +5872,105 @@ async def _sender_controls_room(request: Request, *, room_id: str, sender: str) 
     return sender_level >= required_level
 
 
+_LINK_PROFILE_WARNING_MARKER = "This will make this room your permanent fediverse profile"
+
+
 async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -> None:
+    """First half of a two-step, confirmation-gated link: runs the real
+    gating checks (already linked, room already used for something else,
+    sender doesn't actually control the room) up front so an obviously
+    invalid request never even gets a scary warning, then sends an
+    itemized warning and tells the sender to reply "confirm" -- nothing is
+    linked yet just from running this command. See
+    ``maybe_handle_link_profile_confirmation`` for how that reply is
+    recognized, and ``_execute_link_profile`` for what actually runs once
+    confirmed (which redoes these same checks fresh rather than trusting
+    anything found here -- state can change in the meantime, same
+    reasoning ``_execute_delete_profile`` gives for its own identical
+    re-check). Added live 2026-08-29: this used to link immediately with
+    no warning at all, and a user who didn't understand a Profile Room is
+    permanent (not a one-off action) linked a room already serving another
+    purpose entirely -- see issue #6."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+
+    existing = await repository.get_local_actor_by_matrix_id(sender)
+    if existing is not None and existing.room_id:
+        await _notice(
+            request, room_id,
+            f"{sender} is already linked as {existing.username}@{config.bridge.domain} "
+            f"(room {existing.room_id}).",
+            html_message=(
+                f"{html.escape(sender)} is already linked as {existing.username}@{config.bridge.domain} "
+                f"(room {room_pill_html(existing.room_id)})."
+            ),
+        )
+        return
+
+    already_used_as = await _room_already_bridged_as(request, room_id)
+    if already_used_as is not None:
+        await _notice(
+            request, room_id,
+            f"This room is already {already_used_as} -- it can't also become your Profile Room. "
+            f'Run "{_COMMAND_PREFIX}create profile" instead for a fresh room of your own, or '
+            f'"{_COMMAND_PREFIX}link profile" in a different room you actually control.',
+        )
+        return
+
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}link profile" needs you to actually control this room -- high enough '
+            "power to set its name/avatar yourself -- not just be a member of it. Give yourself (or "
+            f'have an admin give you) a higher power level here, or run "{_COMMAND_PREFIX}create '
+            'profile" instead for a fresh room the bot makes you the owner of.',
+        )
+        return
+
+    reattaching = existing is not None
+    warning = (
+        f"⚠️ {_LINK_PROFILE_WARNING_MARKER}. From now on, everything sent here publishes to the "
+        "fediverse under this identity -- this isn't a one-off action, it's a lasting change to what "
+        "this room IS. "
+        + (
+            "Your previous followers/following will be restored onto it. "
+            if reattaching else
+            "This room's own name/avatar/topic will be adopted as the profile's (best-effort, needs "
+            "the bot to have enough power here). "
+        )
+        + 'Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_LINK_PROFILE_WARNING_MARKER}. From now on, everything sent here publishes to the "
+        "fediverse under this identity -- this isn't a one-off action, it's a lasting change to what "
+        "this room IS. "
+        + (
+            "Your previous followers/following will be restored onto it. "
+            if reattaching else
+            "This room's own name/avatar/topic will be adopted as the profile's (best-effort, needs "
+            "the bot to have enough power here). "
+        )
+        + '</p><p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send link-profile warning to %s", room_id, exc_info=True)
+
+
+async def _execute_link_profile(request: Request, *, sender: str, room_id: str) -> None:
+    """The actual linking, only ever reached via a confirmed
+    ``maybe_handle_link_profile_confirmation``. Redoes every gating check
+    from ``_handle_link_profile`` fresh -- see that function's own
+    docstring for why -- so it's just as safe to call this directly as it
+    would be to re-run the command from scratch."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
@@ -6001,11 +6099,105 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
     await _notice(request, room_id, message)
 
 
+async def maybe_handle_link_profile_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``link profile`` warnings -- same stateless-marker mechanism as
+    ``maybe_handle_delete_confirmation`` (see its own docstring for the
+    full reasoning); must run in the same place in the dispatch chain, for
+    the same reason."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    if _LINK_PROFILE_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+        return False
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_link_profile(request, sender=sender, room_id=room_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
+_UNLINK_PROFILE_WARNING_MARKER = "This will detach this room from your fediverse identity"
+
+
 async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str) -> None:
-    """Detach this room from the sender's linked fediverse identity WITHOUT
-    telling the fediverse side anything at all -- no Delete is sent, and
-    followers/following/keys are all left exactly as they are. This is what
-    lets someone move their identity to a different room (unlink here, then
+    """First half of a two-step, confirmation-gated unlink: sends a
+    warning and tells the sender to reply "confirm" -- nothing is unlinked
+    yet just from running this command. See
+    ``maybe_handle_unlink_profile_confirmation``/``_execute_unlink_profile``
+    for the rest, same stateless-marker pattern as ``delete profile``.
+    Added live 2026-08-29 -- see issue #6: this used to unlink immediately,
+    and while unlinking itself is reversible (nothing is told to the
+    fediverse, keys/followers/following all survive -- see
+    ``_execute_unlink_profile``'s own docstring), it still detaches a room
+    someone may not have meant to, and immediately opens that room back up
+    to being linked as something else entirely by ANYONE with enough
+    power in it."""
+    repository = request.app.state.repository
+
+    record = await repository.get_local_actor_by_matrix_id(sender)
+    if record is None:
+        await _notice(request, room_id, "You don't have a linked profile to unlink.")
+        return
+
+    warning = (
+        f"⚠️ {_UNLINK_PROFILE_WARNING_MARKER} ({record.username}@{request.app.state.config.bridge.domain}). "
+        "The identity itself survives (followers, following, and keys are all preserved, nobody on the "
+        "fediverse is told anything), but this room stops publishing for it immediately, and becomes "
+        "linkable as a DIFFERENT identity by anyone with enough power here. "
+        'Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_UNLINK_PROFILE_WARNING_MARKER} "
+        f"(<strong>{html.escape(record.username)}@{html.escape(request.app.state.config.bridge.domain)}</strong>). "
+        "The identity itself survives (followers, following, and keys are all preserved, nobody on the "
+        "fediverse is told anything), but this room stops publishing for it immediately, and becomes "
+        "linkable as a DIFFERENT identity by anyone with enough power here.</p>"
+        '<p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    try:
+        await request.app.state.synapse.send_message_event(
+            room_id, warning_content, as_user_id=_bot_mxid(request.app.state.config)
+        )
+    except SynapseError:
+        logger.warning("Failed to send unlink-profile warning to %s", room_id, exc_info=True)
+
+
+async def _execute_unlink_profile(request: Request, *, sender: str, room_id: str) -> None:
+    """The actual unlinking, only ever reached via a confirmed
+    ``maybe_handle_unlink_profile_confirmation``. Detaches this room from
+    the sender's linked fediverse identity WITHOUT telling the fediverse
+    side anything at all -- no Delete is sent, and followers/following/
+    keys are all left exactly as they are. This is what lets someone move
+    their identity to a different room (unlink here, then
     `link profile`/`create profile` in the new one to reattach the same
     actor) with nobody on the other end ever noticing the room changed.
     For a permanent, fediverse-visible removal instead, use `delete profile`.
@@ -6028,6 +6220,45 @@ async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str)
         f'reattach it, or "{_COMMAND_PREFIX}delete profile" instead if you actually want to permanently '
         "remove it from the fediverse.",
     )
+
+
+async def maybe_handle_unlink_profile_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``unlink profile`` warnings -- same stateless-marker mechanism as
+    ``maybe_handle_delete_confirmation`` (see its own docstring for the
+    full reasoning); must run in the same place in the dispatch chain, for
+    the same reason."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    if _UNLINK_PROFILE_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+        return False
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_unlink_profile(request, sender=sender, room_id=room_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
 
 
 _DELETE_PROFILE_WARNING_MARKER = "This will permanently delete your fediverse identity"
@@ -6594,20 +6825,24 @@ async def _execute_leave_unfollowed(request: Request, *, sender: str, room_id: s
     )
 
 
-async def _handle_replace_room(request: Request, *, sender: str, room_id: str) -> None:
-    """Replace whichever bridged room this command was run in with a
-    freshly-created one representing the exact same identity, bringing it
-    up to date with anything the bridge has added since it was originally
-    created (MSC4501 room type, m.bridge info, the bot always being
-    invited, ...). Purely local -- nothing goes out over ActivityPub, since
-    the identity itself isn't changing, just which Matrix room represents
-    it. Only the command runner (and, for a Remote User Room, nobody else)
-    is invited into the replacement; anyone else who was in the old room
-    isn't automatically brought along.
+class _ReplaceRoomTargetError(Exception):
+    """Raised by ``_classify_replace_room_target`` for any reason ``room_id``
+    isn't a valid ``;replace room`` target for ``sender`` right now --
+    carries the exact refusal notice to show."""
 
-    Permissioned per the room's kind: a regular user may only replace their
-    own linked Profile Room; a Remote User Room (someone else's mirrored
-    fediverse account) requires a Matrix server admin.
+    def __init__(self, notice: str) -> None:
+        super().__init__(notice)
+        self.notice = notice
+
+
+async def _classify_replace_room_target(request: Request, *, room_id: str, sender: str) -> str:
+    """Read-only: what kind of room ``room_id`` currently is, after
+    checking ``sender`` is actually allowed to replace it -- or raises
+    ``_ReplaceRoomTargetError`` with the exact refusal notice otherwise.
+    Used only for ``_handle_replace_room``'s own warning label; the actual
+    replace (``_execute_replace_room``) redoes this whole classification
+    independently rather than trusting anything found here, same
+    "recompute fresh at confirm time" reasoning as ``_execute_delete_profile``.
     """
     repository = request.app.state.repository
 
@@ -6624,79 +6859,204 @@ async def _handle_replace_room(request: Request, *, sender: str, room_id: str) -
     # rather than silently falling through to whichever OTHER type it also
     # happens to match and compounding the corruption further.
     if await repository.get_channel_room_by_room_id(room_id) is not None:
-        await _notice(
-            request, room_id,
+        raise _ReplaceRoomTargetError(
             "This room is registered as a Shoot guild's Channel room -- it can't be replaced this way. "
             "If it's showing up as something else too, that's a bug -- contact a Matrix server admin "
-            "instead of running this command.",
+            "instead of running this command."
         )
-        return
     if await repository.get_guild_by_space_room_id(room_id) is not None:
-        await _notice(
-            request, room_id,
+        raise _ReplaceRoomTargetError(
             "This room is a Shoot guild's own Space -- it can't be replaced this way. If it's showing "
             "up as something else too, that's a bug -- contact a Matrix server admin instead of "
-            "running this command.",
+            "running this command."
         )
+
+    actor_record = await repository.get_local_actor_by_room_id(room_id)
+    if actor_record is not None:
+        if actor_record.matrix_user_id != sender and not await _is_matrix_admin(request, sender):
+            raise _ReplaceRoomTargetError(
+                "Only this profile's owner (or a Matrix server admin) can replace this room."
+            )
+        return "your linked Profile Room"
+
+    remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
+    if remote_room is not None:
+        if not await _is_matrix_admin(request, sender):
+            raise _ReplaceRoomTargetError(
+                "Replacing a room representing someone else's fediverse account requires being a "
+                "Matrix server admin."
+            )
+        return "a Remote User Room"
+
+    dm_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
+    if dm_actor_id is not None:
+        owner = await repository.get_ghost_dm_room_matrix_user_id(room_id)
+        if owner != sender and not await _is_matrix_admin(request, sender):
+            raise _ReplaceRoomTargetError("Only this DM's owner (or a Matrix server admin) can replace this room.")
+        return "this DM room"
+
+    chat_actor_id = await repository.get_ghost_chat_room_actor_id(room_id)
+    if chat_actor_id is not None:
+        owner = await repository.get_ghost_chat_room_matrix_user_id(room_id)
+        if owner != sender and not await _is_matrix_admin(request, sender):
+            raise _ReplaceRoomTargetError("Only this chat's owner (or a Matrix server admin) can replace this room.")
+        return "this Chat room"
+
+    notification_owner = await repository.get_bot_dm_room_owner(room_id)
+    if notification_owner is not None:
+        if notification_owner != sender and not await _is_matrix_admin(request, sender):
+            raise _ReplaceRoomTargetError(
+                "Only this room's owner (or a Matrix server admin) can replace this Notifications room."
+            )
+        return "your Notifications room"
+
+    raise _ReplaceRoomTargetError("This isn't a room the bridge manages -- nothing to replace.")
+
+
+_REPLACE_ROOM_WARNING_MARKER = "This will create a new room and tombstone this one"
+
+
+async def _handle_replace_room(request: Request, *, sender: str, room_id: str) -> None:
+    """First half of a two-step, confirmation-gated replace: classifies
+    the room and checks permission via ``_classify_replace_room_target``
+    (so an obviously invalid request never even gets a scary warning),
+    then sends a warning and tells the sender to reply "confirm" -- nothing
+    is replaced yet just from running this command. See
+    ``maybe_handle_replace_room_confirmation``/``_execute_replace_room``
+    for the rest. Added live 2026-08-29 -- see issue #6: this used to
+    replace immediately with no warning, and a room already corrupted by
+    the (now-fixed) ;link profile hijack bug got replaced as if it were
+    only ever a Profile Room, compounding the damage -- a warning that
+    spells out exactly what's about to happen is the only real defense
+    against acting on a room you don't fully understand the state of."""
+    try:
+        kind_label = await _classify_replace_room_target(request, room_id=room_id, sender=sender)
+    except _ReplaceRoomTargetError as exc:
+        await _notice(request, room_id, exc.notice)
+        return
+
+    warning = (
+        f"⚠️ {_REPLACE_ROOM_WARNING_MARKER} -- {kind_label}. The new room picks up anything the bridge "
+        "has added since this one was created; a predecessor link is set and this room is tombstoned "
+        "(renamed, no longer linked). Not everyone who was in this room is necessarily brought along to "
+        "the new one -- anyone left behind stays in the old, now-retired room. "
+        'Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_REPLACE_ROOM_WARNING_MARKER} -- {html.escape(kind_label)}. The new room picks up anything "
+        "the bridge has added since this one was created; a predecessor link is set and this room is "
+        "tombstoned (renamed, no longer linked). Not everyone who was in this room is necessarily brought "
+        "along to the new one -- anyone left behind stays in the old, now-retired room.</p>"
+        '<p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    config = request.app.state.config
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send replace-room warning to %s", room_id, exc_info=True)
+
+
+async def _execute_replace_room(request: Request, *, sender: str, room_id: str) -> None:
+    """The actual replace, only ever reached via a confirmed
+    ``maybe_handle_replace_room_confirmation``. Replaces whichever bridged
+    room this command was run in with a freshly-created one representing
+    the exact same identity, bringing it up to date with anything the
+    bridge has added since it was originally created (MSC4501 room type,
+    m.bridge info, the bot always being invited, ...). Purely local --
+    nothing goes out over ActivityPub, since the identity itself isn't
+    changing, just which Matrix room represents it. Only the command
+    runner (and, for a Remote User Room, nobody else) is invited into the
+    replacement; anyone else who was in the old room isn't automatically
+    brought along.
+
+    Redoes the full classification+permission check from
+    ``_classify_replace_room_target`` fresh rather than trusting anything
+    found by ``_handle_replace_room``'s own earlier call to it -- state can
+    change in the meantime, same reasoning ``_execute_delete_profile``
+    gives for its own identical re-check."""
+    repository = request.app.state.repository
+
+    try:
+        await _classify_replace_room_target(request, room_id=room_id, sender=sender)
+    except _ReplaceRoomTargetError as exc:
+        await _notice(request, room_id, exc.notice)
         return
 
     actor_record = await repository.get_local_actor_by_room_id(room_id)
-    remote_room = None if actor_record is not None else await repository.get_remote_actor_room_by_room_id(room_id)
-
     if actor_record is not None:
-        if actor_record.matrix_user_id != sender and not await _is_matrix_admin(request, sender):
-            await _notice(
-                request, room_id, "Only this profile's owner (or a Matrix server admin) can replace this room."
-            )
-            return
         await _replace_profile_room(request, sender=sender, old_room_id=room_id, actor_record=actor_record)
         return
 
+    remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
     if remote_room is not None:
-        if not await _is_matrix_admin(request, sender):
-            await _notice(
-                request, room_id,
-                "Replacing a room representing someone else's fediverse account requires being a "
-                "Matrix server admin.",
-            )
-            return
         await _replace_remote_actor_room(request, sender=sender, old_room_id=room_id, remote_room=remote_room)
         return
 
     dm_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
     if dm_actor_id is not None:
         owner = await repository.get_ghost_dm_room_matrix_user_id(room_id)
-        if owner != sender and not await _is_matrix_admin(request, sender):
-            await _notice(
-                request, room_id, "Only this DM's owner (or a Matrix server admin) can replace this room."
-            )
-            return
         await _replace_dm_room(request, old_room_id=room_id, actor_id=dm_actor_id, matrix_user_id=owner)
         return
 
     chat_actor_id = await repository.get_ghost_chat_room_actor_id(room_id)
     if chat_actor_id is not None:
         owner = await repository.get_ghost_chat_room_matrix_user_id(room_id)
-        if owner != sender and not await _is_matrix_admin(request, sender):
-            await _notice(
-                request, room_id, "Only this chat's owner (or a Matrix server admin) can replace this room."
-            )
-            return
         await _replace_chat_room(request, old_room_id=room_id, actor_id=chat_actor_id, matrix_user_id=owner)
         return
 
     notification_owner = await repository.get_bot_dm_room_owner(room_id)
     if notification_owner is not None:
-        if notification_owner != sender and not await _is_matrix_admin(request, sender):
-            await _notice(
-                request, room_id,
-                "Only this room's owner (or a Matrix server admin) can replace this Notifications room.",
-            )
-            return
         await _replace_notification_room(request, old_room_id=room_id, matrix_user_id=notification_owner)
         return
 
-    await _notice(request, room_id, "This isn't a room the bridge manages -- nothing to replace.")
+    # _classify_replace_room_target already succeeded above, so one of the
+    # branches above always matches -- unreachable in practice.
+
+
+async def maybe_handle_replace_room_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``replace room`` warnings -- same stateless-marker mechanism as
+    ``maybe_handle_delete_confirmation`` (see its own docstring for the
+    full reasoning); must run in the same place in the dispatch chain, for
+    the same reason."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    if _REPLACE_ROOM_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+        return False
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_replace_room(request, sender=sender, room_id=room_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
 
 
 async def _members_to_reinvite(

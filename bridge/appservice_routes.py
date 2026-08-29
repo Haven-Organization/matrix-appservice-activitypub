@@ -60,6 +60,9 @@ from bridge.commands import (
     maybe_handle_command,
     maybe_handle_delete_confirmation,
     maybe_handle_leave_unfollowed_confirmation,
+    maybe_handle_link_profile_confirmation,
+    maybe_handle_replace_room_confirmation,
+    maybe_handle_unlink_profile_confirmation,
 )
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
@@ -318,6 +321,15 @@ async def _handle_transaction(
                 continue
             handled_as_delete_confirmation = await maybe_handle_delete_confirmation(request, event)
             if handled_as_delete_confirmation:
+                continue
+            handled_as_link_profile_confirmation = await maybe_handle_link_profile_confirmation(request, event)
+            if handled_as_link_profile_confirmation:
+                continue
+            handled_as_unlink_profile_confirmation = await maybe_handle_unlink_profile_confirmation(request, event)
+            if handled_as_unlink_profile_confirmation:
+                continue
+            handled_as_replace_room_confirmation = await maybe_handle_replace_room_confirmation(request, event)
+            if handled_as_replace_room_confirmation:
                 continue
             handled_as_leave_unfollowed_confirmation = await maybe_handle_leave_unfollowed_confirmation(
                 request, event
