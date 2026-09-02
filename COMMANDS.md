@@ -490,6 +490,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 - The ghost's own Matrix display name and avatar.
 - The Remote User Room's name, avatar, and banner.
 - The MSC4503 `m.external_handle` profile field -- brought into line with whatever `bridge.msc4503_external_handle` currently allows either way: set/refreshed if it's `profile` or `both`, actively removed if it's `off` or `events`, rather than leaving a stale value in place after a config change.
+- The room's `history_visibility` -- brought into line with `bridge.world_readable_remote_rooms` either way, not just applied once at room creation.
 
 **Who can run it:** Matrix server admins only.
 
