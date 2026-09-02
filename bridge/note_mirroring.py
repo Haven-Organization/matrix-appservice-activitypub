@@ -619,6 +619,31 @@ REPLACE_ROOM_VERSION = "12"
 KNOCK_JOIN_RULE = "knock"
 
 
+async def sync_remote_room_history_visibility(request: Request, *, room_id: str) -> None:
+    """Sets (or actively un-sets) ``history_visibility: world_readable`` on
+    a Remote User Room, per ``bridge.world_readable_remote_rooms`` -- called
+    both right after a Remote User Room is created (every creation path:
+    ``;follow``, ``;import``, an inbound mention/reply auto-import,
+    ``;replace room``) and from ``;refresh`` run inside one
+    (``bridge.commands._handle_refresh``), so a later config change
+    converges already-existing rooms too, not just newly-created ones --
+    same "actively converge to current config, don't just apply once and
+    forget" pattern as that command's own MSC4503 ``m.external_handle``
+    field. Independent of ``ghost_room_join_rule``: this only ever touches
+    history_visibility, never join_rules. Best-effort, matching this
+    module's own room-styling calls."""
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    visibility = "world_readable" if config.bridge.world_readable_remote_rooms else "shared"
+    try:
+        await synapse.send_state_event(
+            room_id, "m.room.history_visibility", "", {"history_visibility": visibility},
+            as_user_id=_bot_mxid(config),
+        )
+    except SynapseError:
+        logger.info("Could not set history_visibility=%s on %s", visibility, room_id, exc_info=True)
+
+
 def _bot_mxid(config) -> str:
     return f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
 
@@ -2582,6 +2607,7 @@ async def ensure_remote_actor_room(
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
+        await sync_remote_room_history_visibility(request, room_id=new_room_id)
         await set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(
             request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc)

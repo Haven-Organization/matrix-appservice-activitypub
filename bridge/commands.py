@@ -295,6 +295,7 @@ from bridge.note_mirroring import set_profile_user_id as _set_profile_user_id
 from bridge.note_mirroring import protect_profile_user_id_power_level as _protect_profile_user_id_power_level
 from bridge.note_mirroring import SOCIAL_PROFILE_USER_ID_STATE_TYPE, SOCIAL_PROFILE_USER_ID_POWER_LEVEL
 from bridge.note_mirroring import source_post_url as _source_post_url
+from bridge.note_mirroring import sync_remote_room_history_visibility as _sync_remote_room_history_visibility
 from bridge.repository import (
     ActorRecord,
     FederatedEvent,
@@ -1759,6 +1760,7 @@ async def _establish_remote_follow(
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
+        await _sync_remote_room_history_visibility(request, room_id=new_room_id)
         await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(request, mxid=mxid, handle=handle, profile_url=extract_actor_url(actor_doc))
         await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=mxid, as_user_id=mxid)
@@ -4007,6 +4009,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
+        await _sync_remote_room_history_visibility(request, room_id=new_room_id)
         await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
         await set_ghost_external_handle(
             request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(author_doc),
@@ -4235,6 +4238,9 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
       "both"), actively removed if it doesn't (e.g. the operator just
       turned this off, or switched to "events" only), rather than leaving
       a stale value in place forever either way.
+    - The room's ``history_visibility``, brought into line with the
+      CURRENT ``bridge.world_readable_remote_rooms`` setting either way --
+      see ``bridge.note_mirroring.sync_remote_room_history_visibility``.
 
     Bare ``;refresh`` (no argument) run as a reply inside a poll's own
     thread refreshes THAT poll instead -- same resolution and permission
@@ -4391,6 +4397,11 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
         )
     else:
         await clear_ghost_external_handle(request, mxid=mxid)
+
+    # bridge.world_readable_remote_rooms -- same "converge to the current
+    # setting either way" treatment as MSC4503 above, not just applied once
+    # at room creation and then forgotten.
+    await _sync_remote_room_history_visibility(request, room_id=remote_room.room_id)
 
     # Keep this bridge's own cached bookkeeping (used by sync_ghost_profile
     # and every other reply/reaction-driven sync) from immediately treating
@@ -7355,6 +7366,7 @@ async def _replace_remote_actor_room(
         display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
+    await _sync_remote_room_history_visibility(request, room_id=new_room_id)
     await _set_ghost_profile_room(request, mxid=mxid, room_id=new_room_id)
     await set_ghost_external_handle(
         request, mxid=mxid, handle=f"@{username}@{domain}", profile_url=extract_actor_url(actor_doc)

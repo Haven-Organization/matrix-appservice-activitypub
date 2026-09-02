@@ -36,6 +36,14 @@ bridge:
   # Same as ghost_room_join_rule, but for a local user's own Profile Room.
   # local_profile_room_join_rule: knock
 
+  # Whether a Remote User Room (including a followed PeerTube channel's)
+  # is history_visibility: world_readable, letting anyone on this
+  # homeserver preview its content without joining/knocking first -- e.g.
+  # to verify a repost's social.relates_to against its real source. Off by
+  # default. ";refresh" run inside one of these rooms re-syncs its current
+  # setting to match this, so a later change here converges existing rooms.
+  # world_readable_remote_rooms: false
+
   # What an admin-allowlisted user on a DIFFERENT homeserver (see the
   # ";allow"/";disallow"/";allowed" commands) gets, once allowed:
   #   follow_only (default) - ";follow" and interact only. No Profile Room;

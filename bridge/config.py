@@ -173,6 +173,17 @@ class BridgeSection:
     # operator might want their own users' profiles knockable but a
     # remote account's mirror invite-only, or vice versa.
     local_profile_room_join_rule: str = "knock"
+    # Whether a Remote User Room (including a followed PeerTube channel's --
+    # both use this same room type) gets history_visibility: world_readable,
+    # letting anyone on THIS homeserver preview its content without joining
+    # or knocking first -- e.g. to verify a repost's own social.relates_to
+    # block against its actual claimed source, rather than trusting it.
+    # Off by default; independent of ghost_room_join_rule above, which
+    # still governs whether joining itself needs an invite/knock/nothing.
+    # ";refresh" run inside one of these rooms re-syncs its current
+    # history_visibility to match this setting, so a later config change
+    # converges already-existing rooms too, not just newly-created ones.
+    world_readable_remote_rooms: bool = False
     # Whether an admin-allowlisted user on a DIFFERENT Matrix homeserver
     # (see the `;allow`/`;disallow`/`;allowed` commands) gets treated as a
     # full local user ("full": self-service `;create profile`/`;link
@@ -457,6 +468,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         use_msc4501_post_event_type=bool(bridge_raw.get("use_msc4501_post_event_type", False)),
         ghost_room_join_rule=ghost_room_join_rule,
         local_profile_room_join_rule=local_profile_room_join_rule,
+        world_readable_remote_rooms=bool(bridge_raw.get("world_readable_remote_rooms", False)),
         third_party_access_mode=third_party_access_mode,
         poll_default_duration_days=int(bridge_raw.get("poll_default_duration_days", 7)),
         admins=list(bridge_raw.get("admins", []) or []),
