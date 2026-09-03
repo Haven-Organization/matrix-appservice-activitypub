@@ -2644,7 +2644,40 @@ async def _import_note_locked(
             except SynapseError as exc:
                 if exc.errcode != "M_FORBIDDEN":
                     logger.warning("Could not invite %s to %s: %s", inviter, existing.room_id, exc)
-        return ImportedNote(federated_event=existing)
+        # Confirmed live 2026-09-02: this used to return with
+        # first_attachment_mxc left at its default None, so a caller
+        # reusing it (e.g. _handle_announce's repost summary card) had no
+        # way to tell this post already has a real uploaded attachment and
+        # fell through to fetching+re-uploading the SAME file fresh from
+        # its own (often differently-signed/re-hosted) copy of the
+        # attachment URL -- a genuine duplicate upload under a new mxc://
+        # for byte-identical content, confirmed via SHA-256. Reading the
+        # ALREADY-mirrored event's own content back is a single cheap GET,
+        # only paid on this already-imported path (which is already
+        # skipping the far more expensive fetch+upload), and lets EVERY
+        # caller of import_note -- not just the repost path -- reuse it.
+        first_attachment_mxc: str | None = None
+        first_attachment_width: int | None = None
+        first_attachment_height: int | None = None
+        try:
+            existing_event = await synapse.get_event(existing.room_id, existing.event_id, as_user_id=bot_mxid)
+        except SynapseError:
+            logger.info(
+                "Could not fetch existing event %s in %s to reuse its attachment",
+                existing.event_id, existing.room_id, exc_info=True,
+            )
+        else:
+            existing_content = existing_event.get("content") or {}
+            url = existing_content.get("url")
+            if isinstance(url, str) and url.startswith("mxc://"):
+                first_attachment_mxc = url
+                info = existing_content.get("info") or {}
+                first_attachment_width = info.get("w")
+                first_attachment_height = info.get("h")
+        return ImportedNote(
+            federated_event=existing, first_attachment_mxc=first_attachment_mxc,
+            first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
+        )
 
     remote_room, author_avatar_mxc = await ensure_remote_actor_room(
         request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
