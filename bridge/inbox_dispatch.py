@@ -2194,7 +2194,39 @@ async def _echo_reply_in_own_room(
     if handle_content:
         message_content[EXTERNAL_HANDLE_FIELD] = handle_content
     attachments = extract_attachments(note)
-    message_content, _ = await _attach_media_to_content(request, message_content, attachments)
+    # reply_event is the threaded copy _mirror_note_as_reply just built from
+    # this SAME note -- if it embedded an attachment, its own mxc:// is read
+    # back here (one cheap GET) and reused instead of fetching+re-uploading
+    # the identical file fresh for this second, echo copy. Confirmed live
+    # 2026-09-03: without this, every echoed reply with media got its own
+    # distinct mxc:// for byte-identical content, same bug class as the
+    # repost dedup fix (see _import_note_locked).
+    echo_mxc: str | None = None
+    echo_width: int | None = None
+    echo_height: int | None = None
+    if attachments:
+        config = request.app.state.config
+        bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+        try:
+            reply_event_content = await request.app.state.synapse.get_event(
+                reply_event.room_id, reply_event.event_id, as_user_id=bot_mxid
+            )
+        except SynapseError:
+            logger.info(
+                "Could not fetch %s in %s to reuse its attachment for the echo copy",
+                reply_event.event_id, reply_event.room_id, exc_info=True,
+            )
+        else:
+            existing_content = reply_event_content.get("content") or {}
+            url = existing_content.get("url")
+            if isinstance(url, str) and url.startswith("mxc://"):
+                echo_mxc = url
+                info = existing_content.get("info") or {}
+                echo_width = info.get("w")
+                echo_height = info.get("h")
+    message_content, _ = await _attach_media_to_content(
+        request, message_content, attachments, mxc_uri=echo_mxc, width=echo_width, height=echo_height,
+    )
 
     federation_config = request.app.state.config.federation
     try:
