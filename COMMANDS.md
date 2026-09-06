@@ -18,7 +18,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;import follows`](#import-follows-or-import-following)
   - [`;banner`](#banner-mxcservermediaid)
 - [General](#general)
-  - [`;help` / `;help all` / `;help admin`](#help--help-all--help-admin)
+  - [`;help` / `;help <section>`](#help--help-section)
   - [`;follow`](#follow-userinstanceorg)
   - [`;unfollow`](#unfollow-userinstanceorg)
   - [`;following`](#following)
@@ -54,7 +54,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;allowed`](#allowed)
   - [`;refresh`](#refresh-userinstanceorg)
 - [Widget vs. commands](#widget-vs-commands)
-- [**Danger Zone**](#danger-zone)
+- [Danger Zone](#danger-zone)
   - [`;link profile`](#link-profile)
   - [`;unlink profile`](#unlink-profile)
   - [`;replace room`](#replace-room)
@@ -104,7 +104,7 @@ Setting up and maintaining your own linked fediverse identity.
 
 Following, messaging, and everyday day-to-day commands.
 
-### `;help` / `;help all` / `;help admin`
+### `;help` / `;help <section>`
 
 **Syntax:** `;help`, or tag the bot with nothing else recognizable, shows a table of every section (this document's own breakdown: Profile, General, Advanced/Maintenance, Guild, PeerTube, Admin, Danger Zone) with a one-line blurb each. Run `;help <section>` (e.g. `;help profile`, `;help guild`, `;help danger`) to see that section's own commands, in the same rich format `;help all` used to show everything in. `;help all` still works as a shortcut showing every section's commands in one combined table (except Admin -- see below). `;help admin` shows the commands actually gated to a Matrix server admin (`;allow`/`;disallow`/`;allowed`/`;refresh`) -- now just this same `;help <section>` form, "admin" being a section like any other.
 
