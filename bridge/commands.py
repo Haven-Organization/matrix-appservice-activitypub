@@ -3574,6 +3574,19 @@ async def _resolve_backfill_source(
             raise _BackfillSourceError(
                 "That thread isn't one I'm tracking -- can't tell which fediverse post it maps to."
             )
+        if root_event.reposted_object_id is not None:
+            # A thread rooted on a REPOST echo isn't a mirrored AP
+            # conversation at all -- ap_object_id here names the Announce
+            # activity itself (see FederatedEvent's docstring), and any
+            # Matrix thread under it is purely a local construct (replies
+            # to the bot's own repost notice), not something the original
+            # post's real replies belong in. Backfilling the ACTUAL
+            # post's replies into it would misrepresent a Matrix-only
+            # thread as an AP one, so this refuses rather than guessing.
+            raise _BackfillSourceError(
+                "This thread is under a repost, not a mirrored ActivityPub conversation -- "
+                "there's no real thread here to backfill."
+            )
         try:
             root_note = await fetch_actor(request, root_event.ap_object_id)
         except RemoteActorFetchError as exc:
