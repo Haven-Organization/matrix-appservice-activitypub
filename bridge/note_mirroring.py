@@ -1907,6 +1907,65 @@ async def provision_ghost(request: Request, actor_id: str) -> tuple[str, dict, s
     return mxid, actor_doc, display_name, avatar_mxc
 
 
+def encrypted_room_notice(bot_mxid: str) -> str:
+    return (
+        "This room is end-to-end encrypted, and I can't read encrypted messages -- "
+        f"tagging me won't work here. Please message me ({bot_mxid}) in a new, unencrypted room "
+        "instead (in Element: turn off the encryption toggle before sending the invite -- once a "
+        "room is encrypted it can't be switched back)."
+    )
+
+
+async def warn_if_encrypted(request: Request, room_id: str, bot_mxid: str) -> bool:
+    """Returns whether ``room_id`` turned out to be encrypted (and, if so,
+    warns into it) -- so a caller can skip ALSO sending something else that
+    would just be another plaintext event into the same encrypted room.
+    Shared by ``bridge.membership``'s own invite-acceptance check (a local
+    user created their own encrypted room and invited the bot into it) and
+    ``ensure_ghost_dm_room``/``ensure_ghost_chat_room`` below (a room THIS
+    bridge itself just created via ``create_room`` can still come out
+    encrypted -- Synapse's ``encryption_enabled_by_default_for_room_type``
+    forces it server-side, with no Client-Server API parameter to override
+    per-request; confirmed 2026-09-13 against Synapse's own source, see
+    issue #7)."""
+    synapse = request.app.state.synapse
+    try:
+        await synapse.get_room_state(room_id, "m.room.encryption", as_user_id=bot_mxid)
+    except SynapseError as exc:
+        if exc.errcode != "M_NOT_FOUND":
+            logger.debug("Could not check encryption state for %s: %s", room_id, exc)
+        return False  # no m.room.encryption state event -> room is unencrypted
+
+    # The state event exists, so the room is encrypted. Room *state* (unlike
+    # message content) is never encrypted, so we could see this even though
+    # we can't read any messages sent in the room -- but our own reply here
+    # is a plaintext event going into a room marked encrypted, which most
+    # clients (correctly) treat with suspicion; it may show with a warning
+    # or not render at all depending on the client. Best effort.
+    try:
+        await synapse.send_message_event(
+            room_id, {"msgtype": "m.notice", "body": encrypted_room_notice(bot_mxid)}, as_user_id=bot_mxid
+        )
+    except SynapseError:
+        logger.debug("Could not send encrypted-room notice to %s", room_id, exc_info=True)
+    return True
+
+
+class RoomForcedEncryptedError(Exception):
+    """Raised by ``ensure_ghost_dm_room``/``ensure_ghost_chat_room`` when a
+    room they just created came out encrypted (see ``warn_if_encrypted``'s
+    docstring) -- distinct from returning ``None`` (an ordinary creation
+    failure) so a caller with an actual room to talk back into (``;dm``/
+    ``;chat``'s own invoking room) can give a specific, actionable notice
+    instead of a generic "could not create" one. ``room_id`` is the
+    encrypted room itself, for a caller that wants to reference it anyway
+    (best-effort -- it may not even be legible to whoever's in it)."""
+
+    def __init__(self, room_id: str) -> None:
+        super().__init__(f"{room_id} came out encrypted")
+        self.room_id = room_id
+
+
 async def ensure_ghost_dm_room(
     request: Request, *, actor_id: str, matrix_user_id: str, display_name: str, avatar_mxc: str | None, mxid: str,
     respect_silence: bool = True,
@@ -1958,6 +2017,17 @@ async def ensure_ghost_dm_room(
         except SynapseError:
             logger.warning("Could not create DM room for %s with %s", actor_id, matrix_user_id, exc_info=True)
             return None
+        if await warn_if_encrypted(request, dm_room_id, bot_mxid):
+            # Never registered as "the" DM room for this pair -- it's
+            # unusable, and leaving it registered would make every future
+            # ;dm/inbound message for this pair silently point right back
+            # at the same broken room forever instead of trying again.
+            logger.warning(
+                "DM room %s for %s with %s came out encrypted despite create_room -- "
+                "this homeserver forces encryption on new private rooms (see issue #7)",
+                dm_room_id, actor_id, matrix_user_id,
+            )
+            raise RoomForcedEncryptedError(dm_room_id)
         await repository.register_ghost_dm_room(actor_id, matrix_user_id, dm_room_id)
         await send_bridge_info(
             request, room_id=dm_room_id, actor_id=actor_id,
@@ -2036,10 +2106,17 @@ async def mirror_direct_message(
         return None
     mxid, actor_doc, display_name, avatar_mxc = provisioned
 
-    dm_room_id = await ensure_ghost_dm_room(
-        request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
-        display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
-    )
+    try:
+        dm_room_id = await ensure_ghost_dm_room(
+            request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
+            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
+        )
+    except RoomForcedEncryptedError:
+        # warn_if_encrypted already left an explanation in the room itself
+        # (best-effort -- may not even be legible there); there's no
+        # interactive command context here to notice into instead, this
+        # was triggered by an inbound message arriving.
+        return None
     if dm_room_id is None:
         return None
 
@@ -2153,6 +2230,15 @@ async def ensure_ghost_chat_room(
         except SynapseError:
             logger.warning("Could not create chat room for %s with %s", actor_id, matrix_user_id, exc_info=True)
             return None
+        if await warn_if_encrypted(request, chat_room_id, bot_mxid):
+            # See ensure_ghost_dm_room's identical reasoning: never
+            # registered, so a retry isn't stuck pointing at a dead room.
+            logger.warning(
+                "Chat room %s for %s with %s came out encrypted despite create_room -- "
+                "this homeserver forces encryption on new private rooms (see issue #7)",
+                chat_room_id, actor_id, matrix_user_id,
+            )
+            raise RoomForcedEncryptedError(chat_room_id)
         await repository.register_ghost_chat_room(actor_id, matrix_user_id, chat_room_id)
         await send_bridge_info(
             request, room_id=chat_room_id, actor_id=actor_id,
@@ -2207,10 +2293,16 @@ async def mirror_chat_message(
         return None
     mxid, _actor_doc, display_name, avatar_mxc = provisioned
 
-    chat_room_id = await ensure_ghost_chat_room(
-        request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
-        display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
-    )
+    try:
+        chat_room_id = await ensure_ghost_chat_room(
+            request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
+            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
+        )
+    except RoomForcedEncryptedError:
+        # See mirror_direct_message's identical reasoning: no interactive
+        # command context to notice into here, warn_if_encrypted already
+        # left a best-effort explanation in the room itself.
+        return None
     if chat_room_id is None:
         return None
 

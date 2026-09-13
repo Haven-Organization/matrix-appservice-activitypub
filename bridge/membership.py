@@ -92,7 +92,12 @@ from bridge.commands import (
     handle_guild_auto_join,
 )
 from bridge.matrix_links import matrix_to_room_link
-from bridge.note_mirroring import resolve_old_ghost_room_owner, resolve_old_remote_actor_room, unfollow_remote_actor
+from bridge.note_mirroring import (
+    resolve_old_ghost_room_owner,
+    resolve_old_remote_actor_room,
+    unfollow_remote_actor,
+    warn_if_encrypted,
+)
 from bridge.notifications import notification_actor_html
 from bridge.repository import RemoteActorRoom
 from bridge.spaces import (
@@ -106,15 +111,6 @@ from bridge.spaces import (
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
-
-
-def _encrypted_room_notice(bot_mxid: str) -> str:
-    return (
-        "This room is end-to-end encrypted, and I can't read encrypted messages -- "
-        f"tagging me won't work here. Please message me ({bot_mxid}) in a new, unencrypted room "
-        "instead (in Element: turn off the encryption toggle before sending the invite -- once a "
-        "room is encrypted it can't be switched back)."
-    )
 
 
 async def maybe_accept_invite(request: Request, event: dict) -> bool:
@@ -197,7 +193,7 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
         return True
 
     if invited_user == bot_mxid:
-        is_encrypted = await _warn_if_encrypted(request, room_id, bot_mxid)
+        is_encrypted = await warn_if_encrypted(request, room_id, bot_mxid)
         inviter = event.get("sender", "")
         if not is_encrypted and _is_fresh_dm_invite(config, content, invited_user=bot_mxid, inviter=inviter):
             await _welcome_dm_invite(request, room_id=room_id, inviter=inviter)
@@ -306,33 +302,6 @@ async def _welcome_dm_invite(request: Request, *, room_id: str, inviter: str) ->
         )
     except SynapseError:
         logger.info("Could not send DM-invite welcome to %s", room_id, exc_info=True)
-
-
-async def _warn_if_encrypted(request: Request, room_id: str, bot_mxid: str) -> bool:
-    """Returns whether ``room_id`` turned out to be encrypted (and, if so,
-    warns into it) -- so a caller can skip ALSO sending something else that
-    would just be another plaintext event into the same encrypted room."""
-    synapse = request.app.state.synapse
-    try:
-        await synapse.get_room_state(room_id, "m.room.encryption", as_user_id=bot_mxid)
-    except SynapseError as exc:
-        if exc.errcode != "M_NOT_FOUND":
-            logger.debug("Could not check encryption state for %s: %s", room_id, exc)
-        return False  # no m.room.encryption state event -> room is unencrypted
-
-    # The state event exists, so the room is encrypted. Room *state* (unlike
-    # message content) is never encrypted, so we could see this even though
-    # we can't read any messages sent in the room -- but our own reply here
-    # is a plaintext event going into a room marked encrypted, which most
-    # clients (correctly) treat with suspicion; it may show with a warning
-    # or not render at all depending on the client. Best effort.
-    try:
-        await synapse.send_message_event(
-            room_id, {"msgtype": "m.notice", "body": _encrypted_room_notice(bot_mxid)}, as_user_id=bot_mxid
-        )
-    except SynapseError:
-        logger.debug("Could not send encrypted-room notice to %s", room_id, exc_info=True)
-    return True
 
 
 async def _resolve_ghost_room_inviter(request: Request, room_id: str, *, knocker: str) -> str | None:

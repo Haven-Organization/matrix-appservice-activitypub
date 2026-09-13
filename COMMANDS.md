@@ -58,6 +58,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;link profile`](#link-profile)
   - [`;unlink profile`](#unlink-profile)
   - [`;replace room`](#replace-room)
+  - [`;replace dm`/`;replace chat`](#replace-dmchat-userinstanceorg)
   - [`;delete profile`](#delete-profile)
 
 ---
@@ -160,7 +161,7 @@ Following, messaging, and everyday day-to-day commands.
 
 **Who can run it:** Requires a linked profile. Refuses if the resolved handle is actually a local bridge user; just start an ordinary Matrix DM with them directly.
 
-**Notes:** Distinct from `;chat` even for the same account. Different rooms, different ActivityPub message shapes.
+**Notes:** Distinct from `;chat` even for the same account. Different rooms, different ActivityPub message shapes. The bridge has no end-to-end encryption support at all (no OLM/Megolm), so it needs the room it creates to actually be unencrypted -- if your homeserver is configured to force encryption on new private rooms anyway (`encryption_enabled_by_default_for_room_type`), there's no way for this command to override that; you'll get a clear notice explaining that instead of a silently broken room. Ask a Matrix server admin to turn that setting off (or exclude invite-only rooms) if you hit this. See [`;replace dm`](#replace-dmchat-userinstanceorg) for fixing a room that already ended up encrypted this way.
 
 ---
 
@@ -172,7 +173,7 @@ Following, messaging, and everyday day-to-day commands.
 
 **Who can run it:** Requires a linked profile; refuses for a local target the same way `;dm` does.
 
-**Notes:** The other way to start one is inviting the ghost's own Matrix account directly into a fresh DM.
+**Notes:** The other way to start one is inviting the ghost's own Matrix account directly into a fresh DM. Same forced-encryption caveat as `;dm` above -- see [`;replace chat`](#replace-dmchat-userinstanceorg) if an existing chat room ends up encrypted.
 
 ---
 
@@ -508,7 +509,7 @@ It deliberately omits `;repost`, `;rejoin`, `;leave unfollowed`, `;create channe
 
 ## Danger Zone
 
-The four commands below directly manipulate the binding between a Matrix room and a fediverse identity -- what room an identity lives in, or whether it exists at all. Used on the wrong room, or without understanding exactly what they do, they **can leave a bridged identity in a bugged/inconsistent state, or cause irreversible damage**. **Make sure you fully understand what a command does before using it.** Every command here is confirmation-gated for exactly this reason: running it alone only sends a warning explaining what's about to happen and asks you to reply "confirm" to a specific message -- nothing actually happens until you do.
+The commands below directly manipulate the binding between a Matrix room and a fediverse identity -- what room an identity lives in, or whether it exists at all. Used on the wrong room, or without understanding exactly what they do, they **can leave a bridged identity in a bugged/inconsistent state, or cause irreversible damage**. **Make sure you fully understand what a command does before using it.** Every command here is confirmation-gated for exactly this reason: running it alone only sends a warning explaining what's about to happen and asks you to reply "confirm" to a specific message -- nothing actually happens until you do.
 
 Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` permanently binds a room, ran it in a room that was already serving another purpose (a Shoot guild's Channel room), leaving the bridge's own bookkeeping registered as both at once -- then running `;replace room` on that already-corrupted room compounded the damage further, tombstoning it as if it had only ever been the one thing. Read the warning each of these sends. If you're not sure what it means, ask before confirming.
 
@@ -556,6 +557,18 @@ Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` 
 - A DM/Chat/Notifications room: that room's owner, or an admin.
 
 **Notes:** Anyone not automatically re-invited is left in the retired room, which stays around, just tombstoned. Nobody's forced out of it. Refuses outright, with no warning shown at all, if the room turns out to be ambiguously registered as more than one kind at once -- that means something's already wrong (a bug, not a normal state), and this command isn't the way to fix it; contact a Matrix server admin instead.
+
+---
+
+### `;replace dm/chat @user@instance.org`
+
+**Syntax:** `;replace dm @user@instance.org` or `;replace chat @user@instance.org` (tagged ghost pills work too), then reply "confirm" to the bot's own warning message. Two-step and confirmation-gated -- but unlike `;replace room`, run from **anywhere**, not inside the room being replaced.
+
+**What it does:** The DM/Chat-room equivalent of `;replace room`, for the one case that command can't itself reach: if a DM/Chat room ended up end-to-end encrypted (see `;dm`/`;chat`'s own notes -- this bridge has no encryption support at all), the bot can never read anything sent inside it, including a `;replace room` typed there. This command looks up your existing DM/Chat room with the target directly, so it works even against a room that's completely unreadable to the bot. Otherwise identical to `;replace room`'s own DM/Chat handling: new room, predecessor link, old room tombstoned. If the new room *also* comes out encrypted (the homeserver is still misconfigured), nothing is registered or tombstoned -- you're told plainly that a server admin needs to fix it first.
+
+**Who can run it:** That room's owner, or a Matrix server admin. Disabled for third-party accounts in Follow Only mode, same as `;dm`/`;chat` themselves.
+
+**Notes:** All warning/success notices go to wherever you ran this command, never into the old (possibly unreadable) room. Also works perfectly well on an ordinary, unencrypted DM/Chat room -- it's not encryption-specific, just the only option when it is.
 
 ---
 

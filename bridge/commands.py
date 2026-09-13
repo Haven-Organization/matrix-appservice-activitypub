@@ -153,6 +153,13 @@ Supported commands (sent as a plain Matrix message, tagging the bot):
                                   replacing a Remote User Room (representing
                                   someone else's fediverse account) requires
                                   being a Matrix server admin.
+    <tag> replace dm/chat @user@instance.org
+                                  Same as ``replace room``, but for a DM/Chat
+                                  room with that account -- run from ANYWHERE
+                                  (not inside the room itself), since a room
+                                  that ended up encrypted (see ``dm``/``chat``
+                                  above) can never have a command typed
+                                  inside it read at all.
     <tag> rejoin <room_id> [@other:matrix.id]
                                   Force-attempt an invite into a room the
                                   bridge manages -- for recovering from a
@@ -266,6 +273,7 @@ from bridge.note_mirroring import (
     SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
+    RoomForcedEncryptedError,
     actor_html_with_avatar,
     build_repost_note_content,
     clear_ghost_external_handle,
@@ -287,6 +295,7 @@ from bridge.note_mirroring import (
     social_relates_to,
     thread_reply_relates_to,
     unfollow_remote_actor,
+    warn_if_encrypted,
 )
 from bridge.note_mirroring import send_bridge_info as _send_bridge_info
 from bridge.note_mirroring import set_ghost_profile_room as _set_ghost_profile_room
@@ -629,6 +638,23 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
                         f'"{_COMMAND_PREFIX}replace video" is disabled for third-party accounts in Follow Only mode.',
                     )
                     return True
+                # Same reasoning -- "dm"/"chat" are already blocked outright
+                # (_FOLLOW_ONLY_BLOCKED_ANY_ARG), so replacing one from
+                # outside it shouldn't be a back door to the same capability.
+                # Word-boundary checked the same way the actual dispatch
+                # below matches these, so a nonsense argument like "dmitri"
+                # isn't mistaken for one of these two subcommands.
+                if subcommand == "replace" and (
+                    normalized_argument in ("dm", "chat")
+                    or normalized_argument.startswith("dm ")
+                    or normalized_argument.startswith("chat ")
+                ):
+                    await _notice(
+                        request, room_id,
+                        f'"{_COMMAND_PREFIX}replace {normalized_argument.split()[0]}" is disabled for '
+                        "third-party accounts in Follow Only mode.",
+                    )
+                    return True
 
         if subcommand == "follow":
             await _handle_follow(request, sender=sender, room_id=room_id, handle=argument, content=content)
@@ -661,6 +687,16 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         elif subcommand == "replace" and (argument.lower() == "video" or argument.lower().startswith("video ")):
             await _handle_replace_video(
                 request, sender=sender, room_id=room_id, content=content, argument=argument[len("video"):].strip()
+            )
+        elif subcommand == "replace" and (argument.lower() == "dm" or argument.lower().startswith("dm ")):
+            await _handle_replace_ghost_room(
+                request, sender=sender, room_id=room_id, kind="dm",
+                argument=argument[len("dm"):].strip(), content=content,
+            )
+        elif subcommand == "replace" and (argument.lower() == "chat" or argument.lower().startswith("chat ")):
+            await _handle_replace_ghost_room(
+                request, sender=sender, room_id=room_id, kind="chat",
+                argument=argument[len("chat"):].strip(), content=content,
             )
         elif subcommand == "leave" and argument.lower() == "unfollowed":
             await _handle_leave_unfollowed(request, sender=sender, room_id=room_id)
@@ -2755,6 +2791,20 @@ async def _is_matrix_admin(request: Request, mxid: str) -> bool:
         return False
 
 
+def _forced_encryption_notice(kind_label: str) -> str:
+    """Shared by ``_handle_dm``/``_handle_chat`` for the one room-creation
+    failure worth a specific explanation rather than a generic "could not
+    create" -- see ``RoomForcedEncryptedError``'s own docstring for why
+    this can happen at all despite the bridge never asking for it."""
+    return (
+        f"Your homeserver encrypts new private rooms by default, and I can't read or send encrypted "
+        f"messages, so this {kind_label} room is unusable -- I've left an explanation in it, but you may "
+        "not even be able to read that either. Ask your Matrix server admin to set "
+        '"encryption_enabled_by_default_for_room_type" to "off" (or exclude invite-only rooms) in the '
+        f"homeserver config, then run {_COMMAND_PREFIX}{kind_label.lower()} again."
+    )
+
+
 async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str, content: dict) -> None:
     """Start (or reuse) a 1:1 Note-based direct-message room with ``handle``
     -- lets a local user proactively open a DM instead of only ever getting
@@ -2845,10 +2895,14 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
     mxid, _actor_doc, display_name, avatar_mxc = provisioned
 
     already_existed = await repository.get_ghost_dm_room(remote_actor_id, sender) is not None
-    dm_room_id = await ensure_ghost_dm_room(
-        request, actor_id=remote_actor_id, matrix_user_id=sender,
-        display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
-    )
+    try:
+        dm_room_id = await ensure_ghost_dm_room(
+            request, actor_id=remote_actor_id, matrix_user_id=sender,
+            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
+        )
+    except RoomForcedEncryptedError:
+        await _notice(request, room_id, _forced_encryption_notice("DM"))
+        return
     if dm_room_id is None:
         await _notice(request, room_id, f"Could not create a DM room with {display_name}.")
         return
@@ -2964,10 +3018,14 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
         )
 
     already_existed = await repository.get_ghost_chat_room(remote_actor_id, sender) is not None
-    chat_room_id = await ensure_ghost_chat_room(
-        request, actor_id=remote_actor_id, matrix_user_id=sender,
-        display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
-    )
+    try:
+        chat_room_id = await ensure_ghost_chat_room(
+            request, actor_id=remote_actor_id, matrix_user_id=sender,
+            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
+        )
+    except RoomForcedEncryptedError:
+        await _notice(request, room_id, _forced_encryption_notice("Chat"))
+        return
     if chat_room_id is None:
         await _notice(request, room_id, f"Could not create a chat room with {display_name}.")
         return
@@ -7148,6 +7206,186 @@ async def maybe_handle_replace_room_confirmation(request: Request, event: dict) 
     return True
 
 
+_REPLACE_GHOST_ROOM_WARNING_MARKER = "This will replace your existing"
+_REPLACE_GHOST_ROOM_ID_RE = re.compile(r"![^\s()]+:[^\s()]+")
+
+
+async def _resolve_replace_target_actor(request: Request, *, room_id: str, handle: str, content: dict) -> str | None:
+    """Handle resolution for ``;replace dm/chat <handle>`` -- a leaner copy
+    of ``_handle_dm``'s own resolution (no "run with no argument inside
+    that account's own room" shortcut, since this is a recovery command,
+    not an everyday one), sending its own notice and returning None on any
+    failure."""
+    tagged_ghost = await _resolve_tagged_ghost(request, content)
+    if tagged_ghost is not None:
+        return tagged_ghost.actor_id
+    if not handle:
+        await _notice(
+            request, room_id,
+            f"Usage: {_COMMAND_PREFIX}replace dm @user@instance.org (or {_COMMAND_PREFIX}replace chat ...)",
+        )
+        return None
+    mxid_match = await _resolve_mxid_handle(request, handle)
+    if mxid_match is not None:
+        remote_actor_id, handle, local_record = mxid_match
+        if local_record is not None:
+            await _notice(
+                request, room_id, f"{handle} is a local user on this bridge -- there's no bridged room to replace.",
+            )
+            return None
+        return remote_actor_id
+    try:
+        return await resolve_remote_actor_id(request.app.state.http_client, handle)
+    except WebfingerNotFoundError:
+        await _notice(request, room_id, f"Couldn't find {handle} -- check the handle and try again.")
+        return None
+    except WebfingerUnreachableError:
+        await _notice(request, room_id, f"Couldn't reach {handle}'s server right now -- try again in a bit.")
+        return None
+    except WebfingerError as exc:
+        await _notice(request, room_id, f"Could not resolve {handle}: {exc}")
+        return None
+
+
+async def _handle_replace_ghost_room(
+    request: Request, *, sender: str, room_id: str, kind: str, argument: str, content: dict,
+) -> None:
+    """``;replace dm @user@instance.org`` / ``;replace chat @user@instance.org``
+    -- replaces an existing DM/Chat room for (``sender``, that actor) from
+    OUTSIDE it, unlike ``;replace room`` (which must be run INSIDE the room
+    being replaced). The only way to fix an already-encrypted DM/Chat room
+    (issue #7): the bot can never read anything sent inside one (no OLM/
+    megolm implementation exists here at all), so a command typed there
+    would never arrive readable in the first place -- this has to be
+    invocable from somewhere else entirely, e.g. the ghost's own Remote
+    User Room. ``kind`` is ``"dm"`` or ``"chat"``."""
+    repository = request.app.state.repository
+    kind_label = "DM" if kind == "dm" else "Chat"
+
+    remote_actor_id = await _resolve_replace_target_actor(request, room_id=room_id, handle=argument, content=content)
+    if remote_actor_id is None:
+        return  # already told the sender why
+
+    old_room_id = (
+        await repository.get_ghost_dm_room(remote_actor_id, sender) if kind == "dm"
+        else await repository.get_ghost_chat_room(remote_actor_id, sender)
+    )
+    if old_room_id is None:
+        await _notice(request, room_id, f"You don't have a {kind_label} room with them to replace.")
+        return
+
+    warning = (
+        f"⚠️ {_REPLACE_GHOST_ROOM_WARNING_MARKER} {kind_label} room ({old_room_id}) -- a new room is "
+        "created and this one is tombstoned (renamed, no longer linked); anyone in the old room isn't "
+        "automatically brought along unless they're still a member when this runs. Use this if the "
+        f"existing room came out encrypted -- I can't read or fix anything sent inside one. "
+        'Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_REPLACE_GHOST_ROOM_WARNING_MARKER} {kind_label} room ({html.escape(old_room_id)}) -- a new "
+        "room is created and this one is tombstoned (renamed, no longer linked); anyone in the old room "
+        "isn't automatically brought along unless they're still a member when this runs. Use this if the "
+        "existing room came out encrypted -- I can't read or fix anything sent inside one.</p>"
+        '<p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    config = request.app.state.config
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send replace-%s warning to %s", kind, room_id, exc_info=True)
+
+
+async def _execute_replace_ghost_room(request: Request, *, sender: str, notice_room_id: str, old_room_id: str) -> None:
+    """Confirmed execution of ``;replace dm/chat <handle>`` -- the external
+    counterpart of ``_execute_replace_room``'s own DM/Chat branches.
+    ``old_room_id`` (parsed back out of the warning's own body -- there's
+    no other state kept between the warning and the confirm) is looked up
+    fresh rather than trusting anything from the warning step, same
+    "recompute at confirm time" reasoning as ``_execute_replace_room``
+    itself; which of the two tables it's actually in also tells us whether
+    this is a DM or a Chat room, so that doesn't need to be encoded too."""
+    repository = request.app.state.repository
+
+    dm_actor_id = await repository.get_ghost_dm_room_actor_id(old_room_id)
+    if dm_actor_id is not None:
+        owner = await repository.get_ghost_dm_room_matrix_user_id(old_room_id)
+        if owner != sender and not await _is_matrix_admin(request, sender):
+            await _notice(request, notice_room_id, "Only that DM's owner (or a Matrix server admin) can replace it.")
+            return
+        await _replace_dm_room(
+            request, old_room_id=old_room_id, actor_id=dm_actor_id, matrix_user_id=owner,
+            notice_room_id=notice_room_id,
+        )
+        return
+
+    chat_actor_id = await repository.get_ghost_chat_room_actor_id(old_room_id)
+    if chat_actor_id is not None:
+        owner = await repository.get_ghost_chat_room_matrix_user_id(old_room_id)
+        if owner != sender and not await _is_matrix_admin(request, sender):
+            await _notice(request, notice_room_id, "Only that chat's owner (or a Matrix server admin) can replace it.")
+            return
+        await _replace_chat_room(
+            request, old_room_id=old_room_id, actor_id=chat_actor_id, matrix_user_id=owner,
+            notice_room_id=notice_room_id,
+        )
+        return
+
+    await _notice(request, notice_room_id, "That room isn't a tracked DM/Chat room anymore -- nothing to replace.")
+
+
+async def maybe_handle_replace_ghost_room_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``;replace dm/chat <handle>`` warnings -- same stateless-marker
+    mechanism as ``maybe_handle_replace_room_confirmation``, except the
+    target room is parsed back out of the warning's own body instead of
+    being ``event``'s own ``room_id`` -- the whole point of this command is
+    replacing a room from somewhere else entirely (see
+    ``_handle_replace_ghost_room``'s docstring)."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    warning_body = (target_event.get("content") or {}).get("body") or ""
+    if _REPLACE_GHOST_ROOM_WARNING_MARKER not in warning_body:
+        return False
+    match = _REPLACE_GHOST_ROOM_ID_RE.search(warning_body)
+    if not match:
+        return False
+    old_room_id = match.group(0)
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_replace_ghost_room(request, sender=sender, notice_room_id=room_id, old_room_id=old_room_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
 async def _members_to_reinvite(
     request: Request, *, old_room_id: str, as_user_id: str, already_invited: set[str], exclude_ghosts: bool
 ) -> list[str]:
@@ -7406,21 +7644,32 @@ async def _replace_remote_actor_room(
     )
 
 
-async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str, matrix_user_id: str) -> None:
+async def _replace_dm_room(
+    request: Request, *, old_room_id: str, actor_id: str, matrix_user_id: str, notice_room_id: str | None = None,
+) -> None:
     """The DM-room counterpart of ``_replace_remote_actor_room`` -- same
     identity (the ghost for ``actor_id`` and ``matrix_user_id``), fresh
     room. Reuses the ghost's already-synced profile (``get_ghost_profile``)
     rather than re-fetching the actor doc, since a DM room's identity is
     the (ghost, local user) pair, not a public profile that needs to be
-    re-resolved."""
+    re-resolved.
+
+    ``notice_room_id``, if given, is where every outcome notice below goes
+    instead of ``old_room_id`` -- used by ``_execute_replace_ghost_room``
+    (``;replace dm <handle>``, issue #7), which replaces a DM room from
+    OUTSIDE it specifically because it might be encrypted and thus
+    unreadable; the tombstone itself still goes into ``old_room_id`` as
+    usual (best-effort, same as always -- it may just not be legible
+    there)."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
     bot_mxid = _bot_mxid(config)
+    notice_room_id = notice_room_id or old_room_id
 
     ghost_profile = await repository.get_ghost_profile(actor_id)
     if ghost_profile is None or not ghost_profile.mxid:
-        await _notice(request, old_room_id, "Could not create a replacement room -- please try again.")
+        await _notice(request, notice_room_id, "Could not create a replacement room -- please try again.")
         return
     mxid = ghost_profile.mxid
     display_name = ghost_profile.display_name or ghost_profile.handle or actor_id
@@ -7478,7 +7727,23 @@ async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str,
         )
     except SynapseError as exc:
         logger.warning("Could not create replacement DM room for %s with %s: %s", actor_id, matrix_user_id, exc)
-        await _notice(request, old_room_id, "Could not create a replacement room -- please try again.")
+        await _notice(request, notice_room_id, "Could not create a replacement room -- please try again.")
+        return
+
+    if await warn_if_encrypted(request, new_room_id, bot_mxid):
+        # The server is STILL forcing encryption on new private rooms --
+        # replacing just produced another unusable room. Don't register,
+        # tombstone, or claim success: nothing was actually fixed.
+        logger.warning(
+            "Replacement DM room %s for %s with %s came out encrypted too -- server config not fixed yet",
+            new_room_id, actor_id, matrix_user_id,
+        )
+        await _notice(
+            request, notice_room_id,
+            "The replacement room came out encrypted too -- your homeserver still forces encryption on "
+            "new private rooms, so this won't work until a Matrix server admin fixes that server-side "
+            '(set "encryption_enabled_by_default_for_room_type" to "off", or exclude invite-only rooms).',
+        )
         return
 
     await repository.register_ghost_dm_room(actor_id, matrix_user_id, new_room_id)
@@ -7493,7 +7758,7 @@ async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str,
     await _mark_room_replaced(request, old_room_id=old_room_id, as_user_id=mxid)
 
     await _notice(
-        request, old_room_id,
+        request, notice_room_id,
         f"Replaced. Your DMs with {display_name} now continue in {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
         html_message=(
@@ -7503,19 +7768,23 @@ async def _replace_dm_room(request: Request, *, old_room_id: str, actor_id: str,
     )
 
 
-async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: str, matrix_user_id: str) -> None:
+async def _replace_chat_room(
+    request: Request, *, old_room_id: str, actor_id: str, matrix_user_id: str, notice_room_id: str | None = None,
+) -> None:
     """The ``ChatMessage`` counterpart of ``_replace_dm_room`` -- identical
     except for the separate ``ghost_chat_rooms`` table and "(Chat)" naming
     (see ``ensure_ghost_chat_room``'s docstring for why a Chat room and a DM
-    room are never the same room)."""
+    room are never the same room). ``notice_room_id`` -- see
+    ``_replace_dm_room``'s identical parameter."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
     bot_mxid = _bot_mxid(config)
+    notice_room_id = notice_room_id or old_room_id
 
     ghost_profile = await repository.get_ghost_profile(actor_id)
     if ghost_profile is None or not ghost_profile.mxid:
-        await _notice(request, old_room_id, "Could not create a replacement room -- please try again.")
+        await _notice(request, notice_room_id, "Could not create a replacement room -- please try again.")
         return
     mxid = ghost_profile.mxid
     display_name = ghost_profile.display_name or ghost_profile.handle or actor_id
@@ -7552,7 +7821,23 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
         )
     except SynapseError as exc:
         logger.warning("Could not create replacement chat room for %s with %s: %s", actor_id, matrix_user_id, exc)
-        await _notice(request, old_room_id, "Could not create a replacement room -- please try again.")
+        await _notice(request, notice_room_id, "Could not create a replacement room -- please try again.")
+        return
+
+    if await warn_if_encrypted(request, new_room_id, bot_mxid):
+        # See _replace_dm_room's identical reasoning: the server is still
+        # forcing encryption, so this replacement didn't actually fix
+        # anything -- don't register/tombstone/claim success.
+        logger.warning(
+            "Replacement chat room %s for %s with %s came out encrypted too -- server config not fixed yet",
+            new_room_id, actor_id, matrix_user_id,
+        )
+        await _notice(
+            request, notice_room_id,
+            "The replacement room came out encrypted too -- your homeserver still forces encryption on "
+            "new private rooms, so this won't work until a Matrix server admin fixes that server-side "
+            '(set "encryption_enabled_by_default_for_room_type" to "off", or exclude invite-only rooms).',
+        )
         return
 
     await repository.register_ghost_chat_room(actor_id, matrix_user_id, new_room_id)
@@ -7569,7 +7854,7 @@ async def _replace_chat_room(request: Request, *, old_room_id: str, actor_id: st
     await _mark_room_replaced(request, old_room_id=old_room_id, as_user_id=mxid)
 
     await _notice(
-        request, old_room_id,
+        request, notice_room_id,
         f"Replaced. Your chat with {display_name} now continues in {new_room_id} instead -- "
         "you've been invited there. This room is no longer linked.",
         html_message=(
