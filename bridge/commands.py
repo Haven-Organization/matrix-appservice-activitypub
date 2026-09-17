@@ -3389,7 +3389,10 @@ async def _note_from_item(request: Request, item: dict, *, fallback_author: str 
     """Normalize a raw outbox/replies collection item into a ``Create``
     activity JSON dict ready for ``Activity.from_dict``. Items show up as
     either a full ``Create`` activity (typical of an outbox) or a bare
-    ``Note`` (typical of a ``replies`` collection) -- wraps the latter.
+    ``Note`` (typical of a ``replies`` collection) -- wraps the latter. A
+    ``Create`` whose own ``object`` is a bare IRI rather than embedded
+    (GoToSocial and Misskey-family outboxes both do this -- see the
+    ``Create`` branch's own comment) is resolved by fetching it first.
     Returns None for anything else (Questions, ...) -- backfill only ever
     mirrors the account's own authored posts, same scope as a live
     ``Create`` delivery.
@@ -3412,7 +3415,21 @@ async def _note_from_item(request: Request, item: dict, *, fallback_author: str 
     before."""
     if item.get("type") == "Create":
         obj = item.get("object")
-        return item if isinstance(obj, dict) and obj.get("type") in ("Note", "Video") else None
+        if isinstance(obj, str):
+            # GoToSocial (and Misskey-family software -- Iceshrimp.NET,
+            # Sharkey, ...) wrap each outbox post as a Create whose object
+            # is a bare IRI, not embedded -- confirmed live 2026-09-17
+            # (issue #8) against real gts.dc09.xyz/gts.artegoser.ru/
+            # gts.redume.lol and a Misskey-family instance's outboxes: every
+            # item was silently dropped here despite real posts actually
+            # being present, matching the reported "0 post(s) mirrored".
+            # Same "fetch it if it's a bare string" handling the Announce
+            # branch right below already has.
+            try:
+                obj = await fetch_actor(request, obj)
+            except RemoteActorFetchError:
+                return None
+        return {**item, "object": obj} if isinstance(obj, dict) and obj.get("type") in ("Note", "Video") else None
     if item.get("type") == "Announce":
         obj = item.get("object")
         if isinstance(obj, str):
