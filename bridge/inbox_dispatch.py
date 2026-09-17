@@ -64,7 +64,7 @@ from urllib.parse import urlsplit
 from fastapi import Request
 
 from bridge.activitypub.delivery import DeliveryError, deliver_activity
-from bridge.activitypub.models import Activity
+from bridge.activitypub.models import Activity, as2_list
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_attachments,
@@ -902,7 +902,7 @@ async def _resolve_dm_recipient(request: Request, username: str, obj: dict, acti
             return record
 
     base = request.app.state.config.bridge.public_base_url
-    addressed = [*(obj.get("to") or []), *(obj.get("cc") or []), *(activity.to or []), *(activity.cc or [])]
+    addressed = [*as2_list(obj.get("to")), *as2_list(obj.get("cc")), *(activity.to or []), *(activity.cc or [])]
     for target in addressed:
         if not isinstance(target, str):
             continue

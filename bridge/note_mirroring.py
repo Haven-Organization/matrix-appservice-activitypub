@@ -31,7 +31,7 @@ from urllib.parse import urlsplit
 from fastapi import Request
 
 from bridge.activitypub.delivery import DeliveryError, deliver_activity
-from bridge.activitypub.models import AS_PUBLIC, Activity, Actor, PublicKey
+from bridge.activitypub.models import AS_PUBLIC, Activity, Actor, PublicKey, as2_list
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
     extract_actor_url,
@@ -1610,7 +1610,7 @@ def note_is_direct_message(note: dict, *, extra_to: list[str] | None = None, ext
     ``Activity`` at all.
     """
     addressed = [
-        *(note.get("to") or []), *(note.get("cc") or []),
+        *as2_list(note.get("to")), *as2_list(note.get("cc")),
         *(extra_to or []), *(extra_cc or []),
     ]
     if not addressed:

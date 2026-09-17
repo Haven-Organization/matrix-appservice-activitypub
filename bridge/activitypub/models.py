@@ -351,6 +351,27 @@ class Question:
         )
 
 
+def as2_list(value: Any) -> list[Any]:
+    """Normalize a multi-valued AS2/JSON-LD property (``to``/``cc``/``tag``,
+    ...) into a real list. JSON-LD compaction drops the wrapping array
+    entirely when a property has exactly one value, so a single-recipient
+    ``to``/``cc`` is just as spec-valid serialized as a bare string as it is
+    wrapped in a one-element list -- confirmed live 2026-09-17 (issue #8
+    follow-up) against a real GoToSocial account, whose own posts routinely
+    carry ``"to": "https://www.w3.org/ns/activitystreams#Public"`` with no
+    array at all. The naive ``list(value)``/``*value`` unpacking this
+    replaced silently exploded that STRING into one list entry per
+    CHARACTER instead, defeating every ``AS_PUBLIC``/``"/followers"``
+    substring check downstream and misclassifying ordinary public posts as
+    direct messages -- silently dropping every one of them (backfill showed
+    this as "0"/near-zero posts mirrored despite real posts existing)."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 @dataclass(frozen=True)
 class Activity:
     """A generic ActivityStreams Activity envelope.
@@ -430,10 +451,10 @@ class Activity:
             actor=actor,
             object=data.get("object"),
             published=data.get("published"),
-            to=list(data.get("to", []) or []),
-            cc=list(data.get("cc", []) or []),
+            to=as2_list(data.get("to")),
+            cc=as2_list(data.get("cc")),
             content=data.get("content"),
-            tag=list(data.get("tag", []) or []),
+            tag=as2_list(data.get("tag")),
             instrument=data.get("instrument"),
         )
 
