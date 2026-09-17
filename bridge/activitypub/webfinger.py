@@ -51,6 +51,20 @@ class ParsedAcct:
     domain: str
 
 
+def _is_activitypub_link_type(link_type: str) -> bool:
+    """Whether a webfinger link's ``type`` names an ActivityPub actor
+    document -- either the common ``application/activity+json``, or the
+    equally valid ``application/ld+json; profile="...activitystreams"``
+    form some implementations use instead. Confirmed live 2026-09-17
+    (issue #8) against mitra.social: its own webfinger ``self`` link is
+    ``application/ld+json; profile="https://www.w3.org/ns/activitystreams"``
+    only -- a plain ``"activity+json" in type`` check missed it entirely,
+    making every mitra.social account unresolvable via ``;follow``."""
+    return "activity+json" in link_type or (
+        "ld+json" in link_type and "www.w3.org/ns/activitystreams" in link_type
+    )
+
+
 def parse_acct(resource: str) -> ParsedAcct:
     """Parse an ``acct:user@domain`` resource string."""
     match = ACCT_RE.match(resource)
@@ -113,7 +127,7 @@ async def resolve_remote_actor_id(http_client: httpx.AsyncClient, acct: str) -> 
         ) from exc
 
     for link in document.get("links", []):
-        if link.get("rel") == "self" and "activity+json" in (link.get("type") or ""):
+        if link.get("rel") == "self" and _is_activitypub_link_type(link.get("type") or ""):
             href = link.get("href")
             if href:
                 return href
@@ -181,7 +195,7 @@ async def resolve_invite_code(request: Request, code: str, domain: str) -> tuple
 
     invite_code_url: str | None = None
     for link in document.get("links", []):
-        if link.get("rel") == "self" and "activity+json" in (link.get("type") or ""):
+        if link.get("rel") == "self" and _is_activitypub_link_type(link.get("type") or ""):
             href = link.get("href")
             if href:
                 invite_code_url = href
