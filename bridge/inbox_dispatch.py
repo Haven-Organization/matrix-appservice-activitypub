@@ -2560,22 +2560,23 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     # would, into a Remote User Room for its ORIGINAL author, not the
     # reposter) -- not just the summary card below -- so it's independently
     # navigable/reply-able/reactable, and dedupes against it being imported
-    # again later some other way. `inviter` is whichever local actor's
-    # inbox this Announce actually arrived at (i.e. the person following
-    # the reposter), so they land in the original author's room too, not
-    # just the reposter's. Its first attachment is reused below for the
-    # repost summary card rather than re-uploaded, since it's the exact
-    # same file.
+    # again later some other way. Deliberately NO `inviter`: nobody is
+    # invited into the original author's room just for following the
+    # reposter -- only a genuine mention of a local user invites them into
+    # a profile they don't follow (see notify_mentioned_locals). The repost
+    # card below still links straight to the imported post, and the room is
+    # knockable, so anyone interested can still join it (reported
+    # 2026-09-20: a boost was pulling followers into rooms for accounts they
+    # don't follow). Its first attachment is reused below for the repost
+    # summary card rather than re-uploaded, since it's the exact same file.
     imported_link: str | None = None
     imported_ref: tuple[str, str] | None = None
     imported_attachment_mxc: str | None = None
     imported_attachment_width: int | None = None
     imported_attachment_height: int | None = None
     if isinstance(original_author_id, str):
-        local_actor = await repository.get_local_actor(username)
-        inviter = local_actor.matrix_user_id if local_actor is not None else None
         imported = await import_note(
-            request, note=obj, author_actor_id=original_author_id, author_doc=original_actor_doc, inviter=inviter,
+            request, note=obj, author_actor_id=original_author_id, author_doc=original_actor_doc,
         )
         imported_attachment_mxc = imported.first_attachment_mxc
         imported_attachment_width = imported.first_attachment_width
