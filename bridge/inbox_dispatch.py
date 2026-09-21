@@ -77,7 +77,7 @@ from bridge.activitypub.sanitize import strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, main_key_id, username_from_actor_url
 from bridge.matrix_links import matrix_to_link, room_pill_html
 from bridge.custom_emoji import emoji_img_html, inline_custom_emoji, resolve_custom_emoji_image
-from bridge.media import fetch_and_upload_media, filename_with_extension
+from bridge.media import fetch_and_upload_media, filename_with_extension, unresolvable_encrypted_attachment_mxc
 from bridge.ghosts import ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
@@ -436,6 +436,22 @@ async def _fetch_post_preview(
     msgtype = content.get("msgtype")
     info = content.get("info") or {}
 
+    # An attachment that was sent per-file AES-encrypted carries its file
+    # under content["file"], not a plain content["url"] -- so without this
+    # its preview was silently dropped (reported 2026-09-21: a "liked/
+    # reposted your post" notification for a video sent encrypted and then
+    # confirmed showed no video). The decrypted plaintext copy uploaded on
+    # "confirm" is already cached against the encrypted mxc:// (see
+    # bridge.media.decrypt_and_reupload_encrypted_attachment) -- reuse it
+    # rather than uploading anything new, and never copy the encrypted
+    # file's key into another event. No cached copy (never confirmed) just
+    # means no preview, same as before.
+    media_mxc = content.get("url")
+    if not media_mxc:
+        encrypted_mxc = unresolvable_encrypted_attachment_mxc(content)
+        if encrypted_mxc:
+            media_mxc = await request.app.state.repository.get_custom_emoji_mxc(encrypted_mxc)
+
     # An image/video's `body` is a genuine caption only when a separate
     # `filename` exists and differs from it (MSC2530); otherwise body IS
     # the filename -- not post text, so previewing it as such would
@@ -453,11 +469,11 @@ async def _fetch_post_preview(
         body = body[:_PREVIEW_TEXT_LIMIT].rstrip() + "…"
 
     image: dict[str, object] | None = None
-    if msgtype == "m.image" and content.get("url"):
+    if msgtype == "m.image" and media_mxc:
         width, height = _scaled_dimensions(info.get("w"), info.get("h"), _PREVIEW_IMAGE_SIZE)
         image_mimetype = info.get("mimetype") or "image/jpeg"
         image = {
-            "mxc": content["url"],
+            "mxc": media_mxc,
             "mimetype": image_mimetype,
             "width": width,
             "height": height,
@@ -470,11 +486,11 @@ async def _fetch_post_preview(
         }
 
     video: dict[str, object] | None = None
-    if msgtype == "m.video" and content.get("url"):
+    if msgtype == "m.video" and media_mxc:
         width, height = _scaled_dimensions(info.get("w"), info.get("h"), _PREVIEW_VIDEO_MAX_DIMENSION)
         video_mimetype = info.get("mimetype") or "video/mp4"
         video = {
-            "mxc": content["url"],
+            "mxc": media_mxc,
             "mimetype": video_mimetype,
             "width": width,
             "height": height,
