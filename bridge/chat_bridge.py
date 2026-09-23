@@ -32,7 +32,12 @@ from bridge.activitypub.models import Activity, ChatMessage
 from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.activitypub.urls import actor_url, main_key_id
 from bridge.commands import is_third_party_still_allowed, message_addresses_bot
-from bridge.media import build_ap_attachment, resolve_attachment_or_request_confirmation
+from bridge.media import (
+    OUTBOUND_EVENT_TYPES,
+    build_ap_attachment,
+    normalized_message_content,
+    resolve_attachment_or_request_confirmation,
+)
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
 
@@ -43,9 +48,9 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
     """Returns True if this event was sent in a ghost chat room (handled,
     successfully or not) -- callers should not also treat it as a reply or
     a fresh post."""
-    if event.get("type") != "m.room.message":
+    if event.get("type") not in OUTBOUND_EVENT_TYPES:
         return False
-    content = event.get("content") or {}
+    content = normalized_message_content(event)
     config = request.app.state.config
 
     if message_addresses_bot(content, config):

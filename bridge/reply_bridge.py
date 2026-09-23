@@ -54,7 +54,13 @@ from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
 from bridge.commands import is_third_party_still_allowed, message_addresses_bot
-from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
+from bridge.media import (
+    OUTBOUND_EVENT_TYPES,
+    build_ap_attachment,
+    media_caption,
+    normalized_message_content,
+    resolve_attachment_or_request_confirmation,
+)
 from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
@@ -321,9 +327,9 @@ async def _send_outbound_dm(
 async def maybe_federate_reply(request: Request, event: dict) -> bool:
     """Returns True if this event was a reply to a federated post (handled,
     successfully or not) -- callers should not also treat it as a fresh post."""
-    if event.get("type") != "m.room.message":
+    if event.get("type") not in OUTBOUND_EVENT_TYPES:
         return False
-    content = event.get("content") or {}
+    content = normalized_message_content(event)
 
     if message_addresses_bot(content, request.app.state.config):
         # bridge.commands.maybe_handle_command runs earlier in the dispatch

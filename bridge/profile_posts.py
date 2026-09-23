@@ -45,7 +45,13 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import _effective_third_party_mode, message_addresses_bot
-from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
+from bridge.media import (
+    OUTBOUND_EVENT_TYPES,
+    build_ap_attachment,
+    media_caption,
+    normalized_message_content,
+    resolve_attachment_or_request_confirmation,
+)
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
 from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPOST,
@@ -299,10 +305,10 @@ async def _maybe_handle_msc4501_quote_post(
 async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     """Returns True if this event belonged to a linked Profile Room (handled,
     successfully distributed or not) -- callers shouldn't process it further."""
-    if event.get("type") != "m.room.message":
+    if event.get("type") not in OUTBOUND_EVENT_TYPES:
         return False
 
-    content = event.get("content") or {}
+    content = normalized_message_content(event)
     if message_addresses_bot(content, request.app.state.config):
         # bridge.commands.maybe_handle_command runs earlier in the dispatch
         # chain and normally intercepts anything tagging the bot before we're

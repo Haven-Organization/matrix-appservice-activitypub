@@ -37,6 +37,35 @@ _MATRIX_MSGTYPE_TO_AP_TYPE = {
     "m.file": "Document",
 }
 
+# Event types every outbound federation path (reply/DM, chat, profile post)
+# accepts, alongside the ordinary "m.room.message". A sticker
+# (MSC2545/spec) is its own top-level Matrix event type, never an
+# "m.room.message", with no "msgtype" field of its own at all -- so it was
+# silently unhandled everywhere: rejected by every path's own type check
+# before any of them ever looked at its content (confirmed live
+# 2026-09-22, issue report: a sticker sent as a threaded reply never
+# federated at all). See normalized_message_content below for the other
+# half of this.
+OUTBOUND_EVENT_TYPES = ("m.room.message", "m.sticker")
+
+
+def normalized_message_content(event: dict) -> dict:
+    """``event["content"]``, normalized so every downstream consumer here
+    (``build_ap_attachment``, ``media_caption``,
+    ``unresolvable_encrypted_attachment_mxc``, ...) can treat a sticker
+    exactly like an ordinary ``m.image`` message without any of them
+    needing to special-case the event type. The spec has no video/audio/
+    file sticker -- every one is an image by definition -- so
+    ``msgtype: "m.image"`` is synthesized here rather than derived from
+    ``info.mimetype`` (which would be redundant, and animated ones are
+    still images, e.g. GIF). A plain ``m.room.message`` passes through
+    completely unchanged. Callers should already have checked
+    ``event["type"] in OUTBOUND_EVENT_TYPES`` before calling this."""
+    content = event.get("content") or {}
+    if event.get("type") == "m.sticker":
+        return {**content, "msgtype": "m.image"}
+    return content
+
 # Generic/unhelpful Content-Types some remote servers serve media with
 # regardless of what the file actually is (e.g. an avatar uploaded without
 # an extension, so the server has nothing to guess from either) -- seen in
