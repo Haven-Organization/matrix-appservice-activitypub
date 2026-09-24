@@ -1775,6 +1775,30 @@ async def _verify_and_parse_activity(request: Request) -> Activity:
     return activity
 
 
+_RUNNING_INBOX_ACTIVITIES: set = set()
+
+
+def _process_activity_in_background(request: Request, username: str, activity: Activity, *, log_label: str) -> None:
+    """Fire-and-forget wrapper for ``handle_activity`` -- see
+    ``post_inbox``/``post_shared_inbox``'s own reasoning for why they
+    return 202 before this even starts, rather than awaiting it. Same
+    "strong reference until done" pattern as ``bridge.commands``'
+    ``_RUNNING_BACKFILLS``, so the task isn't garbage-collected mid-flight.
+    ``request`` is safe to keep using after the response has already been
+    sent -- only ``request.app.state`` (a long-lived reference, not
+    anything tied to this one HTTP exchange) is ever touched from here,
+    same as every other backgrounded task in this codebase already does."""
+    async def _run() -> None:
+        try:
+            await handle_activity(request, username, activity)
+        except Exception:
+            logger.exception("Error handling %s activity from %s for %s", activity.type, activity.actor, log_label)
+
+    task = asyncio.get_running_loop().create_task(_run())
+    _RUNNING_INBOX_ACTIVITIES.add(task)
+    task.add_done_callback(_RUNNING_INBOX_ACTIVITIES.discard)
+
+
 @router.post("/inbox/{username}")
 async def post_inbox(request: Request, username: str) -> Response:
     await _get_actor_or_channel_record(request, username)
@@ -1785,11 +1809,19 @@ async def post_inbox(request: Request, username: str) -> Response:
     # it?" unanswerable from the journal (2026-07-04, a vanished reply).
     logger.info("Inbox %s: %s from %s (object %s)", username, activity.type, activity.actor, activity.object_id())
 
-    try:
-        await handle_activity(request, username, activity)
-    except Exception:
-        logger.exception("Error handling %s activity from %s for %s", activity.type, activity.actor, username)
-
+    # Acknowledge immediately, once the signature's verified -- actually
+    # bridging (Synapse calls, media fetches, ghost/room provisioning, ...)
+    # runs in the background instead of being awaited here. Measured live
+    # 2026-09-23: awaiting it inline meant the sender waited for ALL of
+    # that before getting a response, and Pleroma/Akkoma give up and
+    # retry at ~5s -- about 1 in 10 deliveries took 4.5s or more, so
+    # events routinely arrived one or more retry backoffs late (median
+    # 72s, p90 ~20min end to end). A 202 this fast removes that retry
+    # cycle entirely; handle_activity's own per-activity activity_lock
+    # (see its docstring) covers the resulting risk of a genuine
+    # redelivery now running concurrently with the original instead of
+    # queued safely behind a slow synchronous response.
+    _process_activity_in_background(request, username, activity, log_label=username)
     return Response(status_code=202)
 
 
@@ -1829,11 +1861,8 @@ async def post_shared_inbox(request: Request) -> Response:
     # See post_inbox's identical line.
     logger.info("Shared inbox: %s from %s (object %s)", activity.type, activity.actor, activity.object_id())
 
-    try:
-        await handle_activity(request, username, activity)
-    except Exception:
-        logger.exception("Error handling shared-inbox %s activity from %s", activity.type, activity.actor)
-
+    # See post_inbox's identical reasoning for acking before processing.
+    _process_activity_in_background(request, username, activity, log_label="shared inbox")
     return Response(status_code=202)
 
 

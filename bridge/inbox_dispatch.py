@@ -144,7 +144,29 @@ async def handle_activity(request: Request, username: str, activity: Activity) -
     if handler is None:
         logger.info("No handler for activity type %s (from %s)", activity.type, activity.actor)
         return
-    await handler(request, username, activity)
+    # Serializes concurrent processing of the exact same activity -- a
+    # sender's own redelivery (retried after a slow/timed-out response, or
+    # just resent) can arrive as a second, genuinely concurrent inbox POST
+    # before the first finishes. `_handle_announce` already had its own
+    # narrower version of this (see activity_lock's docstring); this covers
+    # every activity type uniformly, at the single shared dispatch point,
+    # since none of the others had any protection at all -- confirmed live
+    # 2026-09-23 via a real crash: two concurrent Create deliveries for the
+    # same post both passed the "not tracked yet" check, each imported it
+    # as a separate Matrix event, and the second's federated_events insert
+    # died on federated_events' own primary-ap-object uniqueness
+    # constraint (asyncpg UniqueViolationError). Keyed on the ACTIVITY's
+    # own id (not its object's), which is what a genuine redelivery always
+    # repeats exactly -- narrower than activity_lock's other callers, which
+    # key on the underlying POST because they're guarding a different
+    # race (two DIFFERENT activities about the same post). Skipped
+    # entirely for the rare malformed activity with no id at all -- same
+    # "nothing to key a lock on" carve-out as those callers.
+    if not activity.id:
+        await handler(request, username, activity)
+        return
+    async with activity_lock(activity.id):
+        await handler(request, username, activity)
 
 
 async def _handle_follow(request: Request, username: str, activity: Activity) -> None:
