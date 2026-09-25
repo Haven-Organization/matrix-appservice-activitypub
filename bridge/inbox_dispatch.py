@@ -2510,19 +2510,23 @@ async def _handle_announce(request: Request, username: str, activity: Activity) 
     check right after that import) -- not at the top, since there's
     nothing to react to yet at that point.
 
-    Serializes concurrent calls for the SAME Announce (see
-    ``bridge.note_mirroring.activity_lock``) -- two near-simultaneous
-    inbox deliveries of the exact same Announce (e.g. a redelivered
-    transaction) would otherwise both pass the "already handled?" dedup
-    check below before either had recorded it, each re-upload their own
-    copy of the reposted attachment under its own fresh ``mxc://``, and
-    both send a duplicate repost card -- confirmed live 2026-07-10."""
-    announce_id = activity.id
-    if not announce_id:
-        # Nothing to key a lock (or the dedup check below) on regardless.
-        return await _handle_announce_locked(request, username, activity)
-    async with activity_lock(announce_id):
-        return await _handle_announce_locked(request, username, activity)
+    Concurrent calls for the SAME Announce (e.g. a redelivered transaction)
+    used to be serialized here directly, via this exact same ``activity.id``
+    -- otherwise both would pass the "already handled?" dedup check below
+    before either had recorded it, each re-upload their own copy of the
+    reposted attachment under its own fresh ``mxc://``, and both send a
+    duplicate repost card (confirmed live 2026-07-10). ``handle_activity``
+    (the shared dispatch point every activity type goes through) now takes
+    a lock on that same ``activity.id`` itself before calling any handler
+    at all, which already fully covers this -- a SECOND lock acquisition
+    here, on the identical key, would just be this same call deadlocking
+    against its own already-held lock (``asyncio.Lock`` isn't reentrant).
+    Confirmed live 2026-09-25: every inbound Announce (a repost of a
+    tracked post) hung forever with no exception, no notification, and no
+    trace in the logs at any level -- silently swallowed by exactly that
+    deadlock, from the moment the 2026-09-23 ack-fast/lock-at-dispatch
+    change (commit 79b5e06) shipped."""
+    return await _handle_announce_locked(request, username, activity)
 
 
 async def _handle_announce_locked(request: Request, username: str, activity: Activity) -> None:
