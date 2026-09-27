@@ -40,13 +40,14 @@ _RSS_ICON_SVG = (
 
 
 def _is_like_key(key: str) -> bool:
-    """Whether a mirrored reaction's key is a plain thumbs up -- the only
-    key a bare ``Like`` activity ever carries (see
-    ``bridge.inbox_dispatch._DEFAULT_LIKE_EMOJI``), and the one this bridge's
-    own outbound side (``bridge.reaction_bridge._is_favorite_emoji``) treats
-    as a "like" rather than a distinct emoji reaction -- kept consistent
-    with that same narrow definition here so a skin-toned thumbs up still
-    counts as its own emoji reaction, not a like."""
+    """Whether a mirrored reaction's key is a plain thumbs up -- the ONLY
+    key a bare inbound ``Like`` activity is ever mirrored as (see
+    ``bridge.inbox_dispatch._DEFAULT_LIKE_EMOJI``), regardless of what
+    emoji (if any) the remote sender's own client showed for it. No skin
+    tone to strip here: unlike the outbound side
+    (``bridge.reaction_bridge._is_favorite_emoji``, which accepts a
+    Matrix user's own toned reaction as a Like), an inbound Like is never
+    mirrored with one."""
     return key.replace(_VARIATION_SELECTOR_16, "") == _THUMBS_UP
 
 

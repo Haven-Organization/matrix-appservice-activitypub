@@ -5,11 +5,11 @@ Triggered for every ``m.reaction`` event the AppService receives: if it
 annotates a Matrix event that mirrors, or is itself chained from, a
 fediverse post (tracked via ``ActorRepository.record_federated_event``),
 this builds a ``Like`` (a bare "favorite", maximally Mastodon-compatible --
-sent ONLY for the plain thumbs up emoji, no skin tone, since that's the one
-Matrix reaction that most directly maps to what a favorite/like button
-conventionally means) or ``EmojiReact`` (Pleroma/Misskey/Akkoma extension,
-carries the actual emoji in ``content``, for every other emoji -- including
-a skin-toned thumbs up -- so those clients still show the specific emoji
+sent for a thumbs up in any skin tone, since that's the one Matrix reaction
+that most directly maps to what a favorite/like button conventionally
+means, regardless of which specific tone was picked) or ``EmojiReact``
+(Pleroma/Misskey/Akkoma extension, carries the actual emoji in ``content``,
+for every other emoji, so those clients still show the specific emoji
 reacted with instead of it being silently collapsed into a generic
 favorite) activity addressed to that post's author, signed with the
 reacting Matrix user's own linked Profile Room actor. Reacting with the
@@ -63,10 +63,13 @@ logger = logging.getLogger(__name__)
 # The ONLY emoji sent as a plain `Like` (for maximum compatibility with
 # software, e.g. Mastodon, that only understands a bare favorite with no
 # choice of emoji) rather than an `EmojiReact` carrying the actual emoji --
-# deliberately narrow, not a broad set of "positive" emoji this used to
-# treat as equivalent: everything else, including a skin-toned thumbs up,
-# is a distinct reaction and should be sent as one instead of being
-# silently collapsed into a generic favorite.
+# deliberately narrow (everything else is a distinct reaction and should be
+# sent as one instead of being silently collapsed into a generic favorite),
+# but a thumbs up is still recognized as this same one favorite regardless
+# of skin tone -- user-requested 2026-09-26: the tone is a rendering choice
+# on top of "thumbs up", not a different reaction, so a toned one should
+# federate as a Like exactly like the plain one already does, not as a
+# distinct EmojiReact. See _SKIN_TONE_MODIFIERS below.
 _THUMBS_UP = "\U0001F44D"
 # Only ever a distinct reaction (a real ``Dislike``, see
 # maybe_federate_reaction) when the target is a PeerTube-channel video.
@@ -75,6 +78,12 @@ _THUMBS_UP = "\U0001F44D"
 # in this bridge or the wider fediverse convention it follows.
 _THUMBS_DOWN = "\U0001F44E"
 _VARIATION_SELECTOR_16 = "️"
+# Unicode's 5 Fitzpatrick skin-tone modifiers (light to dark) -- appended
+# directly after a base emoji like a plain thumbs up to pick its rendered
+# tone, e.g. "\U0001F44D\U0001F3FD" for a medium-toned one. Stripped in
+# _is_favorite_emoji so every tone of thumbs up is recognized as the same
+# favorite, same as the bare variation selector already is.
+_SKIN_TONE_MODIFIERS = "\U0001F3FB\U0001F3FC\U0001F3FD\U0001F3FE\U0001F3FF"
 
 # The clockwise-arrows symbol reposts -- a common "retweet/boost" convention
 # across other Matrix<->fediverse bridges and clients' own quick-react
@@ -89,11 +98,15 @@ _REPOST_EMOJIS = ("\U0001F501",)
 
 
 def _is_favorite_emoji(key: str) -> bool:
-    """Whether ``key`` is the plain thumbs up -- optionally followed by the
-    emoji-presentation variation selector (harmless, some clients append it
-    even where it isn't needed), but NOT a skin-toned one, which is its own
-    distinct emoji and should go out as an EmojiReact instead."""
-    return key.replace(_VARIATION_SELECTOR_16, "") == _THUMBS_UP
+    """Whether ``key`` is a thumbs up in any skin tone (or none) --
+    optionally followed by the emoji-presentation variation selector
+    (harmless, some clients append it even where it isn't needed) and/or a
+    Fitzpatrick skin-tone modifier (see ``_SKIN_TONE_MODIFIERS``), both
+    stripped before comparing so every tone counts as the same favorite."""
+    stripped = key.replace(_VARIATION_SELECTOR_16, "")
+    for modifier in _SKIN_TONE_MODIFIERS:
+        stripped = stripped.replace(modifier, "")
+    return stripped == _THUMBS_UP
 
 
 def _is_thumbs_down_emoji(key: str) -> bool:
