@@ -8005,10 +8005,25 @@ async def _rejoin_invite(
 ) -> None:
     """Shared tail end of ``;rejoin``'s three forms (a literal room ID, or
     the ``profile``/``space`` keywords) -- actually sends the invite and
-    reports the outcome."""
+    reports the outcome. An invite that fails because the target is
+    already a member (confirmed live 2026-09-29: this was the common case
+    for ``profile``/``space`` in particular, and surfaced as a raw
+    ``Synapse error 403 M_FORBIDDEN: ... is already in the room.`` --
+    accurate, but not exactly reassuring on its own) gets a friendly,
+    linked "you're already there" notice instead of the bare Synapse
+    error text."""
     try:
         await request.app.state.synapse.invite_user(target_room_id, target_mxid, as_user_id=as_user_id)
     except SynapseError as exc:
+        if exc.errcode == "M_FORBIDDEN" and exc.error and "already in the room" in exc.error.lower():
+            await _notice(
+                request, room_id,
+                f"{target_mxid} is already in {target_room_id} -- nothing to do.",
+                html_message=(
+                    f"{html.escape(target_mxid)} is already in {room_pill_html(target_room_id)} -- nothing to do."
+                ),
+            )
+            return
         await _notice(request, room_id, f"Could not invite {target_mxid} to {target_room_id}: {exc}")
         return
     await _notice(
