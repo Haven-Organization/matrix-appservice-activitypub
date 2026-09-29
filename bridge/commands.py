@@ -31,7 +31,12 @@ Supported commands (sent as a plain Matrix message, tagging the bot):
                                   (MSC4501), and links it -- one command
                                   instead of manually making a room, inviting
                                   the bot with enough power, and running
-                                  ``link profile`` yourself.
+                                  ``link profile`` yourself. Already linked?
+                                  Re-invites you to your existing profile
+                                  room and Fediverse space instead of
+                                  refusing -- recovers a still-linked identity
+                                  a Matrix account deactivation force-left
+                                  you from everything in.
     <tag> link profile           Bind the sending Matrix user's identity to
                                   the room the command was sent in, minting a
                                   local AP actor (``username@bridge.domain``).
@@ -160,16 +165,20 @@ Supported commands (sent as a plain Matrix message, tagging the bot):
                                   that ended up encrypted (see ``dm``/``chat``
                                   above) can never have a command typed
                                   inside it read at all.
-    <tag> rejoin <room_id> [@other:matrix.id]
+    <tag> rejoin <room_id>|profile|space [@other:matrix.id]
                                   Force-attempt an invite into a room the
                                   bridge manages -- for recovering from a
                                   lockout (e.g. a room's join rule got set to
-                                  knocking with nobody left to approve it).
-                                  Self-service into any Remote User Room, or
-                                  a room that is or ever was your own linked
-                                  Profile Room; inviting anyone but yourself,
-                                  or targeting any other room, requires being
-                                  a Matrix server admin. Does NOT also follow
+                                  knocking with nobody left to approve it, or
+                                  a Matrix account deactivation force-left
+                                  you from everything). ``profile``/``space``
+                                  invite you back into your own without
+                                  needing to know its room ID. Self-service
+                                  into any Remote User Room, or a room that
+                                  is or ever was your own linked Profile
+                                  Room; inviting anyone but yourself, or
+                                  targeting any other room, requires being a
+                                  Matrix server admin. Does NOT also follow
                                   the account on the fediverse -- following
                                   only ever happens via ``follow`` itself.
     <tag> banner mxc://server/mediaid
@@ -318,6 +327,7 @@ from bridge.spaces import (
     NOTIFICATIONS_ROOM_SPACE_ORDER,
     PROFILE_ROOM_SPACE_ORDER,
     add_room_to_space,
+    ensure_user_space,
     get_guild_invite_code,
     set_guild_invite_code,
 )
@@ -1025,8 +1035,9 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
             "One-off account/room-recovery operations and other things almost nobody needs day to day.",
             [
                 (
-                    f"{_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id]",
-                    "Force an invite into a room the bridge manages, e.g. to recover from a lockout.",
+                    f"{_COMMAND_PREFIX}rejoin <room_id>|profile|space [@other:matrix.id]",
+                    "Force an invite into a room the bridge manages, e.g. to recover from a lockout. "
+                    "\"profile\"/\"space\" invite you back into your own without needing to know its room ID.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}leave unfollowed",
@@ -4943,6 +4954,55 @@ async def _handle_repost(
         await _notice(request, room_id, "Reposted.", relates_to=relates_to)
 
 
+async def _reinvite_to_profile_and_space(
+    request: Request, *, sender: str, room_id: str, actor_record: ActorRecord,
+) -> None:
+    """Best-effort re-invite ``sender`` (already linked, per
+    ``actor_record``) back into their own Profile Room and Fediverse
+    space -- user-requested 2026-09-29 (issue #9): a Matrix account
+    deactivation force-leaves every room it's in (confirmed against
+    Synapse's own admin docs), but the bridge's own linked-identity record
+    survives that untouched (nothing auto-unlinks on the owner leaving
+    their own Profile Room -- see ``bridge.membership.maybe_handle_leave``'s
+    own docstring), so a later-reactivated account is still fully linked,
+    just no longer a member of either room. Harmless to run even when
+    they're still a member of both -- inviting an existing member is just
+    a no-op 403 (``M_FORBIDDEN``), swallowed the same way every other
+    re-invite path in this codebase already does."""
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+
+    try:
+        await synapse.invite_user(actor_record.room_id, sender, as_user_id=bot_mxid)
+    except SynapseError as exc:
+        if exc.errcode != "M_FORBIDDEN":
+            logger.warning("Could not re-invite %s to their profile room %s: %s", sender, actor_record.room_id, exc)
+
+    space_room_id = await ensure_user_space(request, matrix_user_id=sender)
+    if space_room_id is not None:
+        try:
+            await synapse.invite_user(space_room_id, sender, as_user_id=bot_mxid)
+        except SynapseError as exc:
+            if exc.errcode != "M_FORBIDDEN":
+                logger.warning("Could not re-invite %s to their Fediverse space %s: %s", sender, space_room_id, exc)
+
+    await _notice(
+        request, room_id,
+        f"{sender} is already linked as {actor_record.username}@{config.bridge.domain} -- sent a fresh "
+        f"invite to your profile room ({actor_record.room_id}) and your Fediverse space"
+        + (f" ({space_room_id})." if space_room_id else " (couldn't reach it, sorry).")
+        + " Already a member of either? That invite is just a harmless no-op.",
+        html_message=(
+            f"{html.escape(sender)} is already linked as {actor_record.username}@{config.bridge.domain} -- "
+            f"sent a fresh invite to your profile room ({room_pill_html(actor_record.room_id)}) and your "
+            "Fediverse space"
+            + (f" ({room_pill_html(space_room_id)})." if space_room_id else " (couldn't reach it, sorry).")
+            + " Already a member of either? That invite is just a harmless no-op."
+        ),
+    )
+
+
 async def _handle_create_profile(request: Request, *, sender: str, room_id: str) -> None:
     """Do everything ``link profile`` otherwise requires the user to have
     already set up manually themselves (their own room, with the bot
@@ -4953,6 +5013,12 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
     ActivityPub profile room (MSC4501), and mint the actual linked local
     actor -- all as a single atomic command. ``link profile`` still exists
     unchanged for anyone who'd rather use their own already-existing room.
+
+    Already linked? Re-invites instead of just refusing (see
+    ``_reinvite_to_profile_and_space``) -- this doubles as the recovery
+    path for someone locked out of (and, if their homeserver admin
+    reactivated them, back into) their own account: still fully linked in
+    our own records, just no longer a member of either room.
     """
     repository = request.app.state.repository
     config = request.app.state.config
@@ -4961,15 +5027,7 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
 
     existing = await repository.get_local_actor_by_matrix_id(sender)
     if existing is not None and existing.room_id:
-        await _notice(
-            request, room_id,
-            f"{sender} is already linked as {existing.username}@{config.bridge.domain} "
-            f"(room {existing.room_id}).",
-            html_message=(
-                f"{html.escape(sender)} is already linked as {existing.username}@{config.bridge.domain} "
-                f"(room {room_pill_html(existing.room_id)})."
-            ),
-        )
+        await _reinvite_to_profile_and_space(request, sender=sender, room_id=room_id, actor_record=existing)
         return
 
     # An `existing` record with no room_id is a previously `unlink profile`d
@@ -7942,11 +8000,31 @@ _ROOM_ID_RE = re.compile(r"^!\S+$")
 _MXID_RE = re.compile(r"^@\S+:\S+$")
 
 
+async def _rejoin_invite(
+    request: Request, *, room_id: str, target_room_id: str, target_mxid: str, as_user_id: str,
+) -> None:
+    """Shared tail end of ``;rejoin``'s three forms (a literal room ID, or
+    the ``profile``/``space`` keywords) -- actually sends the invite and
+    reports the outcome."""
+    try:
+        await request.app.state.synapse.invite_user(target_room_id, target_mxid, as_user_id=as_user_id)
+    except SynapseError as exc:
+        await _notice(request, room_id, f"Could not invite {target_mxid} to {target_room_id}: {exc}")
+        return
+    await _notice(
+        request, room_id, f"Invited {target_mxid} to {target_room_id}.",
+        html_message=f"Invited {html.escape(target_mxid)} to {room_pill_html(target_room_id)}.",
+    )
+
+
 async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argument: str) -> None:
     """Force-attempt an invite into a room the bridge manages, for
     recovering from lockouts -- e.g. someone locks themselves out of their
     own Profile Room by setting its join rule to knocking with nobody left
-    who can approve the knock.
+    who can approve the knock, or a Matrix account deactivation force-left
+    them from everything (see ``_reinvite_to_profile_and_space``'s
+    identical reasoning -- the bridge's own linked-identity record isn't
+    affected by that, just their room membership).
 
     Self-service (inviting only yourself) is allowed into any Remote User
     Room (mirroring a fediverse account) -- those aren't "owned" by any one
@@ -7960,6 +8038,19 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
     target any room this way, not just ones the bridge recognizes, since
     the whole point is a manual escape hatch of last resort.
 
+    ``;rejoin profile`` / ``;rejoin space`` (user-requested 2026-09-29,
+    issue #9) are shortcuts for the two self/admin-only cases above that
+    don't require knowing a room ID at all -- resolved from
+    ``[@other:matrix.id]``'s (default: the sender's own) linked
+    ``ActorRecord``/``ActorRepository.get_user_space`` directly, which is
+    ALSO how ``get_profile_room_owner``'s ownership check for the literal-
+    room-ID form is ultimately backed, so this is exactly as safe, just
+    without needing that room ID handed to you first (the whole problem
+    for someone locked out of everything, including whatever client
+    history would normally remember it) -- unlike a literal room ID,
+    there's no bare "space" analog to a Remote User Room, so this has no
+    third, ownerless case the way that form does.
+
     Deliberately does NOT also establish an AP Follow the way it briefly did
     -- ActivityPub following only ever happens via the explicit `follow`
     command now, precisely so getting into a room (this way, or by knocking,
@@ -7970,14 +8061,58 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
     repository = request.app.state.repository
-    synapse = request.app.state.synapse
 
     parts = argument.split()
+    keyword = parts[0].lower() if parts else ""
+
+    if keyword in ("profile", "space"):
+        target_mxid = parts[1] if len(parts) > 1 else sender
+        if len(parts) > 1 and not _MXID_RE.match(target_mxid):
+            await _notice(request, room_id, f"Usage: {_COMMAND_PREFIX}rejoin {keyword} [@other:matrix.id]")
+            return
+
+        is_admin = await _is_matrix_admin(request, sender)
+        if target_mxid != sender and not is_admin:
+            await _notice(request, room_id, "Only a Matrix server admin can invite someone other than themselves.")
+            return
+
+        target_record = await repository.get_local_actor_by_matrix_id(target_mxid)
+        if target_record is None or not target_record.room_id:
+            await _notice(
+                request, room_id,
+                f"{target_mxid} doesn't have a linked profile -- nothing to rejoin."
+                if target_mxid != sender else
+                "You don't have a linked profile yet -- nothing to rejoin.",
+            )
+            return
+
+        if keyword == "profile":
+            target_room_id = target_record.room_id
+        else:
+            space_room_id = await repository.get_user_space(target_mxid)
+            if space_room_id is None:
+                await _notice(
+                    request, room_id,
+                    f"{target_mxid} doesn't have a Fediverse space yet."
+                    if target_mxid != sender else
+                    "You don't have a Fediverse space yet.",
+                )
+                return
+            target_room_id = space_room_id
+
+        await _rejoin_invite(request, room_id=room_id, target_room_id=target_room_id, target_mxid=target_mxid, as_user_id=bot_mxid)
+        return
+
     target_room_id = parts[0] if parts else ""
     target_mxid = parts[1] if len(parts) > 1 else sender
 
     if not _ROOM_ID_RE.match(target_room_id) or (len(parts) > 1 and not _MXID_RE.match(target_mxid)):
-        await _notice(request, room_id, f"Usage: {_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id]")
+        await _notice(
+            request, room_id,
+            f"Usage: {_COMMAND_PREFIX}rejoin <room_id> [@other:matrix.id], or "
+            f"{_COMMAND_PREFIX}rejoin profile|space [@other:matrix.id] for your own (or, as an admin, "
+            "someone else's) Profile Room/Fediverse space without needing to know its room ID.",
+        )
         return
 
     is_admin = await _is_matrix_admin(request, sender)
@@ -7997,15 +8132,7 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
         return
 
     as_user_id = remote_room.ghost_user_id if remote_room is not None else bot_mxid
-    try:
-        await synapse.invite_user(target_room_id, target_mxid, as_user_id=as_user_id)
-    except SynapseError as exc:
-        await _notice(request, room_id, f"Could not invite {target_mxid} to {target_room_id}: {exc}")
-        return
-    await _notice(
-        request, room_id, f"Invited {target_mxid} to {target_room_id}.",
-        html_message=f"Invited {html.escape(target_mxid)} to {room_pill_html(target_room_id)}.",
-    )
+    await _rejoin_invite(request, room_id=room_id, target_room_id=target_room_id, target_mxid=target_mxid, as_user_id=as_user_id)
 
 
 # Matrix server_name shape: a domain (optionally with a port) -- deliberately

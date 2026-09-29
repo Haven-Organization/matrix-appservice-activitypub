@@ -32,7 +32,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;unblock`](#unblock-userinstanceorg)
   - [`;mute`](#mute-userinstanceorg)
   - [`;unmute`](#unmute-userinstanceorg)
-  - [`;rejoin`](#rejoin-room_id-othermatrixid)
+  - [`;rejoin`](#rejoin-room_idprofilespace-othermatrixid)
   - [`;leave unfollowed`](#leave-unfollowed)
   - [`;backfill`](#backfill-n)
   - [`;refresh poll`](#refresh-poll-reply-to-a-poll-or-anything-in-its-thread)
@@ -73,7 +73,7 @@ Setting up and maintaining your own linked fediverse identity.
 
 **What it does:** One-shot setup that would otherwise take several manual steps. Creates a brand-new Matrix room (bot as creator/admin), invites you and sets your power level to 99 (one below the bot), copies your current Matrix display name and avatar onto the room, tags it as a bridge-made Profile Room, adds the room widget, adds it to your personal Fediverse space, and mints (or, if you'd previously run `;unlink profile`, reattaches) your actual ActivityPub actor (`username@bridge-domain`) to it. Your username is derived from your Matrix localpart.
 
-**Who can run it:** Any local Matrix user without an already-linked profile. If you already have one, this just reports its room and does nothing further.
+**Who can run it:** Any local Matrix user. If you already have a linked profile, this doesn't create a second one -- it re-invites you to your existing profile room and Fediverse space instead (harmless no-op if you're already in either). Useful if a Matrix account deactivation force-left you from both; your linked identity itself isn't affected by that, only your Matrix-side room membership. See [`;rejoin profile`/`;rejoin space`](#rejoin-room_idprofilespace-othermatrixid) for the same recovery without recreating anything.
 
 **Notes:** Reattaching an unlinked identity preserves its followers and following exactly as before. If room creation fails, you're told you can make your own room and use `;link profile` instead (see [Danger Zone](#danger-zone)).
 
@@ -266,15 +266,15 @@ One-off account/room-recovery operations and other things almost nobody needs da
 
 ---
 
-### `;rejoin <room_id> [@other:matrix.id]`
+### `;rejoin <room_id>|profile|space [@other:matrix.id]`
 
-**Syntax:** `;rejoin <room_id>` to invite yourself, or add `@other:matrix.id` to invite someone else.
+**Syntax:** `;rejoin <room_id>` to invite yourself into a specific room, or `;rejoin profile`/`;rejoin space` to invite yourself into your own linked Profile Room or Fediverse space without needing to know its room ID at all. Add `@other:matrix.id` to any form to invite someone else instead.
 
-**What it does:** Force-attempts a fresh invite into a room the bridge manages, a manual recovery tool for a lockout (e.g. a room's join rule got switched to knock-only with nobody left to approve one). Never triggers an ActivityPub `Follow` as a side effect; following only ever happens via `;follow` itself.
+**What it does:** Force-attempts a fresh invite into a room the bridge manages, a manual recovery tool for a lockout -- a room's join rule got switched to knock-only with nobody left to approve one, or (the reason `profile`/`space` exist) a Matrix account deactivation force-left you from every room you were in. Your linked identity itself (keys, followers, following, room pointer) survives that untouched on the bridge's own side -- deactivation only ever affects Matrix-side room membership -- so once you're back (a homeserver admin can reverse a deactivation onto the same account), this is how you get back into the rooms themselves. Inviting someone already a member is a harmless no-op. Never triggers an ActivityPub `Follow` as a side effect; following only ever happens via `;follow` itself.
 
 **Who can run it:**
-- Inviting only yourself: any Remote User Room (even an already-replaced one no longer live-tracked), or any room that currently is, or ever was, your own linked Profile Room.
-- Inviting anyone else, or targeting anything else: admin only. An admin can target any room this way, even ones the bridge doesn't otherwise recognize, as a true last resort.
+- Inviting only yourself: any Remote User Room (even an already-replaced one no longer live-tracked), your own linked Profile Room (`profile`, or its literal room ID, current or past), or your own Fediverse space (`space`).
+- Inviting anyone else, or targeting anything else (including someone else's `profile`/`space`): admin only. An admin can also target any literal room ID this way, even ones the bridge doesn't otherwise recognize, as a true last resort.
 
 ---
 
