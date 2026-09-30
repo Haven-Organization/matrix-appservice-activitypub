@@ -79,7 +79,6 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from urllib.parse import urlsplit
 
 from fastapi import Request
 
@@ -93,6 +92,7 @@ from bridge.commands import (
 )
 from bridge.matrix_links import matrix_to_room_link
 from bridge.note_mirroring import (
+    resolve_actor_matrix_identity,
     resolve_old_ghost_room_owner,
     resolve_old_remote_actor_room,
     unfollow_remote_actor,
@@ -582,9 +582,10 @@ async def _notify_if_not_following(
 
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    domain = urlsplit(remote_room.actor_id).hostname or ""
-    username = remote_room.actor_id.rstrip("/").rsplit("/", 1)[-1]
-    handle = remote_room.display_name or f"@{username}@{domain}"
+    # Not derived from remote_room.actor_id's own URL -- see
+    # bridge.commands._handle_list_following's identical fix/reasoning.
+    actual_handle, _display_name, _mxid = await resolve_actor_matrix_identity(request, remote_room.actor_id)
+    handle = remote_room.display_name or actual_handle
     synapse = request.app.state.synapse
 
     # Tag the joiner by name at the front -- a Remote User Room is shared,

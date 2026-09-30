@@ -2370,11 +2370,13 @@ async def _handle_unfollow(request: Request, *, sender: str, room_id: str, handl
     # function's own docstring -- bridge.membership sees the resulting
     # leave and does the real bookkeeping/Undo(Follow) from there), so this
     # is safe to send right away rather than waiting on that to happen.
-    remote_domain = urlsplit(remote_room.actor_id).hostname or ""
-    remote_username = remote_room.actor_id.rstrip("/").rsplit("/", 1)[-1]
-    remote_handle = remote_room.display_name or f"@{remote_username}@{remote_domain}"
+    # See _handle_list_following's identical fix/reasoning -- not derived
+    # from remote_room.actor_id's own URL, which isn't always the real
+    # localpart.
+    remote_actual_handle, _display_name, _mxid = await resolve_actor_matrix_identity(request, remote_room.actor_id)
+    remote_handle = remote_room.display_name or remote_actual_handle
     unfollowed_pill = notification_actor_html(
-        mxid=remote_room.ghost_user_id, handle=remote_handle, display_name=remote_room.display_name,
+        mxid=remote_room.ghost_user_id, handle=remote_actual_handle, display_name=remote_room.display_name,
     )
     await notify_user(
         request,
@@ -2459,9 +2461,16 @@ async def _handle_list_following(request: Request, *, sender: str, room_id: str)
     html_lines = []
     for actor_id in sorted(following):
         remote_room = await repository.get_remote_actor_room(actor_id)
-        domain = urlsplit(actor_id).hostname or ""
-        username = actor_id.rstrip("/").rsplit("/", 1)[-1]
-        handle = f"@{username}@{domain}"
+        # NOT derived from actor_id's own URL (its last path segment is
+        # only the real localpart for software that happens to use it that
+        # way -- e.g. Smithereen actor IDs end in an opaque numeric id
+        # instead, confirmed live 2026-09-30: "@1@friends.grishka.me"
+        # shown instead of the real "@grishka@friends.grishka.me").
+        # resolve_actor_matrix_identity already resolves this correctly
+        # everywhere else (the ghost profile's own handle, set at
+        # provisioning time from the actor document's real
+        # preferredUsername) -- this just hadn't been using it.
+        handle, _display_name, _mxid = await resolve_actor_matrix_identity(request, actor_id)
         label = f"{remote_room.display_name} ({handle})" if remote_room and remote_room.display_name else handle
         html_label = html.escape(label)
         if remote_room is not None:
