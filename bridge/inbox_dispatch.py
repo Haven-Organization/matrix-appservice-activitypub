@@ -1022,7 +1022,15 @@ async def _maybe_import_quoted_note(
     ``"always"`` imports unconditionally, matching how a reply's untracked
     root is already handled. Returns ``None`` on policy-declined, a missing
     author, or an import failure -- the caller falls back to its old
-    read-only preview either way."""
+    read-only preview either way.
+
+    If ``quoted_obj`` is ITSELF a reply to something else, this doesn't walk
+    that chain the way ``_handle_create`` does for the outer quoting post --
+    just a best-effort header (no live fetch beyond the one immediate-parent
+    attempt; see ``_resolve_reply_header_context``), same reasoning as every
+    other caller of ``import_note`` that mirrors a reply as a flat post:
+    without it, a quoted post that's ALSO a reply would land with zero
+    indication of that at all."""
     if quoted_author_id is None:
         return None
     policy = request.app.state.config.bridge.quote_import_policy
@@ -1035,7 +1043,16 @@ async def _maybe_import_quoted_note(
         author_doc = await fetch_actor(request, quoted_author_id)
     except RemoteActorFetchError:
         author_doc = {}
-    imported = await import_note(request, note=quoted_obj, author_actor_id=quoted_author_id, author_doc=author_doc)
+    quoted_in_reply_to = quoted_obj.get("inReplyTo")
+    reply_header = None
+    if quoted_in_reply_to:
+        context = await _resolve_reply_header_context(
+            request, in_reply_to_ap=quoted_in_reply_to, obj=quoted_obj,
+        )
+        reply_header = _render_reply_header(context)
+    imported = await import_note(
+        request, note=quoted_obj, author_actor_id=quoted_author_id, author_doc=author_doc, reply_header=reply_header,
+    )
     return imported.federated_event
 
 
@@ -1522,8 +1539,19 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         if actor_record is None:
             logger.info("Could not resolve a local recipient for a direct message from %s", activity.actor)
             return
+        # Best-effort header for the common "started a DM by replying to a
+        # public post" case -- mirror_direct_message itself only applies
+        # this if it DOESN'T end up threading within the DM room (see its
+        # own docstring); resolving it here either way is cheap insurance
+        # against a DM landing with zero indication of what it replied to.
+        dm_in_reply_to = obj.get("inReplyTo")
+        dm_reply_header = None
+        if dm_in_reply_to:
+            dm_context = await _resolve_reply_header_context(request, in_reply_to_ap=dm_in_reply_to, obj=obj)
+            dm_reply_header = _render_reply_header(dm_context)
         await mirror_direct_message(
-            request, note=obj, author_actor_id=activity.actor, recipient_matrix_user_id=actor_record.matrix_user_id
+            request, note=obj, author_actor_id=activity.actor, recipient_matrix_user_id=actor_record.matrix_user_id,
+            reply_header=dm_reply_header,
         )
         return
 
@@ -1627,12 +1655,20 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # the mention can still be surfaced, without starting to mirror
         # their entire ongoing post stream the way actually following them
         # would. import_note does its own dedup (redelivery-safe) and runs
-        # notify_mentioned_locals itself.
+        # notify_mentioned_locals itself. Reuses unresolved_reply_context
+        # (already resolved above, if this post is ALSO a reply we
+        # couldn't thread) as import_note's own reply_header -- import_note
+        # never walks inReplyTo itself, so without this, a reply that only
+        # reaches us via this mention carve-out would mirror with zero
+        # indication it's a reply at all (confirmed missing 2026-10-01).
         try:
             author_doc = await fetch_actor(request, activity.actor)
         except RemoteActorFetchError:
             author_doc = {}
-        await import_note(request, note=obj, author_actor_id=activity.actor, author_doc=author_doc)
+        reply_header = _render_reply_header(unresolved_reply_context) if unresolved_reply_context is not None else None
+        await import_note(
+            request, note=obj, author_actor_id=activity.actor, author_doc=author_doc, reply_header=reply_header,
+        )
         return
 
     if followed:
@@ -1755,19 +1791,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # just with an EXTERNAL link (no Matrix event exists for this
         # parent -- that's the whole reason this branch runs at all)
         # instead of a matrix.to one.
-        parent_handle, parent_author_html, external_link = unresolved_reply_context
-        if parent_handle is not None:
-            header_plain = f"⤵️ Reply to {parent_handle}'s post:"
-            header_html = (
-                f"<p>⤵️ Reply to {parent_author_html}'s "
-                f'<a href="{html.escape(external_link, quote=True)}">post</a>:</p>'
-            )
-        else:
-            # Couldn't name an author at all -- still mark this as a reply,
-            # with a working link, rather than mirroring it with zero
-            # context (see _resolve_reply_header_context's own docstring).
-            header_plain = "⤵️ Reply to this post:"
-            header_html = f'<p>⤵️ Reply to <a href="{html.escape(external_link, quote=True)}">this post</a>:</p>'
+        header_plain, header_html = _render_reply_header(unresolved_reply_context)
         message_content["body"] = f"{header_plain}\n\n{message_content['body']}".strip()
         message_content["format"] = "org.matrix.custom.html"
         existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
@@ -2602,8 +2626,23 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     imported_attachment_width: int | None = None
     imported_attachment_height: int | None = None
     if isinstance(original_author_id, str):
+        # Reposting a reply is completely ordinary fediverse behavior --
+        # without this, the reposted post's own import (right above) would
+        # land with zero indication it's a reply at all, same gap as every
+        # other import_note caller that skips walking inReplyTo (see
+        # import_note's own docstring). Best-effort header only, no actual
+        # chain walk/threading here -- this import already isn't the
+        # reply's own canonical home (its ORIGINAL author's room, not
+        # whoever it was replying to), so there's no parent room to thread
+        # onto even if the chain resolved.
+        obj_in_reply_to = obj.get("inReplyTo")
+        reply_header = None
+        if obj_in_reply_to:
+            context = await _resolve_reply_header_context(request, in_reply_to_ap=obj_in_reply_to, obj=obj)
+            reply_header = _render_reply_header(context)
         imported = await import_note(
             request, note=obj, author_actor_id=original_author_id, author_doc=original_actor_doc,
+            reply_header=reply_header,
         )
         imported_attachment_mxc = imported.first_attachment_mxc
         imported_attachment_width = imported.first_attachment_width
@@ -2765,6 +2804,30 @@ async def _resolve_reply_header_context(
     # a reply, with a working link, rather than silently mirroring it with
     # no context at all.
     return None, None, in_reply_to_ap
+
+
+def _render_reply_header(context: tuple[str | None, str | None, str]) -> tuple[str, str]:
+    """``(header_plain, header_html)`` for ``_resolve_reply_header_context``'s
+    own result -- prepended to whatever body/formatted_body a caller already
+    built, same "prepend a header, everything else stays exactly as it would
+    otherwise be" shape as ``_echo_reply_in_own_room``'s own header, just
+    with an EXTERNAL link (no Matrix event exists for this parent -- that's
+    the whole reason this helper is needed at all) instead of a matrix.to
+    one. Shared by every caller that mirrors a reply it couldn't actually
+    thread -- see ``_resolve_reply_header_context``'s own docstring for when
+    that is."""
+    parent_handle, parent_author_html, external_link = context
+    if parent_handle is not None:
+        return (
+            f"⤵️ Reply to {parent_handle}'s post:",
+            f'<p>⤵️ Reply to {parent_author_html}\'s <a href="{html.escape(external_link, quote=True)}">post</a>:</p>',
+        )
+    # Couldn't name an author at all -- still mark this as a reply, with a
+    # working link, rather than mirroring it with zero context.
+    return (
+        "⤵️ Reply to this post:",
+        f'<p>⤵️ Reply to <a href="{html.escape(external_link, quote=True)}">this post</a>:</p>',
+    )
 
 
 def _note_author(note: dict) -> str | None:

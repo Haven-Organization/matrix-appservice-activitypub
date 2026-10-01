@@ -248,7 +248,9 @@ from bridge.inbox_dispatch import (
     _handle_create,
     _mirror_note_as_reply,
     _note_author,
+    _render_reply_header,
     _resolve_ancestor_chain,
+    _resolve_reply_header_context,
     build_preview_media_content,
 )
 from bridge.matrix_links import matrix_to_link, matrix_to_room_link, room_pill_html
@@ -4021,11 +4023,27 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
     # User Room at all.
     in_reply_to = obj.get("inReplyTo")
     parent: FederatedEvent | None = None
+    reply_header_context: tuple[str | None, str | None, str] | None = None
     if in_reply_to:
         chain = await _resolve_ancestor_chain(request, in_reply_to)
+        missing_ancestors: list[dict] = []
         if chain is not None:
             chain_parent, missing_ancestors = chain
             parent, _imported_root = await _backfill_ancestor_chain(request, chain_parent, missing_ancestors)
+        if parent is None:
+            # Couldn't actually thread it (chain unusable, or resolved fine
+            # but importing the untracked root failed outright) -- same
+            # fallback a live inbound reply gets from _handle_create: still
+            # mark this as a reply, reusing the chain walk's own
+            # already-fetched immediate parent when we have one instead of
+            # a second, redundant fetch (see _resolve_reply_header_context's
+            # own docstring -- this command used to have no such fallback
+            # at all, mirroring bare with zero reply context whenever the
+            # chain couldn't be walked).
+            known_parent_note = missing_ancestors[-1] if missing_ancestors else None
+            reply_header_context = await _resolve_reply_header_context(
+                request, in_reply_to_ap=in_reply_to, obj=obj, known_parent_note=known_parent_note,
+            )
 
     if parent is not None:
         new_federated_event = await _mirror_note_as_reply(request, obj, parent, author_actor_id)
@@ -4148,6 +4166,12 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         # (MSC3952) is what actually highlights/notifies the tagged
         # user's client.
         message_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
+    if reply_header_context is not None:
+        header_plain, header_html = _render_reply_header(reply_header_context)
+        message_content["body"] = f"{header_plain}\n\n{message_content['body']}".strip()
+        message_content["format"] = "org.matrix.custom.html"
+        existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
+        message_content["formatted_body"] = header_html + existing_html
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url

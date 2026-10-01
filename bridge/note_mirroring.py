@@ -2059,7 +2059,8 @@ async def ensure_ghost_dm_room(
 
 
 async def mirror_direct_message(
-    request: Request, *, note: dict, author_actor_id: str, recipient_matrix_user_id: str
+    request: Request, *, note: dict, author_actor_id: str, recipient_matrix_user_id: str,
+    reply_header: tuple[str, str] | None = None,
 ) -> FederatedEvent | None:
     """Mirror an inbound Note addressed as a private/direct message (see
     ``note_is_direct_message``) into a dedicated 1:1 Matrix DM room between
@@ -2087,7 +2088,14 @@ async def mirror_direct_message(
     to a public post, which is how a DM conversation often starts -- is
     sent as a fresh top-level message in the DM room instead, since the
     "parent" it's structurally replying to doesn't actually belong to this
-    private conversation.
+    private conversation. In that case, ``reply_header`` -- a caller's own
+    pre-rendered ``_render_reply_header`` result for ``note.inReplyTo``, if
+    it has one -- is prepended instead, same reasoning as ``import_note``'s
+    identical parameter: without it, a DM started by replying to a public
+    post (the common way to start one on Mastodon) would land with zero
+    indication of what it was structurally replying to. Never applied once
+    this DOES thread within the DM room itself -- the real thread relation
+    already shows that.
 
     Returns the recorded ``FederatedEvent``, or None if the author's domain
     couldn't be determined or actually sending into Matrix failed.
@@ -2154,6 +2162,12 @@ async def mirror_direct_message(
         message_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
     if relates_to is not None:
         message_content["m.relates_to"] = relates_to
+    elif reply_header is not None:
+        header_plain, header_html = reply_header
+        message_content["body"] = f"{header_plain}\n\n{message_content['body']}".strip()
+        message_content["format"] = "org.matrix.custom.html"
+        existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
+        message_content["formatted_body"] = header_html + existing_html
     src = source_post_url(note)
     if src:
         message_content["external_url"] = src
@@ -2398,7 +2412,8 @@ async def activity_lock(key: str):
 
 
 async def import_note(
-    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None,
+    reply_header: tuple[str, str] | None = None,
 ) -> ImportedNote:
     """Mirror ``note`` (an already-fetched, already-type-checked Note, with
     its author already resolved/fetched too) into a Remote User Room for
@@ -2414,10 +2429,19 @@ async def import_note(
     ``bridge.inbox_dispatch``'s ``Announce``/quote-post handling
     (automatically importing whatever a followed account reposts/reposts, or
     whatever an inbound quote-post's own target turns out to be). Doesn't
-    handle reply-threading the way ``import`` does for its own case -- a
-    caller that cares should check for a trackable parent first and only
-    fall back to this for the plain-top-level-post case, same as ``import``
-    itself does.
+    WALK ``note``'s own ancestor chain the way ``import``/``_handle_create``
+    do for their own top-level case -- a caller that cares should check for
+    a trackable parent first and only fall back to this for the plain-top-
+    level-post case, same as ``import`` itself does.
+
+    ``reply_header``, if given -- a caller's own pre-rendered
+    ``_render_reply_header`` result -- is prepended to the mirrored post's
+    body/formatted_body exactly like ``_handle_create``'s own unthreaded-
+    reply fallback does: for a ``note`` that IS itself a reply but is being
+    imported here as a flat top-level post anyway (e.g. a reply mentioning
+    a local user, or a reply that's itself someone else's quote target),
+    this is the only way such a post ever gets ANY indication it's a reply
+    at all, since this function itself never walks ``note.inReplyTo``.
 
     Serializes concurrent calls for the SAME ``note`` (see ``activity_lock``)
     -- two different inbound deliveries can legitimately both want to
@@ -2431,11 +2455,13 @@ async def import_note(
     if not ap_object_id:
         # Nothing to key a lock (or future dedup lookups) on regardless.
         return await _import_note_locked(
-            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter,
+            reply_header=reply_header,
         )
     async with activity_lock(ap_object_id):
         return await _import_note_locked(
-            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter
+            request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter,
+            reply_header=reply_header,
         )
 
 
@@ -2718,7 +2744,8 @@ async def ensure_remote_actor_room(
 
 
 async def _import_note_locked(
-    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None
+    request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None,
+    reply_header: tuple[str, str] | None = None,
 ) -> ImportedNote:
     """``import_note``'s actual body, run while holding that post's own
     ``activity_lock`` -- see ``import_note``'s own docstring for why."""
@@ -2794,6 +2821,12 @@ async def _import_note_locked(
         # mention a clickable link -- an intentional mention (MSC3952) is
         # what actually highlights/notifies the tagged user's client.
         message_content["m.mentions"] = {"user_ids": [a.matrix_user_id for a in mentions.mentioned_locals]}
+    if reply_header is not None:
+        header_plain, header_html = reply_header
+        message_content["body"] = f"{header_plain}\n\n{message_content['body']}".strip()
+        message_content["format"] = "org.matrix.custom.html"
+        existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
+        message_content["formatted_body"] = header_html + existing_html
     src = source_post_url(note)
     if src:
         message_content["external_url"] = src
