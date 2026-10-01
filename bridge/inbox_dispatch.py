@@ -1527,15 +1527,14 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         )
         return
 
-    # Set only when a reply's own ancestor chain turns out unusable (a
-    # broken/inaccessible ancestor, or one deeper than
-    # _resolve_ancestor_chain's own max_depth) -- (parent_handle,
-    # parent_author_html, external_link) for the "⤵️ Reply to" header the
-    # ordinary top-level path below adds in that case. Filled in from a
-    # live fetch of the immediate parent when that succeeds, or (if even
-    # THAT 404s) from this post's own Mention tags instead -- see the two
-    # assignments further down.
-    unresolved_reply_context: tuple[str, str, str] | None = None
+    # Set only when a reply couldn't actually be threaded (its ancestor
+    # chain turned out unusable, or resolved fine but we declined to import
+    # it) -- (parent_handle, parent_author_html, external_link) for the
+    # "⤵️ Reply to" header the ordinary top-level path below adds in that
+    # case, via _resolve_reply_header_context further down. The first two
+    # elements are None only when even that can't name an author at all --
+    # rendered as a nameless "in reply to this post" instead.
+    unresolved_reply_context: tuple[str | None, str | None, str] | None = None
 
     in_reply_to_ap = obj.get("inReplyTo")
     if in_reply_to_ap:
@@ -1585,53 +1584,31 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                     )
                 return
 
-        # The chain itself is unusable (a broken/inaccessible ancestor
-        # somewhere up it, or one deeper than max_depth -- see
-        # _resolve_ancestor_chain's own docstring for both), so there's no
-        # real thread to build. This reply's own IMMEDIATE target is still
-        # worth one extra, isolated fetch, purely for display: confirmed
+        # No real thread to build -- either the chain itself is unusable (a
+        # broken/inaccessible ancestor somewhere up it, or one deeper than
+        # max_depth), or it resolved just fine but we deliberately declined
+        # to import it (nobody follows the replier and the conversation was
+        # untracked -- see the "pass" branch above). Still worth a header
+        # pointing at whichever immediate parent we can identify, rather
+        # than mirroring this as a context-free standalone post: confirmed
         # live 2026-07-15 that a reply whose direct parent was perfectly
-        # fine mirrored as a totally context-free standalone post, purely
-        # because a MUCH older ancestor several hops further up the same
-        # thread (on a third, unrelated instance) turned out to be a
-        # genuine 404 for everyone, not just us -- nothing about that
-        # should erase the fact that THIS post visibly replies to a real,
-        # perfectly fine, still-reachable post one hop up. Best-effort:
-        # if even this single fetch fails too, falls through with no
-        # header at all, same as before this existed.
-        try:
-            immediate_parent_note = await _resolve_object(request, in_reply_to_ap)
-        except Exception:
-            immediate_parent_note = None
-        if immediate_parent_note is not None and immediate_parent_note.get("type") == "Note":
-            immediate_parent_author_id = _note_author(immediate_parent_note)
-            if isinstance(immediate_parent_author_id, str):
-                parent_handle, parent_author_html = await actor_html_with_avatar(request, immediate_parent_author_id)
-                external_link = _source_post_url(immediate_parent_note) or in_reply_to_ap
-                unresolved_reply_context = (parent_handle, parent_author_html, external_link)
-        else:
-            # The immediate parent itself is unreachable too (confirmed
-            # live 2026-08-05: a genuine 404, not just some older ancestor
-            # further up) -- no object to read attributedTo from. Real
-            # fediverse convention (Mastodon/Pleroma/Misskey alike; see
-            # collect_reply_participants's identical reasoning) is that a
-            # reply's own tag array names its parent's author, so fall
-            # back to reading THIS post's own Mention tags instead of
-            # giving up on a header entirely. Matched by host against
-            # in_reply_to_ap, not just "first tag", so an unrelated CC'd
-            # mention on a different domain is never mistaken for the
-            # parent author. actor_html_with_avatar needs no live fetch
-            # either way -- a real ghost pill if one's on file, else a
-            # plain @user@domain derived straight from the href.
-            in_reply_to_host = urlsplit(in_reply_to_ap).hostname
-            for tag in obj.get("tag") or []:
-                if not isinstance(tag, dict) or tag.get("type") != "Mention":
-                    continue
-                href = tag.get("href")
-                if isinstance(href, str) and urlsplit(href).hostname == in_reply_to_host:
-                    parent_handle, parent_author_html = await actor_html_with_avatar(request, href)
-                    unresolved_reply_context = (parent_handle, parent_author_html, in_reply_to_ap)
-                    break
+        # fine mirrored with no header at all, purely because a MUCH older
+        # ancestor several hops further up the same thread (on a third,
+        # unrelated instance) turned out to be a genuine 404 for everyone,
+        # not just us -- nothing about that should erase the fact that THIS
+        # post visibly replies to a real, perfectly fine, still-reachable
+        # post one hop up. known_parent_note reuses the chain walk's own
+        # already-fetched copy of that immediate parent when we have one
+        # (the declined-import case) instead of a second, redundant fetch
+        # of the exact same URL -- confirmed live 2026-09-30: a reply into
+        # an untracked, unfollowed-replier conversation lost its header
+        # entirely, apparently to a transient failure on that avoidable
+        # second fetch, with nothing in the logs to show it (see
+        # project_reply_ordering_race).
+        known_parent_note = missing_ancestors[-1] if (chain is not None and missing_ancestors) else None
+        unresolved_reply_context = await _resolve_reply_header_context(
+            request, in_reply_to_ap=in_reply_to_ap, obj=obj, known_parent_note=known_parent_note,
+        )
 
     # Extracted early (not just where it's used for rendering, below) since
     # a quote of a post we already track is itself a relevance signal --
@@ -1779,12 +1756,20 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         # parent -- that's the whole reason this branch runs at all)
         # instead of a matrix.to one.
         parent_handle, parent_author_html, external_link = unresolved_reply_context
-        message_content["body"] = f"⤵️ Reply to {parent_handle}'s post:\n\n{message_content['body']}".strip()
+        if parent_handle is not None:
+            header_plain = f"⤵️ Reply to {parent_handle}'s post:"
+            header_html = (
+                f"<p>⤵️ Reply to {parent_author_html}'s "
+                f'<a href="{html.escape(external_link, quote=True)}">post</a>:</p>'
+            )
+        else:
+            # Couldn't name an author at all -- still mark this as a reply,
+            # with a working link, rather than mirroring it with zero
+            # context (see _resolve_reply_header_context's own docstring).
+            header_plain = "⤵️ Reply to this post:"
+            header_html = f'<p>⤵️ Reply to <a href="{html.escape(external_link, quote=True)}">this post</a>:</p>'
+        message_content["body"] = f"{header_plain}\n\n{message_content['body']}".strip()
         message_content["format"] = "org.matrix.custom.html"
-        header_html = (
-            f"<p>⤵️ Reply to {parent_author_html}'s "
-            f'<a href="{html.escape(external_link, quote=True)}">post</a>:</p>'
-        )
         existing_html = message_content.get("formatted_body") or (html.escape(plain) if plain else "")
         message_content["formatted_body"] = header_html + existing_html
     if (
@@ -2717,6 +2702,69 @@ async def _resolve_object(request: Request, obj_field) -> dict | None:
         except RemoteActorFetchError:
             return None
     return None
+
+
+async def _resolve_reply_header_context(
+    request: Request, *, in_reply_to_ap: str, obj: dict, known_parent_note: dict | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Best-effort ``(parent_handle, parent_author_html, external_link)`` for
+    the "⤵️ Reply to ..." header a reply gets when it couldn't actually be
+    threaded (see ``_handle_create``'s own reasoning for when this runs).
+    The first two elements are ``None`` -- rendered as a nameless "in reply
+    to this post" by the caller -- only in the rare case nothing below can
+    name an author at all; a reply is never mirrored with zero indication
+    it's a reply, even then (user-requested, 2026-09-30: a transient failure
+    resolving the parent used to drop the header entirely, with nothing
+    pointing back at the thread it actually belongs to).
+
+    ``known_parent_note`` -- the Note ``in_reply_to_ap`` itself refers to,
+    if a caller already has it on hand from its own ancestor-chain walk
+    (``_resolve_ancestor_chain``'s own ``missing_ancestors[-1]``) -- avoids
+    a second, redundant fetch of the exact same URL, and the extra point of
+    failure that is, when the chain was perfectly resolvable but just not
+    imported (e.g. nobody here follows the replier -- see
+    ``_handle_create``'s "nobody follows the replier" branch).
+
+    Falls back, in order: a fresh fetch of the immediate parent if
+    ``known_parent_note`` wasn't given or wasn't usable; this post's own
+    Mention tags (matched by host against ``in_reply_to_ap``), which need no
+    network at all -- real fediverse convention (Mastodon/Pleroma/Misskey
+    alike; see ``collect_reply_participants``'s identical reasoning) is that
+    a reply's own ``tag`` array names its parent's author; and finally, a
+    nameless link if even that comes up empty."""
+    immediate_parent_note = known_parent_note
+    if immediate_parent_note is None:
+        try:
+            immediate_parent_note = await _resolve_object(request, in_reply_to_ap)
+        except Exception:
+            immediate_parent_note = None
+
+    if immediate_parent_note is not None and immediate_parent_note.get("type") == "Note":
+        immediate_parent_author_id = _note_author(immediate_parent_note)
+        if isinstance(immediate_parent_author_id, str):
+            parent_handle, parent_author_html = await actor_html_with_avatar(request, immediate_parent_author_id)
+            external_link = _source_post_url(immediate_parent_note) or in_reply_to_ap
+            return parent_handle, parent_author_html, external_link
+
+    # The immediate parent itself is unreachable too (confirmed live
+    # 2026-08-05: a genuine 404, not just some older ancestor further up) --
+    # no object to read attributedTo from. actor_html_with_avatar needs no
+    # live fetch either way -- a real ghost pill if one's on file, else a
+    # plain @user@domain derived straight from the href -- so this is
+    # reliable regardless of whatever made the fetch above fail.
+    in_reply_to_host = urlsplit(in_reply_to_ap).hostname
+    for tag in obj.get("tag") or []:
+        if not isinstance(tag, dict) or tag.get("type") != "Mention":
+            continue
+        href = tag.get("href")
+        if isinstance(href, str) and urlsplit(href).hostname == in_reply_to_host:
+            parent_handle, parent_author_html = await actor_html_with_avatar(request, href)
+            return parent_handle, parent_author_html, in_reply_to_ap
+
+    # Truly nothing to name the parent's author with -- still mark this as
+    # a reply, with a working link, rather than silently mirroring it with
+    # no context at all.
+    return None, None, in_reply_to_ap
 
 
 def _note_author(note: dict) -> str | None:
