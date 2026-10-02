@@ -2987,21 +2987,34 @@ async def _build_repost_message(
             via=[request.app.state.config.synapse.server_name],
             content_inline=content_inline, content=None if content_inline else reposted_content,
         )
-        # Blank, not the reposted post's own text (``plain``/``inner_html``)
-        # -- see SOCIAL_BODY_FIELD's own docstring: it stands for THIS
-        # message's own added commentary, and this function only ever
-        # renders a genuine Announce-shaped repost (its own docstring --
-        # never a captioned quote-post, which carries real commentary and
-        # is rendered elsewhere), so there's never any. The reposted post's
-        # real content is already fully available via relates_to above (as
-        # content_inline or a real content= copy). Setting this to a copy
-        # of the reposted text instead (what this did until 2026-10-02)
-        # made a compliant client show that text TWICE: once in the outer
-        # message's own main body (per the MSC's "render social.body in
-        # body's place" rule), and again inside the repost card itself --
-        # confirmed live against a real MSC4501 client that day.
-        message_content[SOCIAL_BODY_FIELD] = ""
-        message_content[SOCIAL_FORMATTED_BODY_FIELD] = ""
+        # A compliant client's replacement for body/formatted_body: the
+        # reposted post's own content alone, without the "🔁 reposted X's
+        # post:" header above it -- see SOCIAL_BODY_FIELD's own docstring.
+        # inner_html specifically, NOT content_html -- a compliant client
+        # renders its OWN quote/repost styling around this, so it must be
+        # the bare content, not pre-wrapped in the <blockquote> content_html
+        # now carries for the plain (non-MSC4501-aware) formatted_body above.
+        # Omitted for a caption-less repost of a text-free (media-only)
+        # post -- confirmed live 2026-07-13: Haven already recognizes an
+        # empty repost by body alone being a bare matrix.to/matrix: link
+        # (per MSC4501's own convention -- see this function's docstring),
+        # so an empty social.body/formatted_body would be pure noise, not a
+        # disambiguation a compliant client actually needs.
+        #
+        # 2026-10-02 correction: this field is the REPOSTED post's own real
+        # content, not the reposting message's own added commentary -- a
+        # genuine Announce never has any of the latter, so it was briefly
+        # (wrongly) set blank here on the theory that a non-blank copy
+        # duplicated relates_to.content for a compliant client. The actual
+        # cause of that duplication (confirmed against a real MSC4501
+        # client, and the official MSC4501 example) was ``send_repost``
+        # using ``content=`` instead of ``content_inline=True`` for ITS OWN
+        # relates_to -- not this function, which already used
+        # content_inline by default and was correct all along.
+        if plain:
+            message_content[SOCIAL_BODY_FIELD] = plain
+            if inner_html:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = inner_html
     source_url = _source_post_url(obj)
     if source_url:
         message_content["external_url"] = source_url

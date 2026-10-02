@@ -405,7 +405,10 @@ async def send_repost(
     notice_event_id: str | None = None
     if actor_record.room_id and not already_has_native_record:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
-        preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+        # preview_full_content unused here -- content_inline=True below
+        # means this card's own attached media stands in for it, no
+        # separate copy needed (see that assignment's own comment).
+        preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
             request, preview_target
         )
         post_link = matrix_to_link(preview_target.room_id, preview_target.event_id, via=[config.synapse.server_name])
@@ -454,13 +457,22 @@ async def send_repost(
         # MSC4501 info at all). Per the MSC, body becomes nothing but the
         # bare permalink once relates_to is actually attached (formatted_body
         # keeps the full "🔁 reposted X's post" card regardless -- only an
-        # MSC4501-aware client parses plain body for this at all); unlike
-        # _build_repost_message, relates_to.content carries the REAL full
-        # content (preview_full_content, already fetched above for the
-        # preview text/media -- no extra round trip) rather than
-        # content_inline, since this card's own body is a condensed preview,
-        # not a genuine full copy -- content_inline would wrongly assert it
-        # is one.
+        # MSC4501-aware client parses plain body for this at all).
+        #
+        # content_inline=True (not a separate content= copy) -- per the
+        # MSC's own example and _build_repost_message's already-working
+        # identical convention: it tells a compliant client to treat THIS
+        # event's own content (the preview_image/preview_video attached via
+        # build_preview_media_content below, genuinely sourced from the
+        # reposted post itself, just scaled down for a compact card) as the
+        # repost's real content, rather than expecting a separate
+        # relates_to.content copy. A first attempt at this (2026-10-02)
+        # used content= instead, on the theory that this card's own preview
+        # was too condensed to assert as "the full copy" -- confirmed
+        # against a real MSC4501 client that content= (not content_inline)
+        # was the actual cause of the client showing the reposted text
+        # twice, not social.body carrying real text (a second, wrong
+        # theory tried immediately after, also reverted the same day).
         use_relates_to = config.bridge.set_msc4501_relates_to and original_sender is not None
         plain_body = post_link if use_relates_to else plain_body_full
         notice_content = build_preview_media_content(
@@ -473,22 +485,17 @@ async def send_repost(
                 SOCIAL_REL_TYPE_REPOST,
                 event_id=preview_target.event_id, room_id=preview_target.room_id,
                 sender=original_sender, displayname=original_displayname,
-                via=[config.synapse.server_name], content=preview_full_content,
+                via=[config.synapse.server_name], content_inline=True,
             )
-            # Blank, not the reposted post's own text -- see
-            # SOCIAL_BODY_FIELD's own docstring for why: it stands for THIS
-            # message's own added commentary, and triggering this notice
-            # (the 🔁 reaction, or a caption-less ;repost) never carries any
-            # -- the reposted post's real content is already fully available
-            # via relates_to.content above, in the repost card's own
-            # sub-rendering. Setting it to a copy of that text instead (what
-            # this did until 2026-10-02) made a compliant client show the
-            # original post's words TWICE: once in the outer message's own
-            # main body (per the MSC's "render social.body in body's place"
-            # rule), and again inside the repost card itself -- confirmed
-            # live against a real MSC4501 client the same day.
-            notice_content[SOCIAL_BODY_FIELD] = ""
-            notice_content[SOCIAL_FORMATTED_BODY_FIELD] = ""
+            # The reposted post's own real caption (not this message's own
+            # commentary -- there never is any on this path) -- omitted
+            # entirely for a caption-less/media-only repost, same as
+            # _build_repost_message's identical guard: an empty
+            # social.body/formatted_body would be pure noise, not a
+            # disambiguation a compliant client actually needs.
+            if preview_text:
+                notice_content[SOCIAL_BODY_FIELD] = preview_text
+                notice_content[SOCIAL_FORMATTED_BODY_FIELD] = html.escape(preview_text)
         per_message_profile = await _build_per_message_profile(request, actor_record)
         if per_message_profile is not None:
             notice_content[_PER_MESSAGE_PROFILE_FIELD] = per_message_profile
