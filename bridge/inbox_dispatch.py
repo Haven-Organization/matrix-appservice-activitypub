@@ -2886,13 +2886,11 @@ async def _build_repost_message(
     ``m.social.relates_to`` is actually attached (``use_relates_to`` below)
     -- ``formatted_body`` (and, for a non-MSC4501-aware client reading only
     plain text, the fact that ``m.social.relates_to`` even exists) is where
-    the real rendering lives. This does NOT apply to ``send_repost``'s own
-    "you reposted" notice card (a different function, in
-    ``bridge.reaction_bridge``): that one deliberately never sets
-    ``m.social.relates_to`` at all -- see its own docstring -- so the MSC's
-    bare-``body`` rule for a relates_to-bearing event never applies to it in
-    the first place; it's the bridge's own confirmation card, not a mirrored
-    MSC4501 repost record.
+    the real rendering lives. ``bridge.reaction_bridge.send_repost``'s own
+    "you reposted" notice card follows the exact same bare-``body`` rule now
+    too (added 2026-10-02, once ``SOCIAL_BODY_FIELD``/
+    ``SOCIAL_FORMATTED_BODY_FIELD`` made it safe -- see that function's own
+    docstring for why it predates this one not having ``relates_to`` at all).
     A 2026-07-11 change here briefly made ``body`` always carry full content
     even with ``m.social.relates_to`` set, on the theory that a bare-link
     ``body`` "looked empty" -- reverted 2026-07-12 per explicit correction:

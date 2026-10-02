@@ -54,7 +54,16 @@ from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media
 from bridge.commands import is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
-from bridge.note_mirroring import actor_html_with_avatar, deliver_to_actor_or_followers
+from bridge.note_mirroring import (
+    SOCIAL_BODY_FIELD,
+    SOCIAL_FORMATTED_BODY_FIELD,
+    SOCIAL_REL_TYPE_REPOST,
+    SOCIAL_RELATES_TO_FIELD,
+    actor_html_with_avatar,
+    deliver_to_actor_or_followers,
+    resolve_actor_matrix_identity,
+    social_relates_to,
+)
 from bridge.repository import ActorRecord, FederatedEvent, ReactionRecord
 from bridge.synapse_client import SynapseError
 
@@ -396,7 +405,7 @@ async def send_repost(
     notice_event_id: str | None = None
     if actor_record.room_id and not already_has_native_record:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
-        preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+        preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
             request, preview_target
         )
         post_link = matrix_to_link(preview_target.room_id, preview_target.event_id, via=[config.synapse.server_name])
@@ -411,37 +420,67 @@ async def send_repost(
 
         _, reposter_html = await actor_html_with_avatar(request, own_actor_id)
         original_handle, original_author_html = await actor_html_with_avatar(request, target_author_actor_id)
+        original_sender: str | None = None
+        original_displayname: str | None = None
+        if target_author_actor_id:
+            _, original_displayname, original_sender = await resolve_actor_matrix_identity(
+                request, target_author_actor_id
+            )
 
-        plain_body = f"\U0001F501 reposted {original_handle}'s post:"
+        plain_body_full = f"\U0001F501 reposted {original_handle}'s post:"
         if preview_text:
-            plain_body += f"\n> {preview_text}"
-        plain_body += f"\n{post_link}"
+            plain_body_full += f"\n> {preview_text}"
+        plain_body_full += f"\n{post_link}"
 
         post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
         formatted_caption = (
             f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
         )
-        # Deliberately NEVER sets org.matrix.msc4501.social.relates_to on
-        # this notice (unlike _build_repost_message/_echo_reply_in_own_room,
-        # which DO) -- relates_to's whole point is telling an MSC4501-aware
-        # client "here's the reposted post's own real content, go render
-        # that instead of duplicating it inline," but this notice already
-        # embeds a full plain_body/formatted_caption/media preview of its
-        # own (this IS the record of the repost, not raw mirrored content
-        # that just happens to also carry a header) -- confirmed live
-        # (2026-07-09) that carrying relates_to here just made ordinary
-        # (non-MSC4501) clients redundantly render the same post twice, not
-        # once. body is always the full plain_body (with quote + link),
-        # never just a bare permalink.
+
+        # Used to deliberately never set org.matrix.msc4501.social.relates_to
+        # on this notice at all, since relates_to's whole point is telling an
+        # MSC4501-aware client "here's the reposted post's own real content,
+        # go render that instead of duplicating it inline" -- but this
+        # notice's own body/formatted_body already embeds a full copy, so a
+        # NAIVE relates_to just made ordinary (non-MSC4501) clients render
+        # the same post twice (confirmed live 2026-07-09).
         #
-        # Same reasoning rules out SOCIAL_BODY_FIELD/SOCIAL_FORMATTED_BODY_FIELD
-        # too -- never set without SOCIAL_RELATES_TO_FIELD alongside them, and
-        # this notice deliberately never sets that either (immediately above).
+        # Since then, MSC4501 gained SOCIAL_BODY_FIELD/SOCIAL_FORMATTED_BODY_FIELD:
+        # a compliant client renders THOSE in body/formatted_body's place
+        # instead of duplicating anything, so there's no longer a reason to
+        # withhold relates_to here -- same combo _build_repost_message
+        # already uses for a mirrored repost (user-requested, 2026-10-02:
+        # this notice card was the one remaining repost rendering without
+        # MSC4501 info at all). Per the MSC, body becomes nothing but the
+        # bare permalink once relates_to is actually attached (formatted_body
+        # keeps the full "🔁 reposted X's post" card regardless -- only an
+        # MSC4501-aware client parses plain body for this at all); unlike
+        # _build_repost_message, relates_to.content carries the REAL full
+        # content (preview_full_content, already fetched above for the
+        # preview text/media -- no extra round trip) rather than
+        # content_inline, since this card's own body is a condensed preview,
+        # not a genuine full copy -- content_inline would wrongly assert it
+        # is one.
+        use_relates_to = config.bridge.set_msc4501_relates_to and original_sender is not None
+        plain_body = post_link if use_relates_to else plain_body_full
         notice_content = build_preview_media_content(
             plain_body=plain_body,
             formatted_caption=formatted_caption,
             preview_image=preview_image, preview_video=preview_video,
         )
+        if use_relates_to:
+            notice_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+                SOCIAL_REL_TYPE_REPOST,
+                event_id=preview_target.event_id, room_id=preview_target.room_id,
+                sender=original_sender, displayname=original_displayname,
+                via=[config.synapse.server_name], content=preview_full_content,
+            )
+            full_body = (preview_full_content.get("body") or "").strip()
+            if full_body:
+                notice_content[SOCIAL_BODY_FIELD] = full_body
+                notice_content[SOCIAL_FORMATTED_BODY_FIELD] = preview_full_content.get("formatted_body") or (
+                    html.escape(full_body)
+                )
         per_message_profile = await _build_per_message_profile(request, actor_record)
         if per_message_profile is not None:
             notice_content[_PER_MESSAGE_PROFILE_FIELD] = per_message_profile
