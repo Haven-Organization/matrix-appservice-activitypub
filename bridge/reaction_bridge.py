@@ -475,12 +475,20 @@ async def send_repost(
                 sender=original_sender, displayname=original_displayname,
                 via=[config.synapse.server_name], content=preview_full_content,
             )
-            full_body = (preview_full_content.get("body") or "").strip()
-            if full_body:
-                notice_content[SOCIAL_BODY_FIELD] = full_body
-                notice_content[SOCIAL_FORMATTED_BODY_FIELD] = preview_full_content.get("formatted_body") or (
-                    html.escape(full_body)
-                )
+            # Blank, not the reposted post's own text -- see
+            # SOCIAL_BODY_FIELD's own docstring for why: it stands for THIS
+            # message's own added commentary, and triggering this notice
+            # (the 🔁 reaction, or a caption-less ;repost) never carries any
+            # -- the reposted post's real content is already fully available
+            # via relates_to.content above, in the repost card's own
+            # sub-rendering. Setting it to a copy of that text instead (what
+            # this did until 2026-10-02) made a compliant client show the
+            # original post's words TWICE: once in the outer message's own
+            # main body (per the MSC's "render social.body in body's place"
+            # rule), and again inside the repost card itself -- confirmed
+            # live against a real MSC4501 client the same day.
+            notice_content[SOCIAL_BODY_FIELD] = ""
+            notice_content[SOCIAL_FORMATTED_BODY_FIELD] = ""
         per_message_profile = await _build_per_message_profile(request, actor_record)
         if per_message_profile is not None:
             notice_content[_PER_MESSAGE_PROFILE_FIELD] = per_message_profile
