@@ -1440,9 +1440,24 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     common way to start one on Mastodon), which would otherwise land it in
     whichever room mirrors that parent, visible to anyone else who's been
     invited into it. This has to run before the reply-chain check below,
-    since that's exactly the path that would otherwise catch it."""
+    since that's exactly the path that would otherwise catch it.
+
+    ``activity.object`` is resolved via ``_resolve_object`` (fetching it if
+    it's only a bare IRI, same as ``_handle_announce_locked`` already does
+    for an Announce's own object) rather than requiring an already-embedded
+    dict -- GoToSocial's own outbox represents a Create's object as a bare
+    IRI (confirmed live 2026-10-10 against a real account), and its live
+    inbox deliveries use the identical shape: every Create from a followed
+    GoToSocial account was silently dropped right here, with no log trace
+    at any level, since the dict-only check simply treated a bare-string
+    object as "nothing to mirror" and returned. ``;backfill``/``;import``
+    already resolved this correctly for their own outbox-fetched items
+    (``bridge.commands._note_from_item``) -- this was the one remaining
+    path still requiring an embedded object, which is why backfilling a
+    GoToSocial account's past posts worked while its new ones, delivered
+    live, never arrived at all."""
     repository = request.app.state.repository
-    obj = activity.object if isinstance(activity.object, dict) else None
+    obj = await _resolve_object(request, activity.object)
     if obj is None:
         return
 
