@@ -45,78 +45,14 @@ Most of what's above just happens through ordinary Matrix actions: sending a mes
 
 Synapse is the only homeserver this bridge has actually been tested against. It should work against any other spec-compliant homeserver in theory, with one exception: `bridge.use_synapse_admin_api` (on by default) depends on Synapse's own Admin API, which isn't part of the spec and other implementations aren't guaranteed to have. Turn it off if you're not running Synapse.
 
-Running on other homeservers is untested, experimental territory as of this writing. When turning `bridge.use_synapse_admin_api` off: populate `bridge.admins` (see `config.example.yaml`), since admin status no longer falls back to a Synapse API check. As soon as the bridge is started up, spot-test every command by hand rather than assuming it behaves the same as the Synapse-backed path; and watch the bridge's logs closely to make sure you're not getting any unexpected errors.
+Running on other homeservers is untested, experimental territory as of this writing. When turning `bridge.use_synapse_admin_api` off: populate `bridge.admins` (see [CONFIG.md](CONFIG.md)), since admin status no longer falls back to a Synapse API check. As soon as the bridge is started up, spot-test every command by hand rather than assuming it behaves the same as the Synapse-backed path; and watch the bridge's logs closely to make sure you're not getting any unexpected errors.
 
 ## Setup
 
-1. Install dependencies and generate a config:
+See [INSTALL.md](INSTALL.md) for the full walkthrough, natively or in Docker. In short: `./scripts/setup.sh` (or the `Dockerfile`), edit `config.yaml` (from `config.example.yaml`), register the AppService with your homeserver, then run the bridge.
 
-   ```sh
-   ./scripts/setup.sh
-   ```
-
-   This creates a virtualenv, installs `requirements.txt`, and generates `config.yaml` from `config.example.yaml` with fresh random AppService tokens.
-
-2. Edit `config.yaml`. At minimum set `bridge.domain`, `bridge.public_base_url`, `synapse.base_url`, and `synapse.server_name` (these fields are named after Synapse, but just mean "your homeserver" -- see "What homeservers are supported?" above). Also set `synapse.admin_token` (an access token for a homeserver account with `admin: true`) unless you've explicitly turned off `bridge.use_synapse_admin_api`. See `config.example.yaml` for every option; each is documented inline (storage backend, logging level, federation timeouts, backfill defaults, and more).
-
-3. Generate the AppService registration and wire it into your homeserver:
-
-   ```sh
-   .venv/bin/python -m bridge.appservice config.yaml appservice-registration.yaml
-   ```
-
-   In Docker, this is a one-off run of the same module with the entrypoint overridden (see step 4 below for the mounts this assumes):
-
-   ```sh
-   docker run --rm --entrypoint python \
-     -v $(pwd)/config.yaml:/config/config.yaml:ro \
-     -v bridge-data:/data \
-     ghcr.io/haven-organization/matrix-appservice-activitypub:latest \
-     -m bridge.appservice /config/config.yaml /data/appservice-registration.yaml
-   ```
-
-   Add the resulting file's path to your homeserver's own application-service registration config (`app_service_config_files` in `homeserver.yaml`, if you're running Synapse), then restart it.
-
-4. Run the bridge, natively or in Docker:
-
-   **Natively:**
-
-   ```sh
-   .venv/bin/python main.py
-   ```
-
-   Or install `deploy/matrix-appservice-activitypub.service` to run it under systemd (see that file for the expected user/paths). `deploy/nginx.conf.example` shows a reverse-proxy config for exposing the ActivityPub surface on the same public domain as your homeserver. That's recommended, since it's what makes a user's Matrix ID and fediverse handle the exact same string (`@alice:example.org` == `@alice@example.org`).
-
-   **In Docker:** the `Dockerfile` runs the exact same code, so every feature and both storage backends work identically -- it's just a different way to run it. Two settings in `config.yaml` need a container-specific value first, both confirmed live:
-   - `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1` -- otherwise nothing outside the container's own network namespace can reach it, even with the port published.
-   - If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`) -- that's the volume the image actually creates and can write to as its non-root user.
-
-   The container runs as a fixed, non-root `bridge` user, UID/GID `999:999`. A named volume (like `bridge-data` in the examples above) is chowned automatically and needs nothing extra. A bind mount instead of a named volume needs the host directory owned by that same UID/GID first (`chown -R 999:999 ./data`) -- permission alone (even `chmod 777`) isn't enough on a host running SELinux in enforcing mode (common on Fedora/RHEL/CentOS/Rocky); add the `:z` suffix to that mount instead (`-v ./data:/data:z`, or the same in compose) to relabel it for container access.
-
-   A prebuilt multi-arch image (amd64/arm64) is published to `ghcr.io/haven-organization/matrix-appservice-activitypub` on every push to `main`. Simplest form, standalone:
-
-   ```sh
-   docker run -d --name matrix-appservice-activitypub \
-     -p 8090:8090 \
-     -v $(pwd)/config.yaml:/config/config.yaml:ro \
-     -v bridge-data:/data \
-     ghcr.io/haven-organization/matrix-appservice-activitypub:latest
-   ```
-
-   Or copy `docker-compose.example.yml` to `docker-compose.yml` and adjust it to your setup (it bundles a Postgres container and wires in an existing containerized Synapse via an external network -- see the file's own comments for both), then:
-
-   ```sh
-   docker compose up -d
-   ```
-
-   To build from your own checkout instead of pulling the published image (e.g. to test an unreleased change), `docker build -t matrix-appservice-activitypub .` and use that tag in place of the `ghcr.io/...` one above, or swap `docker-compose.example.yml`'s `image:` line for `build: .`.
-
-5. Optionally, verify end-to-end:
-
-   ```sh
-   .venv/bin/python scripts/simulate_remote_follow.py --username <a-linked-profile>
-   ```
+`config.example.yaml` only has the settings you need to start. Every other setting is documented in [CONFIG.md](CONFIG.md).
 
 ## Storage
 
-Bookkeeping (linked identities and their keys, follow relationships, ghost profiles, the Matrix-event/ActivityPub-object map, and room-history tables used for knock/backfill/outbox continuity after a `;replace room`) lives in either a local SQLite file (`storage.backend: sqlite`, the default) or Postgres (`storage.backend: postgresql`), selected in `config.yaml`. Same schema and content either way. No post content or media is stored outside Matrix itself.
+Bookkeeping (linked identities and their keys, follow relationships, ghost profiles, the Matrix-event/ActivityPub-object map, and room-history tables used for knock/backfill/outbox continuity after a `;replace room`) lives in either a local SQLite file (`storage.backend: sqlite`, the default) or Postgres (`storage.backend: postgresql`, see [CONFIG.md](CONFIG.md#storage) for its connection settings), selected in `config.yaml`. Same schema and content either way. No post content or media is stored outside Matrix itself.

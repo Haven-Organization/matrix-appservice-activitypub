@@ -1,7 +1,11 @@
 # Matrix <-> ActivityPub federation bridge configuration.
 #
-# Copy this file to config.yaml and fill in real values. Secrets (tokens) should
-# never be committed to version control.
+# Copy this file to config.yaml and fill in real values. Secrets (tokens)
+# should never be committed to version control.
+#
+# This file only holds what you need to get going. Every other setting has a
+# sensible default and is documented in CONFIG.md -- add one here, under the
+# section CONFIG.md lists it in, only if you want to change it.
 
 bridge:
   # Public domain used to mint ActivityPub actor IDs, e.g. https://<domain>/actor/<user>
@@ -15,145 +19,13 @@ bridge:
   listen_host: 127.0.0.1
   listen_port: 8090
 
-  # Address Synapse should push AppService transactions to. Only set this if
-  # Synapse and the bridge are on different hosts.
-  # internal_base_url: http://127.0.0.1:8090
-
-  # Auto-accept knocks from OTHER homeservers' users the same as local ones.
-  # Off by default -- who gets auto-admitted into this server's rooms is this
-  # server's call.
-  # accept_federated_knocks: false
-
-  # Default post count for ";backfill" with no explicit argument. A Matrix
-  # server admin can override this per-use.
-  # backfill_default_count: 15
-
-  # Join rule for a Remote User Room (a ghost's mirror of a remote fediverse
-  # account). "knock" (default) lets anyone locked out ask their way back in
-  # without an admin. "invite"/"public" also work.
-  # ghost_room_join_rule: knock
-
-  # Same as ghost_room_join_rule, but for a local user's own Profile Room.
-  # local_profile_room_join_rule: knock
-
-  # Whether a Remote User Room (including a followed PeerTube channel's)
-  # is history_visibility: world_readable, letting anyone on this
-  # homeserver preview its content without joining/knocking first -- e.g.
-  # to verify a repost's social.relates_to against its real source. Off by
-  # default. ";refresh" run inside one of these rooms re-syncs its current
-  # setting to match this, so a later change here converges existing rooms.
-  # world_readable_remote_rooms: false
-
-  # What an admin-allowlisted user on a DIFFERENT homeserver (see the
-  # ";allow"/";disallow"/";allowed" commands) gets, once allowed:
-  #   follow_only (default) - ";follow" and interact only. No Profile Room;
-  #                            their AP identity is minted automatically,
-  #                            always mirroring their live Matrix profile.
-  #   full                    - identical to a local user: self-service
-  #                             ";create profile"/";link profile", DM, Chat.
-  # A single deployment-wide, reversible setting.
-  # third_party_access_mode: follow_only
-
-  # Matrix polls have no expiry; some fediverse receivers (Mastodon-family)
-  # refuse a poll with none. This many days from creation is sent as the
-  # poll's endTime instead.
-  # poll_default_duration_days: 7
-
-  # Set org.matrix.msc4501.social.profile_room (MSC4133 Extensible
-  # Profiles) on every ghost. Off by default -- needs
-  # experimental_features.msc4133_enabled: true in homeserver.yaml first.
-  # set_msc4501_profile_room: false
-
-  # Set org.matrix.msc4503.external_handle (MSC4503) on every ghost, carrying
-  # its actual ActivityPub handle (e.g. "@alice@mastodon.social"). One of:
-  #   - "off" (default)
-  #   - "profile": an MSC4133 profile field (needs the same homeserver
-  #     support as set_msc4501_profile_room above)
-  #   - "events": a snapshot on every event the ghost sends instead
-  #   - "both"
-  # An admin can force an existing ghost's field into line with a new value via ";refresh".
-  # msc4503_external_handle: off
-
-  # Mirror an inbound custom-emoji Like/EmojiReact as a real MSC4027
-  # custom-image reaction instead of plain ":shortcode:" text. Off by
-  # default -- a client that doesn't understand MSC4027 would show the raw
-  # mxc://... string instead of the shortcode text it showed before, so
-  # only turn this on once you know your users' clients support it.
-  # Reacting with a custom image FROM Matrix always federates out as a
-  # custom-emoji EmojiReact regardless of this setting.
-  # msc4027_custom_reactions: false
-
-  # Adds MSC4144 per-message profile data (id/displayname/avatar_url from
-  # the user's Profile Room) to bridge-sent messages acting on their
-  # behalf, like the repost card. On by default; other clients ignore it.
-  # msc4144_per_message_profiles: true
-
-  # Set org.matrix.msc4501.social.relates_to on every mirrored repost,
-  # quote-post, and cross-posted reply echo. On by default -- purely
-  # additive content a non-MSC4501 client just ignores.
-  # set_msc4501_relates_to: true
-
-  # For a mirrored repost, assert content_inline instead of duplicating the
-  # reposted content a second time into relates_to.content. On by default;
-  # turn off for a client that doesn't handle content_inline yet.
-  # use_msc4501_content_inline: true
-
-  # Whether an untracked quote-post's TARGET gets imported into its own
-  # Remote User Room (needed for relates_to to populate on it at all).
-  #   known  (default) - only if the quoted author already has a Remote
-  #                       User Room for some other reason
-  #   always            - import unconditionally
-  #   never             - read-only preview only, relates_to stays unset
-  # quote_import_policy: known
-
-  # Mirror a remote account's posts using org.matrix.msc4501.social.post as
-  # the event TYPE instead of m.room.message. Off by default, and NOT
-  # RECOMMENDED until Phase 2 of MSC4501's rollout plan -- a non-MSC4501
-  # client won't render the event at all.
-  # use_msc4501_post_event_type: false
-
-  # MXIDs treated as bridge admins regardless of Synapse server-admin
-  # status. Always additive.
-  # admins: []
-
-  # Whether the bridge is allowed to call Synapse's own Admin API. On by
-  # default. Turning this off lets the bridge run against a homeserver
-  # without Synapse's Admin API -- EXPERIMENTAL, only tested with Synapse.
-  # Admin status then relies entirely on the `admins` list above. Spot-test
-  # every admin-gated command and watch this bridge's own logs if you turn
-  # this off.
-  # use_synapse_admin_api: true
-
-  # Let Matrix rooms become real, federating PeerTube-compatible video
-  # channels (;create channel, ;publish, and friends). Off by default:
-  # a real behavior change, not a safely-ignorable additive field. Every
-  # remote view/scrub of a hosted video streams through this bridge's own
-  # media proxy with no caching layer, a much heavier bandwidth pattern
-  # per view than the images that proxy already serves, so weigh that
-  # cost for your own deployment before turning this on.
-  # peertube_channels_enabled: false
-
-  # How a followed PeerTube channel/account's videos show up as posts.
-  # "link": always a text/thumbnail card linking back to the original
-  # instance, never downloads the video. "embed": try to download and
-  # re-host the video natively (same path an ordinary post's video
-  # attachment already goes through), falling back to a "link"-style card
-  # when the file is bigger than follow_video_max_embed_mb below. Defaults
-  # to "link" for the same bandwidth/storage reasoning as
-  # peertube_channels_enabled above.
-  # follow_video_media_mode: link
-
-  # Only consulted in "embed" mode -- checked against the video's own
-  # declared file size before ever starting a download.
-  # follow_video_max_embed_mb: 100
-
 synapse:
   # Synapse Client-Server / Admin API base URL, as reachable from the bridge process.
   base_url: http://localhost:8008
   # The homeserver's server_name (the part after the colon in @user:server.name).
   server_name: matrix.example.org
   # Access token for an account with admin: true, used for the Admin API.
-  # Only required while bridge.use_synapse_admin_api (above) is on, the default.
+  # Required unless bridge.use_synapse_admin_api (see CONFIG.md) is turned off.
   admin_token: "syt_replace_me"
 
 appservice:
@@ -172,10 +44,11 @@ appservice:
   # on every Client-Server API call.
   hs_token: "hs_replace_me"
   as_token: "as_replace_me"
-  # Localpart prefix for ghosted ActivityPub users,
-  # e.g. "ap_" -> @ap_user_instance.org:bridge.example.org
+  # Localpart prefix for ghosted ActivityPub users, e.g. "ap_" ->
+  # @ap_user_instance.org:bridge.example.org. DECIDE NOW: changing it later
+  # orphans existing ghosts and needs the registration file regenerated.
   user_prefix: "ap_"
-  # Localpart of the bridge bot user that handles !bridge commands.
+  # Localpart of the bridge bot user that handles ;commands.
   bot_localpart: "bridgebot"
   # Optional display name / avatar for the bot's own Matrix profile. Applied
   # on every startup; leave unset to not manage either.
@@ -186,45 +59,14 @@ appservice:
   # bot_avatar_mxc: "mxc://bridge.example.org/SomeMediaId"
 
 storage:
-  # Directory for the bridge's own bookkeeping state (actor keypairs, sqlite cache).
-  # No ActivityPub post content or media is stored here -- that lives in Matrix.
+  # Directory for the bridge's own bookkeeping state (actor keypairs, sqlite
+  # cache). No ActivityPub post content or media is stored here -- that lives
+  # in Matrix. Back this up: it holds every linked identity's keys.
   data_dir: ./data
   # "sqlite" (default) -- a single file at {data_dir}/bridge.db, no setup
-  # needed. "postgresql" -- connects to the server described below instead;
-  # useful if you already run Postgres for something else (e.g. Synapse
-  # itself). Same data either way; switching backends on an existing
-  # deployment starts that backend's storage empty (no automatic migration).
+  # needed. "postgresql" -- a Postgres server instead; see CONFIG.md for its
+  # settings.
   backend: sqlite
-  # Only read when backend is "postgresql". Either set `dsn` directly
-  # (postgresql://user:pass@host:port/dbname) or fill in the discrete
-  # fields below -- `dsn` wins if both are present.
-  # postgres:
-  #   dsn: "postgresql://matrix_appservice_activitypub:replace_me@localhost:5432/matrix_appservice_activitypub"
-  #   host: localhost
-  #   port: 5432
-  #   database: matrix_appservice_activitypub
-  #   user: matrix_appservice_activitypub
-  #   password: "replace_me"
-  #   min_pool_size: 1
-  #   max_pool_size: 10
-
-federation:
-  # Timeout (seconds) for outgoing ActivityPub HTTP requests (inbox delivery,
-  # actor/webfinger lookups).
-  request_timeout: 15
-  # How long fetched remote actor public keys are cached, in seconds.
-  actor_key_cache_ttl: 3600
-  # Maximum allowed clock skew (seconds) between the Date header on an incoming
-  # signed request and local time, before the signature is rejected.
-  max_clock_skew: 3600
-  # How far in the past (days) a mirrored post's own "published" time is
-  # trusted to set the Matrix event's displayed timestamp, before falling
-  # back to "now" instead. Keep this comfortably BELOW your homeserver's own
-  # retention.default_policy.max_lifetime if you have one configured --
-  # Synapse silently accepts but never persists an event backdated past
-  # that. There's no way for the bridge to detect your retention policy on
-  # its own, so this must be set by hand.
-  max_backdate_days: 730
 
 logging:
   # ERROR by default to keep the service journal quiet -- switch to INFO

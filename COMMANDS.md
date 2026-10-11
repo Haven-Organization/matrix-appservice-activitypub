@@ -376,7 +376,7 @@ Shoot guild and channel commands -- FEP-bebd guild join/leave and channel manage
 
 ## PeerTube
 
-Publishing and managing a PeerTube-compatible video channel. Opt-in (`bridge.peertube_channels_enabled`, off by default -- see the setting's own comment in `config.example.yaml`, and [FEATURES.md](FEATURES.md#peertube-video-channels) for how channel bridging works overall). Every command below responds with a plain notice if that setting is off.
+Publishing and managing a PeerTube-compatible video channel. Opt-in (`bridge.peertube_channels_enabled`, off by default -- see [CONFIG.md](CONFIG.md#peertube-video-channels), and [FEATURES.md](FEATURES.md#peertube-video-channels) for how channel bridging works overall). Every command below responds with a plain notice if that setting is off.
 
 ### `;create channel <id> [display name]`
 
@@ -458,7 +458,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 
 **Who can run it:** Matrix server admins only.
 
-**Notes:** Flipping `bridge.third_party_access_mode` later is always safe and instant for everyone currently allowed -- nothing about an already-provisioned identity is ever deleted or reassigned by a config change alone (see the option's own comment in `config.example.yaml`).
+**Notes:** Flipping `bridge.third_party_access_mode` later is always safe and instant for everyone currently allowed -- nothing about an already-provisioned identity is ever deleted or reassigned by a config change alone (see [CONFIG.md](CONFIG.md#third-party-access)).
 
 ---
 
