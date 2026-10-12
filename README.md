@@ -56,3 +56,14 @@ See [INSTALL.md](INSTALL.md) for the full walkthrough, natively or in Docker. In
 ## Storage
 
 Bookkeeping (linked identities and their keys, follow relationships, ghost profiles, the Matrix-event/ActivityPub-object map, and room-history tables used for knock/backfill/outbox continuity after a `;replace room`) lives in either a local SQLite file (`storage.backend: sqlite`, the default) or Postgres (`storage.backend: postgresql`, see [CONFIG.md](CONFIG.md#storage) for its connection settings), selected in `config.yaml`. Same schema and content either way. No post content or media is stored outside Matrix itself.
+
+## MSC4501 Compliance
+
+[MSC4501](https://github.com/matrix-org/matrix-spec-proposals/pull/4501) ("Social Media on Matrix") is a Matrix spec proposal for representing fediverse-style social media, such as posts, reposts, replies, and profiles, as native Matrix concepts, so a social timeline can be built directly on top of ordinary Matrix rooms and events rather than a bespoke protocol. This bridge makes use of MSC4501's types and concepts wherever it can. Mirrored posts, reposts, quote-posts, and cross-posted reply echoes carry `org.matrix.msc4501.social.relates_to`, and Profile Rooms and Remote User Rooms are tagged and cross-linked via `m.social.profile_room`/`m.social.profile_user_id`, among other things. See [FEATURES.md](FEATURES.md) for the full breakdown and [CONFIG.md](CONFIG.md#msc4501-and-related-proposals) for the settings that control it.
+
+<p align="center">
+  <img src="screenshots/haven-desktop-feed.png" alt="The Social feed in Haven, showing posts from followed Fediverse and Matrix accounts" width="280">
+  <img src="screenshots/haven-desktop-profile.png" alt="A Social profile page in Haven, showing a Fediverse account bridged into Matrix" width="280">
+</p>
+
+Any ordinary Matrix client can be used with this bridge; nothing about it requires MSC4501 support. It's best experienced, though, with an MSC4501-compatible client, which renders that extra structure as an actual social-media-style timeline and profile instead of a plain chat room. [Haven Desktop](https://github.com/Haven-Organization/haven-desktop) is one such client.
