@@ -275,6 +275,27 @@ class BridgeSection:
     # declared file size (part of the AP object already, no extra request
     # needed) before ever starting a download.
     follow_video_max_embed_mb: int = 100
+    # Whether a remote actor's reply into a conversation that's ALREADY
+    # tracked here also gets an annotated "⤵️ Reply to X's post" copy
+    # posted into THEIR OWN Remote User Room (not just threaded into the
+    # parent's room) -- see bridge.inbox_dispatch._echo_reply_in_own_room.
+    # A reply whose conversation root had to be freshly imported here for
+    # the first time ALWAYS gets this echo regardless of this setting (see
+    # that function's own docstring -- a separate, long-standing fallback
+    # that predates this setting and protects against silently dropping a
+    # post that used to be visible as a standalone). This setting only
+    # governs the newer, additional case of a reply into a conversation
+    # this bridge already knew about one way or another.
+    #   "off"      - never.
+    #   "followed" (default) - only if the replier already has a Remote
+    #                User Room here (i.e. is already followed/known) --
+    #                never provisions a new room/ghost just for this echo.
+    #   "always"   - echo regardless, provisioning a Remote User Room/
+    #                ghost for the replier on demand if they don't have
+    #                one yet. Can mint a room for every chatty remote
+    #                account that ever replies to anything tracked here,
+    #                followed or not -- weigh that before turning this on.
+    reply_cross_post_mode: str = "followed"
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -450,6 +471,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         raise ConfigError(
             f"bridge.follow_video_media_mode must be 'link' or 'embed', got {follow_video_media_mode!r}"
         )
+    reply_cross_post_mode = bridge_raw.get("reply_cross_post_mode", "followed")
+    if reply_cross_post_mode not in ("off", "followed", "always"):
+        raise ConfigError(
+            "bridge.reply_cross_post_mode must be one of 'off', 'followed', 'always', "
+            f"got {reply_cross_post_mode!r}"
+        )
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -476,6 +503,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         peertube_channels_enabled=bool(bridge_raw.get("peertube_channels_enabled", False)),
         follow_video_media_mode=follow_video_media_mode,
         follow_video_max_embed_mb=int(bridge_raw.get("follow_video_max_embed_mb", 100)),
+        reply_cross_post_mode=reply_cross_post_mode,
     )
 
     synapse_section = SynapseSection(
