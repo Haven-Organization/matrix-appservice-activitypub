@@ -92,7 +92,7 @@ These are documented inline in `config.example.yaml` and only summarised here.
 
 **Default:** `http://<listen_host>:<listen_port>`
 
-The address Synapse pushes AppService transactions to. Only set this if Synapse and the bridge are on different hosts (or separate Docker networks) and can't reach each other at the default directly -- that traffic never needs to leave the host/trusted network otherwise.
+The address Synapse pushes AppService transactions to. Only set this if Synapse and the bridge are on different hosts (or separate Docker networks) and can't reach each other at the default directly; that traffic never needs to leave the host/trusted network otherwise.
 
 ---
 
@@ -122,7 +122,7 @@ Join rule for a new Remote User Room (a ghost's mirror of a remote fediverse acc
 
 **Default:** `false`
 
-Whether a Remote User Room (including a followed PeerTube channel's) gets `history_visibility: world_readable`, letting anyone on this homeserver preview it without joining or knocking -- e.g. to check a repost's `social.relates_to` against its real source. Independent of `ghost_room_join_rule` above, which still governs joining itself. Run `;refresh` in an existing room to re-sync it to a changed value.
+Whether a Remote User Room (including a followed PeerTube channel's) gets `history_visibility: world_readable`, letting anyone on this homeserver preview it without joining or knocking (e.g. to check a repost's `social.relates_to` against its real source). Independent of `ghost_room_join_rule` above, which still governs joining itself. Run `;refresh` in an existing room to re-sync it to a changed value.
 
 ---
 
@@ -157,10 +157,10 @@ How many posts `;backfill` pulls with no explicit count given. A Matrix server a
 Whether a remote actor's reply into a conversation that's ALREADY tracked here also gets an annotated "⤵️ Reply to X's post" copy posted into THEIR OWN Remote User Room, not just threaded into the parent post's own room:
 
 - `off`: never.
-- `followed` (default): only if the replier already has a Remote User Room here (i.e. is already followed/known) -- never provisions a new room/ghost just for this echo.
-- `always`: echo regardless, provisioning a Remote User Room/ghost for the replier on demand if they don't have one yet. Can mint a room for every chatty remote account that ever replies to anything tracked here, followed or not -- weigh that before turning this on.
+- `followed` (default): only if the replier already has a Remote User Room here (i.e. is already followed/known); never provisions a new room/ghost just for this echo.
+- `always`: echo regardless, provisioning a Remote User Room/ghost for the replier on demand if they don't have one yet. Can mint a room for every chatty remote account that ever replies to anything tracked here, followed or not, so weigh that before turning this on.
 
-A reply whose conversation root had to be freshly imported here for the first time always gets this echo, regardless of this setting -- that's a separate, long-standing fallback (predating this setting) that keeps a reply visible in the replier's own room the way it used to appear before threading existed for that case.
+A reply whose conversation root had to be freshly imported here for the first time always gets this echo, regardless of this setting. That's a separate, long-standing fallback (predating this setting) that keeps a reply visible in the replier's own room the way it used to appear before threading existed for that case.
 
 ---
 
@@ -184,7 +184,7 @@ Matrix polls have no expiry; Mastodon-family servers refuse a poll with none. Th
 
 **Default:** `[]`
 
-Matrix user IDs treated as bridge admins regardless of real Synapse server-admin status. Always additive -- a real Synapse admin not listed here still gets admin rights too, as long as `use_synapse_admin_api` is on.
+Matrix user IDs treated as bridge admins regardless of real Synapse server-admin status. Always additive: a real Synapse admin not listed here still gets admin rights too, as long as `use_synapse_admin_api` is on.
 
 ```yaml
 bridge:
@@ -200,7 +200,7 @@ bridge:
 
 **Default:** `true`
 
-Whether the bridge is allowed to call Synapse's own Admin API, for checking whether another user is a server admin and for a couple of admin-only room sweeps. Turn this off to run against a homeserver that doesn't have (or won't grant) Synapse's Admin API -- EXPERIMENTAL, only ever tested against Synapse itself.
+Whether the bridge is allowed to call Synapse's own Admin API, for checking whether another user is a server admin and for a couple of admin-only room sweeps. Turn this off to run against a homeserver that doesn't have (or won't grant) Synapse's Admin API. EXPERIMENTAL, only ever tested against Synapse itself.
 
 Turning it off means admin status relies entirely on [`bridge.admins`](#bridge-admins) above (give it real entries, or nobody gets those commands), and `synapse.admin_token` is no longer required. Spot-test every admin-gated command and watch the bridge's logs after turning this off, rather than assuming it behaves the same as the Synapse-backed path.
 
@@ -215,15 +215,15 @@ Turning it off means admin status relies entirely on [`bridge.admins`](#bridge-a
 What a user on a DIFFERENT homeserver gets once an admin allows them (the `;allow`/`;disallow`/`;allowed` commands):
 
 - `follow_only`: `;follow` and interact only. No Profile Room; their AP identity is minted automatically, always mirroring their live Matrix profile.
-- `full`: identical to a local user -- self-service `;create profile`/`;link profile`, DM, Chat.
+- `full`: identical to a local user, with self-service `;create profile`/`;link profile`, DM, Chat.
 
-A single deployment-wide setting, applied live to everyone currently allowed -- not fixed at the time they were first allowed. Flipping it is always safe and reversible: nothing about an already-provisioned identity is ever deleted or reassigned by the change alone.
+A single deployment-wide setting, applied live to everyone currently allowed, not fixed at the time they were first allowed. Flipping it is always safe and reversible: nothing about an already-provisioned identity is ever deleted or reassigned by the change alone.
 
 ---
 
 ### MSC4501 and related proposals
 
-Behaviour each of these controls is described in [FEATURES.md](FEATURES.md#msc4501).
+Behaviour each of these controls is described throughout [FEATURES.md](FEATURES.md); there's no single dedicated section, since MSC4501 touches most of what's bridged.
 
 <a id="bridge-set_msc4501_relates_to"></a>
 
@@ -267,7 +267,7 @@ A quote is often adversarial ("quote-dunking"), so `always` means provisioning a
 
 **Default:** `false`
 
-Mirror a remote account's posts using `org.matrix.msc4501.social.post` as the event TYPE, instead of `m.room.message`. **Not recommended** until Phase 2 of MSC4501's own rollout plan -- unlike the additive fields above, a client that's never heard of MSC4501 won't render the event at all.
+Mirror a remote account's posts using `org.matrix.msc4501.social.post` as the event TYPE, instead of `m.room.message`. **Not recommended** until Phase 2 of MSC4501's own rollout plan: unlike the additive fields above, a client that's never heard of MSC4501 won't render the event at all.
 
 ---
 
@@ -287,7 +287,7 @@ Adds an MSC4144 per-message profile (id/displayname/avatar_url from the user's P
 
 **Default:** `false`
 
-Set `org.matrix.msc4501.social.profile_room` (MSC4133 Extensible Profiles) on every ghost, pointing at its room. Needs `experimental_features.msc4133_enabled: true` in Synapse's `homeserver.yaml` first (off even there by default) -- leave this off until that's done, or every ghost registration eats a guaranteed-failing request. An admin can force an existing ghost's field into line via `;refresh`.
+Set `org.matrix.msc4501.social.profile_room` (MSC4133 Extensible Profiles) on every ghost, pointing at its room. Needs `experimental_features.msc4133_enabled: true` in Synapse's `homeserver.yaml` first (off even there by default). Leave this off until that's done, or every ghost registration eats a guaranteed-failing request. An admin can force an existing ghost's field into line via `;refresh`.
 
 ---
 
@@ -319,7 +319,7 @@ Mirror an inbound custom-emoji reaction as a real MSC4027 custom-image reaction 
 
 **Default:** `false`
 
-Whether a Matrix room can become a real, federating PeerTube-compatible video channel (`;create channel`, `;publish`, and friends -- see [FEATURES.md](FEATURES.md#peertube-video-channels-publishing-and-following)). Off by default: a real behavior change, not a safely-ignorable additive field. Every remote view/scrub of a hosted video streams through this bridge's own media proxy with no caching layer, a much heavier bandwidth pattern per view than the images that proxy already serves -- weigh that cost for your own deployment before turning this on.
+Whether a Matrix room can become a real, federating PeerTube-compatible video channel (`;create channel`, `;publish`, and friends; see [FEATURES.md](FEATURES.md#peertube-video-channels-publishing-and-following)). Off by default: a real behavior change, not a safely-ignorable additive field. Every remote view/scrub of a hosted video streams through this bridge's own media proxy with no caching layer, a much heavier bandwidth pattern per view than the images that proxy already serves, so weigh that cost for your own deployment before turning this on.
 
 ---
 
@@ -339,7 +339,7 @@ How a followed PeerTube channel/account's videos show up as posts. `link` always
 
 **Default:** `100`
 
-Only consulted in `embed` mode -- checked against the video's own declared file size before ever starting a download.
+Only consulted in `embed` mode, checked against the video's own declared file size before ever starting a download.
 
 ---
 
@@ -368,7 +368,7 @@ Bookkeeping (linked identities and their keys, follow relationships, ghost profi
 - `sqlite`: a single file, `bridge.db`, under `storage.data_dir`. Nothing to set up.
 - `postgresql`: the Postgres server described by `storage.postgres` below. Useful if you already run Postgres for something else, such as your homeserver.
 
-Switching backends on an existing deployment starts that backend's storage empty -- there is no automatic migration between them.
+Switching backends on an existing deployment starts that backend's storage empty; there is no automatic migration between them.
 
 ---
 
@@ -450,7 +450,7 @@ Maximum allowed clock skew between the `Date` header on an incoming signed reque
 
 **Default:** `730`
 
-A mirrored post's Matrix event shows the real ActivityPub `published` time, trusted up to this many days in the past before falling back to "now" instead. This exists mainly as a safety margin against Synapse's own `retention.default_policy.max_lifetime`, if configured: a custom `origin_server_ts` older than that policy's `max_lifetime` is silently accepted (a real event ID, 200 OK) but never actually reachable afterwards -- a silent post-drop, worse than just showing "now". There's no API to discover a homeserver's own retention policy, so set this by hand, comfortably below it, if one is configured. Leave it generous (or raise it) if the homeserver has no retention policy limiting history at all.
+A mirrored post's Matrix event shows the real ActivityPub `published` time, trusted up to this many days in the past before falling back to "now" instead. This exists mainly as a safety margin against Synapse's own `retention.default_policy.max_lifetime`, if configured: a custom `origin_server_ts` older than that policy's `max_lifetime` is silently accepted (a real event ID, 200 OK) but never actually reachable afterwards, a silent post-drop that's worse than just showing "now". There's no API to discover a homeserver's own retention policy, so set this by hand, comfortably below it, if one is configured. Leave it generous (or raise it) if the homeserver has no retention policy limiting history at all.
 
 ---
 

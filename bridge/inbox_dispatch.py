@@ -1620,17 +1620,17 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
                 if reply_event is not None:
                     if imported_root:
                         # The reply's author previously had this post show up
-                        # in their OWN room (as the severed standalone) --
+                        # in their OWN room (as the severed standalone), so
                         # keep that room's timeline complete with an
                         # annotated copy pointing back at the thread it
-                        # actually lives in. Unconditional -- predates and is
+                        # actually lives in. Unconditional: predates and is
                         # independent of reply_cross_post_mode below.
                         await _echo_reply_in_own_room(
                             request, note=obj, reply_event=reply_event, parent=parent, author_actor_id=activity.actor
                         )
                     else:
                         # A reply into a conversation already tracked here
-                        # one way or another -- optionally ALSO echo it into
+                        # one way or another: optionally ALSO echo it into
                         # the replier's own room (user-requested, 2026-10-12;
                         # see bridge.config.BridgeSection.reply_cross_post_mode).
                         cross_post_mode = request.app.state.config.bridge.reply_cross_post_mode
@@ -2168,22 +2168,22 @@ async def _echo_reply_in_own_room(
       UNCONDITIONALLY (user-requested, 2026-07-04): before that path
       existed, such a reply landed in the replier's own room as a
       standalone post, so anyone watching that room as the account's
-      timeline SAW it there -- threading it into the (freshly imported)
+      timeline SAW it there. Threading it into the (freshly imported)
       conversation room alone would silently remove it from the timeline
       it used to appear in. This keeps the replier's room complete while
       pointing at where the thread actually lives. Not gated on
-      ``bridge.config.BridgeSection.reply_cross_post_mode`` below --
+      ``bridge.config.BridgeSection.reply_cross_post_mode`` below, since
       that's a separate, newer, additional case.
     - ``_handle_create``'s already-tracked-parent path calls this
       depending on ``reply_cross_post_mode`` (user-requested,
       2026-10-12): a reply into a conversation this bridge already knew
       about never used to get an echo at all, since it never appeared in
-      the replier's own room before either -- "followed"/"always" opt
-      into echoing it there too, "off" (and the setting's own default
-      before this existed) keeps the original behavior.
+      the replier's own room before either. "followed"/"always" opt into
+      echoing it there too; "off" (and the setting's own default before
+      this existed) keeps the original behavior.
 
-    ``create_room_if_missing`` -- only ever passed by the second caller,
-    for ``reply_cross_post_mode: "always"`` -- provisions a Remote User
+    ``create_room_if_missing``, only ever passed by the second caller,
+    for ``reply_cross_post_mode: "always"``, provisions a Remote User
     Room/ghost for the replier on demand if they don't already have one,
     the same on-demand path ``import_note`` itself uses for an untracked
     author. Left ``False`` (the default) for both the unconditional
@@ -2192,12 +2192,12 @@ async def _echo_reply_in_own_room(
     room (checked by ``get_remote_actor_room`` returning ``None`` below).
 
     Skips entirely if ``parent.room_id`` already IS the replier's own
-    Remote User Room -- e.g. the replier replying to their own earlier
+    Remote User Room, e.g. the replier replying to their own earlier
     post, or to some third party's post that happens to already be
     mirrored into their room (Remote User Rooms routinely hold posts by
     OTHER authors too, via ``_backfill_ancestor_chain``'s own third-party
     ancestor mirroring). ``_mirror_note_as_reply`` just threaded the reply
-    directly into that same room, so it's already visible there -- an
+    directly into that same room, so it's already visible there, and an
     echo would just duplicate it.
 
     Best-effort: any failure just means no echo; the canonical threaded
@@ -2220,13 +2220,13 @@ async def _echo_reply_in_own_room(
     remote_room = await repository.get_remote_actor_room(author_actor_id)
     if remote_room is None:
         if not create_room_if_missing:
-            return  # replier isn't followed here -- no room of theirs to keep complete
+            return  # replier isn't followed here, so there's no room of theirs to keep complete
         try:
             author_doc = await fetch_actor(request, author_actor_id)
         except RemoteActorFetchError:
             author_doc = {}
         # No inviter: nobody here follows this actor (that's why they had
-        # no room yet), so there's nobody specific to pull in -- same
+        # no room yet), so there's nobody specific to pull in. Same
         # reasoning as _handle_announce_locked's own no-inviter import.
         remote_room, _ = await ensure_remote_actor_room(
             request, author_actor_id=author_actor_id, author_doc=author_doc, inviter=None,
@@ -2234,7 +2234,7 @@ async def _echo_reply_in_own_room(
         if remote_room is None:
             return
     if parent.room_id == remote_room.room_id:
-        return  # the threaded reply above already landed here -- echoing would duplicate it
+        return  # the threaded reply above already landed here, so echoing would duplicate it
     profile = await repository.get_ghost_profile(author_actor_id)
     if profile is None or not profile.mxid:
         return

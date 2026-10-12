@@ -14,7 +14,7 @@ Setting the bridge up, natively or in Docker. For what the bridge does, see [REA
 ## Requirements
 
 - Python 3.11 or newer, or Docker.
-- A reverse proxy (nginx in the example) in front of the bridge, if you want its ActivityPub surface public on the same domain as your homeserver (recommended -- see step 2).
+- A reverse proxy (nginx in the example) in front of the bridge, if you want its ActivityPub surface public on the same domain as your homeserver (recommended; see step 2).
 
 ## 1. Install and configure
 
@@ -31,7 +31,7 @@ This creates a virtualenv, installs `requirements.txt`, and generates `config.ya
 Then edit `config.yaml`. At minimum set:
 
 - `bridge.domain` and `bridge.public_base_url`.
-- `synapse.base_url` and `synapse.server_name` (these fields are named after Synapse, but just mean "your homeserver" -- see the README's "What homeservers are supported?" section).
+- `synapse.base_url` and `synapse.server_name` (these fields are named after Synapse, but just mean "your homeserver"; see the README's "What homeservers are supported?" section).
 - `synapse.admin_token` (an access token for a homeserver account with `admin: true`), unless you've explicitly turned off `bridge.use_synapse_admin_api` (see [CONFIG.md](CONFIG.md)).
 
 `config.example.yaml` documents each of its own settings inline. It's deliberately short: everything else has a default, and [CONFIG.md](CONFIG.md) is the full reference (storage backend, logging level, federation timeouts, backfill defaults, MSC4501 behavior, and more).
@@ -72,14 +72,14 @@ Add the resulting file's path to your homeserver's own application-service regis
 
 Or install `deploy/matrix-appservice-activitypub.service` to run it under systemd (see that file for the expected user/paths).
 
-**In Docker:** the `Dockerfile` runs the exact same code, so every feature and both storage backends work identically -- it's just a different way to run it. Two settings in `config.yaml` need a container-specific value first, both confirmed live:
+**In Docker:** the `Dockerfile` runs the exact same code, so every feature and both storage backends work identically; it's just a different way to run it. Two settings in `config.yaml` need a container-specific value first, both confirmed live:
 
-- `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1` -- otherwise nothing outside the container's own network namespace can reach it, even with the port published.
-- If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`) -- that's the volume the image actually creates and can write to as its non-root user.
+- `bridge.listen_host` must be `0.0.0.0`, not the native default `127.0.0.1`. Otherwise nothing outside the container's own network namespace can reach it, even with the port published.
+- If `storage.backend` is `sqlite`, `storage.data_dir` must be `/data` (not the native default `./data`), since that's the volume the image actually creates and can write to as its non-root user.
 
-If Synapse can't reach the bridge at its default address (for example, Synapse is also containerized on a shared Docker network), also set `bridge.internal_base_url` (see [CONFIG.md](CONFIG.md)) to wherever it can, e.g. `http://bridge:8090` -- before running step 3, since it's written into the registration file.
+If Synapse can't reach the bridge at its default address (for example, Synapse is also containerized on a shared Docker network), also set `bridge.internal_base_url` (see [CONFIG.md](CONFIG.md)) to wherever it can, e.g. `http://bridge:8090`, before running step 3, since it's written into the registration file.
 
-The container runs as a fixed, non-root `bridge` user, UID/GID `999:999`. A named volume (like `bridge-data` in the examples above) is chowned automatically and needs nothing extra. A bind mount instead of a named volume needs the host directory owned by that same UID/GID first (`chown -R 999:999 ./data`) -- permission alone (even `chmod 777`) isn't enough on a host running SELinux in enforcing mode (common on Fedora/RHEL/CentOS/Rocky); add the `:z` suffix to that mount instead (`-v ./data:/data:z`, or the same in compose) to relabel it for container access.
+The container runs as a fixed, non-root `bridge` user, UID/GID `999:999`. A named volume (like `bridge-data` in the examples above) is chowned automatically and needs nothing extra. A bind mount instead of a named volume needs the host directory owned by that same UID/GID first (`chown -R 999:999 ./data`); permission alone (even `chmod 777`) isn't enough on a host running SELinux in enforcing mode (common on Fedora/RHEL/CentOS/Rocky), so add the `:z` suffix to that mount instead (`-v ./data:/data:z`, or the same in compose) to relabel it for container access.
 
 A prebuilt multi-arch image (amd64/arm64) is published to `ghcr.io/haven-organization/matrix-appservice-activitypub` on every push to `main`. Simplest form, standalone:
 
@@ -91,7 +91,7 @@ docker run -d --name matrix-appservice-activitypub \
   ghcr.io/haven-organization/matrix-appservice-activitypub:latest
 ```
 
-Or copy `docker-compose.example.yml` to `docker-compose.yml` and adjust it to your setup (it bundles a Postgres container and wires in an existing containerized Synapse via an external network -- see the file's own comments for both), then:
+Or copy `docker-compose.example.yml` to `docker-compose.yml` and adjust it to your setup (it bundles a Postgres container and wires in an existing containerized Synapse via an external network; see the file's own comments for both), then:
 
 ```sh
 docker compose up -d

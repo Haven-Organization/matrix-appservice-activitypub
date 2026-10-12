@@ -278,23 +278,23 @@ class BridgeSection:
     # Whether a remote actor's reply into a conversation that's ALREADY
     # tracked here also gets an annotated "⤵️ Reply to X's post" copy
     # posted into THEIR OWN Remote User Room (not just threaded into the
-    # parent's room) -- see bridge.inbox_dispatch._echo_reply_in_own_room.
+    # parent's room); see bridge.inbox_dispatch._echo_reply_in_own_room.
     # A reply whose conversation root had to be freshly imported here for
     # the first time ALWAYS gets this echo regardless of this setting (see
-    # that function's own docstring -- a separate, long-standing fallback
+    # that function's own docstring: a separate, long-standing fallback
     # that predates this setting and protects against silently dropping a
     # post that used to be visible as a standalone). This setting only
     # governs the newer, additional case of a reply into a conversation
     # this bridge already knew about one way or another.
     #   "off"      - never.
     #   "followed" (default) - only if the replier already has a Remote
-    #                User Room here (i.e. is already followed/known) --
+    #                User Room here (i.e. is already followed/known);
     #                never provisions a new room/ghost just for this echo.
     #   "always"   - echo regardless, provisioning a Remote User Room/
     #                ghost for the replier on demand if they don't have
     #                one yet. Can mint a room for every chatty remote
     #                account that ever replies to anything tracked here,
-    #                followed or not -- weigh that before turning this on.
+    #                followed or not, so weigh that before turning this on.
     reply_cross_post_mode: str = "followed"
 
     def resolved_internal_base_url(self) -> str:
