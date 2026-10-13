@@ -16,12 +16,21 @@ completely ordinary ``Person``).
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import httpx
 from fastapi import Request
 
 _TTL_SECONDS = 3600.0
 _cache: dict[str, tuple[float, str | None]] = {}  # domain -> (fetched_at, software_name_or_None)
+
+# This bridge's own reported identity in the NodeInfo documents it serves.
+# There's no real release/version tracking anywhere in this project yet
+# (no VERSION file, no git tags), so this is a placeholder until one exists.
+SOFTWARE_NAME = "matrix-appservice-activitypub"
+SOFTWARE_VERSION = "0.1.0"
+
+NODEINFO_SCHEMA_VERSIONS = ("2.0", "2.1")
 
 
 async def remote_software_name(request: Request, domain: str) -> str | None:
@@ -60,3 +69,39 @@ async def remote_software_name(request: Request, domain: str) -> str | None:
 
     _cache[domain] = (time.monotonic(), software_name)
     return software_name
+
+
+def build_nodeinfo_discovery_document(public_base_url: str) -> dict[str, Any]:
+    """The ``/.well-known/nodeinfo`` document. Just links to the actual
+    per-schema-version documents below, per the NodeInfo discovery spec.
+    Directory/crawler sites (fedidb, fedilist, the-federation.info) start
+    here to confirm a domain is a federated instance at all before looking
+    at anything else."""
+    return {
+        "links": [
+            {
+                "rel": f"http://nodeinfo.diaspora.software/ns/schema/{version}",
+                "href": f"{public_base_url}/nodeinfo/{version}",
+            }
+            for version in NODEINFO_SCHEMA_VERSIONS
+        ]
+    }
+
+
+def build_nodeinfo_document(schema_version: str, *, local_user_count: int) -> dict[str, Any]:
+    """The actual NodeInfo document for one schema version. ``openRegistrations``
+    is always ``False`` since this is an appservice mirroring an existing
+    homeserver's own accounts, not something a stranger can sign up on."""
+    software: dict[str, Any] = {"name": SOFTWARE_NAME, "version": SOFTWARE_VERSION}
+    if schema_version != "2.0":
+        # 2.1 added these two optional fields to the "software" object.
+        software["repository"] = "https://github.com/Haven-Organization/matrix-appservice-activitypub"
+    return {
+        "version": schema_version,
+        "software": software,
+        "protocols": ["activitypub"],
+        "services": {"outbound": [], "inbound": []},
+        "usage": {"users": {"total": local_user_count}},
+        "openRegistrations": False,
+        "metadata": {},
+    }

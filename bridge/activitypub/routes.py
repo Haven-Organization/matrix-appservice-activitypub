@@ -50,6 +50,11 @@ from bridge.activitypub.models import (
     OrderedCollection,
     PublicKey,
 )
+from bridge.activitypub.nodeinfo import (
+    NODEINFO_SCHEMA_VERSIONS,
+    build_nodeinfo_discovery_document,
+    build_nodeinfo_document,
+)
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.signatures import SignatureError, verify_incoming_request
 from bridge.custom_emoji import apply_resolved_emoji
@@ -335,6 +340,25 @@ async def _build_channel_video_cards(request: Request, *, channel: PeerTubeChann
             )
         )
     return cards
+
+
+@router.get("/.well-known/nodeinfo")
+async def nodeinfo_discovery(request: Request) -> JSONResponse:
+    config = request.app.state.config
+    document = build_nodeinfo_discovery_document(config.bridge.public_base_url)
+    return JSONResponse(content=document, media_type="application/json")
+
+
+@router.get("/nodeinfo/{schema_version}")
+async def nodeinfo_document(request: Request, schema_version: str) -> JSONResponse:
+    if schema_version not in NODEINFO_SCHEMA_VERSIONS:
+        raise HTTPException(status_code=404, detail=f"Unsupported NodeInfo schema version: {schema_version!r}")
+
+    repository: ActorRepository = request.app.state.repository
+    usernames = await repository.list_local_usernames()
+    document = build_nodeinfo_document(schema_version, local_user_count=len(usernames))
+    media_type = f'application/json; profile="http://nodeinfo.diaspora.software/ns/schema/{schema_version}#"'
+    return JSONResponse(content=document, media_type=media_type)
 
 
 @router.get("/.well-known/webfinger")

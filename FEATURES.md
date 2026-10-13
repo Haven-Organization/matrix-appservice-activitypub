@@ -81,6 +81,7 @@ Opt-in (`bridge.peertube_channels_enabled`, off by default -- every remote view/
 
 - **HTTP Signatures** on every outbound activity and every inbound delivery, including cross-checking the signing key's actor against the activity's own claimed actor to reject spoofing.
 - **WebFinger**, both serving local identities for remote discovery and resolving remote handles for outgoing follows, mentions, and DMs.
+- **NodeInfo** (`/.well-known/nodeinfo`, `/nodeinfo/2.0`, `/nodeinfo/2.1`), the standard discovery document directory/crawler sites (fedidb.com, fedilist.com, the-federation.info) check before listing a domain as a federated instance at all.
 - **Outbox/followers/following/actor pages** are all served live, reconstructed from actual Matrix room state and history on every request, never cached separately, in keeping with the project's philosophy that Matrix is the only place content lives.
 - A **shared inbox** endpoint, plus per-actor inboxes, both signature-verified.
 - **Knock-based self-service room access**: every bridge room uses Matrix's `knock` join rule, and a knock from that room's rightful local owner (current or a past, since-replaced room) is auto-accepted without side effects.

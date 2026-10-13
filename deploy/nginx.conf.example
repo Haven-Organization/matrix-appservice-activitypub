@@ -64,6 +64,17 @@ server {
         proxy_pass http://matrix_appservice_activitypub;
     }
 
+    # -- ActivityPub: NodeInfo discovery + documents -------------------------
+    # Directory/crawler sites (fedidb.com, fedilist.com, the-federation.info)
+    # use this to confirm a domain is a federated instance at all and to show
+    # its software/user-count. Without it they never list this domain.
+    location = /.well-known/nodeinfo {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+    location ~ ^/nodeinfo/ {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+
     # -- ActivityPub: actor / inbox / outbox / followers / following / media -
     location ~ ^/(actor|inbox|outbox|followers|following|media)/ {
         proxy_pass http://matrix_appservice_activitypub;
