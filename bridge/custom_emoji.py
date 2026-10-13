@@ -66,6 +66,12 @@ async def resolve_custom_emoji_image(
 
     cached = await repository.get_custom_emoji_mxc(icon_url)
     if cached:
+        if emoji_name:
+            # Backfills a name onto a row cached before this bridge started
+            # tracking emoji names at all (or any other gap): a no-op once
+            # it's already set, matching record_custom_emoji_mxc's own
+            # idempotent contract for everything else about this row.
+            await repository.record_custom_emoji_mxc(icon_url, cached, emoji_name)
         return cached
 
     mxc = await fetch_and_upload_media(http_client, synapse, icon_url)

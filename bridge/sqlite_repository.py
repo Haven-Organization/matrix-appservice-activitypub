@@ -1445,7 +1445,10 @@ class SqliteActorRepository:
 
     def _record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO custom_emoji (source_url, mxc_url, name) VALUES (?, ?, ?)",
+            """
+            INSERT INTO custom_emoji (source_url, mxc_url, name) VALUES (?, ?, ?)
+            ON CONFLICT(source_url) DO UPDATE SET name = COALESCE(custom_emoji.name, excluded.name)
+            """,
             (source_url, mxc_url, name),
         )
         self._conn.commit()
@@ -1453,13 +1456,13 @@ class SqliteActorRepository:
     async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         await self._run(self._record_custom_emoji_mxc, source_url, mxc_url, name)
 
-    def _get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+    def _get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str | None] | None:
         row = self._conn.execute(
-            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = ? AND name IS NOT NULL", (mxc_url,)
+            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = ? LIMIT 1", (mxc_url,)
         ).fetchone()
         return (row["source_url"], row["name"]) if row else None
 
-    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str | None] | None:
         return await self._run(self._get_custom_emoji_source, mxc_url)
 
     def _get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:

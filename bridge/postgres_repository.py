@@ -1122,13 +1122,16 @@ class PostgresActorRepository:
 
     async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         await self._pool.execute(
-            "INSERT INTO custom_emoji (source_url, mxc_url, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            """
+            INSERT INTO custom_emoji (source_url, mxc_url, name) VALUES ($1, $2, $3)
+            ON CONFLICT (source_url) DO UPDATE SET name = COALESCE(custom_emoji.name, EXCLUDED.name)
+            """,
             source_url, mxc_url, name,
         )
 
-    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str | None] | None:
         row = await self._pool.fetchrow(
-            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = $1 AND name IS NOT NULL", mxc_url,
+            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = $1 LIMIT 1", mxc_url,
         )
         return (row["source_url"], row["name"]) if row else None
 

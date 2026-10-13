@@ -685,13 +685,24 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
             # Either an inbound-imported emoji's own remote identity, or
             # (see the else branch below) a self-published sticker this
             # bridge has already federated once before under its own
-            # settled name. Either way, reuse it as-is rather than
-            # re-deriving anything.
+            # settled name. Either way, this mxc's real source is already
+            # known, so icon_url is settled regardless of name.
             source_url, remembered_name = remembered
-            shortcode = (
-                remembered_name if remembered_name.startswith(":") and remembered_name.endswith(":")
-                else f":{remembered_name.strip(':')}:"
-            )
+            if remembered_name:
+                shortcode = (
+                    remembered_name if remembered_name.startswith(":") and remembered_name.endswith(":")
+                    else f":{remembered_name.strip(':')}:"
+                )
+            else:
+                # Confirmed live (2026-10-12): a row cached before this
+                # bridge started tracking names at all (an inbound import
+                # from before today) has a real source_url but no name yet.
+                # Derive the best available text and backfill it onto this
+                # SAME row, rather than falling through to the else branch
+                # below and minting a second, wrongly self-published
+                # identity for an mxc that's already tied to a real source.
+                shortcode = _reaction_shortcode(content, key)
+                await repository.record_custom_emoji_mxc(source_url, key, shortcode)
             icon_url = source_url
         else:
             # A genuinely local image-pack sticker, never seen before: has

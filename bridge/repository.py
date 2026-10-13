@@ -762,21 +762,31 @@ class ActorRepository(Protocol):
         ...
 
     async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
-        """Record that ``source_url`` has been uploaded as ``mxc_url`` --
-        idempotent (a second call for the same ``source_url`` is a no-op),
-        matching every other dedup-by-insert pattern in this module.
-        ``name`` is the emoji's own AP shortcode (``tag[].name``, as the
-        source instance declared it), kept so ``get_custom_emoji_source``
-        can later recover the original identity of an already-downloaded
-        emoji from its local ``mxc_url`` alone."""
+        """Record that ``source_url`` has been uploaded as ``mxc_url``.
+        ``mxc_url`` itself is fixed forever once a ``source_url`` row
+        exists (a second call for the same ``source_url`` never changes
+        it), matching every other dedup-by-insert pattern in this module.
+        ``name`` (the emoji's own AP shortcode, ``tag[].name`` as the
+        source instance declared it) is backfilled onto an existing row
+        that doesn't have one yet rather than ignored, since a row cached
+        before this bridge started tracking names at all would otherwise
+        stay nameless forever. Never overwrites an already-recorded name
+        with a different one. ``get_custom_emoji_source`` is this method's
+        reverse lookup."""
         ...
 
-    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str | None] | None:
         """Reverse of ``get_custom_emoji_mxc``: given an already-downloaded
         emoji's local ``mxc_url``, returns ``(source_url, name)`` from
         whichever ``record_custom_emoji_mxc`` call first produced it, or
-        None if ``mxc_url`` has never been recorded that way, or was
-        recorded without a ``name``. Covers both an inbound-imported
+        None if ``mxc_url`` has never been recorded that way at all.
+        ``name`` alone may be None if the row predates this bridge tracking
+        names, or otherwise never got backfilled. Callers should treat
+        that as "this mxc's real source/icon is already known, its
+        readable name just still needs deriving (and ideally backfilling
+        via a further ``record_custom_emoji_mxc`` call)," never as license
+        to mint a brand new, separately-hosted identity for an mxc that's
+        already tied to a real source. Covers both an inbound-imported
         emoji's own remote image (``source_url`` is the remote instance's
         URL) and a self-published Matrix image-pack sticker this bridge has
         already federated once before (``source_url`` is this bridge's own
@@ -784,8 +794,10 @@ class ActorRepository(Protocol):
         first time it's sent out). Lets a Matrix reaction that reuses
         EITHER kind's own mxc (clicking an existing reaction pill, rather
         than picking a fresh image pack entry) federate back out under its
-        already-settled shortcode and image, instead of minting a brand
-        new, differently-named copy under this bridge's own domain."""
+        already-settled (or now-derivable) shortcode and image, instead of
+        minting a brand new, differently-named copy under this bridge's own
+        domain. Confirmed live (2026-10-12) that skipping this check for a
+        nameless-but-known row did exactly that."""
         ...
 
     async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
@@ -1426,10 +1438,13 @@ class InMemoryActorRepository:
 
     async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         self._custom_emoji.setdefault(source_url, mxc_url)
-        if name:
-            self._custom_emoji_source.setdefault(mxc_url, (source_url, name))
+        existing = self._custom_emoji_source.get(mxc_url)
+        if existing is None:
+            self._custom_emoji_source[mxc_url] = (source_url, name)
+        elif existing[1] is None and name:
+            self._custom_emoji_source[mxc_url] = (existing[0], name)
 
-    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str | None] | None:
         return self._custom_emoji_source.get(mxc_url)
 
     async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
