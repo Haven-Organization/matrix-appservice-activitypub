@@ -775,13 +775,29 @@ class ActorRepository(Protocol):
         """Reverse of ``get_custom_emoji_mxc``: given an already-downloaded
         emoji's local ``mxc_url``, returns ``(source_url, name)`` from
         whichever ``record_custom_emoji_mxc`` call first produced it, or
-        None if ``mxc_url`` was never recorded that way (a plain Matrix
-        image-pack sticker someone uploaded themselves, say) or was recorded
-        without a ``name``. Lets a Matrix reaction that reuses an inbound
-        custom emoji's own mxc (clicking an existing reaction pill, rather
+        None if ``mxc_url`` has never been recorded that way, or was
+        recorded without a ``name``. Covers both an inbound-imported
+        emoji's own remote image (``source_url`` is the remote instance's
+        URL) and a self-published Matrix image-pack sticker this bridge has
+        already federated once before (``source_url`` is this bridge's own
+        ``media_url`` for it, recorded by ``bridge.reaction_bridge`` the
+        first time it's sent out). Lets a Matrix reaction that reuses
+        EITHER kind's own mxc (clicking an existing reaction pill, rather
         than picking a fresh image pack entry) federate back out under its
-        original shortcode and image, instead of minting a brand new,
-        differently-named copy under this bridge's own domain."""
+        already-settled shortcode and image, instead of minting a brand
+        new, differently-named copy under this bridge's own domain."""
+        ...
+
+    async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
+        """The ``mxc_url`` already recorded under AP shortcode ``name``,
+        restricted to rows whose ``source_url`` starts with
+        ``source_prefix``: used to scope a collision check to emoji this
+        bridge itself federated under its own identity (a self-published
+        image-pack sticker, whose ``source_url`` is always this bridge's
+        own ``media_url``), never matching an inbound-imported emoji that
+        happens to reuse the same shortcode text on some other instance,
+        which isn't a collision this bridge created or could resolve. None
+        if ``name`` isn't in use by any such row yet."""
         ...
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
@@ -1415,6 +1431,12 @@ class InMemoryActorRepository:
 
     async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
         return self._custom_emoji_source.get(mxc_url)
+
+    async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
+        for mxc_url, (source_url, stored_name) in self._custom_emoji_source.items():
+            if source_url.startswith(source_prefix) and stored_name == name:
+                return mxc_url
+        return None
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         result = {}

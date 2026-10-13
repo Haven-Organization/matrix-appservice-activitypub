@@ -680,24 +680,45 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         # bridge's own domain, which a real user report (2026-10-12) showed
         # Pleroma/Akkoma treating as an entirely separate emoji from the one
         # already on the post.
-        imported = await repository.get_custom_emoji_source(key)
-        if imported:
-            source_url, imported_name = imported
+        remembered = await repository.get_custom_emoji_source(key)
+        if remembered:
+            # Either an inbound-imported emoji's own remote identity, or
+            # (see the else branch below) a self-published sticker this
+            # bridge has already federated once before under its own
+            # settled name. Either way, reuse it as-is rather than
+            # re-deriving anything.
+            source_url, remembered_name = remembered
             shortcode = (
-                imported_name if imported_name.startswith(":") and imported_name.endswith(":")
-                else f":{imported_name.strip(':')}:"
+                remembered_name if remembered_name.startswith(":") and remembered_name.endswith(":")
+                else f":{remembered_name.strip(':')}:"
             )
             icon_url = source_url
         else:
-            # A genuinely local image-pack sticker, never seen inbound: has
+            # A genuinely local image-pack sticker, never seen before: has
             # to be published through the bridge's own public media proxy
             # first, since an ordinary Matrix image-pack upload was never
             # exposed publicly before now, unlike an avatar/attachment mxc
             # that's already been through mark_media_published by the time
             # it's federated.
             await repository.mark_media_published(key)
-            shortcode = _reaction_shortcode(content, key)
             icon_url = media_url(base, key)
+            shortcode = _reaction_shortcode(content, key)
+            # The Matrix event's own shortcode (used above) is already
+            # readable, unlike the media-id fallback _reaction_shortcode
+            # falls back to when a client reuses an existing pill with no
+            # shortcode field of its own. That fallback only still fires
+            # here on a mxc this bridge has truly never recorded before,
+            # since every later reuse of the SAME mxc hits the `remembered`
+            # branch above instead. If a DIFFERENT sticker already settled
+            # on this exact shortcode text under this bridge's own domain,
+            # append a short random suffix so the two don't collide under
+            # one AP identity for whoever receives both.
+            colliding_mxc = await repository.get_custom_emoji_mxc_by_source_prefix_and_name(
+                f"{base}/media/", shortcode
+            )
+            if colliding_mxc and colliding_mxc != key:
+                shortcode = f":{shortcode.strip(':')}_{uuid.uuid4().hex[:6]}:"
+            await repository.record_custom_emoji_mxc(icon_url, key, shortcode)
         reaction_activity = Activity(
             id=activity_id,
             type="EmojiReact",

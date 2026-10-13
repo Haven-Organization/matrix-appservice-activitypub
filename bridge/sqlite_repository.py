@@ -532,6 +532,7 @@ class SqliteActorRepository:
             self._conn.execute("ALTER TABLE custom_emoji ADD COLUMN name TEXT")
             self._conn.commit()
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_custom_emoji_mxc_url ON custom_emoji (mxc_url)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_custom_emoji_name ON custom_emoji (name)")
         self._conn.commit()
 
         # mark_transaction_processed's own opportunistic cleanup DELETEs by
@@ -1460,6 +1461,16 @@ class SqliteActorRepository:
 
     async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
         return await self._run(self._get_custom_emoji_source, mxc_url)
+
+    def _get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT mxc_url FROM custom_emoji WHERE source_url LIKE ? AND name = ? LIMIT 1",
+            (f"{source_prefix}%", name),
+        ).fetchone()
+        return row["mxc_url"] if row else None
+
+    async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
+        return await self._run(self._get_custom_emoji_mxc_by_source_prefix_and_name, source_prefix, name)
 
     def _get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         if not event_ids:

@@ -412,6 +412,7 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE reactions ADD COLUMN IF NOT EXISTS custom_emoji_mxc TEXT",
     "ALTER TABLE custom_emoji ADD COLUMN IF NOT EXISTS name TEXT",
     "CREATE INDEX IF NOT EXISTS idx_custom_emoji_mxc_url ON custom_emoji (mxc_url)",
+    "CREATE INDEX IF NOT EXISTS idx_custom_emoji_name ON custom_emoji (name)",
     # is_current gives profile_room_history the same DB-enforced "only one
     # current room per identity" guarantee as the three newer history
     # tables below -- previously that guarantee only came from
@@ -1130,6 +1131,13 @@ class PostgresActorRepository:
             "SELECT source_url, name FROM custom_emoji WHERE mxc_url = $1 AND name IS NOT NULL", mxc_url,
         )
         return (row["source_url"], row["name"]) if row else None
+
+    async def get_custom_emoji_mxc_by_source_prefix_and_name(self, source_prefix: str, name: str) -> str | None:
+        row = await self._pool.fetchrow(
+            "SELECT mxc_url FROM custom_emoji WHERE source_url LIKE $1 AND name = $2 LIMIT 1",
+            f"{source_prefix}%", name,
+        )
+        return row["mxc_url"] if row else None
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         if not event_ids:
