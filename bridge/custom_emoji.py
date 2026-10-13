@@ -55,9 +55,11 @@ async def resolve_custom_emoji_image(
     ":verified:"`` WITH colons, so neither convention can be assumed."""
     normalized_key = key.strip(":")
     icon_url = None
+    emoji_name = None
     for tag_entry in tag:
         if tag_entry.get("type") == "Emoji" and tag_entry.get("name", "").strip(":") == normalized_key:
             icon_url = (tag_entry.get("icon") or {}).get("url")
+            emoji_name = tag_entry.get("name")
             break
     if not icon_url:
         return None
@@ -68,7 +70,7 @@ async def resolve_custom_emoji_image(
 
     mxc = await fetch_and_upload_media(http_client, synapse, icon_url)
     if mxc:
-        await repository.record_custom_emoji_mxc(icon_url, mxc)
+        await repository.record_custom_emoji_mxc(icon_url, mxc, emoji_name)
         await repository.mark_media_published(mxc)
     return mxc
 

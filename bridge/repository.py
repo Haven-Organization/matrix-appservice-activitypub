@@ -761,10 +761,27 @@ class ActorRepository(Protocol):
         None on a cache miss."""
         ...
 
-    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str) -> None:
+    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         """Record that ``source_url`` has been uploaded as ``mxc_url`` --
         idempotent (a second call for the same ``source_url`` is a no-op),
-        matching every other dedup-by-insert pattern in this module."""
+        matching every other dedup-by-insert pattern in this module.
+        ``name`` is the emoji's own AP shortcode (``tag[].name``, as the
+        source instance declared it), kept so ``get_custom_emoji_source``
+        can later recover the original identity of an already-downloaded
+        emoji from its local ``mxc_url`` alone."""
+        ...
+
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+        """Reverse of ``get_custom_emoji_mxc``: given an already-downloaded
+        emoji's local ``mxc_url``, returns ``(source_url, name)`` from
+        whichever ``record_custom_emoji_mxc`` call first produced it, or
+        None if ``mxc_url`` was never recorded that way (a plain Matrix
+        image-pack sticker someone uploaded themselves, say) or was recorded
+        without a ``name``. Lets a Matrix reaction that reuses an inbound
+        custom emoji's own mxc (clicking an existing reaction pill, rather
+        than picking a fresh image pack entry) federate back out under its
+        original shortcode and image, instead of minting a brand new,
+        differently-named copy under this bridge's own domain."""
         ...
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
@@ -1027,6 +1044,7 @@ class InMemoryActorRepository:
         self._reactions_by_matrix_event: dict[str, ReactionRecord] = {}
         self._poll_votes_by_activity: dict[str, PollVoteRecord] = {}
         self._custom_emoji: dict[str, str] = {}  # source_url -> mxc_url
+        self._custom_emoji_source: dict[str, tuple[str, str]] = {}  # mxc_url -> (source_url, name)
         self._resolved_emoji: dict[str, dict[str, str]] = {}  # subject_id -> {shortcode: mxc_url}
         self._ghost_profiles: dict[str, GhostProfile] = {}
         self._user_spaces: dict[str, str] = {}
@@ -1390,8 +1408,13 @@ class InMemoryActorRepository:
     async def get_custom_emoji_mxc(self, source_url: str) -> str | None:
         return self._custom_emoji.get(source_url)
 
-    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str) -> None:
+    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         self._custom_emoji.setdefault(source_url, mxc_url)
+        if name:
+            self._custom_emoji_source.setdefault(mxc_url, (source_url, name))
+
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+        return self._custom_emoji_source.get(mxc_url)
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         result = {}

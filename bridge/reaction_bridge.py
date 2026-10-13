@@ -666,21 +666,45 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         # EmojiReact carrying a real Emoji tag, same shape Pleroma/Misskey/
         # Akkoma already use for their own custom-emoji reactions (see
         # bridge.custom_emoji.resolve_custom_emoji_image, which resolves
-        # this exact tag shape on the INBOUND side). The image itself has
-        # to be published through the bridge's own public media proxy
-        # first -- an ordinary Matrix image-pack upload was never exposed
-        # publicly before now, unlike an avatar/attachment mxc that's
-        # already been through mark_media_published by the time it's
-        # federated.
-        await repository.mark_media_published(key)
-        shortcode = _reaction_shortcode(content, key)
+        # this exact tag shape on the INBOUND side).
+        #
+        # `key` here is often an mxc:// this bridge itself downloaded for an
+        # INBOUND reaction (see resolve_custom_emoji_image), reused by this
+        # Matrix user clicking that same reaction's pill rather than picking
+        # a fresh image pack entry (a click like that carries no shortcode
+        # of its own in the Matrix event, confirmed against a real one,
+        # unlike picking a fresh entry from an image pack). When that's the
+        # case (get_custom_emoji_source finds it), federate back out under
+        # the emoji's own original shortcode and source image instead of
+        # minting a brand new, differently-named copy hosted under this
+        # bridge's own domain, which a real user report (2026-10-12) showed
+        # Pleroma/Akkoma treating as an entirely separate emoji from the one
+        # already on the post.
+        imported = await repository.get_custom_emoji_source(key)
+        if imported:
+            source_url, imported_name = imported
+            shortcode = (
+                imported_name if imported_name.startswith(":") and imported_name.endswith(":")
+                else f":{imported_name.strip(':')}:"
+            )
+            icon_url = source_url
+        else:
+            # A genuinely local image-pack sticker, never seen inbound: has
+            # to be published through the bridge's own public media proxy
+            # first, since an ordinary Matrix image-pack upload was never
+            # exposed publicly before now, unlike an avatar/attachment mxc
+            # that's already been through mark_media_published by the time
+            # it's federated.
+            await repository.mark_media_published(key)
+            shortcode = _reaction_shortcode(content, key)
+            icon_url = media_url(base, key)
         reaction_activity = Activity(
             id=activity_id,
             type="EmojiReact",
             actor=own_actor_id,
             object=target_object_id,
             content=shortcode,
-            tag=[{"type": "Emoji", "name": shortcode, "icon": {"type": "Image", "url": media_url(base, key)}}],
+            tag=[{"type": "Emoji", "name": shortcode, "icon": {"type": "Image", "url": icon_url}}],
         )
     else:
         if _is_favorite_emoji(key):

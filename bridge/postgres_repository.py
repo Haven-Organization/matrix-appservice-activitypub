@@ -237,11 +237,14 @@ _SCHEMA_STATEMENTS = [
     # emoji image's own URL (unique per emoji per source instance), mxc_url
     # is where it was uploaded to Synapse's media repo. Checked before ever
     # fetching one, so the same emoji is only ever downloaded/uploaded once
-    # no matter how many reactions use it.
+    # no matter how many reactions use it. name is the emoji's own AP
+    # shortcode, kept so get_custom_emoji_source can recover the original
+    # identity of an already-downloaded emoji from mxc_url alone.
     """
     CREATE TABLE IF NOT EXISTS custom_emoji (
         source_url TEXT PRIMARY KEY,
-        mxc_url TEXT NOT NULL
+        mxc_url TEXT NOT NULL,
+        name TEXT
     )
     """,
     # Per-subject resolved custom emoji (see ActorRepository.record_resolved_emoji)
@@ -407,6 +410,8 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE ghost_profiles ADD COLUMN IF NOT EXISTS handle TEXT",
     "ALTER TABLE reactions ADD COLUMN IF NOT EXISTS secondary_event_id TEXT UNIQUE",
     "ALTER TABLE reactions ADD COLUMN IF NOT EXISTS custom_emoji_mxc TEXT",
+    "ALTER TABLE custom_emoji ADD COLUMN IF NOT EXISTS name TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_custom_emoji_mxc_url ON custom_emoji (mxc_url)",
     # is_current gives profile_room_history the same DB-enforced "only one
     # current room per identity" guarantee as the three newer history
     # tables below -- previously that guarantee only came from
@@ -1114,11 +1119,17 @@ class PostgresActorRepository:
         row = await self._pool.fetchrow("SELECT mxc_url FROM custom_emoji WHERE source_url = $1", source_url)
         return row["mxc_url"] if row else None
 
-    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str) -> None:
+    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
         await self._pool.execute(
-            "INSERT INTO custom_emoji (source_url, mxc_url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            source_url, mxc_url,
+            "INSERT INTO custom_emoji (source_url, mxc_url, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            source_url, mxc_url, name,
         )
+
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+        row = await self._pool.fetchrow(
+            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = $1 AND name IS NOT NULL", mxc_url,
+        )
+        return (row["source_url"], row["name"]) if row else None
 
     async def get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         if not event_ids:

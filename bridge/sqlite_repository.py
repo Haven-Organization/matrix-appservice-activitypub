@@ -215,10 +215,13 @@ CREATE TABLE IF NOT EXISTS ghost_chat_rooms (
 -- image's own URL (unique per emoji per source instance), mxc_url is where
 -- it was uploaded to Synapse's media repo. Checked before ever fetching one,
 -- so the same emoji is only ever downloaded/uploaded once no matter how many
--- reactions use it.
+-- reactions use it. name is the emoji's own AP shortcode, kept so
+-- get_custom_emoji_source can recover the original identity of an
+-- already-downloaded emoji from mxc_url alone.
 CREATE TABLE IF NOT EXISTS custom_emoji (
     source_url TEXT PRIMARY KEY,
-    mxc_url TEXT NOT NULL
+    mxc_url TEXT NOT NULL,
+    name TEXT
 );
 
 -- Per-subject resolved custom emoji (see ActorRepository.record_resolved_emoji)
@@ -523,6 +526,13 @@ class SqliteActorRepository:
         if "custom_emoji_mxc" not in columns:
             self._conn.execute("ALTER TABLE reactions ADD COLUMN custom_emoji_mxc TEXT")
             self._conn.commit()
+
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(custom_emoji)")}
+        if "name" not in columns:
+            self._conn.execute("ALTER TABLE custom_emoji ADD COLUMN name TEXT")
+            self._conn.commit()
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_custom_emoji_mxc_url ON custom_emoji (mxc_url)")
+        self._conn.commit()
 
         # mark_transaction_processed's own opportunistic cleanup DELETEs by
         # processed_at on every single write (once per AppService
@@ -1432,14 +1442,24 @@ class SqliteActorRepository:
     async def get_custom_emoji_mxc(self, source_url: str) -> str | None:
         return await self._run(self._get_custom_emoji_mxc, source_url)
 
-    def _record_custom_emoji_mxc(self, source_url: str, mxc_url: str) -> None:
+    def _record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO custom_emoji (source_url, mxc_url) VALUES (?, ?)", (source_url, mxc_url)
+            "INSERT OR IGNORE INTO custom_emoji (source_url, mxc_url, name) VALUES (?, ?, ?)",
+            (source_url, mxc_url, name),
         )
         self._conn.commit()
 
-    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str) -> None:
-        await self._run(self._record_custom_emoji_mxc, source_url, mxc_url)
+    async def record_custom_emoji_mxc(self, source_url: str, mxc_url: str, name: str | None = None) -> None:
+        await self._run(self._record_custom_emoji_mxc, source_url, mxc_url, name)
+
+    def _get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+        row = self._conn.execute(
+            "SELECT source_url, name FROM custom_emoji WHERE mxc_url = ? AND name IS NOT NULL", (mxc_url,)
+        ).fetchone()
+        return (row["source_url"], row["name"]) if row else None
+
+    async def get_custom_emoji_source(self, mxc_url: str) -> tuple[str, str] | None:
+        return await self._run(self._get_custom_emoji_source, mxc_url)
 
     def _get_custom_emoji_by_reaction_event_ids(self, event_ids: list[str]) -> dict[str, str]:
         if not event_ids:
