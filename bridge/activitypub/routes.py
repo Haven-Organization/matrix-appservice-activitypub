@@ -50,6 +50,7 @@ from bridge.activitypub.models import (
     OrderedCollection,
     PublicKey,
 )
+from bridge.activitypub.instance_api import build_mastodon_instance_document
 from bridge.activitypub.nodeinfo import (
     NODEINFO_SCHEMA_VERSIONS,
     build_nodeinfo_discovery_document,
@@ -359,6 +360,50 @@ async def nodeinfo_document(request: Request, schema_version: str) -> JSONRespon
     document = build_nodeinfo_document(schema_version, local_user_count=len(usernames))
     media_type = f'application/json; profile="http://nodeinfo.diaspora.software/ns/schema/{schema_version}#"'
     return JSONResponse(content=document, media_type=media_type)
+
+
+async def _known_peer_domains(repository: ActorRepository, local_usernames: list[str], own_domain: str) -> set[str]:
+    """Every remote domain this instance has a live Follow relationship
+    with, in either direction, derived from existing followers/following
+    records rather than a separately-tracked table."""
+    domains: set[str] = set()
+    for username in local_usernames:
+        for actor_id in (await repository.list_followers(username)) + (await repository.list_following(username)):
+            host = urlsplit(actor_id).hostname
+            if host:
+                domains.add(host)
+    domains.discard(own_domain)
+    return domains
+
+
+@router.get("/api/v1/instance")
+async def mastodon_instance_document(request: Request) -> JSONResponse:
+    config = request.app.state.config
+    repository: ActorRepository = request.app.state.repository
+    usernames = await repository.list_local_usernames()
+    peer_domains = await _known_peer_domains(repository, usernames, config.bridge.domain)
+
+    admin_actor: ActorRecord | None = None
+    if config.bridge.instance_admin_username:
+        admin_actor = await repository.get_local_actor(config.bridge.instance_admin_username)
+
+    document = build_mastodon_instance_document(
+        domain=config.bridge.domain,
+        public_base_url=config.bridge.public_base_url,
+        local_user_count=len(usernames),
+        peer_domain_count=len(peer_domains),
+        admin_actor=admin_actor,
+    )
+    return JSONResponse(content=document)
+
+
+@router.get("/api/v1/instance/peers")
+async def mastodon_instance_peers(request: Request) -> JSONResponse:
+    config = request.app.state.config
+    repository: ActorRepository = request.app.state.repository
+    usernames = await repository.list_local_usernames()
+    peer_domains = await _known_peer_domains(repository, usernames, config.bridge.domain)
+    return JSONResponse(content=sorted(peer_domains))
 
 
 @router.get("/.well-known/webfinger")

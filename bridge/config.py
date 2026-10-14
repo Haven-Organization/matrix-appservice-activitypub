@@ -296,6 +296,12 @@ class BridgeSection:
     #                account that ever replies to anything tracked here,
     #                followed or not, so weigh that before turning this on.
     reply_cross_post_mode: str = "followed"
+    # Local username (not a full MXID) advertised as this instance's admin
+    # contact in the Mastodon-compatible /api/v1/instance document (see
+    # bridge.activitypub.instance_api). Directory sites read this to show
+    # who runs the instance. Must already be a registered local actor (i.e.
+    # has linked a Profile Room). Leave unset to omit contact_account entirely.
+    instance_admin_username: str | None = None
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -504,6 +510,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         follow_video_media_mode=follow_video_media_mode,
         follow_video_max_embed_mb=int(bridge_raw.get("follow_video_max_embed_mb", 100)),
         reply_cross_post_mode=reply_cross_post_mode,
+        instance_admin_username=bridge_raw.get("instance_admin_username") or None,
     )
 
     synapse_section = SynapseSection(

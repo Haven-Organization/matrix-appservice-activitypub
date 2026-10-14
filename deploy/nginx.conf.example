@@ -75,6 +75,16 @@ server {
         proxy_pass http://matrix_appservice_activitypub;
     }
 
+    # -- ActivityPub: Mastodon-compatible instance API -----------------------
+    # Same crawler sites as NodeInfo above also check this; this bridge only
+    # implements these two read-only paths, not the rest of the Mastodon API.
+    location = /api/v1/instance {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+    location = /api/v1/instance/peers {
+        proxy_pass http://matrix_appservice_activitypub;
+    }
+
     # -- ActivityPub: actor / inbox / outbox / followers / following / media -
     location ~ ^/(actor|inbox|outbox|followers|following|media)/ {
         proxy_pass http://matrix_appservice_activitypub;

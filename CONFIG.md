@@ -18,6 +18,8 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
 - [`bridge`](#bridge)
   - [Access and networking](#access-and-networking)
     - [Internal base URL (`bridge.internal_base_url`)](#bridge-internal_base_url)
+  - [Discovery](#discovery)
+    - [Instance admin username (`bridge.instance_admin_username`)](#bridge-instance_admin_username)
   - [Rooms and knocking](#rooms-and-knocking)
     - [Remote User Room join rule (`bridge.ghost_room_join_rule`)](#bridge-ghost_room_join_rule)
     - [Profile Room join rule (`bridge.local_profile_room_join_rule`)](#bridge-local_profile_room_join_rule)
@@ -93,6 +95,18 @@ These are documented inline in `config.example.yaml` and only summarised here.
 **Default:** `http://<listen_host>:<listen_port>`
 
 The address Synapse pushes AppService transactions to. Only set this if Synapse and the bridge are on different hosts (or separate Docker networks) and can't reach each other at the default directly; that traffic never needs to leave the host/trusted network otherwise.
+
+---
+
+### Discovery
+
+<a id="bridge-instance_admin_username"></a>
+
+#### Instance admin username (`bridge.instance_admin_username`)
+
+**Default:** unset
+
+Local username (not a full MXID) of an already-registered local actor to advertise as this instance's admin contact in the Mastodon-compatible `/api/v1/instance` document, which directory/crawler sites (fedidb.com, fedilist.com) read alongside NodeInfo. Leave unset to omit `contact_account` entirely.
 
 ---
 
