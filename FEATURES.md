@@ -51,7 +51,7 @@
 
 ## Per-identity settings
 
-- **`;set`**: one mechanism for every per-ActivityPub-identity preference (`hide_followers`, `hide_following`, `discoverable`), replacing the old one-command-per-setting pattern. Run bare or as `;set list` to see them all. Scoped to whichever identity owns the current room, since a profile and any PeerTube channels it owns are each a separate identity with their own settings, and sparse: only an actual override from the code default is ever stored.
+- **`;set`**: one mechanism for every per-ActivityPub-identity preference (`hide_followers`, `hide_following`, `discoverable`), replacing the old one-command-per-setting pattern. Run bare or as `;set list` to see them all. Scoped to whichever identity owns the current room, since a profile and any PeerTube channels it owns are each a separate identity with their own settings, and sparse: only an actual override from the code default is ever stored. For your main identity, it also works from inside your Fediverse Notifications room, a private place only you can see, so you don't have to manage your settings somewhere a Matrix-side follower in your Profile Room could see the traffic.
 
 ## Profile and identity
 

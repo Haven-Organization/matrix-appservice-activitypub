@@ -98,9 +98,12 @@ Supported commands (sent as a plain Matrix message, tagging the bot):
                                   it, and a key plus ``default`` clears any
                                   override. Scoped to whichever identity owns
                                   the CURRENT room: the sender's own linked
-                                  Profile Room for their main identity, or a
-                                  PeerTube channel room they own for that
-                                  channel's own, separate settings.
+                                  Profile Room or Fediverse Notifications
+                                  room (private, so a Matrix-side follower
+                                  in the Profile Room can't see it) for
+                                  their main identity, or a PeerTube
+                                  channel room they own for that channel's
+                                  own, separate settings.
     <tag> block @user@instance.org (or no argument, from inside the room
                                   representing that account -- their Remote
                                   User Room, or another local bridge user's
@@ -1061,8 +1064,10 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     f"{_COMMAND_PREFIX}set",
                     "View or change your settings (hiding your followers/following list, "
                     f'"discoverable" in remote directories, etc.). Run bare, or as "{_COMMAND_PREFIX}set '
-                    'list", to see them all. Run inside a PeerTube channel room you own to control that '
-                    "channel's own settings instead of your main identity's.",
+                    'list", to see them all. Also works from inside your Fediverse Notifications room, '
+                    "privately, if you'd rather not run it somewhere a Matrix-side follower in your Profile "
+                    "Room could see. Run inside a PeerTube channel room you own to control that channel's "
+                    "own settings instead of your main identity's.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}block @user@instance.org",
@@ -2506,8 +2511,16 @@ async def _resolve_owned_identity(
     channel's own ``owner_username`` resolved back to a Matrix id, same
     check ``_handle_publish``/``_handle_edit`` use).
 
-    ``None`` if ``room_id`` is neither, or ``sender`` doesn't own whichever
-    it is."""
+    Also resolves to the sender's own main identity from inside their own
+    Notifications DM room (``get_bot_dm_room_owner``, same lookup
+    ``;replace room`` already uses to find whose Notifications room one
+    is). Lets someone manage their own settings (hiding their followers
+    list, turning off discoverable, ...) somewhere only they can see,
+    rather than only from their Profile Room, which anyone who's joined it
+    (e.g. a Matrix-side follower) can also see the traffic in.
+
+    ``None`` if ``room_id`` is none of the three, or ``sender`` doesn't own
+    whichever it is."""
     repository = request.app.state.repository
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is not None and actor_record.room_id == room_id:
@@ -2519,6 +2532,9 @@ async def _resolve_owned_identity(
         if owner is not None and owner.matrix_user_id == sender:
             return channel.username, "channel"
 
+    if actor_record is not None and await repository.get_bot_dm_room_owner(room_id) == sender:
+        return actor_record.username, "profile"
+
     return None
 
 
@@ -2527,8 +2543,11 @@ async def _handle_set(request: Request, *, sender: str, room_id: str, argument: 
     preference (see ``bridge.identity_settings``), replacing the old
     one-command-per-toggle pattern (``;hide``/``;show`` used to be the only
     example). Settings are scoped to whichever identity owns the CURRENT
-    room: your own Profile Room for your main identity, or a PeerTube
-    channel room you own for that channel's own, separate settings (see
+    room: your own Profile Room OR your Fediverse Notifications room (a
+    private place only you can see, for anyone who'd rather not run it
+    somewhere a Matrix-side follower in the Profile Room could see the
+    traffic) for your main identity, or a PeerTube channel room you own
+    for that channel's own, separate settings (see
     ``_resolve_owned_identity``).
 
     ``;set`` / ``;set list``: every setting applicable to this identity,
@@ -2541,8 +2560,8 @@ async def _handle_set(request: Request, *, sender: str, room_id: str, argument: 
     if resolved is None:
         await _notice(
             request, room_id,
-            f'Run "{_COMMAND_PREFIX}set" from inside your own linked Profile Room or a PeerTube channel '
-            "room you own, to control that identity's settings.",
+            f'Run "{_COMMAND_PREFIX}set" from inside your own linked Profile Room, your Fediverse '
+            "Notifications room, or a PeerTube channel room you own, to control that identity's settings.",
         )
         return
     username, identity_kind = resolved

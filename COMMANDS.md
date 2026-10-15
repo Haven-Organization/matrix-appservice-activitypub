@@ -217,7 +217,7 @@ One-off account/room-recovery operations and other things almost nobody needs da
 - `hide_followers` / `hide_following` (on/off, default off): whether your public followers/following collection exposes its member list to remote viewers. The reported count is always public regardless; only the list itself is withheld (same semantics as Mastodon's "hide network").
 - `discoverable` (on/off, default on): whether other instances should include you in directories/search (the `toot:discoverable` AS2 extension).
 
-**Who can run it:** Settings are scoped per ActivityPub identity, not per Matrix user. Run from inside your own linked Profile Room to control your main identity's settings, or from inside a PeerTube channel room you own to control that channel's own, separate settings. `discoverable` only applies to a profile; a channel is always discoverable (the whole feature only ever federates public, findable content), so `;set discoverable ...` is rejected from a channel room.
+**Who can run it:** Settings are scoped per ActivityPub identity, not per Matrix user. Run from inside your own linked Profile Room, or privately from inside your Fediverse Notifications room (useful if you'd rather not run it somewhere a Matrix-side follower in your Profile Room could see), to control your main identity's settings; or from inside a PeerTube channel room you own to control that channel's own, separate settings. `discoverable` only applies to a profile; a channel is always discoverable (the whole feature only ever federates public, findable content), so `;set discoverable ...` is rejected from a channel room.
 
 **Notes:** Storage is sparse; only a setting you've actually changed from its default is stored at all.
 
