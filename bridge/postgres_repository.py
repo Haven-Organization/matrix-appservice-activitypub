@@ -247,6 +247,20 @@ _SCHEMA_STATEMENTS = [
         name TEXT
     )
     """,
+    # Per-ActivityPub-identity preference overrides (see
+    # bridge.identity_settings). username is either an ActorRecord's or a
+    # PeerTubeChannelRecord's; the two share one global namespace (see
+    # _handle_create_channel). Sparse: a row only exists when its value
+    # differs from that key's code default: the absence of a row IS the
+    # default, not an unset state to distinguish.
+    """
+    CREATE TABLE IF NOT EXISTS identity_settings (
+        username TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (username, key)
+    )
+    """,
     # Per-subject resolved custom emoji (see ActorRepository.record_resolved_emoji)
     # -- subject_id is either a post's ap_object_id (content emoji) or a
     # remote actor's own actor_id (display-name emoji). Lets a later
@@ -559,15 +573,18 @@ class PostgresActorRepository:
         return [row["room_id"] for row in rows]
 
     async def register_local_actor(self, record: ActorRecord) -> None:
+        # hide_followers/hide_following columns still exist (never dropped,
+        # see this project's additive-only schema convention) but are no
+        # longer read or written. That per-identity state now lives in
+        # identity_settings, see bridge.identity_settings.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     """
                     INSERT INTO local_actors
                         (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
-                         display_name, summary, icon_url, banner_url, hide_followers, hide_following,
-                         is_third_party)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                         display_name, summary, icon_url, banner_url, is_third_party)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     ON CONFLICT (username) DO UPDATE SET
                         matrix_user_id = EXCLUDED.matrix_user_id,
                         room_id = EXCLUDED.room_id,
@@ -577,14 +594,12 @@ class PostgresActorRepository:
                         summary = EXCLUDED.summary,
                         icon_url = EXCLUDED.icon_url,
                         banner_url = EXCLUDED.banner_url,
-                        hide_followers = EXCLUDED.hide_followers,
-                        hide_following = EXCLUDED.hide_following,
                         is_third_party = EXCLUDED.is_third_party
                     """,
                     record.username, record.matrix_user_id, record.room_id,
                     record.public_key_pem, record.private_key_pem,
                     record.display_name, record.summary, record.icon_url, record.banner_url,
-                    record.hide_followers, record.hide_following, record.is_third_party,
+                    record.is_third_party,
                 )
                 if record.room_id:
                     # Permanent, unlike local_actors.room_id itself -- see
@@ -615,6 +630,7 @@ class PostgresActorRepository:
                 await conn.execute("DELETE FROM following WHERE username = $1", username)
                 await conn.execute("DELETE FROM blocked_actors WHERE username = $1", username)
                 await conn.execute("DELETE FROM muted_actors WHERE username = $1", username)
+                await conn.execute("DELETE FROM identity_settings WHERE username = $1", username)
 
     @staticmethod
     def _row_to_actor(row: asyncpg.Record) -> ActorRecord:
@@ -628,8 +644,6 @@ class PostgresActorRepository:
             summary=row["summary"],
             icon_url=row["icon_url"],
             banner_url=row["banner_url"],
-            hide_followers=row["hide_followers"],
-            hide_following=row["hide_following"],
             is_third_party=row["is_third_party"],
         )
 
@@ -735,14 +749,24 @@ class PostgresActorRepository:
             "DELETE FROM following WHERE username = $1 AND remote_actor_id = $2", username, remote_actor_id
         )
 
-    async def set_followers_hidden(self, username: str, hidden: bool) -> None:
+    async def get_identity_settings(self, username: str) -> dict[str, str]:
+        rows = await self._pool.fetch(
+            "SELECT key, value FROM identity_settings WHERE username = $1", username
+        )
+        return {row["key"]: row["value"] for row in rows}
+
+    async def set_identity_setting(self, username: str, key: str, value: str) -> None:
         await self._pool.execute(
-            "UPDATE local_actors SET hide_followers = $1 WHERE username = $2", hidden, username
+            """
+            INSERT INTO identity_settings (username, key, value) VALUES ($1, $2, $3)
+            ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            username, key, value,
         )
 
-    async def set_following_hidden(self, username: str, hidden: bool) -> None:
+    async def clear_identity_setting(self, username: str, key: str) -> None:
         await self._pool.execute(
-            "UPDATE local_actors SET hide_following = $1 WHERE username = $2", hidden, username
+            "DELETE FROM identity_settings WHERE username = $1 AND key = $2", username, key
         )
 
     async def list_third_party_records(self) -> list[ActorRecord]:

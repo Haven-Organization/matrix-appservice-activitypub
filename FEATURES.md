@@ -47,7 +47,11 @@
 - **Unfollow**: leaving or being kicked from a Remote User Room sends a real `Undo(Follow)` under your own identity. An incoming `Undo(Follow)` just drops the follower record.
 - **Block**: cuts any existing follow (a real `Undo(Follow)` if you were following them), kicks you from their rooms, declines future follows with a real `Reject`, and silences notifications, all in one command. An incoming `Block` surfaces as a notification and silently drops the follower record, since AP has no separate unfollow signal for a block.
 - **Mute**: suppresses notifications and auto-invites from an account without touching the follow relationship or their content.
-- **Followers/following visibility**: `;hide`/`;show` withholds just the member list of your public collections. Counts stay public either way, matching Mastodon's "hide network" convention.
+- **Followers/following visibility**: `;set hide_followers on`/`;set hide_following on` withholds just the member list of your public collections. Counts stay public either way, matching Mastodon's "hide network" convention.
+
+## Per-identity settings
+
+- **`;set`**: one mechanism for every per-ActivityPub-identity preference (`hide_followers`, `hide_following`, `discoverable`), replacing the old one-command-per-setting pattern. Run bare or as `;set list` to see them all. Scoped to whichever identity owns the current room, since a profile and any PeerTube channels it owns are each a separate identity with their own settings, and sparse: only an actual override from the code default is ever stored.
 
 ## Profile and identity
 

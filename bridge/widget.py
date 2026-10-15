@@ -50,7 +50,7 @@ from bridge.commands import (
     _handle_link_profile,
     _handle_mute,
     _handle_replace_room,
-    _handle_set_collection_visibility,
+    _handle_set,
     _handle_unblock,
     _handle_unfollow,
     _handle_unlink_profile,
@@ -60,6 +60,7 @@ from bridge.commands import (
     _run_follows_import,
     _RUNNING_FOLLOWS_IMPORTS,
 )
+from bridge.identity_settings import get_effective_settings
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -155,14 +156,18 @@ async def widget_context(request: Request, room_id: str) -> JSONResponse:
             own_actor if is_owner and own_actor is not None
             else await repository.get_local_actor_by_matrix_id(profile_owner)
         )
+        owner_settings = (
+            await get_effective_settings(repository, owner_record.username, "profile")
+            if owner_record else {}
+        )
         room = {
             "kind": "profile",
             "is_owner": is_owner,
             "owner_matrix_user_id": profile_owner,
             "username": owner_record.username if owner_record else None,
             "display_name": owner_record.display_name if owner_record else None,
-            "hide_followers": owner_record.hide_followers if owner_record else False,
-            "hide_following": owner_record.hide_following if owner_record else False,
+            "hide_followers": owner_settings.get("hide_followers", False),
+            "hide_following": owner_settings.get("hide_following", False),
             "public_url": actor_url(base, owner_record.username) if owner_record else None,
         }
     elif remote_room is not None:
@@ -438,14 +443,17 @@ async def widget_import_follows(request: Request, room_id: str) -> JSONResponse:
 
 @router.post("/widget/api/visibility")
 async def widget_visibility(request: Request) -> JSONResponse:
+    # Reuses _handle_set, the exact same handler ";set hide_followers on"
+    # dispatches to. See this module's own docstring on why every widget
+    # action goes through bridge.commands's real handlers rather than
+    # talking to the repository directly.
     body = await request.json()
     which = body.get("which")
     if which not in ("followers", "following"):
         raise HTTPException(400, "which must be 'followers' or 'following'")
-    return await _dispatch(
-        request, body["room_id"], _handle_set_collection_visibility,
-        hidden=bool(body.get("hidden")), argument=which,
-    )
+    key = "hide_followers" if which == "followers" else "hide_following"
+    value = "on" if body.get("hidden") else "off"
+    return await _dispatch(request, body["room_id"], _handle_set, argument=f"{key} {value}")
 
 
 # -- icon ----------------------------------------------------------------------

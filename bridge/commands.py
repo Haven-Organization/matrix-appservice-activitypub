@@ -91,18 +91,16 @@ Supported commands (sent as a plain Matrix message, tagging the bot):
                                   own linked actor is following, with a
                                   matrix.to link to each one's Remote User
                                   Room where there is one.
-    <tag> hide followers          Hide the sender's own public followers (or
-        (or following)               ``hide following``: following) collection's
-                                  member list from remote viewers fetching
-                                  ``/followers/{username}``/``/following/{username}``
-                                  -- ``totalItems`` still reports the real
-                                  count either way (same as Mastodon's own
-                                  "hide network" setting), only the list
-                                  itself is withheld. Run from inside the
-                                  sender's own linked Profile Room. Visible
-                                  by default.
-    <tag> show followers          Undo ``hide`` -- makes the list visible
-        (or following)               again.
+    <tag> set                     View or change a per-identity setting (see
+        (or list/<key>/            ``bridge.identity_settings``): bare or
+         <key> <value>/            ``list`` shows them all, a bare key shows
+         <key> default)            just that one, a key plus a value sets
+                                  it, and a key plus ``default`` clears any
+                                  override. Scoped to whichever identity owns
+                                  the CURRENT room: the sender's own linked
+                                  Profile Room for their main identity, or a
+                                  PeerTube channel room they own for that
+                                  channel's own, separate settings.
     <tag> block @user@instance.org (or no argument, from inside the room
                                   representing that account -- their Remote
                                   User Room, or another local bridge user's
@@ -242,6 +240,14 @@ from bridge.ghosts import (
     sanitize_localpart_component,
     third_party_username_from_mxid,
 )
+from bridge.identity_settings import (
+    SettingError,
+    apply_set,
+    get_effective_setting,
+    get_effective_settings,
+    known_settings,
+    reset_to_default,
+)
 from bridge.inbox_dispatch import (
     _backfill_ancestor_chain,
     _fetch_post_preview,
@@ -349,7 +355,7 @@ _COMMAND_PREFIX = ";"
 
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
-    r"dm|chat|boost|repost|show|hide|unblock|block|unmute|mute|backfill|widget|leave|help|"
+    r"dm|chat|boost|repost|set|unblock|block|unmute|mute|backfill|widget|leave|help|"
     r"disallow|allowed|allow|refresh|joinguild|leaveguild|unpublish|publish|edit"
 )
 
@@ -716,10 +722,8 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_rejoin(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "following":
             await _handle_list_following(request, sender=sender, room_id=room_id)
-        elif subcommand in ("show", "hide"):
-            await _handle_set_collection_visibility(
-                request, sender=sender, room_id=room_id, hidden=(subcommand == "hide"), argument=argument,
-            )
+        elif subcommand == "set":
+            await _handle_set(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "block":
             await _handle_block(request, sender=sender, room_id=room_id, handle=argument, content=content)
         elif subcommand == "unblock":
@@ -1054,10 +1058,11 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     f'"{_COMMAND_PREFIX}refresh" in the Admin section.',
                 ),
                 (
-                    f"{_COMMAND_PREFIX}hide followers",
-                    'Hide your followers list from remote viewers (also works with "following"; your '
-                    f'counts stay public either way). Undo it with "{_COMMAND_PREFIX}show" (visible by '
-                    "default).",
+                    f"{_COMMAND_PREFIX}set",
+                    "View or change your settings (hiding your followers/following list, "
+                    f'"discoverable" in remote directories, etc.). Run bare, or as "{_COMMAND_PREFIX}set '
+                    'list", to see them all. Run inside a PeerTube channel room you own to control that '
+                    "channel's own settings instead of your main identity's.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}block @user@instance.org",
@@ -2489,47 +2494,96 @@ async def _handle_list_following(request: Request, *, sender: str, room_id: str)
     )
 
 
-async def _handle_set_collection_visibility(
-    request: Request, *, sender: str, room_id: str, hidden: bool, argument: str
-) -> None:
-    """``hide followers``/``show followers`` (or ``following``) -- toggles
-    whether the sender's own public ActivityPub followers/following
-    collection exposes its member list to remote viewers fetching
-    ``/followers/{username}``/``/following/{username}`` (see
-    ``bridge.activitypub.routes``). Only the member list is ever withheld --
-    ``totalItems`` always reports the real count, same as Mastodon's own
-    "hide network" setting, so a profile's follower/following COUNT stays
-    public either way. Visible by default; only the sender's own linked
-    actor can be toggled, and only from inside their own Profile Room (same
-    ownership check as ``banner``)."""
-    verb = "hide" if hidden else "show"
-    collection = argument.strip().lower()
-    if collection not in ("followers", "following"):
-        await _notice(
-            request, room_id, f'Usage: {_COMMAND_PREFIX}{verb} followers -- or "{_COMMAND_PREFIX}{verb} following".'
-        )
-        return
+async def _resolve_owned_identity(
+    request: Request, *, sender: str, room_id: str
+) -> tuple[str, str] | None:
+    """The ActivityPub identity (``(username, "profile"|"channel")``) that
+    ``room_id`` belongs to, if ``sender`` actually owns it. Generalizes
+    the two ownership-check patterns already used separately elsewhere in
+    this file: a Profile Room (``get_local_actor_by_matrix_id`` + exact
+    ``room_id`` match, same check ``banner``/the old hide/show used) and a
+    PeerTube channel room (``get_peertube_channel_by_room_id`` then the
+    channel's own ``owner_username`` resolved back to a Matrix id, same
+    check ``_handle_publish``/``_handle_edit`` use).
 
+    ``None`` if ``room_id`` is neither, or ``sender`` doesn't own whichever
+    it is."""
     repository = request.app.state.repository
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
-    if actor_record is None or actor_record.room_id != room_id:
+    if actor_record is not None and actor_record.room_id == room_id:
+        return actor_record.username, "profile"
+
+    channel = await repository.get_peertube_channel_by_room_id(room_id)
+    if channel is not None:
+        owner = await repository.get_local_actor(channel.owner_username)
+        if owner is not None and owner.matrix_user_id == sender:
+            return channel.username, "channel"
+
+    return None
+
+
+async def _handle_set(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;set``: the one mechanism for every per-ActivityPub-identity
+    preference (see ``bridge.identity_settings``), replacing the old
+    one-command-per-toggle pattern (``;hide``/``;show`` used to be the only
+    example). Settings are scoped to whichever identity owns the CURRENT
+    room: your own Profile Room for your main identity, or a PeerTube
+    channel room you own for that channel's own, separate settings (see
+    ``_resolve_owned_identity``).
+
+    ``;set`` / ``;set list``: every setting applicable to this identity,
+    current value, default noted. ``;set <key>``: just that one. ``;set
+    <key> default``: clears an override. ``;set <key> <value>``: sets it
+    (silently clears the stored override instead, if ``<value>`` turns out
+    to equal the default, since storage here is sparse by design)."""
+    repository = request.app.state.repository
+    resolved = await _resolve_owned_identity(request, sender=sender, room_id=room_id)
+    if resolved is None:
         await _notice(
             request, room_id,
-            f'Run "{_COMMAND_PREFIX}{verb} {collection}" from inside your own linked Profile Room.',
+            f'Run "{_COMMAND_PREFIX}set" from inside your own linked Profile Room or a PeerTube channel '
+            "room you own, to control that identity's settings.",
+        )
+        return
+    username, identity_kind = resolved
+
+    parts = argument.strip().split(maxsplit=1)
+    key = parts[0] if parts else ""
+    value = parts[1].strip() if len(parts) > 1 else None
+
+    if not key or key == "list":
+        settings = await get_effective_settings(repository, username, identity_kind)
+        lines = [f"Settings for {username} ({identity_kind}):"]
+        for definition in known_settings(identity_kind):
+            lines.append(f"- {definition.key}: {definition.format(settings[definition.key])}")
+        lines.append(f'Change one with "{_COMMAND_PREFIX}set <key> <value>".')
+        await _notice(request, room_id, "\n".join(lines))
+        return
+
+    if value is None:
+        try:
+            current = await get_effective_setting(repository, username, identity_kind, key)
+        except SettingError as error:
+            await _notice(request, room_id, str(error))
+            return
+        definition = next(d for d in known_settings(identity_kind) if d.key == key)
+        await _notice(
+            request, room_id,
+            f"{key}: {definition.format(current)} (default: {definition.format(definition.default)}). "
+            f"{definition.description}",
         )
         return
 
-    if collection == "followers":
-        await repository.set_followers_hidden(actor_record.username, hidden)
-    else:
-        await repository.set_following_hidden(actor_record.username, hidden)
+    try:
+        if value.lower() == "default":
+            message = await reset_to_default(repository, username, identity_kind, key)
+        else:
+            message = await apply_set(repository, username, identity_kind, key, value)
+    except SettingError as error:
+        await _notice(request, room_id, str(error))
+        return
 
-    visibility = "hidden from" if hidden else "visible to"
-    await _notice(
-        request, room_id,
-        f"Your {collection} list is now {visibility} remote viewers "
-        f"(your {collection} count is still public either way).",
-    )
+    await _notice(request, room_id, message)
 
 
 async def _handle_block(request: Request, *, sender: str, room_id: str, handle: str, content: dict) -> None:

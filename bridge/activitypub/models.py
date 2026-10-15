@@ -146,8 +146,11 @@ class Actor:
     # real channel actor, both true. Plausibly load-bearing for whether a
     # remote PeerTube instance's own search/resolve treats an unfamiliar
     # Group actor as a real, discoverable channel at all, rather than
-    # something to silently ignore; set for channels, left unset (and so
-    # omitted entirely) for an ordinary Person profile.
+    # something to silently ignore. Always set now: True (hardcoded) for a
+    # channel, and for a profile the identity's own effective "discoverable"
+    # setting (see bridge.identity_settings), default True, same as
+    # before this was toggleable, just no longer omitted from the wire
+    # format in the default case.
     discoverable: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -496,7 +499,7 @@ class OrderedCollection:
     # Overrides ``totalItems`` independent of ``len(items)`` -- lets
     # ``get_followers``/``get_following`` report the real follower/following
     # count while still passing an empty ``items`` when the owner has hidden
-    # the member list (``ActorRecord.hide_followers``/``hide_following``),
+    # the member list (``bridge.identity_settings``'s ``hide_followers``/``hide_following``),
     # matching Mastodon's own "hide network" behavior: the count stays
     # public, only the list itself is withheld. ``None`` (the default) just
     # falls back to ``len(items)``, as before.

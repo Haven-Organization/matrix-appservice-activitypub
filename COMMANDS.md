@@ -27,7 +27,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;import <url>`](#import-url)
   - [`;repost`](#repost-caption-reply-to-a-mirrored-fediverse-post)
 - [Advanced/Maintenance](#advancedmaintenance)
-  - [`;hide` / `;show`](#hide-followers--hide-following--show-followers--show-following)
+  - [`;set`](#set)
   - [`;block`](#block-userinstanceorg)
   - [`;unblock`](#unblock-userinstanceorg)
   - [`;mute`](#mute-userinstanceorg)
@@ -208,15 +208,18 @@ Delivered like an ordinary post either way: to your followers, the original auth
 
 One-off account/room-recovery operations and other things almost nobody needs day to day -- shown under `;help all` rather than plain `;help`.
 
-### `;hide followers` / `;hide following` / `;show followers` / `;show following`
+### `;set`
 
-**Syntax:** `;hide followers`, `;hide following`, `;show followers`, `;show following`. The collection name is required.
+**Syntax:** `;set` or `;set list` (show every setting and its current value), `;set <key>` (show just one), `;set <key> <value>`, `;set <key> default` (clear an override, reverting to the default).
 
-**What it does:** Toggles whether your public followers/following collection exposes its member list to remote viewers. The reported count is always public regardless; only the list itself is withheld or shown (same semantics as Mastodon's "hide network"). Visible by default.
+**What it does:** One mechanism for every per-identity preference, replacing the old one-command-per-setting pattern. Current settings:
 
-**Who can run it:** Only your own linked actor, and only from inside your own linked Profile Room.
+- `hide_followers` / `hide_following` (on/off, default off): whether your public followers/following collection exposes its member list to remote viewers. The reported count is always public regardless; only the list itself is withheld (same semantics as Mastodon's "hide network").
+- `discoverable` (on/off, default on): whether other instances should include you in directories/search (the `toot:discoverable` AS2 extension).
 
-**Notes:** Purely a privacy/cosmetic toggle. Doesn't affect who can follow you or see your posts.
+**Who can run it:** Settings are scoped per ActivityPub identity, not per Matrix user. Run from inside your own linked Profile Room to control your main identity's settings, or from inside a PeerTube channel room you own to control that channel's own, separate settings. `discoverable` only applies to a profile; a channel is always discoverable (the whole feature only ever federates public, findable content), so `;set discoverable ...` is rejected from a channel room.
+
+**Notes:** Storage is sparse; only a setting you've actually changed from its default is stored at all.
 
 ---
 
@@ -501,7 +504,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 
 ## Widget vs. commands
 
-The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the `hide`/`show` toggle, and a read-only following list.
+The room widget is a UI wrapper around the exact same handlers the `;` commands use, with the same validation and the same feedback posted into the room. It covers `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`, `dm`, `chat`, `import <url>`, `import follows`, `replace room`, `backfill` (including the admin-only custom count), `create profile`, `link profile`, `unlink profile`, `delete profile`, `banner` (with a convenience direct-upload variant that skips needing an `mxc://` URI first), the followers/following visibility toggle (via `set`), and a read-only following list.
 
 It deliberately omits `;repost`, `;rejoin`, `;leave unfollowed`, `;create channel`/`;publish`/`;unpublish`/`;edit`/`;replace video`, `;joinguild`/`;leaveguild`/`;refresh guild`/`;refresh guild invite`, and `;allow`/`;disallow`/`;allowed`. None fit a simple button: repost needs a specific post to reply to, rejoin is a rare recovery tool, leave-unfollowed is a rare cleanup one, the PeerTube/Guild commands need specific reply targets or arguments the widget has no flow for, and the allowlist commands are admin-only bridge-wide configuration, not something to expose in an ordinary room widget -- several of these also need a confirmation step the widget doesn't have a flow for. It also simplifies `;delete profile`'s confirmation to a plain browser dialog instead of the chat reply flow, though both end up calling the same deletion logic underneath.
 

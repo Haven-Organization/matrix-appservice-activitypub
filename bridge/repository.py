@@ -49,14 +49,6 @@ class ActorRecord:
     summary: str = ""
     icon_url: str | None = None
     banner_url: str | None = None
-    # Visible by default (matching e.g. Mastodon's own default) -- see
-    # ``bridge.commands``'s ``hide``/``show`` commands and
-    # ``bridge.activitypub.routes.get_followers``/``get_following``, which
-    # only withhold the member list (``first.orderedItems``) when set, never
-    # ``totalItems`` -- a profile's follower/following COUNT stays public
-    # either way, same as Mastodon's own "hide network" setting.
-    hide_followers: bool = False
-    hide_following: bool = False
     # True for an actor provisioned for a Matrix user on a DIFFERENT
     # homeserver, admin-allowlisted via the ";allow"/";disallow"/";allowed"
     # commands (see bridge.commands's _effective_third_party_mode). Never
@@ -431,14 +423,27 @@ class ActorRepository(Protocol):
 
     async def remove_following(self, username: str, remote_actor_id: str) -> None: ...
 
-    async def set_followers_hidden(self, username: str, hidden: bool) -> None:
-        """Toggle whether ``username``'s public followers collection exposes
-        its member list to remote viewers (see ``ActorRecord.hide_followers``).
-        No-op if ``username`` doesn't exist."""
+    async def get_identity_settings(self, username: str) -> dict[str, str]:
+        """Every stored per-identity setting OVERRIDE for ``username`` (an
+        ``ActorRecord`` or ``PeerTubeChannelRecord`` username; the two
+        share one global namespace, see ``_handle_create_channel``), as raw
+        strings. Sparse: only a setting that differs from its code default
+        (see ``bridge.identity_settings``) ever has a row here at all;
+        everything else is the registry's own default, not stored. Typed
+        parsing happens in ``bridge.identity_settings``, not here."""
         ...
 
-    async def set_following_hidden(self, username: str, hidden: bool) -> None:
-        """Same as ``set_followers_hidden``, for the following collection."""
+    async def set_identity_setting(self, username: str, key: str, value: str) -> None:
+        """Upsert one setting override for ``username``. Callers (see
+        ``bridge.identity_settings.apply_set``) are expected to have already
+        confirmed ``value`` actually differs from the default. Storing a
+        redundant override that matches the default is the caller's bug to
+        avoid, not something this method itself guards against."""
+        ...
+
+    async def clear_identity_setting(self, username: str, key: str) -> None:
+        """Remove one setting override, reverting ``username`` back to that
+        key's code default. No-op if no override was stored."""
         ...
 
     async def list_third_party_records(self) -> list[ActorRecord]:
@@ -1106,6 +1111,9 @@ class InMemoryActorRepository:
         self._following: dict[str, set[str]] = {}
         self._blocked: dict[str, set[str]] = {}
         self._muted: dict[str, set[str]] = {}
+        # Keyed by plain username same as _followers/_following above. A
+        # channel's settings live independently of any _actors entry too.
+        self._identity_settings: dict[str, dict[str, str]] = {}
 
     async def get_local_actor(self, username: str) -> ActorRecord | None:
         state = self._actors.get(username)
@@ -1189,15 +1197,14 @@ class InMemoryActorRepository:
     async def remove_following(self, username: str, remote_actor_id: str) -> None:
         self._following.get(username, set()).discard(remote_actor_id)
 
-    async def set_followers_hidden(self, username: str, hidden: bool) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.record = replace(state.record, hide_followers=hidden)
+    async def get_identity_settings(self, username: str) -> dict[str, str]:
+        return dict(self._identity_settings.get(username, {}))
 
-    async def set_following_hidden(self, username: str, hidden: bool) -> None:
-        state = self._actors.get(username)
-        if state is not None:
-            state.record = replace(state.record, hide_following=hidden)
+    async def set_identity_setting(self, username: str, key: str, value: str) -> None:
+        self._identity_settings.setdefault(username, {})[key] = value
+
+    async def clear_identity_setting(self, username: str, key: str) -> None:
+        self._identity_settings.get(username, {}).pop(key, None)
 
     async def list_third_party_records(self) -> list[ActorRecord]:
         return [

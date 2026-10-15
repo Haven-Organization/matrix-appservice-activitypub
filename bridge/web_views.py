@@ -695,7 +695,7 @@ def _page_shell(*, title: str, body: str, wide: bool = False) -> str:
 def _follow_stat_html(*, label: str, count: int, dialog_id: str | None) -> str:
     """One "N Followers"/"N Following" stat -- a link opening that list's
     popup when ``dialog_id`` is given (the owner hasn't hidden it, see
-    ``ActorRecord.hide_followers``/``hide_following``), otherwise plain,
+    ``bridge.identity_settings``'s ``hide_followers``/``hide_following``), otherwise plain,
     unlinked text: the count itself is still always shown (same as a
     profile's public ActivityPub collection -- see
     ``bridge.activitypub.routes.get_followers``/``get_following``, which

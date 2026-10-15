@@ -59,6 +59,7 @@ from bridge.activitypub.nodeinfo import (
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.signatures import SignatureError, verify_incoming_request
 from bridge.custom_emoji import apply_resolved_emoji
+from bridge.identity_settings import get_effective_setting
 from bridge.note_mirroring import build_repost_note_content, split_repost_caption
 from bridge.activitypub.urls import (
     actor_url,
@@ -214,6 +215,8 @@ async def _build_actor(request: Request, record) -> Actor:
         # that checks for it -- every local actor accepts them, same as
         # every local actor already implicitly accepts ordinary DMs.
         accepts_chat_messages = True
+    repository: ActorRepository = request.app.state.repository
+    discoverable = await get_effective_setting(repository, record.username, "profile", "discoverable")
     return Actor(
         id=actor_url(base, record.username),
         preferred_username=record.username,
@@ -224,6 +227,7 @@ async def _build_actor(request: Request, record) -> Actor:
         outbox=outbox_url(base, record.username),
         followers=followers_url(base, record.username),
         following=following_url(base, record.username),
+        discoverable=discoverable,
         icon_url=icon_url,
         icon_media_type=await resolve_media_type(request, icon_url),
         image_url=banner_url,
@@ -556,17 +560,20 @@ async def get_actor(request: Request, username: str) -> Response:
         # public AP collection endpoints (get_followers/get_following) --
         # this static HTML page is just as reachable by any anonymous remote
         # visitor, so it honors the exact same hide_followers/hide_following
-        # setting. Resolving each member's identity is skipped entirely when
-        # hidden -- nothing to show, and no reason to pay for it.
+        # setting (see bridge.identity_settings). Resolving each member's
+        # identity is skipped entirely when hidden: nothing to show, and
+        # no reason to pay for it.
+        hide_followers = await get_effective_setting(repository, username, "profile", "hide_followers")
+        hide_following = await get_effective_setting(repository, username, "profile", "hide_following")
         follower_ids = await repository.list_followers(username)
         following_ids = await repository.list_following(username)
         followers = (
             [await _resolve_person_ref(request, actor_id) for actor_id in follower_ids]
-            if not record.hide_followers else []
+            if not hide_followers else []
         )
         following = (
             [await _resolve_person_ref(request, actor_id) for actor_id in following_ids]
-            if not record.hide_following else []
+            if not hide_following else []
         )
 
         html_doc = render_profile_page(
@@ -579,10 +586,10 @@ async def get_actor(request: Request, username: str) -> Response:
             older_posts_url=older_posts_url,
             newer_posts_url=newer_posts_url,
             followers_count=len(follower_ids),
-            followers_hidden=record.hide_followers,
+            followers_hidden=hide_followers,
             followers=followers,
             following_count=len(following_ids),
-            following_hidden=record.hide_following,
+            following_hidden=hide_following,
             following=following,
             rss_url=f"/actor/{username}.rss",
         )
@@ -1759,11 +1766,15 @@ async def get_followers(request: Request, username: str) -> JSONResponse:
     record = await _get_actor_or_channel_record(request, username)
     repository: ActorRepository = request.app.state.repository
     followers = await repository.list_followers(username)
-    # Owner hid the list (see bridge.commands's `hide followers`) -- the
-    # count stays real and public, only the member list is withheld. A
-    # PeerTubeChannelRecord has no such toggle (nothing in the agreed
-    # design calls for one), so a channel's list is never hidden.
-    items = [] if getattr(record, "hide_followers", False) else followers
+    # Owner hid the list (see bridge.identity_settings, ";set hide_followers
+    # on"). The count stays real and public, only the member list is
+    # withheld. "hide_followers" doesn't apply to a channel identity (see
+    # the registry's applies_to), so a channel's list is never hidden.
+    identity_kind = "channel" if isinstance(record, PeerTubeChannelRecord) else "profile"
+    hidden = identity_kind == "profile" and await get_effective_setting(
+        repository, username, identity_kind, "hide_followers"
+    )
+    items = [] if hidden else followers
     collection = OrderedCollection(
         id=followers_url(base, username), items=items, total_items=len(followers),
         embed_first=not isinstance(record, PeerTubeChannelRecord),
@@ -1777,7 +1788,11 @@ async def get_following(request: Request, username: str) -> JSONResponse:
     record = await _get_actor_or_channel_record(request, username)
     repository: ActorRepository = request.app.state.repository
     following = await repository.list_following(username)
-    items = [] if getattr(record, "hide_following", False) else following
+    identity_kind = "channel" if isinstance(record, PeerTubeChannelRecord) else "profile"
+    hidden = identity_kind == "profile" and await get_effective_setting(
+        repository, username, identity_kind, "hide_following"
+    )
+    items = [] if hidden else following
     collection = OrderedCollection(
         id=following_url(base, username), items=items, total_items=len(following),
         embed_first=not isinstance(record, PeerTubeChannelRecord),
