@@ -32,6 +32,7 @@ re-fetch it on its own).
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import re
@@ -510,15 +511,30 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     # notably): their real followers get the delivery instead of a useless
     # "no inbox" warning -- the same convention bridge.reply_bridge already
     # uses for exactly this situation. Best-effort throughout, never raises.
+    #
+    # Fanned out (asyncio.gather) rather than one recipient at a time: each
+    # call here targets exactly ONE remote actor, so deliver_to_actor_or_followers'
+    # own internal concurrency (see its docstring) never kicks in for more
+    # than a single delivery at once -- a sequential await loop over a
+    # popular local actor's real follower list made the overall wall-clock
+    # time scale with follower count instead of with the slowest single
+    # delivery, which is exactly what left a "Sent." confirmation lagging
+    # tens of seconds behind the post already being live on the fediverse
+    # side (confirmed live 2026-10-17, ~50s for an ordinary follower count).
+    # Already bounded app-wide by deliver_to_actor_or_followers' own
+    # semaphore, so gathering here doesn't reintroduce the unbounded-
+    # concurrent-connections problem a plain non-semaphored gather would.
     recipients = list(dict.fromkeys([*followers, *mention_cc]))
-    for recipient_actor_id in recipients:
-        await deliver_to_actor_or_followers(
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
             request,
             target_actor_id=recipient_actor_id,
             activity=create_activity.to_dict(),
             key_id=main_key_id(base, actor_record.username),
             private_key_pem=actor_record.private_key_pem,
         )
+        for recipient_actor_id in recipients
+    ))
 
     return True
 
