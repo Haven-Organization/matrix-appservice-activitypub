@@ -999,7 +999,7 @@ def _strip_quote_tail_html(safe_html: str, quote_uri: str) -> str:
     strip silently no-ops."""
     escaped_uri = re.escape(html.escape(quote_uri, quote=True))
     pattern = re.compile(
-        rf"(?:<span>)?\s*(?:<br\s*/?>\s*)*(?:RT|QT)?:?\s*"
+        rf"(?:<span>)?\s*(?:<br\s*/?>\s*)*(?:RT|QT|RE)?:?\s*"
         rf'<a[^>]*?href="{escaped_uri}"[^>]*>.*?</a>\s*(?:</span>)?\s*(?=(?:</p>)?\s*$)',
         re.IGNORECASE | re.DOTALL,
     )
