@@ -3,21 +3,28 @@ ActivityStreams ``Mention`` tags when federating an outbound post/reply.
 
 Three distinct cases, handled by the two functions below:
 
-``resolve_pill_mentions`` -- a Matrix client's mention of an account this
-bridge already has a fediverse identity on file for shows up two ways in
-the event: ``content["m.mentions"]["user_ids"]`` (a reliable list of
-exactly who was mentioned) and, typically, that user's current display
-name inserted as plain text in the message body (what Element and most
-other clients do when you pick someone from the mention autocomplete) --
-there's no structurally unambiguous marker for *where* in the plain body a
-mention sits the way a formatted_body's pill anchors would give us, so
-replacing the known display name is a best-effort substitution, not a
-guaranteed one. Covers both of the accounts we can resolve this way: a
-ghost (a REMOTE fediverse account already mirrored here), and a real LOCAL
-Matrix user who's linked their own fediverse profile -- mentioning a
-fellow bridge user is otherwise indistinguishable, on the fediverse side,
-from a typo: without resolving it to their own actor IRI, all that goes
-out is their bare Matrix display name as inert plain text.
+``resolve_pill_mentions`` -- ``content["m.mentions"]["user_ids"]`` is a
+Matrix client's own reliable, structural record of exactly who was
+deliberately mentioned (picked from a mention autocomplete, a real pill),
+so it's always trusted to add a ``Mention`` tag. The post's TEXT only ever
+gets rewritten to the real ``@user@instance.org`` handle when the raw mxid
+itself is literally still present in the plain body -- an exact, unambiguous
+marker -- never by matching against the mentioned account's stored display
+name: a display name is ordinary free text with no structural link to any
+particular mention, so a global substring replace against it can corrupt
+*unrelated* prose that happens to contain the same word (a short/common
+display name -- "the", say -- would otherwise get every one of its
+coincidental appearances elsewhere in the post turned into a mention link,
+not just the actual pill). When the raw mxid isn't literally in the body
+either (a client that flattens the pill to the display name there instead),
+the ``Mention`` tag still goes out -- ``m.mentions`` alone is explicit
+enough for that -- the body text is just left exactly as the client sent
+it, unlinked. Covers both of the accounts we can resolve this way: a ghost
+(a REMOTE fediverse account already mirrored here), and a real LOCAL Matrix
+user who's linked their own fediverse profile -- mentioning a fellow bridge
+user is otherwise indistinguishable, on the fediverse side, from a typo:
+without resolving it to their own actor IRI, all that goes out is their
+bare Matrix display name or mxid as inert plain text.
 
 ``resolve_plaintext_mentions`` -- a ``@user@instance.org`` handle typed out
 by hand rather than picked from autocomplete never touches ``m.mentions`` at
@@ -194,9 +201,19 @@ async def collect_reply_participants(
 async def resolve_pill_mentions(request: Request, body: str, content: dict) -> tuple[str, list[dict], list[str]]:
     """Given a Matrix ``m.room.message`` event's already-extracted ``body``
     text (whatever the caller has already decided is the post's actual
-    text) and its full ``content`` dict, replace any mentioned ghost's OR
-    local bridge user's name/mxid in that text with their fediverse
-    ``@user@instance.org`` handle.
+    text) and its full ``content`` dict, add a ``Mention`` tag for every
+    ghost or local bridge user named in ``content["m.mentions"]["user_ids"]``
+    -- an explicit, client-generated signal, always trusted -- and rewrite
+    their raw mxid in ``body`` to their real ``@user@instance.org`` handle
+    wherever that exact mxid is literally still present there.
+
+    Deliberately does NOT fall back to matching a mentioned account's
+    stored display name against the body: unlike the raw mxid, a display
+    name is free text with no structural link to the mention, so replacing
+    it would risk corrupting unrelated prose that happens to contain the
+    same word. When the raw mxid isn't in the body either, the ``Mention``
+    tag still goes out (``m.mentions`` alone is explicit enough), the body
+    text is just left untouched.
 
     Returns ``(rewritten_body, ap_mention_tags, extra_cc_actor_ids)`` --
     ``ap_mention_tags`` are ActivityStreams ``Mention`` tag objects and
@@ -223,29 +240,19 @@ async def resolve_pill_mentions(request: Request, body: str, content: dict) -> t
             profile = await repository.get_ghost_profile_by_mxid(mxid)
             if profile is None or not profile.handle:
                 continue  # not a ghost we've ever actually synced a profile for
-            display_name, actor_id, handle = profile.display_name, profile.actor_id, profile.handle
+            actor_id, handle = profile.actor_id, profile.handle
         else:
             local_actor = await repository.get_local_actor_by_matrix_id(mxid)
             if local_actor is None:
                 continue  # a real Matrix user with no fediverse profile on this bridge -- nothing to tag
-            display_name = local_actor.display_name or local_actor.username
             actor_id = actor_url(config.bridge.public_base_url, local_actor.username)
             handle = f"@{local_actor.username}@{config.bridge.domain}"
 
         if mxid in body:
-            # The raw mxid is an exact, unambiguous marker when present (some
-            # clients -- confirmed with Haven, for an image caption -- leave
-            # it in the plain body as-is rather than flattening the pill to
-            # its display name there). Must be tried BEFORE the display-name
-            # fallback below: a ghost's display name is routinely a plain
-            # substring of its own mxid (mxid embeds the actor's username --
-            # see bridge.ghosts.ghost_localpart), so checking display name
-            # first can match and replace that substring mid-mxid instead,
-            # corrupting the rest of the mxid into stray leftover text
-            # (confirmed live 2026-10-17 against Pleroma).
+            # The only text substitution this function ever does -- see its
+            # own docstring for why a mentioned account's display name is
+            # deliberately NOT matched against the body as a fallback.
             body = body.replace(mxid, handle)
-        elif display_name and display_name in body:
-            body = body.replace(display_name, handle)
 
         tags.append({"type": "Mention", "href": actor_id, "name": handle})
         extra_cc.append(actor_id)
