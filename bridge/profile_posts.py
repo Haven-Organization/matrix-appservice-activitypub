@@ -283,22 +283,19 @@ async def _maybe_handle_msc4501_quote_post(
         )
     )
 
-    await deliver_to_actor_or_followers(
-        request, target_actor_id=own_actor_id, activity=activity_dict,
-        key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
-    )
-    if target_author_actor_id and target_author_actor_id != own_actor_id:
-        await deliver_to_actor_or_followers(
-            request, target_actor_id=target_author_actor_id, activity=activity_dict,
+    # Fanned out (asyncio.gather) rather than one recipient at a time -- see
+    # maybe_distribute_profile_post's own fan-out comment below for why a
+    # sequential loop here would scale with recipient count instead of with
+    # the slowest single delivery.
+    recipients = list(dict.fromkeys([own_actor_id, target_author_actor_id, *mention_cc]))
+    recipients = [r for r in recipients if r]
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
+            request, target_actor_id=target_actor_id, activity=activity_dict,
             key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
         )
-    for mention_actor_id in dict.fromkeys(mention_cc):
-        if mention_actor_id in (own_actor_id, target_author_actor_id):
-            continue
-        await deliver_to_actor_or_followers(
-            request, target_actor_id=mention_actor_id, activity=activity_dict,
-            key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
-        )
+        for target_actor_id in recipients
+    ))
 
     await note_msc4501_native_repost(
         request, reposter_matrix_user_id=actor_record.matrix_user_id, reposted_event_id=reposted_event_id,

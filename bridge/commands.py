@@ -4962,22 +4962,19 @@ async def _handle_repost(
     )
     activity_dict = create_activity.to_dict()
 
-    await deliver_to_actor_or_followers(
-        request, target_actor_id=own_actor_id, activity=activity_dict,
-        key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
-    )
-    if target_author_actor_id and target_author_actor_id != own_actor_id:
-        await deliver_to_actor_or_followers(
-            request, target_actor_id=target_author_actor_id, activity=activity_dict,
+    # Fanned out (asyncio.gather) rather than one recipient at a time -- see
+    # bridge.profile_posts.maybe_distribute_profile_post's own fan-out
+    # comment for why a sequential loop here would scale with recipient
+    # count instead of with the slowest single delivery.
+    recipients = list(dict.fromkeys([own_actor_id, target_author_actor_id, *mention_cc]))
+    recipients = [r for r in recipients if r]
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
+            request, target_actor_id=target_actor_id, activity=activity_dict,
             key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
         )
-    for mention_actor_id in dict.fromkeys(mention_cc):
-        if mention_actor_id in (own_actor_id, target_author_actor_id):
-            continue
-        await deliver_to_actor_or_followers(
-            request, target_actor_id=mention_actor_id, activity=activity_dict,
-            key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
-        )
+        for target_actor_id in recipients
+    ))
 
     # The real (possibly mirrored-copy) Matrix event for the ORIGINAL post,
     # not necessarily `parent` itself -- `parent` is whatever message the

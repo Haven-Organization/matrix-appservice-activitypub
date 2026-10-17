@@ -42,6 +42,7 @@ threaded there instead.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -298,26 +299,24 @@ async def _send_outbound_dm(
         cc=note.cc,
     )
 
-    await deliver_to_actor_or_followers(
-        request,
-        target_actor_id=recipient_actor_id,
-        activity=create_activity.to_dict(),
-        key_id=main_key_id(base, actor_record.username),
-        private_key_pem=actor_record.private_key_pem,
-    )
     # Someone else mentioned in the text isn't necessarily the DM partner,
     # and has no other route to receive this activity -- deliver to them
-    # directly too, or the mention would never actually reach them.
-    for mention_actor_id in dict.fromkeys(mention_cc):
-        if mention_actor_id == recipient_actor_id:
-            continue
-        await deliver_to_actor_or_followers(
+    # directly too, or the mention would never actually reach them. Fanned
+    # out (asyncio.gather) rather than one recipient at a time -- see
+    # bridge.profile_posts.maybe_distribute_profile_post's own fan-out
+    # comment for why a sequential loop here would scale with recipient
+    # count instead of with the slowest single delivery.
+    recipients = list(dict.fromkeys([recipient_actor_id, *mention_cc]))
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
             request,
-            target_actor_id=mention_actor_id,
+            target_actor_id=target_actor_id,
             activity=create_activity.to_dict(),
             key_id=main_key_id(base, actor_record.username),
             private_key_pem=actor_record.private_key_pem,
         )
+        for target_actor_id in recipients
+    ))
 
     matrix_event_id = event.get("event_id")
     if matrix_event_id:
@@ -622,28 +621,26 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
     # their real followers instead of a self-HTTP round trip to their own
     # inbox, which would just loop back into our own inbound handler and be
     # dropped there. Best-effort throughout -- never raises.
-    await deliver_to_actor_or_followers(
-        request,
-        target_actor_id=recipient_actor_id,
-        activity=create_activity.to_dict(),
-        key_id=main_key_id(base, actor_record.username),
-        private_key_pem=actor_record.private_key_pem,
-    )
-
+    #
     # Someone else mentioned in the reply's text isn't necessarily the
     # person being replied to, and has no other route to receive this
     # activity (no follow relationship to fall back on) -- deliver to them
-    # directly too, or the mention would never actually reach them.
-    for mention_actor_id in dict.fromkeys(mention_cc):
-        if mention_actor_id == recipient_actor_id:
-            continue
-        await deliver_to_actor_or_followers(
+    # directly too, or the mention would never actually reach them. Fanned
+    # out (asyncio.gather) rather than one recipient at a time -- see
+    # bridge.profile_posts.maybe_distribute_profile_post's own fan-out
+    # comment for why a sequential loop here would scale with recipient
+    # count instead of with the slowest single delivery.
+    recipients = list(dict.fromkeys([recipient_actor_id, *mention_cc]))
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
             request,
-            target_actor_id=mention_actor_id,
+            target_actor_id=target_actor_id,
             activity=create_activity.to_dict(),
             key_id=main_key_id(base, actor_record.username),
             private_key_pem=actor_record.private_key_pem,
         )
+        for target_actor_id in recipients
+    ))
 
     matrix_event_id = event.get("event_id")
     if matrix_event_id:

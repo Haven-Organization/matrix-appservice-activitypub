@@ -29,6 +29,7 @@ that's built, an edit of a DM simply stays Matrix-only (the old behavior).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -191,13 +192,19 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
     # Same audience the original went to: own followers (via own actor id --
     # deliver_to_actor_or_followers resolves a local actor to exactly that)
     # plus everyone mentioned/carried on the thread. Best-effort throughout.
+    # Fanned out (asyncio.gather) rather than one recipient at a time -- see
+    # bridge.profile_posts.maybe_distribute_profile_post's own fan-out
+    # comment for why a sequential loop here would scale with recipient
+    # count instead of with the slowest single delivery.
     recipients = list(dict.fromkeys([own_actor_id, *mention_cc]))
-    for recipient_actor_id in recipients:
-        await deliver_to_actor_or_followers(
+    await asyncio.gather(*(
+        deliver_to_actor_or_followers(
             request,
             target_actor_id=recipient_actor_id,
             activity=update_activity.to_dict(),
             key_id=main_key_id(base, actor_record.username),
             private_key_pem=actor_record.private_key_pem,
         )
+        for recipient_actor_id in recipients
+    ))
     return True
