@@ -232,10 +232,20 @@ async def resolve_pill_mentions(request: Request, body: str, content: dict) -> t
             actor_id = actor_url(config.bridge.public_base_url, local_actor.username)
             handle = f"@{local_actor.username}@{config.bridge.domain}"
 
-        if display_name and display_name in body:
-            body = body.replace(display_name, handle)
-        elif mxid in body:
+        if mxid in body:
+            # The raw mxid is an exact, unambiguous marker when present (some
+            # clients -- confirmed with Haven, for an image caption -- leave
+            # it in the plain body as-is rather than flattening the pill to
+            # its display name there). Must be tried BEFORE the display-name
+            # fallback below: a ghost's display name is routinely a plain
+            # substring of its own mxid (mxid embeds the actor's username --
+            # see bridge.ghosts.ghost_localpart), so checking display name
+            # first can match and replace that substring mid-mxid instead,
+            # corrupting the rest of the mxid into stray leftover text
+            # (confirmed live 2026-10-17 against Pleroma).
             body = body.replace(mxid, handle)
+        elif display_name and display_name in body:
+            body = body.replace(display_name, handle)
 
         tags.append({"type": "Mention", "href": actor_id, "name": handle})
         extra_cc.append(actor_id)
