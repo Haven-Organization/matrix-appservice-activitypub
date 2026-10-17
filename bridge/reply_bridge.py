@@ -61,7 +61,12 @@ from bridge.media import (
     normalized_message_content,
     resolve_attachment_or_request_confirmation,
 )
-from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
+from bridge.mentions import (
+    collect_reply_participants,
+    resolve_pill_mentions,
+    resolve_plaintext_mentions,
+    resolve_plaintext_mxid_mentions,
+)
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
 
@@ -257,6 +262,10 @@ async def _send_outbound_dm(
         plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
         mention_tags += plaintext_tags
         mention_cc += plaintext_cc
+        already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+        body, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+        mention_tags += mxid_tags
+        mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
 
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
@@ -555,6 +564,10 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
         mention_tags += plaintext_tags
         mention_cc += plaintext_cc
+        already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+        body, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+        mention_tags += mxid_tags
+        mention_cc += mxid_cc
 
     # Replying to a post keeps the whole conversation on the thread (see
     # collect_reply_participants) -- a Mention for the parent's author,

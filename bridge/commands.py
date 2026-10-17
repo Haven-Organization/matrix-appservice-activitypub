@@ -278,7 +278,7 @@ from bridge.peertube import (
     resolve_language,
     video_media_url,
 )
-from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
+from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.notifications import NOTIFICATIONS_ROOM_NAME as _NOTIFICATIONS_ROOM_NAME
 from bridge.notifications import ensure_bot_dm_invite, notification_actor_html, notify_user, welcome_new_user
 from bridge.note_mirroring import KNOCK_JOIN_RULE as _KNOCK_JOIN_RULE
@@ -4933,6 +4933,10 @@ async def _handle_repost(
     plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
     mention_tags += plaintext_tags
     mention_cc += plaintext_cc
+    already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+    body, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+    mention_tags += mxid_tags
+    mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
 
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"

@@ -39,7 +39,12 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
 from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
-from bridge.mentions import collect_reply_participants, resolve_pill_mentions, resolve_plaintext_mentions
+from bridge.mentions import (
+    collect_reply_participants,
+    resolve_pill_mentions,
+    resolve_plaintext_mentions,
+    resolve_plaintext_mxid_mentions,
+)
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.reply_bridge import derive_in_reply_to
 from bridge.synapse_client import SynapseError
@@ -117,6 +122,10 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
         mention_tags += plaintext_tags
         mention_cc += plaintext_cc
+        already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+        body, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+        mention_tags += mxid_tags
+        mention_cc += mxid_cc
 
     # A guest post's owner-mention tack (see bridge.profile_posts) is part
     # of the delivered content, so the edited content owes it too -- same

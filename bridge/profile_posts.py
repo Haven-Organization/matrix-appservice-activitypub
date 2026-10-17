@@ -52,7 +52,7 @@ from bridge.media import (
     normalized_message_content,
     resolve_attachment_or_request_confirmation,
 )
-from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions
+from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
@@ -251,6 +251,10 @@ async def _maybe_handle_msc4501_quote_post(
     plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, caption, already_tagged=already_tagged)
     mention_tags += plaintext_tags
     mention_cc += plaintext_cc
+    already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+    caption, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, caption, already_tagged=already_tagged)
+    mention_tags += mxid_tags
+    mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
 
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
@@ -441,6 +445,10 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         plaintext_tags, plaintext_cc = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
         mention_tags += plaintext_tags
         mention_cc += plaintext_cc
+        already_tagged = {tag["name"].lstrip("@").lower() for tag in mention_tags if tag.get("name")}
+        body, mxid_tags, mxid_cc = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+        mention_tags += mxid_tags
+        mention_cc += mxid_cc
 
     if actor_record is not room_owner:
         # Guest post: tack the room owner's mention onto the front (unless

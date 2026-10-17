@@ -33,7 +33,7 @@
 
 ## Mentions
 
-- A Matrix client's structured mention (`m.mentions`) of a ghost or fellow local user is rewritten to `@user@domain` text and added as a real AS2 `Mention` tag on the way out. A hand-typed `@user@instance.org` is resolved the same way via WebFinger.
+- A Matrix client's structured mention (`m.mentions`) of a ghost or fellow local user is rewritten to `@user@domain` text and added as a real AS2 `Mention` tag on the way out. A hand-typed `@user@instance.org` is resolved the same way via WebFinger, and a ghost's or local user's full Matrix ID (`@localpart:server_name`) typed out by hand instead resolves the same way a real pill does (an exact repository lookup, not WebFinger).
 - Incoming `Mention` tags are matched by handle, not raw URL since they routinely differ, against known ghosts/local users and rendered as genuine Matrix mention pills.
 
 ## Media

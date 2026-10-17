@@ -28,6 +28,16 @@ also transparently covers a hand-typed ``@user@ourdomain`` naming a local
 bridge user, since webfinger for our own users resolves exactly like any
 other account's.
 
+``resolve_plaintext_mxid_mentions`` -- a third case: someone's own Matrix ID
+(``@localpart:server_name``), rather than their fediverse handle, typed out
+by hand -- e.g. copy-pasted from Element's member list instead of using the
+mention autocomplete, so it never touches ``m.mentions`` either. Scans the
+body text for that shape instead and resolves each the same way
+``resolve_pill_mentions`` resolves a real pill (an exact-match repository
+lookup, not WebFinger -- an MXID only ever identifies a ghost or local
+bridge user we already track, never an arbitrary remote account the way a
+hand-typed AP handle can).
+
 Without either, a mention would federate out as either the mentioned
 account's Matrix display name, its raw MXID, or (for a hand-typed handle)
 inert text with no ``Mention`` tag at all -- meaningless in all three
@@ -325,6 +335,82 @@ async def resolve_plaintext_mentions(
     return tags, extra_cc
 
 
+# Matrix's own localpart grammar (lowercase letters/digits plus ``._=-/``,
+# see bridge.ghosts.sanitize_localpart_component) separated from a server
+# name by ``:`` -- a real hostname, so (unlike a WebFinger handle) it needs
+# at least one "."-separated label after the first. A match that isn't
+# actually a known ghost/local user just fails the lookup below and is left
+# alone as plain text, same safety net as _PLAINTEXT_HANDLE_RE above.
+_PLAINTEXT_MXID_RE = re.compile(
+    r"(?<![\w@])(?P<mxid>@[a-z0-9._=\-/]+"
+    r":[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)"
+)
+
+
+async def resolve_plaintext_mxid_mentions(
+    request: Request, body: str, *, already_tagged: set[str] | None = None
+) -> tuple[str, list[dict], list[str]]:
+    """Find a ghost's or a local bridge user's full Matrix ID
+    (``@localpart:server_name``) typed out as plain text -- e.g. copy-pasted
+    rather than picked from the mention autocomplete, so it never touches
+    ``m.mentions`` and ``resolve_pill_mentions`` never sees it -- and
+    resolve it to a proper ``Mention`` tag the same way a real pill would
+    be.
+
+    A ghost's localpart is a lossy, one-way encoding of its real fediverse
+    ``user``/``domain`` (see ``bridge.ghosts.ghost_localpart``) and is never
+    parsed back apart here. Instead this does the same exact-match
+    repository lookup ``resolve_pill_mentions`` already does for a real
+    pill (``get_ghost_profile_by_mxid``/``get_local_actor_by_matrix_id``),
+    just keyed off a plain-text MXID match instead of ``m.mentions``.
+    Unlike ``resolve_plaintext_mentions``, this never falls back to
+    WebFinger -- an MXID only ever names a ghost or local user this bridge
+    already tracks, never an arbitrary remote account.
+
+    ``already_tagged`` -- the ``user@domain`` keys (lowercased) already
+    covered by a prior resolver -- is skipped, same convention as
+    ``resolve_plaintext_mentions``.
+
+    Returns ``(rewritten_body, ap_mention_tags, extra_cc_actor_ids)``, the
+    same shape as ``resolve_pill_mentions`` -- ``rewritten_body`` has the
+    typed MXID swapped for the resolved ``@user@domain`` handle, so the
+    federated post doesn't carry a bare Matrix ID as its visible text.
+    """
+    already_tagged = already_tagged or set()
+    config = request.app.state.config
+    repository = request.app.state.repository
+    ghost_prefix = f"@{config.appservice.user_prefix}"
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    tags: list[dict] = []
+    extra_cc: list[str] = []
+    for match in _PLAINTEXT_MXID_RE.finditer(body):
+        mxid = match.group("mxid")
+        if mxid == bot_mxid:
+            continue  # tagging the bot is a command, not a mention to federate
+
+        if mxid.startswith(ghost_prefix):
+            profile = await repository.get_ghost_profile_by_mxid(mxid)
+            if profile is None or not profile.handle:
+                continue  # not a ghost we've ever actually synced a profile for
+            actor_id, handle = profile.actor_id, profile.handle
+        else:
+            local_actor = await repository.get_local_actor_by_matrix_id(mxid)
+            if local_actor is None:
+                continue  # not a Matrix ID this bridge knows at all, or a local user with no fediverse profile
+            actor_id = actor_url(config.bridge.public_base_url, local_actor.username)
+            handle = f"@{local_actor.username}@{config.bridge.domain}"
+
+        if handle.lstrip("@").lower() in already_tagged:
+            continue
+
+        body = body.replace(mxid, handle)
+        tags.append({"type": "Mention", "href": actor_id, "name": handle})
+        extra_cc.append(actor_id)
+
+    return body, tags, extra_cc
+
+
 async def reconstruct_note_mentions(
     request: Request, *, body: str, event_content: dict, in_reply_to: str | None, sender_actor_id: str,
 ) -> tuple[str, list[dict], dict[str, str]]:
@@ -353,6 +439,9 @@ async def reconstruct_note_mentions(
     already_tagged = {tag["name"].lstrip("@").lower() for tag in tags if tag.get("name")}
     plaintext_tags, _ = await resolve_plaintext_mentions(request, body, already_tagged=already_tagged)
     tags += plaintext_tags
+    already_tagged = {tag["name"].lstrip("@").lower() for tag in tags if tag.get("name")}
+    body, mxid_tags, _ = await resolve_plaintext_mxid_mentions(request, body, already_tagged=already_tagged)
+    tags += mxid_tags
 
     if in_reply_to:
         participant_tags, _ = await collect_reply_participants(
