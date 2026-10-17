@@ -112,6 +112,24 @@ class _SanitizingParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag not in _ALLOWED_TAGS:
             return
+        if tag == "br":
+            # A void element -- HTMLParser only routes it to
+            # handle_startendtag() for the XHTML-style self-closed spelling
+            # (``<br/>``); a bare ``<br>`` (just as common, and the only
+            # spelling some real senders ever use) comes through here
+            # instead with no synthesized end tag. Both spellings must
+            # still emit the SAME text-side newline -- confirmed live
+            # (2026-10-17): a bare ``<br><br>`` between a quote-post's own
+            # caption and its appended "RT: <link>" fallback left them
+            # jammed onto one line in ``plain`` (though ``safe_html`` was
+            # fine, since the html side only ever lost the ``<br>`` tag
+            # itself, not neighboring text), which then made
+            # ``_strip_quote_tail`` in bridge.inbox_dispatch delete the
+            # WHOLE merged line -- caption included -- instead of just the
+            # fallback's own line.
+            self._emit_html("<br>")
+            self._emit_text("\n")
+            return
         if tag == "a":
             if self._anchor_href is not None:
                 return  # a nested <a> isn't valid HTML; ignore rather than corrupt the buffer
@@ -170,9 +188,10 @@ class _SanitizingParser(HTMLParser):
             self._emit_text("\n")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "br":
-            self._emit_html("<br>")
-            self._emit_text("\n")
+        # The self-closed (``<br/>``) spelling -- see handle_starttag's own
+        # "br" branch, which this delegates to so both spellings behave
+        # identically.
+        self.handle_starttag(tag, attrs)
 
     def handle_data(self, data: str) -> None:
         self._emit_html(html.escape(data))
