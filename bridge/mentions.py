@@ -7,19 +7,22 @@ Three distinct cases, handled by the two functions below:
 Matrix client's own reliable, structural record of exactly who was
 deliberately mentioned (picked from a mention autocomplete, a real pill),
 so it's always trusted to add a ``Mention`` tag. The post's TEXT only ever
-gets rewritten to the real ``@user@instance.org`` handle when the raw mxid
-itself is literally still present in the plain body -- an exact, unambiguous
-marker -- never by matching against the mentioned account's stored display
-name: a display name is ordinary free text with no structural link to any
-particular mention, so a global substring replace against it can corrupt
-*unrelated* prose that happens to contain the same word (a short/common
-display name -- "the", say -- would otherwise get every one of its
-coincidental appearances elsewhere in the post turned into a mention link,
-not just the actual pill). When the raw mxid isn't literally in the body
-either (a client that flattens the pill to the display name there instead),
-the ``Mention`` tag still goes out -- ``m.mentions`` alone is explicit
-enough for that -- the body text is just left exactly as the client sent
-it, unlinked. Covers both of the accounts we can resolve this way: a ghost
+gets rewritten to the real ``@user@instance.org`` handle against one of two
+signals literally present in THIS message: the raw mxid itself, if it's in
+the plain body, or (the common case for a real pill -- most clients'
+plain-body fallback is just the pill's own display text, not the mxid) the
+visible text of the matching matrix.to anchor in ``formatted_body``. Never
+by matching against the mentioned account's stored display name: unlike
+either signal above, a display name has no structural link to THIS
+message at all, so a substring replace against it can corrupt *unrelated*
+prose in some other, unrelated message that happens to contain the same
+word (a short/common display name -- "the", say -- would otherwise get
+every one of its coincidental appearances in anyone else's post turned
+into a mention link). When neither signal finds anything in the body (a
+client that flattens the pill to something else entirely), the ``Mention``
+tag still goes out -- ``m.mentions`` alone is explicit enough for that --
+the body text is just left exactly as the client sent it, unlinked.
+Covers both of the accounts we can resolve this way: a ghost
 (a REMOTE fediverse account already mirrored here), and a real LOCAL Matrix
 user who's linked their own fediverse profile -- mentioning a fellow bridge
 user is otherwise indistinguishable, on the fediverse side, from a typo:
@@ -55,6 +58,7 @@ linked, or notified.
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from urllib.parse import urlparse
@@ -198,20 +202,54 @@ async def collect_reply_participants(
     return tags, cc
 
 
+def _pill_anchor_text(formatted_body: str, mxid: str) -> str | None:
+    """The visible text of a real matrix.to pill anchor for ``mxid`` in
+    ``formatted_body``, if one is there -- e.g. ``"bronze"`` for
+    ``<a href="https://matrix.to/#/@fedi_bronze...">bronze</a>``.
+
+    This is NOT the display-name-matching this module's docstring warns
+    against: that was matching a mentioned account's STORED profile name
+    against arbitrary body text with no connection to whether a pill was
+    even used, so a short/common display name corrupted unrelated prose in
+    OTHER people's unrelated messages. This instead reads the one specific
+    anchor THIS message's own sender wrote for THIS specific mxid -- the
+    structural signal case 2 ("a Matrix ID mentioned using a formatted user
+    pill") is actually supposed to key off, never anyone else's messages.
+    A real pill's plain-``body`` fallback is routinely just this same
+    display text, not the raw mxid (confirmed live 2026-10-17: Element's
+    own pill renders exactly this way) -- so without this, the "mxid
+    literally in body" check below almost never fires for an ordinary pill
+    at all, only for the rarer client that puts the bare mxid in the
+    plain-text fallback too.
+    """
+    match = re.search(
+        rf'<a\s+href="https://matrix\.to/#/{re.escape(mxid)}(?:\?[^"]*)?"[^>]*>(.*?)</a>',
+        formatted_body,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    text = re.sub(r"<[^>]+>", "", match.group(1))
+    return html.unescape(text).strip() or None
+
+
 async def resolve_pill_mentions(request: Request, body: str, content: dict) -> tuple[str, list[dict], list[str]]:
     """Given a Matrix ``m.room.message`` event's already-extracted ``body``
     text (whatever the caller has already decided is the post's actual
     text) and its full ``content`` dict, add a ``Mention`` tag for every
     ghost or local bridge user named in ``content["m.mentions"]["user_ids"]``
     -- an explicit, client-generated signal, always trusted -- and rewrite
-    their raw mxid in ``body`` to their real ``@user@instance.org`` handle
-    wherever that exact mxid is literally still present there.
+    the mentioned text in ``body`` to their real ``@user@instance.org``
+    handle: either the raw mxid itself, wherever that's literally present,
+    or (the far more common shape for a real pill) the visible text of its
+    own matrix.to anchor in ``formatted_body`` -- see ``_pill_anchor_text``.
 
     Deliberately does NOT fall back to matching a mentioned account's
-    stored display name against the body: unlike the raw mxid, a display
-    name is free text with no structural link to the mention, so replacing
-    it would risk corrupting unrelated prose that happens to contain the
-    same word. When the raw mxid isn't in the body either, the ``Mention``
+    stored display name against the body: unlike either signal above, a
+    stored display name is free text with no structural link to THIS
+    message at all, so replacing it would risk corrupting unrelated prose
+    in some other, unrelated message that happens to contain the same
+    word. When neither signal finds anything in the body, the ``Mention``
     tag still goes out (``m.mentions`` alone is explicit enough), the body
     text is just left untouched.
 
@@ -249,10 +287,19 @@ async def resolve_pill_mentions(request: Request, body: str, content: dict) -> t
             handle = f"@{local_actor.username}@{config.bridge.domain}"
 
         if mxid in body:
-            # The only text substitution this function ever does -- see its
-            # own docstring for why a mentioned account's display name is
-            # deliberately NOT matched against the body as a fallback.
             body = body.replace(mxid, handle)
+        else:
+            # The common case for a real pill (see _pill_anchor_text) --
+            # the raw mxid usually isn't in plain body at all, only this
+            # specific anchor's own visible text is. Still never matches a
+            # mentioned account's stored display name (see this function's
+            # own docstring for why not): the text replaced here comes from
+            # THIS message's own formatted_body, structurally tied to this
+            # exact mxid by the sender who wrote it, not from a lookup.
+            formatted_body = content.get("formatted_body")
+            pill_text = _pill_anchor_text(formatted_body, mxid) if isinstance(formatted_body, str) else None
+            if pill_text and pill_text in body:
+                body = body.replace(pill_text, handle)
 
         tags.append({"type": "Mention", "href": actor_id, "name": handle})
         extra_cc.append(actor_id)
