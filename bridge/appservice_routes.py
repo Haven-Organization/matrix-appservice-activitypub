@@ -79,6 +79,7 @@ from bridge.pinned_posts import maybe_handle_pinned_events_change
 from bridge.profile_posts import (
     maybe_distribute_profile_post,
     maybe_handle_room_avatar_change,
+    maybe_handle_room_banner_change,
     maybe_handle_room_name_change,
     maybe_handle_topic_change,
 )
@@ -296,6 +297,9 @@ async def _handle_transaction(
                 continue
             handled_as_avatar_change = await maybe_handle_room_avatar_change(request, event)
             if handled_as_avatar_change:
+                continue
+            handled_as_banner_change = await maybe_handle_room_banner_change(request, event)
+            if handled_as_banner_change:
                 continue
             handled_as_pinned_events_change = await maybe_handle_pinned_events_change(request, event)
             if handled_as_pinned_events_change:

@@ -55,6 +55,7 @@ from bridge.media import (
 )
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.note_mirroring import (
+    PROFILE_BANNER_STATE_TYPE,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     build_repost_note_content,
@@ -633,6 +634,42 @@ async def maybe_handle_room_avatar_change(request: Request, event: dict) -> bool
     if actor_record.icon_url != icon_url:
         await repository.mark_media_published(avatar_mxc)
         actor_record = dataclasses.replace(actor_record, icon_url=icon_url)
+        await repository.register_local_actor(actor_record)
+        await push_profile_update(request, actor_record)
+    return True
+
+
+async def maybe_handle_room_banner_change(request: Request, event: dict) -> bool:
+    """Returns True if this event was a ``PROFILE_BANNER_STATE_TYPE`` change
+    in a linked Profile Room (handled -- keeps the local actor's AP banner
+    (``image``) in sync with it, and pushes the change out to followers).
+    Banner counterpart of ``maybe_handle_room_avatar_change``."""
+    if event.get("type") != PROFILE_BANNER_STATE_TYPE:
+        return False
+    content = event.get("content") or {}
+    banner_mxc = content.get("url")
+    if not isinstance(banner_mxc, str) or not banner_mxc:
+        return False
+
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+
+    repository = request.app.state.repository
+    actor_record = await repository.get_local_actor_by_room_id(room_id)
+    if actor_record is None:
+        return False  # not a linked Profile Room
+
+    config = request.app.state.config
+    try:
+        banner_url = media_url(config.bridge.public_base_url, banner_mxc)
+    except ValueError:
+        logger.info("Room banner %r for %s is not an mxc:// URI; ignoring", banner_mxc, room_id)
+        return True
+
+    if actor_record.banner_url != banner_url:
+        await repository.mark_media_published(banner_mxc)
+        actor_record = dataclasses.replace(actor_record, banner_url=banner_url)
         await repository.register_local_actor(actor_record)
         await push_profile_update(request, actor_record)
     return True
