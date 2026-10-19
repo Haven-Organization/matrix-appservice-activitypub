@@ -474,12 +474,14 @@ def _byline_html(post: "PostView") -> str:
     )
 
 
-def _post_card_html(post: PostView, index: int, *, highlighted: bool = False) -> str:
+def _post_card_html(post: PostView, index: int, *, highlighted: bool = False, pinned: bool = False) -> str:
     classes = "post" + (" post-focused" if highlighted else "")
     source_url = html.escape(post.source_url, quote=True)
+    pinned_badge = '<div class="pinned-badge">\U0001F4CC Pinned</div>' if pinned else ""
     return f"""
 <article class="{classes}">
   <a class="post-permalink" href="{source_url}" title="View on source instance" target="_blank" rel="nofollow noopener noreferrer">&#8599;</a>
+  {pinned_badge}
   <div class="post-header">
     {_avatar_html(post.author_display_name, post.author_avatar_url)}
     <div class="post-author">
@@ -549,6 +551,8 @@ a:hover { text-decoration: underline; }
 .profile-stat-hidden { color: var(--text); cursor: default; }
 .profile-stat strong, .profile-stat-hidden strong { font-weight: 700; }
 .timeline { display: flex; flex-direction: column; }
+.pinned-posts { display: flex; flex-direction: column; border-bottom: 1px solid var(--border); }
+.pinned-badge { font-size: 12px; font-weight: 700; color: var(--text-dim); margin-bottom: 6px; }
 .post { position: relative; padding: 12px 16px; border-bottom: 1px solid var(--border); }
 .post-focused { background: var(--bg-elevated); }
 .post-permalink { position: absolute; top: 12px; right: 16px; color: var(--text-dim); font-size: 15px; }
@@ -713,7 +717,7 @@ def render_profile_page(
     posts: list[PostView], older_posts_url: str | None = None, newer_posts_url: str | None = None,
     followers_count: int = 0, followers_hidden: bool = True, followers: list[PersonRef] | None = None,
     following_count: int = 0, following_hidden: bool = True, following: list[PersonRef] | None = None,
-    rss_url: str | None = None,
+    rss_url: str | None = None, pinned_posts: list[PostView] | None = None,
 ) -> str:
     banner_style = f' style="background-image:url(\'{html.escape(banner_url, quote=True)}\')"' if banner_url else ""
     followers_stat = _follow_stat_html(
@@ -748,6 +752,12 @@ def render_profile_page(
             "following-modal", title="Following", people=following or [], empty_message="Not following anyone yet."
         )
 
+    pinned_section = ""
+    if pinned_posts:
+        pinned_section = '<div class="pinned-posts">' + "".join(
+            _post_card_html(p, i, pinned=True) for i, p in enumerate(pinned_posts)
+        ) + "</div>"
+
     if posts:
         timeline = '<div class="timeline">' + "".join(
             _post_card_html(p, i) for i, p in enumerate(posts)
@@ -768,7 +778,7 @@ def render_profile_page(
         pagination = f'<div class="pagination">{newer_link}{older_link}</div>'
 
     body = (
-        f"{header}\n{dialogs}\n{timeline}\n{pagination}"
+        f"{header}\n{dialogs}\n{pinned_section}\n{timeline}\n{pagination}"
         + '<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     )
     return _page_shell(title=f"{display_name} ({handle})", body=body)

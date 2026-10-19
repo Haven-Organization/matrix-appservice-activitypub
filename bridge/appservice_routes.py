@@ -75,6 +75,7 @@ from bridge.peertube import (
     maybe_handle_channel_name_change,
     maybe_handle_channel_topic_change,
 )
+from bridge.pinned_posts import maybe_handle_pinned_events_change
 from bridge.profile_posts import (
     maybe_distribute_profile_post,
     maybe_handle_room_avatar_change,
@@ -295,6 +296,9 @@ async def _handle_transaction(
                 continue
             handled_as_avatar_change = await maybe_handle_room_avatar_change(request, event)
             if handled_as_avatar_change:
+                continue
+            handled_as_pinned_events_change = await maybe_handle_pinned_events_change(request, event)
+            if handled_as_pinned_events_change:
                 continue
             handled_as_channel_topic_change = await maybe_handle_channel_topic_change(request, event)
             if handled_as_channel_topic_change:

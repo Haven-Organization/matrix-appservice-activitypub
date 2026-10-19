@@ -3271,6 +3271,77 @@ async def _handle_note_update(request: Request, obj: dict) -> None:
         logger.warning("Failed to mirror edit of %s", ap_object_id, exc_info=True)
 
 
+async def _handle_add(request: Request, username: str, activity: Activity) -> None:
+    """A followed remote actor pinned one of their own posts -- mirror it
+    into their Remote User Room's own ``m.room.pinned_events``, so Element
+    shows the same pinned-post indicator a real fediverse client would (see
+    ``bridge.pinned_posts`` for the OUTBOUND half of this feature).
+
+    ``Add`` is also legitimately used in AS2 for unrelated things (e.g.
+    PeerTube's "add a video to a playlist") -- ``_handle_pin_activity``'s
+    own ``target`` check is what tells a genuine pin apart from those."""
+    await _handle_pin_activity(request, activity, pin=True)
+
+
+async def _handle_remove(request: Request, username: str, activity: Activity) -> None:
+    """The inverse of ``_handle_add`` -- see its docstring."""
+    await _handle_pin_activity(request, activity, pin=False)
+
+
+async def _handle_pin_activity(request: Request, activity: Activity, *, pin: bool) -> None:
+    target = activity.target_id()
+    if not target or not any(marker in target.lower() for marker in ("featured", "pinned")):
+        # Not a pinned-posts Add/Remove (or we can't tell) -- e.g. a
+        # PeerTube playlist membership change. Nothing for this bridge to
+        # do with it.
+        return
+
+    object_id = activity.object_id()
+    if not object_id:
+        return
+
+    repository = request.app.state.repository
+    remote_room = await repository.get_remote_actor_room(activity.actor)
+    if remote_room is None:
+        return  # not someone we follow -- no Remote User Room to mirror this into
+
+    federated = await repository.get_federated_event_by_ap_object(object_id)
+    if federated is None or federated.author_actor_id != activity.actor or federated.room_id != remote_room.room_id:
+        # Either we never mirrored this post at all (pinned something
+        # posted before we followed them -- no auto-import for v1, same
+        # kind of deliberate scoping as bridge.quote_import_policy's
+        # gating of a similar "should we go fetch something we don't
+        # have" decision), or the activity doesn't check out (pinning a
+        # post that isn't even theirs) -- either way, nothing safe to do.
+        return
+
+    synapse = request.app.state.synapse
+    try:
+        state = await synapse.get_room_state(
+            remote_room.room_id, "m.room.pinned_events", "", as_user_id=remote_room.ghost_user_id
+        )
+    except SynapseError:
+        state = {}  # nothing pinned yet in this room -- Synapse 404s rather than an empty list
+    current = state.get("pinned") or []
+
+    if pin:
+        if federated.event_id in current:
+            return
+        new_pinned = [*current, federated.event_id]
+    else:
+        if federated.event_id not in current:
+            return
+        new_pinned = [event_id for event_id in current if event_id != federated.event_id]
+
+    try:
+        await synapse.send_state_event(
+            remote_room.room_id, "m.room.pinned_events", "", {"pinned": new_pinned},
+            as_user_id=remote_room.ghost_user_id,
+        )
+    except SynapseError:
+        logger.warning("Failed to update pinned_events in %s", remote_room.room_id, exc_info=True)
+
+
 async def _handle_block(request: Request, username: str, activity: Activity) -> None:
     """A remote actor blocked one of our local users -- surface it as a
     \U0001F6AB notification (user-requested, 2026-07-04).
@@ -3506,4 +3577,6 @@ _HANDLERS = {
     "Announce": _handle_announce,
     "Block": _handle_block,
     "Delete": _handle_delete,
+    "Add": _handle_add,
+    "Remove": _handle_remove,
 }

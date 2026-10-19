@@ -28,6 +28,10 @@ def following_url(base_url: str, username: str) -> str:
     return f"{base_url}/following/{username}"
 
 
+def featured_url(base_url: str, username: str) -> str:
+    return f"{base_url}/featured/{username}"
+
+
 def main_key_id(base_url: str, username: str) -> str:
     return f"{actor_url(base_url, username)}#main-key"
 

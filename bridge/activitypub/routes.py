@@ -63,6 +63,7 @@ from bridge.identity_settings import get_effective_setting
 from bridge.note_mirroring import build_repost_note_content, split_repost_caption
 from bridge.activitypub.urls import (
     actor_url,
+    featured_url,
     followers_url,
     following_url,
     inbox_url,
@@ -227,6 +228,7 @@ async def _build_actor(request: Request, record) -> Actor:
         outbox=outbox_url(base, record.username),
         followers=followers_url(base, record.username),
         following=following_url(base, record.username),
+        featured_url=featured_url(base, record.username),
         discoverable=discoverable,
         icon_url=icon_url,
         icon_media_type=await resolve_media_type(request, icon_url),
@@ -576,6 +578,8 @@ async def get_actor(request: Request, username: str) -> Response:
             if not hide_following else []
         )
 
+        pinned_posts = await _fetch_featured_post_views(request, record=record)
+
         html_doc = render_profile_page(
             display_name=record.display_name or record.username,
             handle=f"@{record.username}@{config.bridge.domain}",
@@ -583,6 +587,7 @@ async def get_actor(request: Request, username: str) -> Response:
             avatar_url=record.icon_url,
             banner_url=record.banner_url,
             posts=posts,
+            pinned_posts=pinned_posts,
             older_posts_url=older_posts_url,
             newer_posts_url=newer_posts_url,
             followers_count=len(follower_ids),
@@ -1223,6 +1228,66 @@ async def _build_thread_post_views(request: Request, federated: FederatedEvent) 
     return posts
 
 
+async def _reconstruct_note_from_matrix_event(
+    request: Request, *, matrix_event: dict, base: str, username: str
+) -> Note | None:
+    """Rebuild the AP Note a single already-distributed Matrix message event
+    represents -- ``None`` if it was never actually distributed as a post
+    (no recorded mapping) or has nothing reconstructable.
+
+    Shared by ``_fetch_room_outbox_notes`` (scanning a whole room's history)
+    and ``_fetch_featured_notes`` (a handful of specifically-pinned events),
+    so both build identical Note bodies for the same event rather than two
+    separately-maintained implementations of the same logic."""
+    repository: ActorRepository = request.app.state.repository
+    matrix_event_id = matrix_event.get("event_id")
+    if not matrix_event_id:
+        return None
+    # Only events that were actually distributed as a post have a recorded
+    # mapping -- reuse its `ap_object_id` so the Note `id` here matches
+    # exactly what followers were already delivered.
+    federated = await repository.get_federated_event_by_matrix_event(matrix_event_id)
+    if federated is None:
+        return None
+    # Same raw-vs-effective split as get_note: m.mentions/m.relates_to
+    # are original-event-only fields an edit's m.new_content never
+    # carries (see _effective_event_content's own docstring), so both
+    # derive_in_reply_to and reconstruct_note_mentions need the RAW
+    # content specifically, not the latest-edit one the body/HTML below
+    # is otherwise correctly rendered from.
+    raw_event_content = matrix_event.get("content") or {}
+    event_content = _effective_event_content(matrix_event)
+    attachment = await resolve_reconstructed_attachment(request, event_content)
+    body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
+    if not body and attachment is None:
+        return None
+    in_reply_to = await derive_in_reply_to(repository, raw_event_content)
+
+    note_tags: list[dict] = []
+    if not federated.reposted_object_id and body:
+        body, note_tags, mention_links = await reconstruct_note_mentions(
+            request, body=body, event_content=raw_event_content,
+            in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
+        )
+        content_html = plain_text_to_note_html(body, mention_links)
+
+    origin_server_ts = matrix_event.get("origin_server_ts") or 0
+    return Note(
+        id=federated.ap_object_id,
+        attributed_to=actor_url(base, username),
+        content=content_html,
+        published=_matrix_ts_to_iso(origin_server_ts),
+        to=[AS_PUBLIC],
+        cc=[followers_url(base, username)],
+        # Without this, a reply reconstructed here reads as a standalone
+        # post to anyone fetching it -- see derive_in_reply_to.
+        in_reply_to=in_reply_to,
+        attachment=[attachment] if attachment else [],
+        tag=note_tags,
+        quote_uri=quote_uri,
+    )
+
+
 async def _fetch_room_outbox_notes(
     request: Request, *, room_id: str, base: str, username: str, owner_matrix_id: str, bot_mxid: str
 ) -> list[tuple[int, Note]]:
@@ -1231,7 +1296,6 @@ async def _fetch_room_outbox_notes(
     several rooms' worth (current Profile Room plus any it replaced -- see
     ``ActorRepository.get_profile_room_history``) into one feed sorted by
     recency, instead of only ever showing whichever room is current."""
-    repository: ActorRepository = request.app.state.repository
     try:
         history = await request.app.state.synapse.get_room_messages(
             room_id, limit=OUTBOX_HISTORY_LIMIT, direction="b", as_user_id=bot_mxid
@@ -1244,54 +1308,80 @@ async def _fetch_room_outbox_notes(
     for matrix_event in history.get("chunk", []):
         if matrix_event.get("type") != "m.room.message" or matrix_event.get("sender") != owner_matrix_id:
             continue
-        matrix_event_id = matrix_event.get("event_id")
-        if not matrix_event_id:
+        note = await _reconstruct_note_from_matrix_event(request, matrix_event=matrix_event, base=base, username=username)
+        if note is None:
             continue
-        # Only events that were actually distributed as a post have a recorded
-        # mapping -- reuse its `ap_object_id` so the Note `id` here matches
-        # exactly what followers were already delivered.
+        origin_server_ts = matrix_event.get("origin_server_ts") or 0
+        notes.append((origin_server_ts, note))
+    return notes
+
+
+async def _fetch_pinned_room_events(request: Request, *, room_id: str) -> list[tuple[FederatedEvent, dict]]:
+    """``(FederatedEvent, raw Matrix event)`` pairs for every post currently
+    pinned in ``room_id`` (Matrix's ``m.room.pinned_events`` state), in that
+    state's own order -- shared by ``_fetch_featured_notes`` (the AP
+    ``featured`` collection) and ``_fetch_featured_post_views`` (the HTML
+    profile page's own pinned-posts section), so both always agree on
+    exactly which pinned entries actually resolve to a real distributed
+    post (nothing stops pinning an arbitrary, never-federated timeline
+    event in Element -- see ``bridge.pinned_posts``'s identical skip for
+    that case on the outbound-Add-activity side).
+
+    Reads live off Synapse each request rather than any bridge-maintained
+    copy of its own (there isn't one -- see this feature's own design notes
+    on reusing existing state instead of a new table), the same
+    "reconstruct fresh every time" precedent ``_fetch_room_outbox_notes``
+    above already sets for this room, just scoped to the handful of pinned
+    events instead of the whole room history."""
+    synapse = request.app.state.synapse
+    repository: ActorRepository = request.app.state.repository
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        state = await synapse.get_room_state(room_id, "m.room.pinned_events", "", as_user_id=bot_mxid)
+    except SynapseError:
+        return []  # nothing pinned yet -- Synapse 404s rather than returning an empty list
+
+    pairs: list[tuple[FederatedEvent, dict]] = []
+    for matrix_event_id in state.get("pinned") or []:
         federated = await repository.get_federated_event_by_matrix_event(matrix_event_id)
         if federated is None:
             continue
-        # Same raw-vs-effective split as get_note: m.mentions/m.relates_to
-        # are original-event-only fields an edit's m.new_content never
-        # carries (see _effective_event_content's own docstring), so both
-        # derive_in_reply_to and reconstruct_note_mentions need the RAW
-        # content specifically, not the latest-edit one the body/HTML below
-        # is otherwise correctly rendered from.
-        raw_event_content = matrix_event.get("content") or {}
-        event_content = _effective_event_content(matrix_event)
-        attachment = await resolve_reconstructed_attachment(request, event_content)
-        body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
-        if not body and attachment is None:
+        try:
+            matrix_event = await synapse.get_event(room_id, matrix_event_id, as_user_id=bot_mxid)
+        except SynapseError:
             continue
-        in_reply_to = await derive_in_reply_to(repository, raw_event_content)
+        pairs.append((federated, matrix_event))
+    return pairs
 
-        note_tags: list[dict] = []
-        if not federated.reposted_object_id and body:
-            body, note_tags, mention_links = await reconstruct_note_mentions(
-                request, body=body, event_content=raw_event_content,
-                in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
-            )
-            content_html = plain_text_to_note_html(body, mention_links)
 
-        origin_server_ts = matrix_event.get("origin_server_ts") or 0
-        note = Note(
-            id=federated.ap_object_id,
-            attributed_to=actor_url(base, username),
-            content=content_html,
-            published=_matrix_ts_to_iso(origin_server_ts),
-            to=[AS_PUBLIC],
-            cc=[followers_url(base, username)],
-            # Without this, a reply reconstructed here reads as a standalone
-            # post to anyone fetching it -- see derive_in_reply_to.
-            in_reply_to=in_reply_to,
-            attachment=[attachment] if attachment else [],
-            tag=note_tags,
-            quote_uri=quote_uri,
+async def _fetch_featured_notes(request: Request, *, record: ActorRecord, base: str) -> list[Note]:
+    """``record``'s own Profile Room's currently-pinned posts, as AP Notes --
+    the AP-side half of ``bridge.pinned_posts``'s bidirectional pin sync."""
+    if not record.room_id:
+        return []
+    notes: list[Note] = []
+    for federated, matrix_event in await _fetch_pinned_room_events(request, room_id=record.room_id):
+        note = await _reconstruct_note_from_matrix_event(
+            request, matrix_event=matrix_event, base=base, username=record.username
         )
-        notes.append((origin_server_ts, note))
+        if note is not None:
+            notes.append(note)
     return notes
+
+
+async def _fetch_featured_post_views(request: Request, *, record: ActorRecord) -> list["PostView"]:
+    """``record``'s own Profile Room's currently-pinned posts, as
+    ``PostView``s -- for the "\U0001F4CC Pinned" section at the top of this
+    bridge's own served ``/actor/{username}`` HTML profile page."""
+    if not record.room_id:
+        return []
+    views: list["PostView"] = []
+    for federated, matrix_event in await _fetch_pinned_room_events(request, room_id=record.room_id):
+        view = await _build_post_view(request, federated, matrix_event=matrix_event)
+        if view is not None:
+            views.append(view)
+    return views
 
 
 async def _list_channel_video_events(request: Request, *, channel) -> list[FederatedEvent]:
@@ -1797,6 +1887,28 @@ async def get_following(request: Request, username: str) -> JSONResponse:
         id=following_url(base, username), items=items, total_items=len(following),
         embed_first=not isinstance(record, PeerTubeChannelRecord),
     )
+    return _collection_or_page(request, collection)
+
+
+@router.api_route("/featured/{username}", methods=["GET", "HEAD"])
+async def get_featured(request: Request, username: str) -> JSONResponse:
+    """A local actor's pinned posts, as Mastodon/Pleroma/Akkoma's own
+    ``featured`` collection convention -- see ``bridge.pinned_posts`` for
+    the OUTBOUND (Matrix pin -> Add/Remove to followers) half of this
+    feature; this route and ``_fetch_featured_notes`` are the other half
+    (AP collection reflecting current ``m.room.pinned_events`` state).
+
+    Permanently empty for a PeerTube channel (Group actor) -- pinning is
+    scoped to ordinary Person profiles only for v1, same as
+    ``get_playlists``'s identical stub-for-the-wrong-actor-kind reasoning."""
+    base = request.app.state.config.bridge.public_base_url
+    record = await _get_actor_or_channel_record(request, username)
+    if isinstance(record, PeerTubeChannelRecord):
+        collection = OrderedCollection(id=featured_url(base, username), items=[], embed_first=False)
+        return _collection_or_page(request, collection)
+
+    notes = await _fetch_featured_notes(request, record=record, base=base)
+    collection = OrderedCollection(id=featured_url(base, username), items=[note.to_dict() for note in notes])
     return _collection_or_page(request, collection)
 
 

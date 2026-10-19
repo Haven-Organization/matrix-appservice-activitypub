@@ -136,6 +136,11 @@ class Actor:
     # permanently-empty stub for v1 per the agreed design). Never set for
     # an ordinary Person profile, which has no such concept.
     playlists_url: str | None = None
+    # Mastodon/Pleroma/Akkoma's pinned-posts collection (see
+    # bridge.pinned_posts) -- set for an ordinary Person profile, never for
+    # a PeerTube channel (Group actor), which has no pinned-posts concept
+    # for v1 (same profile-only scoping as `discoverable`).
+    featured_url: str | None = None
     # A channel's owning account actor id(s) -- confirmed live 2026-07-25
     # against a real PeerTube channel actor, which always carries this
     # (pointing back at the Person that owns it). Never set for an
@@ -183,6 +188,7 @@ class Actor:
                 "followers": self.followers,
                 "following": self.following,
                 "playlists": self.playlists_url,
+                "featured": self.featured_url,
                 "attributedTo": self.attributed_to_urls,
                 "discoverable": self.discoverable,
                 "indexable": self.discoverable,
@@ -408,6 +414,16 @@ class Activity:
     # on a Follow<Organization> to join a Shoot guild. Absent for every other
     # activity type/ordinary Follow.
     instrument: str | None = None
+    # Mastodon/Pleroma/Akkoma's pinned-posts convention: an Add/Remove
+    # pinning/unpinning one of OUR OWN posts to our own "featured" collection
+    # names that collection's own IRI here (a bare string, or an embedded
+    # object with its own "id" -- same either-shape tolerance as `object`).
+    # Absent for every other activity type, and for an inbound Add/Remove
+    # this bridge doesn't recognize as a pin (see
+    # bridge.inbox_dispatch._handle_pin_activity, which also uses this to
+    # tell a genuine pin apart from AS2's other, unrelated uses of
+    # Add/Remove -- e.g. PeerTube's "add a video to a playlist").
+    target: Union[str, dict[str, Any], None] = None
 
     def to_dict(self) -> dict[str, Any]:
         obj: Any
@@ -428,6 +444,7 @@ class Activity:
                 "content": self.content,
                 "tag": self.tag,
                 "instrument": self.instrument,
+                "target": self.target,
             }
         )
 
@@ -459,6 +476,7 @@ class Activity:
             content=data.get("content"),
             tag=as2_list(data.get("tag")),
             instrument=data.get("instrument"),
+            target=data.get("target"),
         )
 
     def object_id(self) -> str | None:
@@ -469,6 +487,15 @@ class Activity:
             return self.object.get("id")
         if isinstance(self.object, (Activity, Note, ChatMessage, Question)):
             return self.object.id
+        return None
+
+    def target_id(self) -> str | None:
+        """Best-effort extraction of the IRI referenced by ``target`` -- same
+        shape-tolerance as ``object_id``."""
+        if isinstance(self.target, str):
+            return self.target
+        if isinstance(self.target, dict):
+            return self.target.get("id")
         return None
 
 
