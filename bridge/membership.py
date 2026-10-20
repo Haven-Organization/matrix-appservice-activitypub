@@ -165,6 +165,18 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
         # under the same Matrix event id, causing a persistent false
         # "already published" for a video that was never actually published
         # at all.
+        #
+        # Same class of bug recurred live 2026-10-19/20 for a hosted Lemmy
+        # community room (added well after the incident above, and missed
+        # here): inviting a new follower's ghost into the community room
+        # (bridge.inbox_dispatch._announce_new_community_follower_owned,
+        # purely to display who follows it / let it be pilled -- the same
+        # reason a commenter's ghost is invited into a channel room) got
+        # misread the same way, registering the WHOLE community room as a
+        # 1:1 ghost chat with that one follower. Every post made in the
+        # room after that -- a real, public community post with many other
+        # followers -- went out ONLY as a private ChatMessage to that single
+        # follower instead, confirmed live against a real poa.st account.
         repository = request.app.state.repository
         already_known = (
             await repository.get_remote_actor_room_by_room_id(room_id) is not None
@@ -173,6 +185,8 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
             or await repository.is_ghost_chat_room(room_id)
             or await repository.get_peertube_channel_by_room_id(room_id) is not None
             or await repository.get_channel_room_by_room_id(room_id) is not None
+            or await repository.get_lemmy_community_room_by_room_id(room_id) is not None
+            or await repository.get_lemmy_community_by_room_id(room_id) is not None
         )
         if not already_known:
             inviter = event.get("sender", "")
