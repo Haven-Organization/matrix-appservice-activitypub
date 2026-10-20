@@ -206,6 +206,37 @@ class ChannelRoom:
 
 
 @dataclass(frozen=True)
+class LemmyCommunityRoom:
+    """Maps a mirrored Lemmy community (a ``Group`` actor with its own
+    ``moderators`` collection) to the Matrix room fanning its posts/comments
+    out to many different ghosts -- deliberately has no single
+    ``ghost_user_id``, same reasoning as ``ChannelRoom``: a community's
+    content comes from many different remote Lemmy users, resolved
+    per-post/comment (see ``bridge.lemmy_bridge``), not from the community
+    acting as a single poster the way a PeerTube channel's own ``Group``
+    actor does. Member-ghost tracking reuses ``channel_room_members``/
+    ``is_channel_member_known``/``record_channel_member`` as-is -- that
+    table is already keyed purely by ``(room_id, member_actor_id)`` with no
+    Shoot-specific column, so nothing new was needed for it."""
+
+    community_actor_id: str
+    room_id: str
+    display_name: str = ""
+    icon_url: str | None = None
+    banner_url: str | None = None
+    # The community's own ``moderators`` OrderedCollection URL, as last seen
+    # on its Actor document -- cached so a resync doesn't need to re-fetch
+    # the Actor document itself just to find this again.
+    moderators_url: str | None = None
+    # True only for the room's first-ever creation (nobody on this server
+    # had followed this community before) -- same "one-time auto-backfill"
+    # mechanism as RemoteActorRoom.pending_backfill, consumed by
+    # bridge.membership.maybe_handle_join the first time anyone actually
+    # joins.
+    pending_backfill: bool = False
+
+
+@dataclass(frozen=True)
 class FederatedEvent:
     """Bidirectional link between a Matrix event and the AP object it represents.
 
@@ -672,6 +703,28 @@ class ActorRepository(Protocol):
         the channel room ``room_id``."""
         ...
 
+    async def get_lemmy_community_room(self, community_actor_id: str) -> LemmyCommunityRoom | None:
+        """The Matrix room mirroring ``community_actor_id``, or None if we
+        don't follow/mirror that Lemmy community at all."""
+        ...
+
+    async def get_lemmy_community_room_by_room_id(self, room_id: str) -> LemmyCommunityRoom | None:
+        """The reverse of ``get_lemmy_community_room`` -- which Lemmy
+        community ``room_id`` mirrors, or None if it isn't one at all."""
+        ...
+
+    async def register_lemmy_community_room(self, record: LemmyCommunityRoom) -> None:
+        """Record a freshly created (or updated, e.g. a changed
+        ``display_name``/``moderators_url``) Lemmy community room. Must
+        never clobber an existing row's ``pending_backfill`` -- only
+        ``mark_lemmy_community_backfill_pending_done`` may change it after
+        the row's first creation."""
+        ...
+
+    async def mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        """Consume ``room_id``'s one-time ``pending_backfill`` flag."""
+        ...
+
     async def record_federated_event(self, record: FederatedEvent, *, is_primary: bool = True) -> None:
         """Record ``record``. ``ap_object_id`` is only required to be unique
         among ``is_primary=True`` rows -- not, as it might look, because
@@ -1096,6 +1149,8 @@ class InMemoryActorRepository:
         self._channel_rooms: dict[str, ChannelRoom] = {}
         self._channel_rooms_by_room_id: dict[str, ChannelRoom] = {}
         self._channel_room_members: set[tuple[str, str]] = set()
+        self._lemmy_community_rooms: dict[str, LemmyCommunityRoom] = {}
+        self._lemmy_community_rooms_by_room_id: dict[str, LemmyCommunityRoom] = {}
         self._peertube_channels: dict[str, PeerTubeChannelRecord] = {}
         self._peertube_channels_by_room_id: dict[str, str] = {}  # room_id -> channel username
         # Keyed by plain username, independent of ``_actors`` -- matches the
@@ -1361,6 +1416,30 @@ class InMemoryActorRepository:
 
     async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
         self._channel_room_members.add((room_id, member_actor_id))
+
+    async def get_lemmy_community_room(self, community_actor_id: str) -> LemmyCommunityRoom | None:
+        return self._lemmy_community_rooms.get(community_actor_id)
+
+    async def get_lemmy_community_room_by_room_id(self, room_id: str) -> LemmyCommunityRoom | None:
+        return self._lemmy_community_rooms_by_room_id.get(room_id)
+
+    async def register_lemmy_community_room(self, record: LemmyCommunityRoom) -> None:
+        previous = self._lemmy_community_rooms.get(record.community_actor_id)
+        if previous is not None:
+            # Never clobber pending_backfill on an ordinary re-registration
+            # (a resync) -- same reasoning as register_remote_actor_room's
+            # identical guard.
+            record = replace(record, pending_backfill=previous.pending_backfill)
+        self._lemmy_community_rooms[record.community_actor_id] = record
+        self._lemmy_community_rooms_by_room_id[record.room_id] = record
+
+    async def mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        record = self._lemmy_community_rooms_by_room_id.get(room_id)
+        if record is None:
+            return
+        updated = replace(record, pending_backfill=False)
+        self._lemmy_community_rooms[record.community_actor_id] = updated
+        self._lemmy_community_rooms_by_room_id[room_id] = updated
 
     async def record_federated_event(self, record: FederatedEvent, *, is_primary: bool = True) -> None:
         self._federated_by_matrix_event[record.event_id] = record

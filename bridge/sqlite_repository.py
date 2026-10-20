@@ -32,6 +32,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
@@ -351,6 +352,18 @@ CREATE TABLE IF NOT EXISTS peertube_channels (
     banner_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peertube_channels_owner ON peertube_channels (owner_username);
+
+-- A mirrored Lemmy community (see LemmyCommunityRoom's own docstring for
+-- why it has no ghost_user_id column, unlike remote_actor_rooms).
+CREATE TABLE IF NOT EXISTS lemmy_community_rooms (
+    community_actor_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    icon_url TEXT,
+    banner_url TEXT,
+    moderators_url TEXT,
+    pending_backfill INTEGER NOT NULL DEFAULT 0
+);
 """
 
 _TRANSACTION_RETENTION_SECONDS = 7 * 24 * 3600
@@ -621,6 +634,13 @@ class SqliteActorRepository:
             """
         )
         self._conn.commit()
+
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(lemmy_community_rooms)")}
+        if "pending_backfill" not in columns:
+            self._conn.execute(
+                "ALTER TABLE lemmy_community_rooms ADD COLUMN pending_backfill INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
 
     async def close(self) -> None:
         # sqlite3's close() is fast/local -- no need for the asyncio.to_thread
@@ -1839,6 +1859,66 @@ class SqliteActorRepository:
 
     async def record_channel_member(self, room_id: str, member_actor_id: str) -> None:
         await self._run(self._record_channel_member, room_id, member_actor_id)
+
+    def _get_lemmy_community_room(self, community_actor_id: str) -> LemmyCommunityRoom | None:
+        row = self._conn.execute(
+            "SELECT * FROM lemmy_community_rooms WHERE community_actor_id = ?", (community_actor_id,)
+        ).fetchone()
+        return self._row_to_lemmy_community_room(row) if row else None
+
+    async def get_lemmy_community_room(self, community_actor_id: str) -> LemmyCommunityRoom | None:
+        return await self._run(self._get_lemmy_community_room, community_actor_id)
+
+    def _get_lemmy_community_room_by_room_id(self, room_id: str) -> LemmyCommunityRoom | None:
+        row = self._conn.execute(
+            "SELECT * FROM lemmy_community_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        return self._row_to_lemmy_community_room(row) if row else None
+
+    async def get_lemmy_community_room_by_room_id(self, room_id: str) -> LemmyCommunityRoom | None:
+        return await self._run(self._get_lemmy_community_room_by_room_id, room_id)
+
+    def _register_lemmy_community_room(self, record: LemmyCommunityRoom) -> None:
+        # pending_backfill is deliberately NOT in the DO UPDATE SET below --
+        # same reasoning as RemoteActorRoom's identical omission: only
+        # mark_lemmy_community_backfill_pending_done is allowed to change it
+        # after the row's first creation.
+        self._conn.execute(
+            """
+            INSERT INTO lemmy_community_rooms
+                (community_actor_id, room_id, display_name, icon_url, banner_url, moderators_url, pending_backfill)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(community_actor_id) DO UPDATE SET
+                room_id=excluded.room_id, display_name=excluded.display_name,
+                icon_url=excluded.icon_url, banner_url=excluded.banner_url,
+                moderators_url=excluded.moderators_url
+            """,
+            (
+                record.community_actor_id, record.room_id, record.display_name,
+                record.icon_url, record.banner_url, record.moderators_url, record.pending_backfill,
+            ),
+        )
+        self._conn.commit()
+
+    async def register_lemmy_community_room(self, record: LemmyCommunityRoom) -> None:
+        await self._run(self._register_lemmy_community_room, record)
+
+    def _mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        self._conn.execute(
+            "UPDATE lemmy_community_rooms SET pending_backfill = 0 WHERE room_id = ?", (room_id,)
+        )
+        self._conn.commit()
+
+    async def mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        await self._run(self._mark_lemmy_community_backfill_pending_done, room_id)
+
+    @staticmethod
+    def _row_to_lemmy_community_room(row: sqlite3.Row) -> LemmyCommunityRoom:
+        return LemmyCommunityRoom(
+            community_actor_id=row["community_actor_id"], room_id=row["room_id"],
+            display_name=row["display_name"], icon_url=row["icon_url"], banner_url=row["banner_url"],
+            moderators_url=row["moderators_url"], pending_backfill=bool(row["pending_backfill"]),
+        )
 
     # -- bot DM rooms --------------------------------------------------------
 

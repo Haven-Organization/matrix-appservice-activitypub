@@ -67,6 +67,7 @@ from bridge.commands import (
 )
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
+from bridge.lemmy_bridge import maybe_distribute_community_message, maybe_handle_community_ban
 from bridge.media import ENCRYPTED_ATTACHMENT_WARNING_MARKER, decrypt_and_reupload_encrypted_attachment
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
 from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
@@ -131,7 +132,9 @@ async def _dispatch_outbound_send(request: Request, event: dict) -> None:
                 if not handled_as_poll_start:
                     handled_as_channel_message = await maybe_distribute_channel_message(request, event)
                     if not handled_as_channel_message:
-                        await maybe_distribute_profile_post(request, event)
+                        handled_as_community_message = await maybe_distribute_community_message(request, event)
+                        if not handled_as_community_message:
+                            await maybe_distribute_profile_post(request, event)
 
 
 async def maybe_handle_encrypted_attachment_confirmation(request: Request, event: dict) -> bool:
@@ -285,6 +288,9 @@ async def _handle_transaction(
                 continue
             handled_as_leave = await maybe_handle_leave(request, event)
             if handled_as_leave:
+                continue
+            handled_as_community_ban = await maybe_handle_community_ban(request, event)
+            if handled_as_community_ban:
                 continue
             handled_as_join = await maybe_handle_join(request, event)
             if handled_as_join:

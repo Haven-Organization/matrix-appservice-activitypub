@@ -241,6 +241,13 @@ class Note:
     # AUTHOR, context/to name the CHANNEL). Absent for every ordinary
     # top-level post, which has no such containment to express.
     context: str | None = None
+    # Lemmy's own community-association convention (distinct from FEP-7888
+    # `context` above): set on an outbound comment into a mirrored Lemmy
+    # community (see bridge.lemmy_bridge.maybe_distribute_community_message)
+    # to that community's own actor id, matching the shape join-lemmy.org's
+    # own federation docs show for a real Create<Page>. Absent for every
+    # other outbound Note.
+    audience: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _without_none(
@@ -261,6 +268,7 @@ class Note:
                 "attachment": self.attachment,
                 "name": self.name,
                 "context": self.context,
+                "audience": self.audience,
             }
         )
 

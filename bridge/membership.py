@@ -88,6 +88,7 @@ from bridge.commands import (
     _RUNNING_BACKFILLS,
     _RUNNING_GUILD_AUTO_JOINS,
     _run_auto_backfill,
+    _run_community_auto_backfill,
     handle_guild_auto_join,
 )
 from bridge.matrix_links import matrix_to_room_link
@@ -433,6 +434,7 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     is_profile_room = await repository.get_profile_room_owner(room_id) == joined_user
     dm_room_actor_id = await repository.get_ghost_dm_room_actor_id(room_id)
     channel_room = await repository.get_channel_room_by_room_id(room_id)
+    community_room = await repository.get_lemmy_community_room_by_room_id(room_id)
     is_notification_room = await repository.get_bot_dm_room_owner(room_id) == joined_user
     # A guild's own Space -- distinct from a Channel room (below), which
     # already resolves its guild via channel_room.guild_actor_id. Neither
@@ -443,6 +445,7 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
     if (
         remote_room is None and not is_profile_room and dm_room_actor_id is None
         and channel_room is None and not is_notification_room and guild_space_actor_id is None
+        and community_room is None
     ):
         return False  # not a room the bridge manages for this specific user
 
@@ -501,6 +504,20 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
             task = asyncio.get_running_loop().create_task(
                 _run_auto_backfill(
                     request, room_id=room_id, remote_room=remote_room,
+                    count=config.bridge.backfill_default_count,
+                )
+            )
+            _RUNNING_BACKFILLS.add(task)
+            task.add_done_callback(_RUNNING_BACKFILLS.discard)
+    elif community_room is not None:
+        if community_room.pending_backfill:
+            # Same one-time consume-before-starting reasoning as
+            # remote_room.pending_backfill above.
+            await repository.mark_lemmy_community_backfill_pending_done(room_id)
+            config = request.app.state.config
+            task = asyncio.get_running_loop().create_task(
+                _run_community_auto_backfill(
+                    request, room_id=room_id, community_room=community_room,
                     count=config.bridge.backfill_default_count,
                 )
             )

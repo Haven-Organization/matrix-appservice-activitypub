@@ -357,6 +357,18 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         return False  # never re-federate our own ghosts'/bot's own messages
 
     repository = request.app.state.repository
+    if await repository.get_lemmy_community_room_by_room_id(room_id) is not None:
+        # A mirrored Lemmy community room's own FederatedEvent records
+        # (one per mirrored post/comment) are otherwise indistinguishable
+        # from an ordinary Remote User Room's to get_federated_event_by_matrix_event
+        # below -- without this, a reply here would get resolved and
+        # delivered with the WRONG addressing (as if replying to that
+        # comment's author directly, not the community, with none of
+        # Lemmy's own audience/cc conventions). Always deferred entirely to
+        # bridge.lemmy_bridge.maybe_distribute_community_message instead,
+        # which runs later in bridge.appservice_routes' own dispatch chain.
+        return False
+
     target_event_id = _extract_reply_target_event_id(content)
     if not target_event_id:
         # A ghost DM room (bridge.note_mirroring.mirror_direct_message) has

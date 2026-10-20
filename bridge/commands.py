@@ -262,6 +262,15 @@ from bridge.inbox_dispatch import (
     _resolve_reply_header_context,
     build_preview_media_content,
 )
+from bridge.lemmy_bridge import (
+    backfill_community_posts,
+    backfill_community_thread,
+    ensure_lemmy_community_room,
+    establish_lemmy_community_follow,
+    import_lemmy_page,
+    is_lemmy_community_actor,
+    maybe_resync_community,
+)
 from bridge.matrix_links import matrix_to_link, matrix_to_room_link, room_pill_html
 from bridge.media import build_ap_attachment, fetch_and_upload_media, resolve_attachment_or_request_confirmation
 from bridge.peertube import (
@@ -329,6 +338,7 @@ from bridge.repository import (
     ActorRecord,
     FederatedEvent,
     GhostProfile,
+    LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
     RemoteActorRoom,
@@ -1592,6 +1602,33 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
             return
         handle = tagged_ghost.handle
+    elif handle.startswith(("http://", "https://")):
+        # A bare AP actor URL (e.g. pasted straight from a browser --
+        # https://instance.example/c/community or .../users/alice), not a
+        # @user@instance.org handle at all -- skip webfinger entirely
+        # (resolve_remote_actor_id requires a literal "@", so this would
+        # otherwise always fail as "Expected user@domain").
+        local_username = username_from_actor_url(config.bridge.public_base_url, handle)
+        if local_username is not None:
+            target = await repository.get_local_actor(local_username)
+            if target is None:
+                await _notice(request, room_id, f"{handle} doesn't look like an active profile on this bridge.")
+                return
+            await _follow_local_actor(request, sender=sender, room_id=room_id, target=target)
+            return
+        remote_actor_id = handle
+        try:
+            actor_doc = await fetch_actor(request, remote_actor_id)
+        except RemoteActorFetchError as exc:
+            await _notice(request, room_id, f"Could not fetch {handle}: {exc}")
+            return
+        # Nicer for notices than echoing the raw URL back -- same
+        # @user@domain shape the webfinger/mxid branches below already
+        # display.
+        domain = urlsplit(remote_actor_id).hostname
+        if domain:
+            username = actor_doc.get("preferredUsername") or remote_actor_id.rstrip("/").rsplit("/", 1)[-1]
+            handle = f"@{username}@{domain}"
     elif handle:
         mxid_match = await _resolve_mxid_handle(request, handle)
         if mxid_match is not None:
@@ -1633,20 +1670,27 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
                 return
     else:
         remote_room_here = await repository.get_remote_actor_room_by_room_id(room_id)
-        if remote_room_here is None:
+        community_room_here = (
+            await repository.get_lemmy_community_room_by_room_id(room_id) if remote_room_here is None else None
+        )
+        if remote_room_here is None and community_room_here is None:
             await _notice(
                 request, room_id,
                 f"Usage: {_COMMAND_PREFIX}follow @user@instance.org (or run this with no argument inside "
                 "that account's own room)",
             )
             return
-        remote_actor_id = remote_room_here.actor_id
+        remote_actor_id = (
+            remote_room_here.actor_id if remote_room_here is not None else community_room_here.community_actor_id
+        )
         try:
             actor_doc = await fetch_actor(request, remote_actor_id)
         except RemoteActorFetchError as exc:
             await _notice(request, room_id, f"Could not fetch {remote_actor_id}: {exc}")
             return
-        handle = remote_room_here.display_name or remote_actor_id
+        handle = (
+            remote_room_here.display_name if remote_room_here is not None else community_room_here.display_name
+        ) or remote_actor_id
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:
@@ -1686,7 +1730,39 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             except SynapseError as exc:
                 if exc.errcode != "M_FORBIDDEN":
                     logger.warning("Could not invite %s to %s: %s", sender, remote_room.room_id, exc)
+        else:
+            community_room = await repository.get_lemmy_community_room(remote_actor_id)
+            if community_room is not None:
+                try:
+                    await synapse.invite_user(community_room.room_id, sender, as_user_id=bot_mxid)
+                except SynapseError as exc:
+                    if exc.errcode != "M_FORBIDDEN":
+                        logger.warning("Could not invite %s to %s: %s", sender, community_room.room_id, exc)
         await _notice(request, room_id, f"You're already following {handle}.")
+        return
+
+    if config.bridge.lemmy_communities_enabled and await is_lemmy_community_actor(request, actor_doc):
+        followed_room_id, follow_error = await establish_lemmy_community_follow(
+            request, sender=sender, actor_record=actor_record, community_actor_id=remote_actor_id,
+            actor_doc=actor_doc, handle=handle,
+        )
+        if follow_error is not None:
+            if followed_room_id is not None:
+                await _notice(
+                    request, room_id,
+                    f"Joined the room, but delivering the Follow to {handle} failed "
+                    "(it is not retried automatically yet).",
+                )
+            else:
+                await _notice(request, room_id, f"Could not follow {handle}: {follow_error}.")
+            return
+        await _notice(
+            request, room_id, f"Following the Lemmy community {handle}. Posts will appear in {followed_room_id}.",
+            html_message=(
+                f"Following the Lemmy community {html.escape(handle)}. "
+                f"Posts will appear in {room_pill_html(followed_room_id)}."
+            ),
+        )
         return
 
     followed_room_id, follow_error = await _establish_remote_follow(
@@ -3585,6 +3661,14 @@ async def _handle_backfill(request: Request, *, sender: str, room_id: str, argum
     config = request.app.state.config
     repository = request.app.state.repository
 
+    community_room = await repository.get_lemmy_community_room_by_room_id(room_id)
+    if community_room is not None:
+        await _handle_community_backfill(
+            request, sender=sender, room_id=room_id, argument=argument, content=content,
+            community_room=community_room,
+        )
+        return
+
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
     if remote_room is None:
         await _notice(
@@ -3899,6 +3983,115 @@ async def _run_auto_backfill(request: Request, *, room_id: str, remote_room: Rem
     await _notice(request, room_id, summary)
 
 
+async def _handle_community_backfill(
+    request: Request, *, sender: str, room_id: str, argument: str, content: dict,
+    community_room: LemmyCommunityRoom,
+) -> None:
+    """The Lemmy-community counterpart of ``;backfill``'s ordinary
+    Remote-User-Room handling above -- same count-parsing/admin-gating and
+    thread-vs-outbox resolution, just dispatching to
+    ``bridge.lemmy_bridge.backfill_community_posts``/
+    ``backfill_community_thread`` instead, which land each result in the
+    shared community room rather than a 1:1 room."""
+    config = request.app.state.config
+    repository = request.app.state.repository
+
+    argument = argument.strip()
+    if argument:
+        if not await _is_matrix_admin(request, sender):
+            await _notice(request, room_id, "Only a Matrix server admin can choose a custom backfill count.")
+            return
+        try:
+            count = int(argument)
+        except ValueError:
+            await _notice(request, room_id, f'"{argument}" isn\'t a number.')
+            return
+        if count <= 0:
+            await _notice(request, room_id, "Give a positive number of posts to backfill.")
+            return
+    else:
+        count = config.bridge.backfill_default_count
+
+    root_event = None
+    relates_to = content.get("m.relates_to") or {}
+    if relates_to.get("rel_type") == "m.thread":
+        thread_root_event_id = relates_to.get("event_id")
+        if thread_root_event_id:
+            root_event = await repository.get_federated_event_by_matrix_event(thread_root_event_id)
+            if root_event is None or root_event.room_id != room_id:
+                await _notice(
+                    request, room_id, "That thread isn't one I'm tracking -- can't tell which post/comment it maps to.",
+                )
+                return
+
+    await _notice(
+        request, room_id,
+        f"Backfilling up to {count} {'replies' if root_event else 'posts'} -- this can take a while. "
+        "I'll post a summary here when it's done.",
+    )
+    task = asyncio.get_running_loop().create_task(
+        _run_community_backfill(request, room_id=room_id, community_room=community_room, count=count, root_event=root_event)
+    )
+    _RUNNING_BACKFILLS.add(task)
+    task.add_done_callback(_RUNNING_BACKFILLS.discard)
+
+
+async def _run_community_backfill(
+    request: Request, *, room_id: str, community_room: LemmyCommunityRoom, count: int,
+    root_event: FederatedEvent | None,
+) -> None:
+    """The background half of ``_handle_community_backfill``."""
+    try:
+        if root_event is not None:
+            imported, already, failed = await backfill_community_thread(
+                request, community_room=community_room, root_event=root_event, count=count,
+            )
+        else:
+            imported, already, failed = await backfill_community_posts(
+                request, community_room=community_room, count=count,
+            )
+    except Exception:
+        logger.exception("Community backfill crashed in %s", room_id)
+        await _notice(request, room_id, "Backfill hit an unexpected error and stopped early.")
+        return
+
+    summary = f"Backfill finished: {imported} post(s) mirrored, {already} already here"
+    if failed:
+        summary += f", {failed} couldn't be mirrored"
+    summary += "."
+    await _notice(request, room_id, summary)
+
+
+async def _run_community_auto_backfill(
+    request: Request, *, room_id: str, community_room: LemmyCommunityRoom, count: int,
+) -> None:
+    """The one-time auto-backfill a brand-new Lemmy community follow's
+    first join triggers (see ``bridge.membership.maybe_handle_join``, which
+    consumes ``LemmyCommunityRoom.pending_backfill`` before calling this) --
+    same mechanism/notice style as ``_run_auto_backfill``, always the
+    community's outbox (never a thread -- there's no Matrix thread to be
+    inside yet for a room that was just created and hasn't even been
+    joined)."""
+    await _notice(
+        request, room_id,
+        f"New follow -- backfilling this community's latest {count} posts now. "
+        "I'll post a summary here when it's done.",
+    )
+    try:
+        imported, already, failed = await backfill_community_posts(
+            request, community_room=community_room, count=count,
+        )
+    except Exception:
+        logger.exception("Community auto-backfill crashed in %s", room_id)
+        return
+
+    summary = f"Backfill finished: {imported} post(s) mirrored, {already} already here"
+    if failed:
+        summary += f", {failed} couldn't be mirrored"
+    summary += "."
+    await _notice(request, room_id, summary)
+
+
 async def _handle_widget(request: Request, *, room_id: str) -> None:
     """Adds this bridge's room widget (``bridge.widget``) to the current
     room, on explicit ``;widget`` request -- see
@@ -3918,6 +4111,38 @@ async def _handle_widget(request: Request, *, room_id: str) -> None:
         )
     else:
         await _notice(request, room_id, "Could not add the widget -- check the bridge's logs.")
+
+
+async def _resolve_page_community(request: Request, page: dict) -> str | None:
+    """Find which Lemmy community a standalone ``Page`` (post) belongs to
+    for ``;import`` -- its own ``audience`` field names the community
+    directly (Lemmy's own convention, confirmed against join-lemmy.org's
+    federation docs: a real ``Page``'s ``audience`` is its community's
+    actor id). Falls back to checking ``cc``/``to`` entries for something
+    that actually resolves to a real Lemmy community, in case ``audience``
+    is ever missing."""
+    audience = page.get("audience")
+    if isinstance(audience, str):
+        return audience
+
+    candidates: list[str] = []
+    for field in ("cc", "to"):
+        value = page.get(field)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(v for v in value if isinstance(v, str))
+
+    for candidate in candidates:
+        if candidate == AS_PUBLIC:
+            continue
+        try:
+            candidate_doc = await fetch_actor(request, candidate)
+        except RemoteActorFetchError:
+            continue
+        if await is_lemmy_community_actor(request, candidate_doc):
+            return candidate
+    return None
 
 
 async def _handle_import(request: Request, *, sender: str, room_id: str, url: str) -> None:
@@ -3975,7 +4200,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             await _notice(request, room_id, f"Could not fetch {url}: {exc}")
             return
 
-    if obj.get("type") not in ("Note", "Question", "Video"):
+    if obj.get("type") not in ("Note", "Question", "Video", "Page"):
         await _notice(request, room_id, f"{url} doesn't look like a fediverse post (got {obj.get('type')!r}).")
         return
 
@@ -4075,6 +4300,51 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         if new_federated_event is None:
             await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
             return
+        await _notice(
+            request, room_id,
+            f"Imported: {matrix_to_link(new_federated_event.room_id, new_federated_event.event_id)}",
+        )
+        return
+
+    if obj.get("type") == "Page":
+        # A standalone Lemmy post -- belongs in its COMMUNITY's own shared
+        # room (see bridge.lemmy_bridge), never a 1:1 Remote User Room the
+        # way a Note/Video/Question's own author gets one: comments on it
+        # (a later ;backfill, or live replies) are threaded against the
+        # community room specifically. No reply-chain-walk concept applies
+        # here either (a Page is never itself a reply -- only a Note/
+        # comment can be).
+        if not config.bridge.lemmy_communities_enabled:
+            await _notice(request, room_id, "Lemmy community support isn't enabled on this bridge.")
+            return
+        community_actor_id = await _resolve_page_community(request, obj)
+        if community_actor_id is None:
+            await _notice(request, room_id, f"Could not tell which Lemmy community {url} belongs to.")
+            return
+        try:
+            community_doc = await fetch_actor(request, community_actor_id)
+        except RemoteActorFetchError as exc:
+            await _notice(
+                request, room_id, f"Could not fetch that post's community ({community_actor_id}): {exc}",
+            )
+            return
+        community_room = await ensure_lemmy_community_room(
+            request, community_actor_id=community_actor_id, actor_doc=community_doc,
+        )
+        if community_room is None:
+            await _notice(request, room_id, f"Could not set up a room to import {url} into.")
+            return
+        new_federated_event = await import_lemmy_page(
+            request, page=obj, author_actor_id=author_actor_id, community_room=community_room,
+        )
+        if new_federated_event is None:
+            await _notice(request, room_id, f"Fetched {url}, but failed to post it into Matrix.")
+            return
+        try:
+            await synapse.invite_user(community_room.room_id, sender, as_user_id=bot_mxid)
+        except SynapseError as exc:
+            if exc.errcode != "M_FORBIDDEN":
+                logger.warning("Could not invite %s to %s: %s", sender, community_room.room_id, exc)
         await _notice(
             request, room_id,
             f"Imported: {matrix_to_link(new_federated_event.room_id, new_federated_event.event_id)}",
@@ -4464,6 +4734,14 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     ``bridge.channel_bridge.ensure_channel_room``) -- any current member of
     the guild's Space can join one freely, no elevated power needed at all,
     so being present in one is a much weaker signal of trust than it looks.
+
+    Bare ``;refresh`` run inside a mirrored Lemmy community room instead
+    resyncs that community's own name/topic/avatar and moderator list right
+    now (``bridge.lemmy_bridge.maybe_resync_community``, bypassing its
+    usual debounce since this is an explicit request) -- same "not owned
+    by anyone on the Matrix side" reasoning as guild Channel rooms, so no
+    elevated power is required here either; the per-room resync lock still
+    applies.
     """
     if argument.strip() == "guild":
         await _handle_refresh_guild(request, sender=sender, room_id=room_id)
@@ -4476,6 +4754,11 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
         return
 
     if not argument.strip():
+        resynced = await maybe_resync_community(request, room_id=room_id, reason="manual", bypass_debounce=True)
+        if resynced:
+            await _notice(request, room_id, "Resyncing this community now.")
+            return
+
         poll_target = await _resolve_poll_refresh_target(request, content)
         if poll_target is not None:
             if await refresh_poll_tallies(request, target=poll_target):

@@ -32,6 +32,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
@@ -502,6 +503,20 @@ _SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_peertube_channels_owner ON peertube_channels (owner_username)",
+    # A mirrored Lemmy community (see LemmyCommunityRoom's own docstring for
+    # why it has no ghost_user_id column, unlike remote_actor_rooms).
+    """
+    CREATE TABLE IF NOT EXISTS lemmy_community_rooms (
+        community_actor_id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        icon_url TEXT,
+        banner_url TEXT,
+        moderators_url TEXT,
+        pending_backfill BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+    "ALTER TABLE lemmy_community_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
 ]
 
 _TRANSACTION_RETENTION_SECONDS = 7 * 24 * 3600
@@ -1397,6 +1412,48 @@ class PostgresActorRepository:
         await self._pool.execute(
             "INSERT INTO channel_room_members (room_id, member_actor_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             room_id, member_actor_id,
+        )
+
+    @staticmethod
+    def _row_to_lemmy_community_room(row) -> LemmyCommunityRoom:
+        return LemmyCommunityRoom(
+            community_actor_id=row["community_actor_id"], room_id=row["room_id"],
+            display_name=row["display_name"], icon_url=row["icon_url"], banner_url=row["banner_url"],
+            moderators_url=row["moderators_url"], pending_backfill=row["pending_backfill"],
+        )
+
+    async def get_lemmy_community_room(self, community_actor_id: str) -> LemmyCommunityRoom | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM lemmy_community_rooms WHERE community_actor_id = $1", community_actor_id
+        )
+        return self._row_to_lemmy_community_room(row) if row else None
+
+    async def get_lemmy_community_room_by_room_id(self, room_id: str) -> LemmyCommunityRoom | None:
+        row = await self._pool.fetchrow("SELECT * FROM lemmy_community_rooms WHERE room_id = $1", room_id)
+        return self._row_to_lemmy_community_room(row) if row else None
+
+    async def register_lemmy_community_room(self, record: LemmyCommunityRoom) -> None:
+        # pending_backfill is deliberately NOT in the DO UPDATE SET below --
+        # same reasoning as RemoteActorRoom's identical omission: only
+        # mark_lemmy_community_backfill_pending_done is allowed to change it
+        # after the row's first creation.
+        await self._pool.execute(
+            """
+            INSERT INTO lemmy_community_rooms
+                (community_actor_id, room_id, display_name, icon_url, banner_url, moderators_url, pending_backfill)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (community_actor_id) DO UPDATE SET
+                room_id = EXCLUDED.room_id, display_name = EXCLUDED.display_name,
+                icon_url = EXCLUDED.icon_url, banner_url = EXCLUDED.banner_url,
+                moderators_url = EXCLUDED.moderators_url
+            """,
+            record.community_actor_id, record.room_id, record.display_name,
+            record.icon_url, record.banner_url, record.moderators_url, record.pending_backfill,
+        )
+
+    async def mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        await self._pool.execute(
+            "UPDATE lemmy_community_rooms SET pending_backfill = FALSE WHERE room_id = $1", room_id
         )
 
     # -- bot DM rooms --------------------------------------------------------

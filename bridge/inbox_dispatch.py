@@ -127,6 +127,11 @@ from bridge.repository import (
     RemoteActorRoom,
 )
 from bridge.channel_bridge import ensure_channel_room, maybe_handle_channel_message
+from bridge.lemmy_bridge import (
+    maybe_handle_community_announce,
+    maybe_handle_community_actor_update,
+    maybe_handle_community_mod_list_change,
+)
 from bridge.peertube import record_video_view
 from bridge.spaces import ensure_guild_space
 from bridge.synapse_client import SynapseError
@@ -2630,6 +2635,14 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     if await maybe_handle_channel_message(request, activity):
         return
 
+    # A mirrored Lemmy community's own fan-out of a post/comment is ALSO an
+    # Announce (activity.actor is the community itself) -- same divert-
+    # before-repost-logic reasoning as the Shoot channel-message check
+    # above, see bridge.lemmy_bridge.maybe_handle_community_announce's own
+    # docstring.
+    if await maybe_handle_community_announce(request, activity):
+        return
+
     reposted_id = activity.object_id()
     reposted_target = await repository.get_federated_event_by_ap_object(reposted_id) if reposted_id else None
     if reposted_target is not None:
@@ -3116,6 +3129,9 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     if not isinstance(obj, dict) or obj.get("type") not in _ACTOR_TYPES:
         return  # not a profile update we care about
 
+    if await maybe_handle_community_actor_update(request, obj):
+        return
+
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room(activity.actor)
     if remote_room is None:
@@ -3272,30 +3288,46 @@ async def _handle_note_update(request: Request, obj: dict) -> None:
 
 
 async def _handle_add(request: Request, username: str, activity: Activity) -> None:
-    """A followed remote actor pinned one of their own posts -- mirror it
-    into their Remote User Room's own ``m.room.pinned_events``, so Element
-    shows the same pinned-post indicator a real fediverse client would (see
-    ``bridge.pinned_posts`` for the OUTBOUND half of this feature).
+    """A followed remote actor pinned one of their own posts, or a mirrored
+    Lemmy community's moderator list changed -- see
+    ``_handle_pin_or_mod_activity``'s own docstring for how these are told
+    apart.
 
     ``Add`` is also legitimately used in AS2 for unrelated things (e.g.
-    PeerTube's "add a video to a playlist") -- ``_handle_pin_activity``'s
-    own ``target`` check is what tells a genuine pin apart from those."""
-    await _handle_pin_activity(request, activity, pin=True)
+    PeerTube's "add a video to a playlist") -- the ``target`` check below
+    is what tells a genuine pin/mod-list change apart from those."""
+    await _handle_pin_or_mod_activity(request, activity, add=True)
 
 
 async def _handle_remove(request: Request, username: str, activity: Activity) -> None:
     """The inverse of ``_handle_add`` -- see its docstring."""
-    await _handle_pin_activity(request, activity, pin=False)
+    await _handle_pin_or_mod_activity(request, activity, add=False)
 
 
-async def _handle_pin_activity(request: Request, activity: Activity, *, pin: bool) -> None:
+async def _handle_pin_or_mod_activity(request: Request, activity: Activity, *, add: bool) -> None:
     target = activity.target_id()
-    if not target or not any(marker in target.lower() for marker in ("featured", "pinned")):
+    if not target:
+        return
+    target_lower = target.lower()
+    if "moderators" in target_lower:
+        await maybe_handle_community_mod_list_change(request, activity, added=add)
+        return
+    if not any(marker in target_lower for marker in ("featured", "pinned")):
         # Not a pinned-posts Add/Remove (or we can't tell) -- e.g. a
         # PeerTube playlist membership change. Nothing for this bridge to
         # do with it.
         return
+    await _handle_pin_activity(request, activity, pin=add)
 
+
+async def _handle_pin_activity(request: Request, activity: Activity, *, pin: bool) -> None:
+    """A followed remote actor pinned/unpinned one of their own posts --
+    mirror it into their Remote User Room's own ``m.room.pinned_events``,
+    so Element shows the same pinned-post indicator a real fediverse
+    client would (see ``bridge.pinned_posts`` for the OUTBOUND half of
+    this feature). Called only once ``_handle_pin_or_mod_activity`` has
+    already confirmed ``activity.target_id()`` looks like a genuine
+    featured/pinned collection, not a moderators one."""
     object_id = activity.object_id()
     if not object_id:
         return

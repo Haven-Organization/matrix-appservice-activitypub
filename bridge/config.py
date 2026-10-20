@@ -275,6 +275,19 @@ class BridgeSection:
     # declared file size (part of the AP object already, no extra request
     # needed) before ever starting a download.
     follow_video_max_embed_mb: int = 100
+    # Whether following a Lemmy community (a Group actor with its own
+    # moderators collection) mirrors it as a shared Matrix room, with each
+    # remote poster/commenter as their own ghost and real community
+    # moderators mapped to Matrix power level 50. Off by default: a real,
+    # substantial behavior change, same reasoning as peertube_channels_enabled.
+    lemmy_communities_enabled: bool = False
+    # Minimum seconds between automatic resyncs of the same mirrored Lemmy
+    # community room (re-checking its name/topic/avatar and moderator list)
+    # -- a burst of several triggering activities in a row (e.g. a mod
+    # editing several settings back to back, or several Add/Remove
+    # moderator activities) shouldn't each force their own full re-fetch.
+    # ";refresh" always bypasses this and resyncs immediately.
+    lemmy_community_resync_min_interval_seconds: int = 60
     # Whether a remote actor's reply into a conversation that's ALREADY
     # tracked here also gets an annotated "⤵️ Reply to X's post" copy
     # posted into THEIR OWN Remote User Room (not just threaded into the
@@ -511,6 +524,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         follow_video_max_embed_mb=int(bridge_raw.get("follow_video_max_embed_mb", 100)),
         reply_cross_post_mode=reply_cross_post_mode,
         instance_admin_username=bridge_raw.get("instance_admin_username") or None,
+        lemmy_communities_enabled=bool(bridge_raw.get("lemmy_communities_enabled", False)),
+        lemmy_community_resync_min_interval_seconds=int(
+            bridge_raw.get("lemmy_community_resync_min_interval_seconds", 60)
+        ),
     )
 
     synapse_section = SynapseSection(

@@ -80,6 +80,10 @@ logger = logging.getLogger(__name__)
 # bridge's choice.
 SOCIAL_PROFILE_ROOM_TYPE = "org.matrix.msc4501.social.profile"
 
+# MSC4501's "Group rooms" -- a shared social space with no single owner,
+# set on a mirrored Lemmy community's own room (see bridge.lemmy_bridge).
+SOCIAL_GROUP_ROOM_TYPE = "org.matrix.msc4501.social.group"
+
 # MSC4501's other piece: a per-user profile field (via MSC4133 Extensible
 # Profiles) pointing at which room is "the" official profile for that
 # account, since a room merely being SOCIAL_PROFILE_ROOM_TYPE doesn't by
