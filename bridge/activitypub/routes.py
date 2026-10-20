@@ -69,6 +69,7 @@ from bridge.activitypub.urls import (
     inbox_url,
     main_key_id,
     media_url,
+    moderators_url,
     outbox_url,
     shared_inbox_url,
     username_from_actor_url,
@@ -90,7 +91,13 @@ from bridge.peertube import (
     resolve_media_type,
 )
 from bridge.reply_bridge import derive_in_reply_to
-from bridge.repository import ActorRecord, ActorRepository, FederatedEvent, PeerTubeChannelRecord
+from bridge.repository import (
+    ActorRecord,
+    ActorRepository,
+    FederatedEvent,
+    LemmyCommunityRecord,
+    PeerTubeChannelRecord,
+)
 from bridge.synapse_client import SynapseError
 from bridge.web_views import (
     PersonRef,
@@ -149,13 +156,15 @@ async def _get_actor_record(request: Request, username: str):
     return record
 
 
-async def _get_actor_or_channel_record(request: Request, username: str) -> ActorRecord | PeerTubeChannelRecord:
+async def _get_actor_or_channel_record(
+    request: Request, username: str
+) -> ActorRecord | PeerTubeChannelRecord | LemmyCommunityRecord:
     """Same as ``_get_actor_record``, but also resolves a PeerTube channel
-    username (see ``PeerTubeChannelRecord``'s docstring on why the two
-    share one global namespace) -- for routes that don't need to build a
-    full Actor document, like ``get_followers``/``get_following``/
-    ``post_inbox``, and so work identically for either kind of local
-    actor."""
+    or a hosted Lemmy community username (see ``PeerTubeChannelRecord``'s/
+    ``LemmyCommunityRecord``'s own docstrings on why all three share one
+    global namespace) -- for routes that don't need to build a full Actor
+    document, like ``get_followers``/``get_following``/``post_inbox``, and
+    so work identically for any kind of local actor."""
     repository: ActorRepository = request.app.state.repository
     record = await repository.get_local_actor(username)
     if record is not None:
@@ -163,6 +172,9 @@ async def _get_actor_or_channel_record(request: Request, username: str) -> Actor
     channel = await repository.get_peertube_channel(username)
     if channel is not None:
         return channel
+    community = await repository.get_lemmy_community(username)
+    if community is not None:
+        return community
     raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
 
@@ -276,6 +288,45 @@ async def _build_channel_actor(request: Request, channel: PeerTubeChannelRecord)
             id=main_key_id(base, channel.username),
             owner=actor_url(base, channel.username),
             public_key_pem=channel.public_key_pem,
+        ),
+    )
+
+
+async def _build_community_actor(request: Request, community: LemmyCommunityRecord) -> Actor:
+    """Build the served Actor document for a hosted Lemmy community: a
+    ``Group``-typed actor, unlike ``_build_actor``'s ``Person`` --
+    structurally close to ``_build_channel_actor`` above, with one real
+    difference: ``attributedTo`` here is a single bare URL naming this
+    community's own ``/moderators`` collection (see ``Actor.attributed_to``'s
+    own docstring for why that differs from a PeerTube channel's
+    ``attributed_to_urls``, a literal list of owning-account actor ids),
+    matching real Lemmy's own convention."""
+    base = request.app.state.config.bridge.public_base_url
+    display_name = community.display_name or community.username
+    summary = plain_text_to_note_html(community.summary) if community.summary else community.summary
+    return Actor(
+        id=actor_url(base, community.username),
+        type="Group",
+        preferred_username=community.username,
+        name=display_name,
+        summary=summary,
+        url=actor_url(base, community.username),
+        inbox=inbox_url(base, community.username),
+        outbox=outbox_url(base, community.username),
+        followers=followers_url(base, community.username),
+        following=following_url(base, community.username),
+        featured_url=featured_url(base, community.username),
+        attributed_to=moderators_url(base, community.username),
+        discoverable=True,
+        icon_url=community.icon_url,
+        icon_media_type=await resolve_media_type(request, community.icon_url),
+        image_url=community.banner_url,
+        image_media_type=await resolve_media_type(request, community.banner_url),
+        shared_inbox=shared_inbox_url(base),
+        public_key=PublicKey(
+            id=main_key_id(base, community.username),
+            owner=actor_url(base, community.username),
+            public_key_pem=community.public_key_pem,
         ),
     )
 
@@ -445,6 +496,9 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
         channel = await repository.get_peertube_channel(username)
         resolved_username = channel.username if channel is not None else None
     if resolved_username is None:
+        community = await repository.get_lemmy_community(username)
+        resolved_username = community.username if community is not None else None
+    if resolved_username is None:
         raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
     document = build_local_webfinger_document(
@@ -504,7 +558,15 @@ async def get_actor(request: Request, username: str) -> Response:
     if record is None:
         channel = await repository.get_peertube_channel(username)
         if channel is None:
-            raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+            community = await repository.get_lemmy_community(username)
+            if community is None:
+                raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+            # No dedicated HTML browse page for a hosted community yet
+            # (unlike a Profile/channel) -- serves its AP document either
+            # way for now; a real page is a reasonable future addition,
+            # not something federation itself needs.
+            actor = await _build_community_actor(request, community)
+            return _activity_json(actor.to_dict())
         if _prefers_html(request):
             config = request.app.state.config
             owner = await repository.get_local_actor(channel.owner_username)
@@ -1445,7 +1507,21 @@ async def get_outbox(request: Request, username: str) -> JSONResponse:
     if record is None:
         channel = await repository.get_peertube_channel(username)
         if channel is None:
-            raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+            community = await repository.get_lemmy_community(username)
+            if community is None:
+                raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+            # Real-time delivery at post time reaches whoever already
+            # follows us directly, but a profile page fetched fresh by a
+            # remote server that has never followed us (or is only now
+            # resolving us for the first time) reads THIS collection, not
+            # that history -- confirmed live 2026-10-19: a real post
+            # existed, but https://poa.st/@haven@glowers.club still showed
+            # no posts at all, since this previously returned permanently
+            # empty. See _fetch_community_outbox_items for what it actually
+            # covers (local-member posts only, for now).
+            items = await _fetch_community_outbox_items(request, community=community, base=base)
+            collection = OrderedCollection(id=outbox_url(base, username), items=items, embed_first=False)
+            return _collection_or_page(request, collection)
         items = await _fetch_channel_outbox_items(request, channel=channel, base=base)
         collection = OrderedCollection(id=outbox_url(base, username), items=items, embed_first=False)
         return _collection_or_page(request, collection)
@@ -1638,6 +1714,158 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     # delivered Create (which DOES carry @context, inherited by its
     # embedded object) had it right from the start.
     return _activity_json({"@context": JSON_LD_CONTEXT, **note.to_dict()})
+
+
+async def _reconstruct_lemmy_page(
+    request: Request, *, federated: FederatedEvent, community: LemmyCommunityRecord, base: str,
+) -> dict | None:
+    """Rebuild a hosted community's top-level ``Page`` post from whichever
+    Matrix event actually mirrors it -- shared by ``get_lemmy_post`` (a
+    single post fetched by its own IRI) and ``_fetch_community_outbox_items``
+    (every one of them, for the community's own outbox), so both always
+    agree and an edit is reflected in either. Returns ``None`` if the
+    underlying Matrix event is gone, or a redaction emptied it (see
+    ``get_note``'s identical "nothing here" check -- same reasoning)."""
+    bot_mxid = f"@{request.app.state.config.appservice.bot_localpart}:{request.app.state.config.synapse.server_name}"
+    try:
+        matrix_event = await request.app.state.synapse.get_event(
+            federated.room_id, federated.event_id, as_user_id=bot_mxid
+        )
+    except SynapseError:
+        return None
+
+    event_content = _effective_event_content(matrix_event)
+    from bridge.lemmy_bridge import _title_and_body_from_message
+
+    title, body = _title_and_body_from_message((event_content.get("body") or "").strip())
+    if not title:
+        return None
+
+    community_actor_id = actor_url(base, community.username)
+    return {
+        "id": federated.ap_object_id,
+        "type": "Page",
+        "attributedTo": federated.author_actor_id,
+        "name": title,
+        "content": plain_text_to_note_html(body) if body else "",
+        "mediaType": "text/html",
+        "published": _matrix_ts_to_iso(matrix_event.get("origin_server_ts")),
+        "to": [community_actor_id, AS_PUBLIC],
+        "cc": [],
+        "audience": community_actor_id,
+    }
+
+
+async def _list_owned_community_post_events(
+    request: Request, *, community: LemmyCommunityRecord, base: str,
+) -> list[FederatedEvent]:
+    """Every currently-live top-level post in ``community``'s own room,
+    newest first -- the community-outbox counterpart to
+    ``_fetch_room_outbox_notes``, same "scan recent room history, keep what
+    resolves to a real distributed post" approach.
+
+    Scoped to posts authored by one of OUR OWN linked members for now (a
+    remote member's post imported via ``maybe_handle_owned_community_create``
+    keeps the REMOTE author's own ``ap_object_id``/key, which this bridge
+    has no way to re-sign a reconstructed ``Create`` for) -- an explicit,
+    narrower version of this route's previous "permanently empty" scope cut,
+    not the whole fix; a real reconstruction for remote-authored posts is a
+    reasonable future addition if this turns out to matter in practice."""
+    repository: ActorRepository = request.app.state.repository
+    bot_mxid = f"@{request.app.state.config.appservice.bot_localpart}:{request.app.state.config.synapse.server_name}"
+    try:
+        history = await request.app.state.synapse.get_room_messages(
+            community.room_id, limit=OUTBOX_HISTORY_LIMIT, direction="b", as_user_id=bot_mxid
+        )
+    except (SynapseError, httpx.HTTPError):
+        logger.warning("Failed to fetch history for %s's outbox", community.username, exc_info=True)
+        return []
+
+    events: list[FederatedEvent] = []
+    for matrix_event in history.get("chunk", []):
+        if matrix_event.get("type") != "m.room.message":
+            continue
+        event_id = matrix_event.get("event_id")
+        if not event_id:
+            continue
+        federated = await repository.get_federated_event_by_matrix_event(event_id)
+        if federated is None or federated.thread_root_event_id is not None:
+            continue
+        if username_from_actor_url(base, federated.author_actor_id) is None:
+            continue  # remote-authored import -- see this function's own docstring
+        events.append(federated)
+    return events
+
+
+async def _fetch_community_outbox_items(
+    request: Request, *, community: LemmyCommunityRecord, base: str,
+) -> list[dict]:
+    """A hosted Lemmy community's outbox: every currently-live local-member
+    top-level post, each reconstructed as its own Create+Announce pair --
+    same ``Announce{Create{Page}}`` shape real Lemmy itself uses for a
+    community outbox (confirmed earlier against real captured
+    ``sh.itjust.works`` data, see ``bridge.lemmy_bridge.
+    _page_and_author_from_item``'s own Announce-unwrapping), with
+    deterministic ids so a remote server recognizes a repeat fetch as the
+    same activities rather than new ones (same reasoning as
+    ``bridge.peertube.reconstruct_video_activities``)."""
+    community_actor_id = actor_url(base, community.username)
+    items: list[dict] = []
+    for federated in await _list_owned_community_post_events(request, community=community, base=base):
+        page = await _reconstruct_lemmy_page(request, federated=federated, community=community, base=base)
+        if page is None:
+            continue
+        create_activity = Activity(
+            id=f"{federated.ap_object_id}/activity", type="Create", actor=federated.author_actor_id,
+            object=page, published=page["published"], to=[AS_PUBLIC], cc=[community_actor_id],
+            audience=community_actor_id,
+        )
+        announce_activity = Activity(
+            id=f"{federated.ap_object_id}/announces/outbox", type="Announce", actor=community_actor_id,
+            object=federated.ap_object_id, published=page["published"], to=[AS_PUBLIC],
+            cc=[followers_url(base, community.username)],
+        )
+        items.append(create_activity.to_dict())
+        items.append(announce_activity.to_dict())
+    return items
+
+
+@router.api_route("/actor/{username}/posts/{post_id}", methods=["GET", "HEAD"])
+async def get_lemmy_post(request: Request, username: str, post_id: str) -> Response:
+    """Serve a single hosted-Lemmy-community top-level post at its own AP
+    object IRI -- the ``Page`` counterpart to ``get_note`` above, needed for
+    the exact same reason: a plain ``;repost`` of one of these (send_repost's
+    own Announce references the post by bare ``id`` string, same as any
+    other post) 404s without this route, confirmed live 2026-10-19 (a real
+    repost of a real Haven-community test post never showed up on poa.st --
+    this was the missing piece, not a delivery/signature problem; a direct
+    re-delivery of the real Announce to a real poa.st inbox got a clean 2xx).
+
+    Reconstructs the Page via ``_reconstruct_lemmy_page`` -- see that
+    function for why an edit is reflected here too, same as ``get_note``."""
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    await _get_actor_record(request, username)
+    repository: ActorRepository = request.app.state.repository
+
+    ap_object_id = f"{base}/actor/{username}/posts/{post_id}"
+    federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if federated is None or federated.author_actor_id != actor_url(base, username):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    community = await repository.get_lemmy_community_by_room_id(federated.room_id)
+    if community is None or await _is_private_room(repository, federated.room_id):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    page = await _reconstruct_lemmy_page(request, federated=federated, community=community, base=base)
+    if page is None:
+        # A redaction empties `content` the same way get_note's own comment
+        # explains -- the FederatedEvent row survives, so this route must
+        # stop serving the vanished post rather than re-serve it blank
+        # forever (same "nothing here" test as get_note/get_outbox).
+        raise HTTPException(status_code=410, detail="Gone")
+
+    return _activity_json({"@context": JSON_LD_CONTEXT, **page})
 
 
 async def _build_video_view(
@@ -1858,9 +2086,14 @@ async def get_followers(request: Request, username: str) -> JSONResponse:
     followers = await repository.list_followers(username)
     # Owner hid the list (see bridge.identity_settings, ";set hide_followers
     # on"). The count stays real and public, only the member list is
-    # withheld. "hide_followers" doesn't apply to a channel identity (see
-    # the registry's applies_to), so a channel's list is never hidden.
-    identity_kind = "channel" if isinstance(record, PeerTubeChannelRecord) else "profile"
+    # withheld. "hide_followers" doesn't apply to a channel or a Lemmy
+    # community identity (see the registry's applies_to), so neither's
+    # list is ever hidden.
+    identity_kind = (
+        "channel" if isinstance(record, PeerTubeChannelRecord)
+        else "community" if isinstance(record, LemmyCommunityRecord)
+        else "profile"
+    )
     hidden = identity_kind == "profile" and await get_effective_setting(
         repository, username, identity_kind, "hide_followers"
     )
@@ -1878,7 +2111,11 @@ async def get_following(request: Request, username: str) -> JSONResponse:
     record = await _get_actor_or_channel_record(request, username)
     repository: ActorRepository = request.app.state.repository
     following = await repository.list_following(username)
-    identity_kind = "channel" if isinstance(record, PeerTubeChannelRecord) else "profile"
+    identity_kind = (
+        "channel" if isinstance(record, PeerTubeChannelRecord)
+        else "community" if isinstance(record, LemmyCommunityRecord)
+        else "profile"
+    )
     hidden = identity_kind == "profile" and await get_effective_setting(
         repository, username, identity_kind, "hide_following"
     )
@@ -1890,6 +2127,24 @@ async def get_following(request: Request, username: str) -> JSONResponse:
     return _collection_or_page(request, collection)
 
 
+@router.api_route("/moderators/{username}", methods=["GET", "HEAD"])
+async def get_moderators(request: Request, username: str) -> JSONResponse:
+    """A hosted Lemmy community's own real moderator list, as Lemmy's own
+    ``attributedTo``-named collection convention (see
+    ``bridge.lemmy_bridge``'s module docstring) -- this route is what that
+    field actually points at. Permanently empty for anything that isn't a
+    hosted community (a Profile or a PeerTube channel has no equivalent
+    concept)."""
+    base = request.app.state.config.bridge.public_base_url
+    record = await _get_actor_or_channel_record(request, username)
+    if not isinstance(record, LemmyCommunityRecord):
+        collection = OrderedCollection(id=moderators_url(base, username), items=[], embed_first=False)
+        return _collection_or_page(request, collection)
+
+    collection = OrderedCollection(id=moderators_url(base, username), items=list(record.moderator_actor_ids))
+    return _collection_or_page(request, collection)
+
+
 @router.api_route("/featured/{username}", methods=["GET", "HEAD"])
 async def get_featured(request: Request, username: str) -> JSONResponse:
     """A local actor's pinned posts, as Mastodon/Pleroma/Akkoma's own
@@ -1898,12 +2153,13 @@ async def get_featured(request: Request, username: str) -> JSONResponse:
     feature; this route and ``_fetch_featured_notes`` are the other half
     (AP collection reflecting current ``m.room.pinned_events`` state).
 
-    Permanently empty for a PeerTube channel (Group actor) -- pinning is
-    scoped to ordinary Person profiles only for v1, same as
-    ``get_playlists``'s identical stub-for-the-wrong-actor-kind reasoning."""
+    Permanently empty for a PeerTube channel or a hosted Lemmy community
+    (both Group actors) -- pinning is scoped to ordinary Person profiles
+    only for v1, same as ``get_playlists``'s identical
+    stub-for-the-wrong-actor-kind reasoning."""
     base = request.app.state.config.bridge.public_base_url
     record = await _get_actor_or_channel_record(request, username)
-    if isinstance(record, PeerTubeChannelRecord):
+    if isinstance(record, (PeerTubeChannelRecord, LemmyCommunityRecord)):
         collection = OrderedCollection(id=featured_url(base, username), items=[], embed_first=False)
         return _collection_or_page(request, collection)
 

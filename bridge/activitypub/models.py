@@ -146,6 +146,15 @@ class Actor:
     # (pointing back at the Person that owns it). Never set for an
     # ordinary Person profile, which has no owner of its own to name.
     attributed_to_urls: list[str] | None = None
+    # A hosted Lemmy community's own moderators collection URL -- unlike
+    # PeerTube's attributed_to_urls above (a LIST of real actor ids), real
+    # Lemmy communities serve attributedTo as a single bare collection URL
+    # (confirmed live 2026-10-20 against a real community actor document --
+    # see bridge.lemmy_bridge's own docstring). Takes priority over
+    # attributed_to_urls in to_dict() if both are somehow set, which never
+    # happens in practice (nothing is both a PeerTube channel and a Lemmy
+    # community).
+    attributed_to: str | None = None
     # Mastodon's toot:discoverable/toot:indexable extension (see
     # JSON_LD_CONTEXT's own comment) -- also confirmed live on that same
     # real channel actor, both true. Plausibly load-bearing for whether a
@@ -189,7 +198,7 @@ class Actor:
                 "following": self.following,
                 "playlists": self.playlists_url,
                 "featured": self.featured_url,
-                "attributedTo": self.attributed_to_urls,
+                "attributedTo": self.attributed_to if self.attributed_to is not None else self.attributed_to_urls,
                 "discoverable": self.discoverable,
                 "indexable": self.discoverable,
                 "publicKey": self.public_key.to_dict(),
@@ -418,6 +427,16 @@ class Activity:
     # reaction back out (outbound). Absent (empty) for every other activity
     # type.
     tag: list[dict[str, Any]] = field(default_factory=list)
+    # A real Lemmy community's own outbox Create (wrapping a member's Page)
+    # sets `audience` on the CREATE ITSELF, not just its embedded Page --
+    # confirmed against real sh.itjust.works/c/funny data 2026-10-20, and
+    # missing here turned out to be why a hosted community's own outbound
+    # Create<Page> got a clean 2xx from real Pleroma/Akkoma inboxes
+    # (federation.network, poa.st) but never actually got ingested
+    # (`statuses_count` stayed 0 for the posting account's own backend
+    # record) -- their Group/community handling apparently keys off this.
+    # Absent for every other activity type.
+    audience: str | None = None
     # FEP-bebd's invite-gated Follow: the InviteCode object's own id, carried
     # on a Follow<Organization> to join a Shoot guild. Absent for every other
     # activity type/ordinary Follow.
@@ -451,6 +470,7 @@ class Activity:
                 "cc": self.cc,
                 "content": self.content,
                 "tag": self.tag,
+                "audience": self.audience,
                 "instrument": self.instrument,
                 "target": self.target,
             }
@@ -483,6 +503,7 @@ class Activity:
             cc=as2_list(data.get("cc")),
             content=data.get("content"),
             tag=as2_list(data.get("tag")),
+            audience=data.get("audience"),
             instrument=data.get("instrument"),
             target=data.get("target"),
         )

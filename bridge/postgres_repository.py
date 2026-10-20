@@ -20,6 +20,7 @@ connection directly with no extra serialization needed.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -32,6 +33,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    LemmyCommunityRecord,
     LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
@@ -503,6 +505,25 @@ _SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_peertube_channels_owner ON peertube_channels (owner_username)",
+    # A real Lemmy-compatible community HOSTED by this bridge (see
+    # LemmyCommunityRecord's own docstring for how this differs from
+    # lemmy_community_rooms below, which only ever mirrors a REMOTE one).
+    # moderator_actor_ids is a JSON-encoded list of AP actor ids.
+    """
+    CREATE TABLE IF NOT EXISTS lemmy_communities (
+        username TEXT PRIMARY KEY,
+        owner_username TEXT NOT NULL,
+        room_id TEXT NOT NULL UNIQUE,
+        public_key_pem TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        icon_url TEXT,
+        banner_url TEXT,
+        moderator_actor_ids TEXT NOT NULL DEFAULT '[]'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_lemmy_communities_owner ON lemmy_communities (owner_username)",
     # A mirrored Lemmy community (see LemmyCommunityRoom's own docstring for
     # why it has no ghost_user_id column, unlike remote_actor_rooms).
     """
@@ -714,6 +735,57 @@ class PostgresActorRepository:
             record.username, record.owner_username, record.room_id,
             record.public_key_pem, record.private_key_pem,
             record.display_name, record.summary, record.icon_url, record.banner_url,
+        )
+
+    # -- hosted Lemmy communities ---------------------------------------------
+
+    @staticmethod
+    def _row_to_lemmy_community(row: asyncpg.Record) -> LemmyCommunityRecord:
+        return LemmyCommunityRecord(
+            username=row["username"],
+            owner_username=row["owner_username"],
+            room_id=row["room_id"],
+            public_key_pem=row["public_key_pem"],
+            private_key_pem=row["private_key_pem"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
+            moderator_actor_ids=tuple(json.loads(row["moderator_actor_ids"] or "[]")),
+        )
+
+    async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
+        row = await self._pool.fetchrow("SELECT * FROM lemmy_communities WHERE username = $1", username)
+        return self._row_to_lemmy_community(row) if row else None
+
+    async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
+        if not room_id:
+            return None
+        row = await self._pool.fetchrow("SELECT * FROM lemmy_communities WHERE room_id = $1", room_id)
+        return self._row_to_lemmy_community(row) if row else None
+
+    async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO lemmy_communities
+                (username, owner_username, room_id, public_key_pem, private_key_pem,
+                 display_name, summary, icon_url, banner_url, moderator_actor_ids)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (username) DO UPDATE SET
+                owner_username = EXCLUDED.owner_username,
+                room_id = EXCLUDED.room_id,
+                public_key_pem = EXCLUDED.public_key_pem,
+                private_key_pem = EXCLUDED.private_key_pem,
+                display_name = EXCLUDED.display_name,
+                summary = EXCLUDED.summary,
+                icon_url = EXCLUDED.icon_url,
+                banner_url = EXCLUDED.banner_url,
+                moderator_actor_ids = EXCLUDED.moderator_actor_ids
+            """,
+            record.username, record.owner_username, record.room_id,
+            record.public_key_pem, record.private_key_pem,
+            record.display_name, record.summary, record.icon_url, record.banner_url,
+            json.dumps(list(record.moderator_actor_ids)),
         )
 
     # -- followers / following ----------------------------------------------

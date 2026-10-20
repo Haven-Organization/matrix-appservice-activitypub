@@ -95,6 +95,46 @@ class PeerTubeChannelRecord:
 
 
 @dataclass(frozen=True)
+class LemmyCommunityRecord:
+    """A real, federating Lemmy-compatible community HOSTED by this bridge
+    (see ``bridge.commands``'s ``;create community``/``;link community``) --
+    this bridge is the authoritative home instance for it, unlike
+    ``LemmyCommunityRoom`` (``bridge.repository``), which mirrors a REMOTE
+    community we don't own. Same ``Group``-typed-actor-with-its-own-keypair
+    shape as ``PeerTubeChannelRecord``, and for the same reason gets its own
+    table rather than reusing ``ActorRecord`` -- ``owner_username`` here
+    names the CREATOR (the first moderator, for bookkeeping, e.g. who ";link
+    community"/room-settings commands trust by default) not a single
+    all-powerful owner; Lemmy communities have no such role, see
+    ``moderator_actor_ids`` below.
+
+    ``moderator_actor_ids`` is the real, authoritative moderator list for
+    this community (AP actor ids -- a moderator can be any fediverse user,
+    local or remote, exactly like a real Lemmy community's own mod list is
+    never Matrix-account-only) -- unlike the read-only mirror of a REMOTE
+    community's moderators collection (``LemmyCommunityRoom`` has no
+    equivalent field: it only ever reads, never writes, someone else's real
+    list), a grant/revoke here is a genuine authoritative change this
+    bridge itself must persist and announce out to followers. Stored as a
+    plain tuple rather than a join table: realistically never more than a
+    handful of entries, and every other list-shaped field in this bridge
+    (``tags``, etc.) already goes through the same plain-serialized-column
+    treatment rather than a relational one.
+    """
+
+    username: str
+    owner_username: str
+    room_id: str
+    public_key_pem: str
+    private_key_pem: str
+    display_name: str = ""
+    summary: str = ""
+    icon_url: str | None = None
+    banner_url: str | None = None
+    moderator_actor_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ThirdPartyAllowRecord:
     """One admin-granted allowlist entry letting a user/room/homeserver on a
     DIFFERENT Matrix homeserver use the bridge (see the ";allow"/";disallow"/
@@ -424,6 +464,15 @@ class ActorRepository(Protocol):
         """Create or replace a channel (freshly created, or updated display
         fields via the same generic actor-field commands a Profile Room
         already reuses)."""
+        ...
+
+    async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None: ...
+
+    async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None: ...
+
+    async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
+        """Create or replace a hosted Lemmy community (freshly created, or
+        updated display fields / moderator list)."""
         ...
 
     async def list_followers(self, username: str) -> list[str]:
@@ -1153,6 +1202,8 @@ class InMemoryActorRepository:
         self._lemmy_community_rooms_by_room_id: dict[str, LemmyCommunityRoom] = {}
         self._peertube_channels: dict[str, PeerTubeChannelRecord] = {}
         self._peertube_channels_by_room_id: dict[str, str] = {}  # room_id -> channel username
+        self._lemmy_communities: dict[str, LemmyCommunityRecord] = {}
+        self._lemmy_communities_by_room_id: dict[str, str] = {}  # room_id -> community username
         # Keyed by plain username, independent of ``_actors`` -- matches the
         # real sqlite/postgres ``followers``/``following``/``blocked_actors``/
         # ``muted_actors`` tables, which have no foreign key onto
@@ -1227,6 +1278,21 @@ class InMemoryActorRepository:
         self._peertube_channels[record.username] = record
         if record.room_id:
             self._peertube_channels_by_room_id[record.room_id] = record.username
+
+    async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
+        return self._lemmy_communities.get(username)
+
+    async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
+        username = self._lemmy_communities_by_room_id.get(room_id) if room_id else None
+        return self._lemmy_communities.get(username) if username else None
+
+    async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
+        existing = self._lemmy_communities.get(record.username)
+        if existing is not None and existing.room_id and existing.room_id != record.room_id:
+            self._lemmy_communities_by_room_id.pop(existing.room_id, None)
+        self._lemmy_communities[record.username] = record
+        if record.room_id:
+            self._lemmy_communities_by_room_id[record.room_id] = record.username
 
     async def list_followers(self, username: str) -> list[str]:
         return sorted(self._followers.get(username, ()))

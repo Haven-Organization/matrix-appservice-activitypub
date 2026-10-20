@@ -131,6 +131,7 @@ from bridge.lemmy_bridge import (
     maybe_handle_community_announce,
     maybe_handle_community_actor_update,
     maybe_handle_community_mod_list_change,
+    maybe_handle_owned_community_create,
 )
 from bridge.peertube import record_video_view
 from bridge.spaces import ensure_guild_space
@@ -175,17 +176,21 @@ async def handle_activity(request: Request, username: str, activity: Activity) -
 
 
 async def _handle_follow(request: Request, username: str, activity: Activity) -> None:
-    """A remote actor wants to follow one of our local actors -- either an
-    ordinary Profile Room actor, or a PeerTube channel (see
-    ``PeerTubeChannelRecord``'s docstring for why the two share one global
-    username namespace, which is what makes this single lookup-and-branch
-    correct)."""
+    """A remote actor wants to follow one of our local actors -- an
+    ordinary Profile Room actor, a PeerTube channel, or a hosted Lemmy
+    community (see ``PeerTubeChannelRecord``'s/``LemmyCommunityRecord``'s
+    own docstrings for why all three share one global username namespace,
+    which is what makes this single lookup-and-branch correct)."""
     repository = request.app.state.repository
     record = await repository.get_local_actor(username)
     if record is None:
         channel = await repository.get_peertube_channel(username)
         if channel is not None:
             await _handle_channel_follow(request, username=username, channel=channel, activity=activity)
+            return
+        community = await repository.get_lemmy_community(username)
+        if community is not None:
+            await _handle_community_follow_owned(request, username=username, community=community, activity=activity)
         return
 
     if await repository.is_blocked(username, activity.actor):
@@ -381,6 +386,82 @@ async def _announce_new_channel_follower(
             "formatted_body": (
                 f"<p>\U0001F464 {actor_html} is now following your channel "
                 f"{html.escape(channel.username)}.</p>"
+            ),
+        },
+    )
+
+
+async def _handle_community_follow_owned(
+    request: Request, *, username: str, community, activity: Activity
+) -> None:
+    """Same Follow/Accept handshake as ``_handle_channel_follow`` above, for
+    one of OUR OWN hosted Lemmy communities instead. No block list of its
+    own either, for the same reason -- every Follow is accepted
+    unconditionally."""
+    repository = request.app.state.repository
+    already_following = activity.actor in await repository.list_followers(username)
+    await repository.add_follower(username, activity.actor)
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    accept = Activity(
+        id=f"{actor_url(base, username)}/accepts/{uuid.uuid4().hex}",
+        type="Accept",
+        actor=actor_url(base, username),
+        object=activity.to_dict(),
+    )
+    try:
+        inbox = await _resolve_inbox(request, activity.actor)
+        await deliver_activity(
+            request.app.state.http_client,
+            inbox_url=inbox,
+            activity=accept.to_dict(),
+            key_id=main_key_id(base, username),
+            private_key_pem=community.private_key_pem,
+        )
+    except DeliveryError:
+        logger.warning("Failed to deliver Accept to %s", activity.actor, exc_info=True)
+
+    if not already_following:
+        await _announce_new_community_follower_owned(request, community, activity.actor)
+
+
+async def _announce_new_community_follower_owned(request: Request, community, follower_actor_id: str) -> None:
+    """Same ghost-invite-plus-owner-DM pattern as
+    ``_announce_new_channel_follower``, for a hosted community follow. The
+    notification DM goes to the community's CREATOR (``community.
+    owner_username`` -- see ``LemmyCommunityRecord``'s own docstring on why
+    that names the creator/first moderator only, not a single all-powerful
+    owner)."""
+    resolved = await _resolve_and_invite_ghost(request, follower_actor_id, community.room_id)
+    if resolved is None:
+        return
+    mxid, actor_doc = resolved
+
+    repository = request.app.state.repository
+    owner = await repository.get_local_actor(community.owner_username)
+    if owner is None:
+        return
+    if await is_silenced(repository, community.owner_username, follower_actor_id):
+        return
+
+    domain = urlsplit(follower_actor_id).hostname or ""
+    remote_username = actor_doc.get("preferredUsername") or follower_actor_id.rstrip("/").rsplit("/", 1)[-1]
+    handle = f"@{remote_username}@{domain}"
+    actor_html = notification_actor_html(
+        mxid=mxid, handle=handle, display_name=actor_doc.get("name") or remote_username
+    )
+
+    await notify_user(
+        request,
+        matrix_user_id=owner.matrix_user_id,
+        content={
+            "msgtype": "m.text",
+            "body": f"\U0001F464 {handle} is now following your community {community.username}.",
+            "format": "org.matrix.custom.html",
+            "formatted_body": (
+                f"<p>\U0001F464 {actor_html} is now following your community "
+                f"{html.escape(community.username)}.</p>"
             ),
         },
     )
@@ -3617,12 +3698,28 @@ async def _resolve_inbox(request: Request, actor_id: str) -> str:
     return inbox
 
 
+async def _handle_create_dispatch(request: Request, username: str, activity: Activity) -> None:
+    """A ``Create`` arriving addressed directly to one of OUR OWN hosted
+    Lemmy communities (never Announce-wrapped -- nobody else announces for
+    us, see ``bridge.lemmy_bridge``'s own module docstring) is diverted
+    here first, before ``_handle_create``'s own ordinary Note/Video/
+    Question handling ever runs -- a ``Page`` (new post) or a reply whose
+    ``inReplyTo`` resolves into one of our own community rooms is NOT
+    something ``_handle_create`` knows how to handle (a Page isn't a Note
+    at all, and a reply there needs this bridge to re-announce it
+    afterward, which ``_handle_create``'s own generic reply-threading has
+    no reason to know about)."""
+    if await maybe_handle_owned_community_create(request, activity):
+        return
+    await _handle_create(request, username, activity)
+
+
 _HANDLERS = {
     "Follow": _handle_follow,
     "Accept": _handle_accept,
     "Reject": _handle_reject,
     "Undo": _handle_undo,
-    "Create": _handle_create,
+    "Create": _handle_create_dispatch,
     "Update": _handle_update,
     "Like": _handle_like_or_emoji_react,
     "Dislike": _handle_like_or_emoji_react,

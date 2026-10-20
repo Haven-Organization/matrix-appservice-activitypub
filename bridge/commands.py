@@ -270,6 +270,8 @@ from bridge.lemmy_bridge import (
     import_lemmy_page,
     is_lemmy_community_actor,
     maybe_resync_community,
+    mint_owned_community,
+    push_community_update,
 )
 from bridge.matrix_links import matrix_to_link, matrix_to_room_link, room_pill_html
 from bridge.media import build_ap_attachment, fetch_and_upload_media, resolve_attachment_or_request_confirmation
@@ -293,6 +295,7 @@ from bridge.notifications import ensure_bot_dm_invite, notification_actor_html, 
 from bridge.note_mirroring import KNOCK_JOIN_RULE as _KNOCK_JOIN_RULE
 from bridge.note_mirroring import PROFILE_BANNER_STATE_TYPE
 from bridge.note_mirroring import REPLACE_ROOM_VERSION as _REPLACE_ROOM_VERSION
+from bridge.note_mirroring import SOCIAL_GROUP_ROOM_TYPE as _SOCIAL_GROUP_ROOM_TYPE
 from bridge.note_mirroring import SOCIAL_PROFILE_ROOM_TYPE as _SOCIAL_PROFILE_ROOM_TYPE
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
 from bridge.note_mirroring import resolve_old_remote_actor_room as _resolve_old_remote_actor_room
@@ -705,6 +708,18 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_create_profile(request, sender=sender, room_id=room_id)
         elif subcommand == "create" and (argument.lower() == "channel" or argument.lower().startswith("channel ")):
             await _handle_create_channel(request, sender=sender, room_id=room_id, argument=argument[len("channel"):].strip())
+        elif subcommand == "create" and (
+            argument.lower() == "community" or argument.lower().startswith("community ")
+        ):
+            await _handle_create_community(
+                request, sender=sender, room_id=room_id, argument=argument[len("community"):].strip()
+            )
+        elif subcommand == "link" and (
+            argument.lower() == "community" or argument.lower().startswith("community ")
+        ):
+            await _handle_link_community(
+                request, sender=sender, room_id=room_id, argument=argument[len("community"):].strip()
+            )
         elif subcommand == "publish":
             await _handle_publish(
                 request, sender=sender, room_id=room_id, content=content, command_event_id=event.get("event_id")
@@ -1168,6 +1183,31 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                 ),
             ],
         ),
+        "lemmy": (
+            "Lemmy communities",
+            "Following/mirroring a remote Lemmy community, and (if enabled) hosting your own.",
+            [
+                (
+                    f"{_COMMAND_PREFIX}follow @community@instance.org",
+                    "Mirror a remote Lemmy community into a shared room -- each poster/comment shows up "
+                    "as its own ghost, and real community moderators get Matrix power level 50. A "
+                    "community link (.../c/name) works too, not just the handle.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}backfill [N]",
+                    "Run inside a mirrored community room to pull its latest posts, or as a reply inside "
+                    "a mirrored post/comment's own thread to pull that thread's replies.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}create community <id> [display name]"
+                    + ("" if config.bridge.lemmy_community_hosting_enabled else " (not enabled on this bridge)"),
+                    "Mint a real, federating Lemmy-compatible community hosted by this bridge (requires a "
+                    "linked profile first, which becomes its first moderator). Just post a message to "
+                    "publish: the first line becomes the title, a blank line, then the body. Reply to an "
+                    "existing post/comment to add a comment instead.",
+                ),
+            ],
+        ),
         "admin": (
             "Admin",
             "Bridge-wide access control and maintenance, gated to a Matrix server admin.",
@@ -1201,6 +1241,12 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     "creating a new one -- a lasting change to what this room IS, not a one-off action.",
                 ),
                 (
+                    f"{_COMMAND_PREFIX}link community <id>"
+                    + ("" if config.bridge.lemmy_community_hosting_enabled else " (not enabled on this bridge)"),
+                    "Turn an existing room you control into a real, federating Lemmy-compatible community "
+                    "instead of creating a new one -- adopts the room's current name/avatar/topic/banner.",
+                ),
+                (
                     f"{_COMMAND_PREFIX}unlink profile",
                     "Detach this room from your identity without notifying the fediverse. Relinking (even "
                     "in a different room) reattaches the same identity, but this room is immediately open "
@@ -1221,6 +1267,8 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
     }
     if not config.bridge.peertube_channels_enabled:
         del sections["peertube"]
+    if not config.bridge.lemmy_communities_enabled and not config.bridge.lemmy_community_hosting_enabled:
+        del sections["lemmy"]
     return sections
 
 
@@ -3669,6 +3717,13 @@ async def _handle_backfill(request: Request, *, sender: str, room_id: str, argum
         )
         return
 
+    if await repository.get_lemmy_community_by_room_id(room_id) is not None:
+        # Nothing to pull FROM -- we're the authoritative source for this
+        # community's own posts/comments, there's no remote copy of
+        # ourselves to backfill from.
+        await _notice(request, room_id, "This community is hosted here -- there's nothing to backfill.")
+        return
+
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
     if remote_room is None:
         await _notice(
@@ -4754,6 +4809,16 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
         return
 
     if not argument.strip():
+        owned_community = await request.app.state.repository.get_lemmy_community_by_room_id(room_id)
+        if owned_community is not None:
+            # Nothing remote to pull FROM -- we're the authoritative source
+            # for this community, so a "resync" here just re-broadcasts
+            # the current state (useful if an earlier delivery failed),
+            # same as every other owned-community state push.
+            await push_community_update(request, owned_community)
+            await _notice(request, room_id, "Re-announced this community's current state to its followers.")
+            return
+
         resynced = await maybe_resync_community(request, room_id=room_id, reason="manual", bypass_debounce=True)
         if resynced:
             await _notice(request, room_id, "Resyncing this community now.")
@@ -5617,6 +5682,288 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
         f'Send a video into the room, then reply to it with "{_COMMAND_PREFIX}publish" to publish it.'
     )
     await _notice(request, room_id, message, html_message=html_message)
+
+
+async def _handle_create_community(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;create community <id> [display name]``: mints a real, federating
+    Lemmy-compatible community HOSTED by this bridge (see
+    ``LemmyCommunityRecord``'s own docstring, and ``bridge.lemmy_bridge``'s
+    module-level docstring for the design). Requires ``sender`` to already
+    have a linked Profile (explicit user requirement) -- that Profile's own
+    ``username`` becomes the community's first moderator; a community has
+    no single "owner" beyond that, see ``LemmyCommunityRecord.owner_username``'s
+    own docstring. Run ``;link community`` instead to turn an
+    already-existing room into one."""
+    config = request.app.state.config
+    if not config.bridge.lemmy_community_hosting_enabled:
+        await _notice(request, room_id, "Hosting Lemmy communities is not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    owner = await repository.get_local_actor_by_matrix_id(sender)
+    if owner is None or not owner.room_id:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" before creating a community.',
+        )
+        return
+
+    raw_id, _, rest = argument.partition(" ")
+    community_id = sanitize_localpart_component(raw_id)
+    display_name = rest.strip() or community_id
+    if not community_id:
+        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create community <id> [display name]".')
+        return
+
+    # Shares the same global actor-username namespace as profiles/channels
+    # (all ultimately served at /actor/{username}) -- same reasoning as
+    # _handle_create_channel's identical check.
+    if (
+        await repository.get_local_actor(community_id) is not None
+        or await repository.get_peertube_channel(community_id) is not None
+        or await repository.get_lemmy_community(community_id) is not None
+    ):
+        await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
+        return
+
+    bot_mxid = _bot_mxid(config)
+    try:
+        new_room_id = await synapse.create_room(
+            as_user_id=bot_mxid,
+            name=display_name,
+            invite=[sender],
+            room_type=_SOCIAL_GROUP_ROOM_TYPE,
+            join_rule=_KNOCK_JOIN_RULE,
+            # The creator becomes the community's first MODERATOR (power
+            # level 50), not a near-admin owner -- a Lemmy community has no
+            # single all-powerful owner, see LemmyCommunityRecord's own
+            # docstring.
+            power_level_content_override={"users": {sender: 50}},
+        )
+    except SynapseError as exc:
+        logger.warning("Could not create community room for %s: %s", sender, exc)
+        await _notice(request, room_id, "Could not create a room for that community.")
+        return
+
+    await mint_owned_community(
+        request, owner=owner, community_id=community_id, room_id=new_room_id,
+        display_name=display_name, summary="", icon_mxc=None, banner_mxc=None,
+    )
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
+
+    message = (
+        f"Created {new_room_id} as the community {community_id}@{config.bridge.domain} -- you've been "
+        "invited and made its first moderator there. Just post a message to publish it: the first line "
+        "becomes the title, a blank line, then the body. Reply to an existing post/comment to add a "
+        "comment instead."
+    )
+    html_message = (
+        f"Created {room_pill_html(new_room_id)} as the community {community_id}@{config.bridge.domain} -- "
+        "you've been invited and made its first moderator there. Just post a message to publish it: the "
+        "first line becomes the title, a blank line, then the body. Reply to an existing post/comment to "
+        "add a comment instead."
+    )
+    await _notice(request, room_id, message, html_message=html_message)
+
+
+_LINK_COMMUNITY_WARNING_MARKER = "This will make this room a permanent, federating Lemmy community"
+
+
+async def _handle_link_community(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """First half of a two-step, confirmation-gated ";link community <id>":
+    runs the real gating checks up front (already a community, room already
+    used for something else, sender doesn't actually control the room,
+    sender has no linked profile, id already taken), then sends an
+    itemized warning and tells the sender to reply "confirm" -- nothing is
+    linked yet just from running this command. Same pattern as
+    ``_handle_link_profile``, including WHY it's confirmation-gated:
+    turning an existing room into a federating community is just as much a
+    lasting, surprising change to what that room IS."""
+    config = request.app.state.config
+    if not config.bridge.lemmy_community_hosting_enabled:
+        await _notice(request, room_id, "Hosting Lemmy communities is not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    owner = await repository.get_local_actor_by_matrix_id(sender)
+    if owner is None or not owner.room_id:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" before linking a community.',
+        )
+        return
+
+    community_id = sanitize_localpart_component(argument.strip())
+    if not community_id:
+        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}link community <id>", run inside the room.')
+        return
+    if (
+        await repository.get_local_actor(community_id) is not None
+        or await repository.get_peertube_channel(community_id) is not None
+        or await repository.get_lemmy_community(community_id) is not None
+    ):
+        await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
+        return
+
+    already_used_as = await _room_already_bridged_as(request, room_id)
+    if already_used_as is not None:
+        await _notice(
+            request, room_id,
+            f"This room is already {already_used_as} -- it can't also become a community. Run "
+            f'"{_COMMAND_PREFIX}create community {community_id}" instead for a fresh room of its own.',
+        )
+        return
+
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}link community" needs you to actually control this room -- high enough '
+            "power to set its name/avatar yourself -- not just be a member of it. Give yourself (or have "
+            f'an admin give you) a higher power level here, or run "{_COMMAND_PREFIX}create community '
+            f'{community_id}" instead for a fresh room the bot makes you the first moderator of.',
+        )
+        return
+
+    warning = (
+        f"⚠️ {_LINK_COMMUNITY_WARNING_MARKER} ({community_id}@{config.bridge.domain}). From now on, "
+        "everything posted here publishes to the fediverse as a real community post or comment, and "
+        "anyone who can already set this room's name/avatar becomes a real moderator -- this isn't a "
+        "one-off action, it's a lasting change to what this room IS. This room's own current name/avatar/"
+        'topic/banner will be adopted as the community\'s (best-effort). Reply to THIS message with '
+        '"confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_LINK_COMMUNITY_WARNING_MARKER} ({community_id}@{config.bridge.domain}). From now "
+        "on, everything posted here publishes to the fediverse as a real community post or comment, and "
+        "anyone who can already set this room's name/avatar becomes a real moderator -- this isn't a "
+        "one-off action, it's a lasting change to what this room IS. This room's own current name/avatar/"
+        "topic/banner will be adopted as the community's (best-effort).</p><p>Reply to THIS message with "
+        '"confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send link-community warning to %s", room_id, exc_info=True)
+
+
+async def _execute_link_community(request: Request, *, sender: str, room_id: str, community_id: str) -> None:
+    """The actual link, run once ``maybe_handle_link_community_confirmation``
+    sees the "confirm" reply -- redoes ``_handle_link_community``'s own
+    gating checks fresh rather than trusting anything found there, same
+    reasoning ``_execute_link_profile`` gives for its own identical
+    re-check (state can change between the warning and the confirmation)."""
+    config = request.app.state.config
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    owner = await repository.get_local_actor_by_matrix_id(sender)
+    if owner is None or not owner.room_id:
+        await _notice(request, room_id, "You no longer have a linked profile -- link one first, then try again.")
+        return
+    if (
+        await repository.get_local_actor(community_id) is not None
+        or await repository.get_peertube_channel(community_id) is not None
+        or await repository.get_lemmy_community(community_id) is not None
+    ):
+        await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
+        return
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(request, room_id, "You no longer control this room -- link community cancelled.")
+        return
+
+    bot_mxid = _bot_mxid(config)
+    display_name = community_id
+    summary = ""
+    icon_mxc = None
+    banner_mxc = None
+    try:
+        name_content = await synapse.get_room_state(room_id, "m.room.name", as_user_id=bot_mxid)
+        display_name = name_content.get("name") or community_id
+    except SynapseError:
+        pass
+    try:
+        topic_content = await synapse.get_room_state(room_id, "m.room.topic", as_user_id=bot_mxid)
+        summary = topic_content.get("topic") or ""
+    except SynapseError:
+        pass
+    try:
+        avatar_content = await synapse.get_room_state(room_id, "m.room.avatar", as_user_id=bot_mxid)
+        icon_mxc = avatar_content.get("url") or None
+    except SynapseError:
+        pass
+    try:
+        banner_content = await synapse.get_room_state(room_id, PROFILE_BANNER_STATE_TYPE, as_user_id=bot_mxid)
+        banner_mxc = banner_content.get("url") or None
+    except SynapseError:
+        pass
+
+    await mint_owned_community(
+        request, owner=owner, community_id=community_id, room_id=room_id,
+        display_name=display_name, summary=summary, icon_mxc=icon_mxc, banner_mxc=banner_mxc,
+    )
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id)
+
+    await _notice(
+        request, room_id,
+        f"Linked! This room now publishes as the community {community_id}@{config.bridge.domain}.",
+    )
+
+
+async def maybe_handle_link_community_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``link community`` warnings -- same stateless-marker mechanism as
+    ``maybe_handle_link_profile_confirmation`` (see its own docstring);
+    must run in the same place in the dispatch chain, for the same
+    reason. The community id is parsed back out of the warning's own text
+    (it's never stored anywhere else between the warning and this)."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    warning_body = (target_event.get("content") or {}).get("body") or ""
+    if _LINK_COMMUNITY_WARNING_MARKER not in warning_body:
+        return False
+
+    match = re.search(r"\(([a-z0-9_]+)@", warning_body)
+    if match is None:
+        return False
+    community_id = match.group(1)
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_link_community(request, sender=sender, room_id=room_id, community_id=community_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
 
 
 _TRUTHY_FIELD_VALUES = {"true", "yes", "on", "1"}

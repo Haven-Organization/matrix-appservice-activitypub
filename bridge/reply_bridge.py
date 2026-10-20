@@ -368,6 +368,14 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         # bridge.lemmy_bridge.maybe_distribute_community_message instead,
         # which runs later in bridge.appservice_routes' own dispatch chain.
         return False
+    if await repository.get_lemmy_community_by_room_id(room_id) is not None:
+        # Same reasoning as the mirrored-community guard just above, for a
+        # community we HOST ourselves instead -- deferred entirely to
+        # bridge.lemmy_bridge.maybe_distribute_owned_community_message,
+        # which additionally has to build a real Create+Announce pair
+        # (never just a plain Create) this generic reply path has no way
+        # to know about.
+        return False
 
     target_event_id = _extract_reply_target_event_id(content)
     if not target_event_id:

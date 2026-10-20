@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from fastapi import Request
 
 from bridge.activitypub.delivery import DeliveryError, deliver_activity
-from bridge.activitypub.models import AS_PUBLIC, Activity, Note
+from bridge.activitypub.models import AS_PUBLIC, Activity, Actor, Note, PublicKey
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.remote_actor import (
     RemoteActorFetchError,
@@ -61,20 +61,31 @@ from bridge.activitypub.remote_actor import (
     resolve_actor_inbox,
 )
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_to_matrix_message
-from bridge.activitypub.urls import actor_url, followers_url, main_key_id
+from bridge.activitypub.urls import (
+    actor_url,
+    followers_url,
+    main_key_id,
+    media_url,
+    moderators_url,
+    username_from_actor_url,
+)
+from bridge.crypto import generate_keypair
 from bridge.note_mirroring import (
     KNOCK_JOIN_RULE,
+    PROFILE_BANNER_STATE_TYPE,
     SOCIAL_GROUP_ROOM_TYPE,
     attach_media_to_content,
+    deliver_to_actor_or_followers,
     mirrored_post_event_type,
     notify_mentioned_locals,
     resolve_and_invite_ghost,
     resolve_event_ts,
     resolve_mention_pills,
     send_bridge_info,
+    set_ghost_room_banner,
     source_post_url,
 )
-from bridge.repository import FederatedEvent, LemmyCommunityRoom
+from bridge.repository import ActorRecord, FederatedEvent, LemmyCommunityRecord, LemmyCommunityRoom
 from bridge.room_widget import add_bridge_widget
 from bridge.synapse_client import SynapseError
 
@@ -388,8 +399,6 @@ async def _apply_community_actor_changes(request: Request, community_room: Lemmy
             logger.warning("Could not apply profile changes to community room %s", community_room.room_id, exc_info=True)
 
     if banner_changed and new_banner_url:
-        from bridge.note_mirroring import set_ghost_room_banner
-
         await set_ghost_room_banner(
             request, room_id=community_room.room_id, ghost_user_id=bot_mxid, banner_mxc=new_banner_url,
         )
@@ -976,6 +985,7 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
     create_activity = Activity(
         id=f"{own_actor_id}/activities/{uuid.uuid4().hex}", type="Create", actor=own_actor_id,
         object=note.to_dict(), to=note.to, cc=note.cc, published=published,
+        audience=community_room.community_actor_id,
     )
     http_client = request.app.state.http_client
     try:
@@ -1052,4 +1062,651 @@ async def maybe_handle_community_ban(request: Request, event: dict) -> bool:
             "Failed to deliver Block(%s) to community %s", ghost_profile.actor_id,
             community_room.community_actor_id, exc_info=True,
         )
+    return True
+
+
+# ============================================================================
+# Phase 2: hosting our own Lemmy communities
+# ============================================================================
+#
+# Unlike everything above (which only ever MIRRORS a remote community we
+# don't own), this bridge can also BE a community's authoritative home
+# instance (";create community"/";link community", see bridge.commands).
+# That carries a real new responsibility nothing else in this bridge has:
+# when a post/comment arrives addressed directly to one of our own
+# communities (from a local Matrix member, or a genuinely remote fediverse
+# user posting into it the way real Lemmy allows), WE are the only one who
+# can fan it out to our own followers -- unlike a Shoot Channel or a
+# PeerTube channel's own publish flow, nobody else announces for us.
+#
+# A community has no single owner (LemmyCommunityRecord.owner_username
+# names its CREATOR/first moderator only, for bookkeeping) -- any room
+# member with a linked local profile can post or comment, matching both
+# real Lemmy's own model and this bridge's existing mirrored-community
+# precedent above. Real moderator status (moderator_actor_ids) is granted
+# by raising someone's Matrix power level to 50 in the room -- the SAME
+# mechanism a mirrored community uses to REFLECT a remote moderator grant,
+# just now a genuine, authoritative one this bridge itself persists and
+# announces out (see maybe_handle_owned_community_power_level_change).
+
+
+async def mint_owned_community(
+    request: Request, *, owner: ActorRecord, community_id: str, room_id: str,
+    display_name: str, summary: str, icon_mxc: str | None, banner_mxc: str | None,
+) -> LemmyCommunityRecord:
+    """Generate a keypair, persist the record (the creator as its first
+    moderator -- see this section's own docstring for why there's no higher
+    "owner" level to grant instead), and tag the room. Shared by both
+    ";create community" (a brand new room) and ";link community" (an
+    already-existing one, adopting its current name/avatar/topic/banner) --
+    see bridge.commands for each's own room-creation/confirmation handling;
+    this only runs once that's already settled, and is deliberately
+    power-level-agnostic (neither caller needs this to touch Matrix power
+    levels: a fresh room already set the creator's power level at creation,
+    and an existing room's was already verified high enough by
+    bridge.commands._sender_controls_room before ";link community" ever
+    got here)."""
+    config = request.app.state.config
+    repository = request.app.state.repository
+    base = config.bridge.public_base_url
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    icon_url = media_url(base, icon_mxc) if icon_mxc else None
+    banner_url = media_url(base, banner_mxc) if banner_mxc else None
+
+    private_key_pem, public_key_pem = generate_keypair()
+    owner_actor_id = actor_url(base, owner.username)
+    record = LemmyCommunityRecord(
+        username=community_id, owner_username=owner.username, room_id=room_id,
+        public_key_pem=public_key_pem, private_key_pem=private_key_pem,
+        display_name=display_name, summary=summary, icon_url=icon_url, banner_url=banner_url,
+        moderator_actor_ids=(owner_actor_id,),
+    )
+    await repository.register_lemmy_community(record)
+    await send_bridge_info(
+        request, room_id=room_id, actor_id=actor_url(base, community_id),
+        display_name=display_name, avatar_mxc=icon_mxc, as_user_id=bot_mxid,
+    )
+    await add_bridge_widget(request, room_id=room_id)
+    return record
+
+
+async def push_community_update(request: Request, community: LemmyCommunityRecord) -> None:
+    """Send a signed ``Update(Group)`` carrying ``community``'s CURRENT
+    display name/summary/avatar/banner to every one of its followers --
+    same "an already-cached copy on a follower's server otherwise silently
+    goes stale" reasoning as ``bridge.peertube.push_channel_update``, whose
+    exact shape this mirrors (just with a single ``attributedTo`` moderators
+    URL instead of a list of owning-account actor ids -- see
+    ``Actor.attributed_to``'s own docstring)."""
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    repository = request.app.state.repository
+
+    actor = Actor(
+        id=actor_url(base, community.username),
+        type="Group",
+        preferred_username=community.username,
+        name=community.display_name or community.username,
+        summary=plain_text_to_note_html(community.summary) if community.summary else community.summary,
+        url=actor_url(base, community.username),
+        inbox=f"{base}/inbox/{community.username}",
+        outbox=f"{base}/outbox/{community.username}",
+        followers=followers_url(base, community.username),
+        following=f"{base}/following/{community.username}",
+        attributed_to=moderators_url(base, community.username),
+        discoverable=True,
+        icon_url=community.icon_url,
+        image_url=community.banner_url,
+        shared_inbox=f"{base}/inbox",
+        public_key=PublicKey(
+            id=main_key_id(base, community.username), owner=actor_url(base, community.username),
+            public_key_pem=community.public_key_pem,
+        ),
+    )
+    published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    update_activity = Activity(
+        id=f"{actor.id}/updates/{uuid.uuid4().hex}", type="Update", actor=actor.id, object=actor.to_dict(),
+        published=published, to=[AS_PUBLIC], cc=[followers_url(base, community.username)],
+    )
+    followers = await repository.list_followers(community.username)
+    for follower_actor_id in followers:
+        inbox = await resolve_actor_inbox(request, follower_actor_id)
+        if inbox is None:
+            continue
+        try:
+            await deliver_activity(
+                request.app.state.http_client, inbox_url=inbox, activity=update_activity.to_dict(),
+                key_id=main_key_id(base, community.username), private_key_pem=community.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to deliver community update to %s", follower_actor_id, exc_info=True)
+
+
+# -- room-state -> community actor field sync --------------------------------
+
+
+async def maybe_handle_owned_community_name_change(request: Request, event: dict) -> bool:
+    """Same as ``bridge.peertube.maybe_handle_channel_name_change``, for a
+    hosted Lemmy community room's ``m.room.name``."""
+    if event.get("type") != "m.room.name":
+        return False
+    content = event.get("content") or {}
+    name = content.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+    if community.display_name != name:
+        community = replace(community, display_name=name)
+        await repository.register_lemmy_community(community)
+        await push_community_update(request, community)
+    return True
+
+
+async def maybe_handle_owned_community_topic_change(request: Request, event: dict) -> bool:
+    """Same as above, for ``m.room.topic`` (-> the community's summary)."""
+    if event.get("type") != "m.room.topic":
+        return False
+    content = event.get("content") or {}
+    topic = content.get("topic")
+    if not isinstance(topic, str):
+        return False
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+    if community.summary != topic:
+        community = replace(community, summary=topic)
+        await repository.register_lemmy_community(community)
+        await push_community_update(request, community)
+    return True
+
+
+async def maybe_handle_owned_community_avatar_change(request: Request, event: dict) -> bool:
+    """Same as above, for ``m.room.avatar``."""
+    if event.get("type") != "m.room.avatar":
+        return False
+    content = event.get("content") or {}
+    avatar_mxc = content.get("url")
+    if not isinstance(avatar_mxc, str) or not avatar_mxc:
+        return False
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+    config = request.app.state.config
+    try:
+        icon_url = media_url(config.bridge.public_base_url, avatar_mxc)
+    except ValueError:
+        return True
+    if community.icon_url != icon_url:
+        await repository.mark_media_published(avatar_mxc)
+        community = replace(community, icon_url=icon_url)
+        await repository.register_lemmy_community(community)
+        await push_community_update(request, community)
+    return True
+
+
+async def maybe_handle_owned_community_banner_change(request: Request, event: dict) -> bool:
+    """Same as above, for ``PROFILE_BANNER_STATE_TYPE`` (MSC4221's room
+    banner, same convention a Profile Room's own banner already uses --
+    see ``bridge.profile_posts.maybe_handle_room_banner_change``)."""
+    if event.get("type") != PROFILE_BANNER_STATE_TYPE:
+        return False
+    content = event.get("content") or {}
+    banner_mxc = content.get("url")
+    if not isinstance(banner_mxc, str) or not banner_mxc:
+        return False
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+    config = request.app.state.config
+    try:
+        banner_url = media_url(config.bridge.public_base_url, banner_mxc)
+    except ValueError:
+        return True
+    if community.banner_url != banner_url:
+        await repository.mark_media_published(banner_mxc)
+        community = replace(community, banner_url=banner_url)
+        await repository.register_lemmy_community(community)
+        await push_community_update(request, community)
+    return True
+
+
+# -- real moderator grants (Matrix power level -> authoritative mod list) ---
+
+
+async def maybe_handle_owned_community_power_level_change(request: Request, event: dict) -> bool:
+    """A Matrix power-level change in one of OUR OWN hosted community rooms
+    -- unlike the mirrored direction (which only ever REFLECTS someone
+    else's real mod list), a grant/revoke here is the real, authoritative
+    thing: persists the change to ``moderator_actor_ids`` and announces a
+    real ``Add``/``Remove`` (target: this community's own moderators
+    collection) to followers, exactly the shape real Lemmy itself sends
+    (confirmed against join-lemmy.org's federation docs). Uses Synapse's
+    own ``unsigned.prev_content`` to diff, same technique
+    ``bridge.pinned_posts`` already uses for ``m.room.pinned_events``."""
+    if event.get("type") != "m.room.power_levels":
+        return False
+    room_id = event.get("room_id", "")
+    if not room_id:
+        return False
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+
+    content = event.get("content") or {}
+    prev_content = (event.get("unsigned") or {}).get("prev_content") or {}
+    new_users = content.get("users") or {}
+    old_users = prev_content.get("users") or {}
+
+    newly_modded = {
+        mxid for mxid, level in new_users.items()
+        if level >= _MOD_POWER_LEVEL and old_users.get(mxid, 0) < _MOD_POWER_LEVEL
+    }
+    newly_demoted = {
+        mxid for mxid, level in old_users.items()
+        if level >= _MOD_POWER_LEVEL and new_users.get(mxid, 0) < _MOD_POWER_LEVEL
+    }
+    if not newly_modded and not newly_demoted:
+        return True
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    target = moderators_url(base, community.username)
+    own_actor_id = actor_url(base, community.username)
+
+    mod_ids = set(community.moderator_actor_ids)
+    changed = False
+
+    for mxid in newly_modded:
+        if mxid in (bot_mxid,):
+            continue
+        actor_id = await _resolve_mxid_to_actor_id(request, mxid)
+        if actor_id is None or actor_id in mod_ids:
+            continue
+        mod_ids.add(actor_id)
+        changed = True
+        await _send_mod_list_activity(
+            request, community=community, activity_type="Add", object_actor_id=actor_id,
+            own_actor_id=own_actor_id, target=target,
+        )
+
+    for mxid in newly_demoted:
+        actor_id = await _resolve_mxid_to_actor_id(request, mxid)
+        if actor_id is None or actor_id not in mod_ids:
+            continue
+        mod_ids.discard(actor_id)
+        changed = True
+        await _send_mod_list_activity(
+            request, community=community, activity_type="Remove", object_actor_id=actor_id,
+            own_actor_id=own_actor_id, target=target,
+        )
+
+    if changed:
+        await repository.register_lemmy_community(replace(community, moderator_actor_ids=tuple(sorted(mod_ids))))
+    return True
+
+
+async def _resolve_mxid_to_actor_id(request: Request, mxid: str) -> str | None:
+    """A room member's own AP actor id -- their linked local profile's, or
+    (for a ghost) the real remote actor they represent. None for anyone
+    with neither (a Matrix user with no linked profile, or the bridge bot
+    itself)."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    local_actor = await repository.get_local_actor_by_matrix_id(mxid)
+    if local_actor is not None:
+        return actor_url(base, local_actor.username)
+    ghost_profile = await repository.get_ghost_profile_by_mxid(mxid)
+    if ghost_profile is not None:
+        return ghost_profile.actor_id
+    return None
+
+
+async def _send_mod_list_activity(
+    request: Request, *, community: LemmyCommunityRecord, activity_type: str, object_actor_id: str,
+    own_actor_id: str, target: str,
+) -> None:
+    activity = Activity(
+        id=f"{own_actor_id}/{activity_type.lower()}s/{uuid.uuid4().hex}", type=activity_type, actor=own_actor_id,
+        object=object_actor_id, target=target,
+    )
+    repository = request.app.state.repository
+    followers = await repository.list_followers(community.username)
+    for follower_actor_id in followers:
+        inbox = await resolve_actor_inbox(request, follower_actor_id)
+        if inbox is None:
+            continue
+        try:
+            await deliver_activity(
+                request.app.state.http_client, inbox_url=inbox, activity=activity.to_dict(),
+                key_id=main_key_id(request.app.state.config.bridge.public_base_url, community.username),
+                private_key_pem=community.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to deliver %s(mod) to %s", activity_type, follower_actor_id, exc_info=True)
+
+
+# -- outbound: a Matrix member posting/commenting in their own community ----
+
+
+def _title_and_body_from_message(body: str) -> tuple[str, str]:
+    """First line is the title, blank line then the rest is the body --
+    see this feature's own design discussion (explicit user choice: no
+    special command syntax, just type a message)."""
+    first_line, _, rest = body.partition("\n")
+    title = first_line.strip()
+    remainder = rest.lstrip("\n").strip()
+    return title, remainder
+
+
+async def maybe_distribute_owned_community_message(request: Request, event: dict) -> bool:
+    """A Matrix member's new top-level post or comment inside one of OUR
+    OWN hosted community rooms -- federates out as a real ``Create<Page>``/
+    ``Create<Note>`` (signed by the POSTER's own linked profile) PLUS an
+    ``Announce`` (signed by the COMMUNITY itself) to the community's own
+    followers, the exact choreography ``bridge.commands._handle_publish``
+    already uses for a PeerTube channel's own Create+Announce (see this
+    module's own section docstring for why the Announce half is or own
+    responsibility here, unlike a Shoot channel message)."""
+    if event.get("type") != "m.room.message":
+        return False
+
+    from bridge.commands import message_addresses_bot
+
+    content = event.get("content") or {}
+    config = request.app.state.config
+    if message_addresses_bot(content, config):
+        return True
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    matrix_event_id = event.get("event_id")
+    if not room_id or not sender or not matrix_event_id:
+        return False
+
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
+        return True  # our own bot's/a ghost's echo of a mirrored post -- never re-federate
+
+    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    if actor_record is None:
+        from bridge.commands import _notice
+
+        await _notice(
+            request, room_id,
+            "You need a linked profile before posting here -- run \";link profile\" in your own room first.",
+        )
+        return True
+
+    if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
+        return True  # already distributed
+
+    from bridge.reply_bridge import _extract_reply_target_event_id
+
+    target_event_id = _extract_reply_target_event_id(content)
+    parent = (
+        await repository.get_federated_event_by_matrix_event(target_event_id) if target_event_id else None
+    )
+    is_reply = parent is not None and parent.room_id == room_id
+
+    base = config.bridge.public_base_url
+    own_actor_id = actor_url(base, actor_record.username)
+    own_object_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}" if is_reply else f"{own_actor_id}/posts/{uuid.uuid4().hex}"
+    published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    community_actor_id = actor_url(base, community.username)
+
+    if is_reply:
+        body = (content.get("body") or "").strip()
+        if not body:
+            return False
+        note = Note(
+            id=own_object_id, attributed_to=own_actor_id, content=plain_text_to_note_html(body), published=published,
+            to=[AS_PUBLIC], cc=[community_actor_id], in_reply_to=parent.ap_object_id,
+            audience=community_actor_id, tag=[{"type": "Mention", "href": community_actor_id}],
+        )
+        obj_dict = note.to_dict()
+        thread_root_event_id = parent.thread_root_event_id or parent.event_id
+    else:
+        title, body = _title_and_body_from_message((content.get("body") or "").strip())
+        if not title:
+            from bridge.commands import _notice
+
+            await _notice(
+                request, room_id,
+                "Couldn't tell what to use as this post's title -- the first line of your message becomes "
+                "the title, a blank line, then the body.",
+            )
+            return True
+        plain_text_body = plain_text_to_note_html(body) if body else ""
+        obj_dict = {
+            "id": own_object_id, "type": "Page", "attributedTo": own_actor_id, "name": title,
+            "content": plain_text_body, "mediaType": "text/html", "published": published,
+            "to": [community_actor_id, AS_PUBLIC], "cc": [], "audience": community_actor_id,
+        }
+        thread_root_event_id = None
+
+    create_activity = Activity(
+        id=f"{own_object_id}/activity", type="Create", actor=own_actor_id, object=obj_dict,
+        published=published, to=[AS_PUBLIC], cc=[community_actor_id], audience=community_actor_id,
+    )
+    announce_activity = Activity(
+        id=f"{own_object_id}/announces/{uuid.uuid4().hex}", type="Announce", actor=community_actor_id,
+        object=create_activity.to_dict(), published=published, to=[AS_PUBLIC],
+        cc=[followers_url(base, community.username)],
+    )
+
+    await repository.record_federated_event(
+        FederatedEvent(
+            event_id=matrix_event_id, room_id=room_id, ap_object_id=own_object_id, author_actor_id=own_actor_id,
+            thread_root_event_id=thread_root_event_id,
+        )
+    )
+
+    followers = await repository.list_followers(community.username)
+    for recipient_actor_id in followers:
+        try:
+            await deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=announce_activity.to_dict(),
+                key_id=main_key_id(base, community.username), private_key_pem=community.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to deliver community Announce to %s", recipient_actor_id, exc_info=True)
+    return True
+
+
+# -- inbound: receiving a post/comment addressed to one of our own communities --
+
+
+async def maybe_handle_owned_community_create(request: Request, activity: Activity) -> bool:
+    """A ``Create<Page>``/``Create<Note>`` arriving addressed DIRECTLY to
+    one of OUR OWN hosted communities -- never Announce-wrapped (nobody
+    else announces for us, same reasoning this module's own section
+    docstring gives). A ``Page`` is a brand new top-level post; a ``Note``
+    with ``inReplyTo`` resolving to something we track in one of our own
+    community rooms is a comment, reusing the exact same generic
+    ``_mirror_note_as_reply`` thread-placement machinery every other reply
+    in this bridge already goes through. Either way, since we're the
+    authoritative home for this content, we re-``Announce`` it to our own
+    followers afterward -- the one thing nothing else in this bridge needs
+    to do, see this module's own module-level docstring."""
+    from bridge.inbox_dispatch import _resolve_object
+
+    repository = request.app.state.repository
+    obj = await _resolve_object(request, activity.object)
+    if not isinstance(obj, dict):
+        return False
+
+    base = request.app.state.config.bridge.public_base_url
+    obj_type = obj.get("type")
+    if obj_type == "Page":
+        community = await _resolve_owned_community_from_page(request, obj)
+        if community is None:
+            return False
+        ap_object_id = obj.get("id")
+        if ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None:
+            return True
+        author_actor_id = obj.get("attributedTo")
+        if not isinstance(author_actor_id, str):
+            return True
+        federated = await import_lemmy_page(
+            request, page=obj, author_actor_id=author_actor_id,
+            community_room=_as_community_room(community, base=base),
+        )
+        if federated is not None:
+            await _reannounce_owned_community_content(request, community=community, create_obj=obj, author_actor_id=author_actor_id)
+        return True
+
+    if obj_type == "Note":
+        in_reply_to = obj.get("inReplyTo")
+        if not isinstance(in_reply_to, str):
+            return False
+        parent = await repository.get_federated_event_by_ap_object(in_reply_to)
+        if parent is None:
+            return False
+        community = await repository.get_lemmy_community_by_room_id(parent.room_id)
+        if community is None:
+            return False  # a reply into an ordinary room, not one of our communities -- not ours to handle
+        ap_object_id = obj.get("id")
+        if ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None:
+            return True
+        author_actor_id = obj.get("attributedTo")
+        if not isinstance(author_actor_id, str):
+            return True
+
+        from bridge.inbox_dispatch import _mirror_note_as_reply
+
+        federated = await _mirror_note_as_reply(request, obj, parent, author_actor_id)
+        if federated is not None:
+            await _reannounce_owned_community_content(request, community=community, create_obj=obj, author_actor_id=author_actor_id)
+        return True
+
+    return False
+
+
+async def _resolve_owned_community_from_page(request: Request, page: dict) -> LemmyCommunityRecord | None:
+    audience = page.get("audience")
+    if not isinstance(audience, str):
+        return None
+    config = request.app.state.config
+    username = username_from_actor_url(config.bridge.public_base_url, audience)
+    if username is None:
+        return None
+    return await request.app.state.repository.get_lemmy_community(username)
+
+
+def _as_community_room(community: LemmyCommunityRecord, *, base: str) -> LemmyCommunityRoom:
+    """Adapts a LemmyCommunityRecord (one we OWN) to the shape
+    ``import_lemmy_page``/the shared ghost-resolution helpers expect (both
+    only ever read ``.room_id`` off it in practice, but this still fills in
+    a real ``community_actor_id`` rather than a bare username, in case that
+    ever changes) -- a thin, disposable view, never persisted or
+    registered anywhere."""
+    return LemmyCommunityRoom(community_actor_id=actor_url(base, community.username), room_id=community.room_id)
+
+
+async def _reannounce_owned_community_content(
+    request: Request, *, community: LemmyCommunityRecord, create_obj: dict, author_actor_id: str,
+) -> None:
+    base = request.app.state.config.bridge.public_base_url
+    community_actor_id = actor_url(base, community.username)
+    published = create_obj.get("published") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    create_activity = Activity(
+        id=f"{create_obj.get('id', '')}/activity", type="Create", actor=author_actor_id, object=create_obj,
+        published=published, to=[AS_PUBLIC], cc=[community_actor_id], audience=community_actor_id,
+    )
+    announce_activity = Activity(
+        id=f"{community_actor_id}/announces/{uuid.uuid4().hex}", type="Announce", actor=community_actor_id,
+        object=create_activity.to_dict(), published=published, to=[AS_PUBLIC],
+        cc=[followers_url(base, community.username)],
+    )
+    repository = request.app.state.repository
+    followers = await repository.list_followers(community.username)
+    for recipient_actor_id in followers:
+        if recipient_actor_id == author_actor_id:
+            continue  # the poster already has their own copy -- no need to announce it back to them
+        try:
+            await deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=announce_activity.to_dict(),
+                key_id=main_key_id(base, community.username), private_key_pem=community.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to re-announce inbound community content to %s", recipient_actor_id, exc_info=True)
+
+
+# -- moderation on an owned community: ban/redact ----------------------------
+
+
+async def maybe_handle_owned_community_ban(request: Request, event: dict) -> bool:
+    """Same as ``maybe_handle_community_ban`` (the mirrored direction's own
+    identical handler), for one of OUR OWN hosted communities instead --
+    Synapse's own power-level enforcement already verified the sender's
+    authority before this event ever reached the bridge, same as there."""
+    if event.get("type") != "m.room.member":
+        return False
+    content = event.get("content") or {}
+    if content.get("membership") != "ban":
+        return False
+    room_id = event.get("room_id", "")
+    banned_mxid = event.get("state_key", "")
+    sender = event.get("sender", "")
+    if not room_id or not banned_mxid or not sender:
+        return False
+
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(room_id)
+    if community is None:
+        return False
+
+    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    if actor_record is None:
+        return True
+
+    ghost_profile = await repository.get_ghost_profile_by_mxid(banned_mxid)
+    if ghost_profile is None:
+        return True
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    own_actor_id = actor_url(base, actor_record.username)
+    community_actor_id = actor_url(base, community.username)
+    block_activity = Activity(
+        id=f"{own_actor_id}/blocks/{uuid.uuid4().hex}", type="Block", actor=own_actor_id,
+        object=ghost_profile.actor_id, target=community_actor_id,
+    )
+    inbox = await resolve_actor_inbox(request, ghost_profile.actor_id)
+    if inbox is None:
+        return True
+    try:
+        await deliver_activity(
+            request.app.state.http_client, inbox_url=inbox, activity=block_activity.to_dict(),
+            key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+        )
+    except DeliveryError:
+        logger.warning("Failed to deliver Block(%s) for owned community %s", ghost_profile.actor_id, community.username, exc_info=True)
     return True

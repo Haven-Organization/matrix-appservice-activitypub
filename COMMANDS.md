@@ -119,10 +119,11 @@ Following, messaging, and everyday day-to-day commands.
 
 ### `;follow @user@instance.org`
 
-**Syntax:** `;follow @user@instance.org`, or no argument at all if run from inside that account's own room. A tagged mention pill, of one of the bridge's ghost users or of another local user, works the same as typing the handle, and wins if both are somehow present.
+**Syntax:** `;follow @user@instance.org`, a bare actor URL (e.g. `https://instance.example/users/alice` or a community link like `https://instance.example/c/name`), or no argument at all if run from inside that account's own room (or an already-mirrored community's own room). A tagged mention pill, of one of the bridge's ghost users or of another local user, works the same as typing the handle, and wins if both are somehow present.
 
 **What it does:** Follows the target as your own linked actor.
 - **Genuinely remote target:** creates or reuses a Remote User Room, invites you into it, and delivers a signed `Follow`.
+- **A Lemmy community** (a `Group` actor with its own moderators collection, detected via NodeInfo or the actor document): creates or reuses a SHARED `org.matrix.msc4501.social.group` room instead -- see [Lemmy communities](#lemmy-communities) below.
 - **Actually another local user on this bridge** (tagged directly, or resolved via their own `@user@yourdomain` handle): handled entirely in-process. Invites you straight into their existing Profile Room (never fabricating a ghost for someone with a real Matrix account), records the follow both ways, and DMs them a notification.
 
 **Who can run it:** Requires a linked profile first.
@@ -446,6 +447,36 @@ Description text here.
 **What it does:** Swaps the underlying file of an already-published video while keeping the same video identity -- sends a signed `Update` on the same ActivityPub video id (not a fresh publish), re-runs the mimetype check against the new file, and re-derives its duration/dimensions from it.
 
 **Who can run it:** Only the channel's owner.
+
+---
+
+## Lemmy communities
+
+**Experimental -- still under active development and not fully working yet.** Posting from a hosted community doesn't reliably show up as coming from the community on real remote instances yet (content federates, but community attribution is inconsistent across Pleroma/Mastodon/Akkoma). Expect rough edges.
+
+Following/mirroring a remote Lemmy community (`bridge.lemmy_communities_enabled`), and -- separately -- hosting your own, authoritative one (`bridge.lemmy_community_hosting_enabled`). See `;follow` above for mirroring a remote community, and `;backfill` for pulling its history.
+
+### `;create community <id> [display name]`
+
+**Syntax:** `;create community <id> [display name]`. `<id>` becomes the community's fediverse username (`id@bridge-domain`); everything after it, if given, becomes its display name (defaults to `<id>` itself).
+
+**What it does:** Mints a real, federating Lemmy-compatible community: a `Group`-typed ActivityPub actor with its own keypair, hosted by this bridge itself (unlike mirroring, this bridge is the authoritative home instance). Creates a brand-new Matrix room (bot as creator/admin), invites you and makes you its first moderator (power level 50 -- a community has no single all-powerful owner, matching real Lemmy's own model), adds the room widget, and adds it to your personal Fediverse space. Shares the same global actor-username namespace as profiles/channels (all ultimately served at `/actor/{username}`), so an `<id>` already taken by any of them is rejected.
+
+**Who can run it:** Any local user with a linked profile.
+
+**Notes:** To post, just send an ordinary message: the first line becomes the post's title, a blank line, then the rest becomes the body. Reply to an existing post/comment to add a comment instead. Raising someone's Matrix power level to 50+ in the room makes them a real moderator (announced to followers); dropping it back below does the reverse. Banning a ghost sends a real `Block`; redacting someone else's post/comment sends a `Delete` signed as the moderator.
+
+---
+
+### `;link community <id>`
+
+**Syntax:** `;link community <id>`, run inside the room you want to convert. Sends a warning; reply to THAT message with `confirm` to go ahead -- nothing happens just from running the command itself.
+
+**What it does:** Turns an already-existing room you control into a real, federating Lemmy-compatible community, instead of creating a fresh one. Adopts the room's current name/avatar/topic/banner as the community's starting values (best-effort). Same checks as `;create community` (linked profile required, `<id>` not already taken) plus needing to actually control the room (high enough power to set its own name/avatar).
+
+**Who can run it:** Any local user with a linked profile who controls the target room.
+
+**Notes:** A lasting change to what the room IS, same category as [`;link profile`](#link-profile) -- not reversible by an `;unlink` command (none exists for communities yet).
 
 ---
 

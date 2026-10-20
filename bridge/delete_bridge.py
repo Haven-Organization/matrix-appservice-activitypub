@@ -74,7 +74,22 @@ async def maybe_federate_delete(request: Request, event: dict) -> bool:
         object=federated.ap_object_id,
     )
     http_client = request.app.state.http_client
-    followers = await repository.list_followers(username)
+
+    # A top-level post made BY a member of one of OUR OWN hosted Lemmy
+    # communities (bridge.lemmy_bridge.maybe_distribute_owned_community_
+    # message) is only ever pushed to THAT community's own followers at
+    # post time -- never to the poster's own personal profile followers,
+    # who may have no overlap with it at all. Deleting it must reach the
+    # same audience the post itself actually reached, or a server that
+    # never gets this Delete just keeps showing it forever -- confirmed
+    # live 2026-10-20: a real redacted Haven-community post stayed up on
+    # poa.st because this only ever notified q's own 54 personal followers,
+    # not haven's one real follower who'd actually received it.
+    followers = set(await repository.list_followers(username))
+    owned_community = await repository.get_lemmy_community_by_room_id(federated.room_id)
+    if owned_community is not None:
+        followers |= set(await repository.list_followers(owned_community.username))
+
     for follower_actor_id in followers:
         inbox = await resolve_actor_inbox(request, follower_actor_id)
         if inbox is None:
@@ -94,12 +109,15 @@ async def maybe_federate_delete(request: Request, event: dict) -> bool:
 
 async def _maybe_federate_community_mod_delete(request: Request, *, event: dict, federated: FederatedEvent) -> None:
     """``federated`` names a remote-authored post/comment -- if it lives in
-    a mirrored Lemmy community room, the redaction's SENDER (not
-    ``federated.author_actor_id``) may be a local Matrix mod exercising
-    real moderation power. See this module's own docstring."""
+    a mirrored OR a hosted Lemmy community room, the redaction's SENDER
+    (not ``federated.author_actor_id``) may be a local Matrix mod
+    exercising real moderation power. See this module's own docstring."""
     repository = request.app.state.repository
     community_room = await repository.get_lemmy_community_room_by_room_id(federated.room_id)
-    if community_room is None:
+    owned_community = None if community_room is not None else await repository.get_lemmy_community_by_room_id(
+        federated.room_id
+    )
+    if community_room is None and owned_community is None:
         return
 
     sender = event.get("sender", "")
@@ -116,10 +134,32 @@ async def _maybe_federate_community_mod_delete(request: Request, *, event: dict,
         id=f"{own_actor_id}/deletes/{uuid.uuid4().hex}", type="Delete", actor=own_actor_id,
         object=federated.ap_object_id,
     )
+    http_client = request.app.state.http_client
+
+    if owned_community is not None:
+        # No remote "community inbox" to deliver one copy to -- we ARE the
+        # community, so this reaches its own followers the same way every
+        # other owned-community broadcast does (see
+        # bridge.lemmy_bridge._reannounce_owned_community_content).
+        for follower_actor_id in await repository.list_followers(owned_community.username):
+            inbox = await resolve_actor_inbox(request, follower_actor_id)
+            if inbox is None:
+                continue
+            try:
+                await deliver_activity(
+                    http_client, inbox_url=inbox, activity=delete_activity.to_dict(),
+                    key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+                )
+            except DeliveryError:
+                logger.warning(
+                    "Failed to deliver mod Delete(%s) to %s", federated.ap_object_id, follower_actor_id,
+                    exc_info=True,
+                )
+        return
+
     inbox = await resolve_actor_inbox(request, community_room.community_actor_id)
     if inbox is None:
         return
-    http_client = request.app.state.http_client
     try:
         await deliver_activity(
             http_client, inbox_url=inbox, activity=delete_activity.to_dict(),

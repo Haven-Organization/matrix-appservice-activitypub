@@ -288,6 +288,16 @@ class BridgeSection:
     # moderator activities) shouldn't each force their own full re-fetch.
     # ";refresh" always bypasses this and resyncs immediately.
     lemmy_community_resync_min_interval_seconds: int = 60
+    # Whether a Matrix room can become a real, federating Lemmy-compatible
+    # community HOSTED by this bridge (";create community"/";link
+    # community") -- distinct from lemmy_communities_enabled (following/
+    # mirroring a REMOTE community): hosting means this bridge is the
+    # authoritative home instance, responsible for accepting posts/comments
+    # from anyone (local or remote) and re-announcing them to its own
+    # followers, a real new fan-out responsibility this bridge doesn't have
+    # for anything else. Off by default, same "real, substantial behavior
+    # change" reasoning as every other *_enabled flag here.
+    lemmy_community_hosting_enabled: bool = False
     # Whether a remote actor's reply into a conversation that's ALREADY
     # tracked here also gets an annotated "⤵️ Reply to X's post" copy
     # posted into THEIR OWN Remote User Room (not just threaded into the
@@ -528,6 +538,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         lemmy_community_resync_min_interval_seconds=int(
             bridge_raw.get("lemmy_community_resync_min_interval_seconds", 60)
         ),
+        lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
     )
 
     synapse_section = SynapseSection(

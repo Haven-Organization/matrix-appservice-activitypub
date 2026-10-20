@@ -20,6 +20,7 @@ never blocks the event loop while still serializing access deterministically.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    LemmyCommunityRecord,
     LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
@@ -352,6 +354,24 @@ CREATE TABLE IF NOT EXISTS peertube_channels (
     banner_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_peertube_channels_owner ON peertube_channels (owner_username);
+
+-- A real Lemmy-compatible community HOSTED by this bridge (see
+-- LemmyCommunityRecord's own docstring for how this differs from
+-- lemmy_community_rooms below, which only ever mirrors a REMOTE one).
+-- moderator_actor_ids is a JSON-encoded list of AP actor ids.
+CREATE TABLE IF NOT EXISTS lemmy_communities (
+    username TEXT PRIMARY KEY,
+    owner_username TEXT NOT NULL,
+    room_id TEXT NOT NULL UNIQUE,
+    public_key_pem TEXT NOT NULL,
+    private_key_pem TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    icon_url TEXT,
+    banner_url TEXT,
+    moderator_actor_ids TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_lemmy_communities_owner ON lemmy_communities (owner_username);
 
 -- A mirrored Lemmy community (see LemmyCommunityRoom's own docstring for
 -- why it has no ghost_user_id column, unlike remote_actor_rooms).
@@ -860,6 +880,67 @@ class SqliteActorRepository:
 
     async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         await self._run(self._register_peertube_channel, record)
+
+    @staticmethod
+    def _row_to_lemmy_community(row: sqlite3.Row) -> LemmyCommunityRecord:
+        return LemmyCommunityRecord(
+            username=row["username"],
+            owner_username=row["owner_username"],
+            room_id=row["room_id"],
+            public_key_pem=row["public_key_pem"],
+            private_key_pem=row["private_key_pem"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
+            moderator_actor_ids=tuple(json.loads(row["moderator_actor_ids"] or "[]")),
+        )
+
+    def _get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
+        row = self._conn.execute("SELECT * FROM lemmy_communities WHERE username = ?", (username,)).fetchone()
+        return self._row_to_lemmy_community(row) if row else None
+
+    async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
+        return await self._run(self._get_lemmy_community, username)
+
+    def _get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
+        if not room_id:
+            return None
+        row = self._conn.execute("SELECT * FROM lemmy_communities WHERE room_id = ?", (room_id,)).fetchone()
+        return self._row_to_lemmy_community(row) if row else None
+
+    async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
+        return await self._run(self._get_lemmy_community_by_room_id, room_id)
+
+    def _register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO lemmy_communities
+                (username, owner_username, room_id, public_key_pem, private_key_pem,
+                 display_name, summary, icon_url, banner_url, moderator_actor_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                owner_username=excluded.owner_username,
+                room_id=excluded.room_id,
+                public_key_pem=excluded.public_key_pem,
+                private_key_pem=excluded.private_key_pem,
+                display_name=excluded.display_name,
+                summary=excluded.summary,
+                icon_url=excluded.icon_url,
+                banner_url=excluded.banner_url,
+                moderator_actor_ids=excluded.moderator_actor_ids
+            """,
+            (
+                record.username, record.owner_username, record.room_id,
+                record.public_key_pem, record.private_key_pem,
+                record.display_name, record.summary, record.icon_url, record.banner_url,
+                json.dumps(list(record.moderator_actor_ids)),
+            ),
+        )
+        self._conn.commit()
+
+    async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
+        await self._run(self._register_lemmy_community, record)
 
     # -- followers / following ----------------------------------------------
 

@@ -60,6 +60,7 @@ from bridge.commands import (
     maybe_handle_command,
     maybe_handle_delete_confirmation,
     maybe_handle_leave_unfollowed_confirmation,
+    maybe_handle_link_community_confirmation,
     maybe_handle_link_profile_confirmation,
     maybe_handle_replace_ghost_room_confirmation,
     maybe_handle_replace_room_confirmation,
@@ -67,7 +68,17 @@ from bridge.commands import (
 )
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
-from bridge.lemmy_bridge import maybe_distribute_community_message, maybe_handle_community_ban
+from bridge.lemmy_bridge import (
+    maybe_distribute_community_message,
+    maybe_distribute_owned_community_message,
+    maybe_handle_community_ban,
+    maybe_handle_owned_community_avatar_change,
+    maybe_handle_owned_community_ban,
+    maybe_handle_owned_community_banner_change,
+    maybe_handle_owned_community_name_change,
+    maybe_handle_owned_community_power_level_change,
+    maybe_handle_owned_community_topic_change,
+)
 from bridge.media import ENCRYPTED_ATTACHMENT_WARNING_MARKER, decrypt_and_reupload_encrypted_attachment
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
 from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
@@ -134,7 +145,11 @@ async def _dispatch_outbound_send(request: Request, event: dict) -> None:
                     if not handled_as_channel_message:
                         handled_as_community_message = await maybe_distribute_community_message(request, event)
                         if not handled_as_community_message:
-                            await maybe_distribute_profile_post(request, event)
+                            handled_as_owned_community_message = await maybe_distribute_owned_community_message(
+                                request, event
+                            )
+                            if not handled_as_owned_community_message:
+                                await maybe_distribute_profile_post(request, event)
 
 
 async def maybe_handle_encrypted_attachment_confirmation(request: Request, event: dict) -> bool:
@@ -292,6 +307,9 @@ async def _handle_transaction(
             handled_as_community_ban = await maybe_handle_community_ban(request, event)
             if handled_as_community_ban:
                 continue
+            handled_as_owned_community_ban = await maybe_handle_owned_community_ban(request, event)
+            if handled_as_owned_community_ban:
+                continue
             handled_as_join = await maybe_handle_join(request, event)
             if handled_as_join:
                 continue
@@ -319,6 +337,27 @@ async def _handle_transaction(
             handled_as_channel_avatar_change = await maybe_handle_channel_avatar_change(request, event)
             if handled_as_channel_avatar_change:
                 continue
+            handled_as_owned_community_name_change = await maybe_handle_owned_community_name_change(request, event)
+            if handled_as_owned_community_name_change:
+                continue
+            handled_as_owned_community_topic_change = await maybe_handle_owned_community_topic_change(request, event)
+            if handled_as_owned_community_topic_change:
+                continue
+            handled_as_owned_community_avatar_change = await maybe_handle_owned_community_avatar_change(
+                request, event
+            )
+            if handled_as_owned_community_avatar_change:
+                continue
+            handled_as_owned_community_banner_change = await maybe_handle_owned_community_banner_change(
+                request, event
+            )
+            if handled_as_owned_community_banner_change:
+                continue
+            handled_as_owned_community_power_level_change = await maybe_handle_owned_community_power_level_change(
+                request, event
+            )
+            if handled_as_owned_community_power_level_change:
+                continue
             handled_as_reaction = await maybe_federate_reaction(request, event)
             if handled_as_reaction:
                 continue
@@ -339,6 +378,9 @@ async def _handle_transaction(
                 continue
             handled_as_link_profile_confirmation = await maybe_handle_link_profile_confirmation(request, event)
             if handled_as_link_profile_confirmation:
+                continue
+            handled_as_link_community_confirmation = await maybe_handle_link_community_confirmation(request, event)
+            if handled_as_link_community_confirmation:
                 continue
             handled_as_unlink_profile_confirmation = await maybe_handle_unlink_profile_confirmation(request, event)
             if handled_as_unlink_profile_confirmation:
