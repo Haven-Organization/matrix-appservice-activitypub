@@ -447,9 +447,10 @@ async def _fetch_post_preview(
     filename-as-body -- since there's nothing to shrink down and show at
     a glance the way an image or video frame is."""
     config = request.app.state.config
+    synapse = request.app.state.synapse
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
     try:
-        event = await request.app.state.synapse.get_event(target.room_id, target.event_id, as_user_id=bot_mxid)
+        event = await synapse.get_event(target.room_id, target.event_id, as_user_id=bot_mxid)
     except SynapseError:
         logger.info(
             "Could not fetch %s in %s for a notification preview", target.event_id, target.room_id, exc_info=True
@@ -457,6 +458,27 @@ async def _fetch_post_preview(
         return "", {}, None, None
 
     content = event.get("content") or {}
+    # A plain GET of a single event returns its ORIGINAL content forever --
+    # Matrix edits (m.replace) are separate events, never mutate the
+    # original's own content server-side. Without this, a repost/quote
+    # card built after a post was edited (e.g. bridge.lemmy_bridge's own
+    # retroactive content fixes) kept showing stale pre-edit text/media
+    # indefinitely (confirmed live 2026-10-19: a Lemmy post's image fix
+    # never showed up in an already-built repost card, and a NEW repost
+    # made after the fix still quoted the pre-fix body). Best-effort, same
+    # as the rest of this function -- a failed relations lookup just means
+    # no edit was found, falling back to the original content as before.
+    try:
+        edits = await synapse.get_relations(
+            target.room_id, target.event_id, rel_type="m.replace", as_user_id=bot_mxid,
+        )
+    except SynapseError:
+        edits = []
+    latest_edit = max(edits, key=lambda e: e.get("origin_server_ts") or 0, default=None)
+    if latest_edit is not None:
+        new_content = (latest_edit.get("content") or {}).get("m.new_content")
+        if isinstance(new_content, dict):
+            content = new_content
     full_content = content
     raw_body = (content.get("body") or "").strip()
     event_filename = (content.get("filename") or "").strip()
