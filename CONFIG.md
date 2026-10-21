@@ -50,6 +50,9 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
   - [Multi-identity support](#multi-identity-support)
     - [Enable custom identities (`bridge.custom_identities_enabled`)](#bridge-custom_identities_enabled)
     - [Max identities per user (`bridge.max_identities_per_user`)](#bridge-max_identities_per_user)
+  - [Multi-bridge rooms](#multi-bridge-rooms)
+    - [Command prefix (`bridge.command_prefix`)](#bridge-command_prefix)
+    - [Other bots' prefixes (`bridge.other_bot_prefixes`)](#bridge-other_bot_prefixes)
 - [`synapse`](#synapse)
   - [Admin token (`synapse.admin_token`)](#synapse-admin_token)
 - [`storage`](#storage)
@@ -379,6 +382,35 @@ Whether a Matrix user may own more than one ActivityPub identity, and pick a cus
 **Default:** `5`
 
 Per-user cap on how many ActivityPub identities they may create once [`bridge.custom_identities_enabled`](#bridge-custom_identities_enabled) is on. A bridge admin (see [`bridge.admins`](#bridge-admins) / [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api)) is never subject to this cap.
+
+---
+
+### Multi-bridge rooms
+
+Settings for sharing a Matrix room with other bots/bridges -- e.g. a room that's simultaneously an ActivityPub, Bluesky (atproto), and Nostr identity, each bridged separately into the same room. See [FEATURES.md](FEATURES.md) for the full picture of what's safe to share and what isn't.
+
+<a id="bridge-command_prefix"></a>
+
+#### Command prefix (`bridge.command_prefix`)
+
+**Default:** `;`
+
+The character(s) that start a bot command (`;follow ...`, `;help`, and so on). Change this if `;` collides with another bot/bridge sharing the same room -- e.g. set it to something that bot doesn't also use. Must not be empty.
+
+---
+
+<a id="bridge-other_bot_prefixes"></a>
+
+#### Other bots' prefixes (`bridge.other_bot_prefixes`)
+
+**Default:** `[]` (empty)
+
+Other bots'/bridges' own command prefixes (e.g. `["!", "nostr:"]`), for a room shared with other bridges or Matrix bots -- entries come in two shapes, matched differently:
+
+- A short/punctuation-style prefix (`!`, `]`, `nostr:`, ...) matches only at the very start of a message's first line, same as this bridge's own `;` prefix -- not matched anywhere in the message, since a common character like `!` would otherwise show up in ordinary prose by coincidence and silently swallow real posts.
+- A full Matrix ID (e.g. `@bluesky:yourdomain`, `@fediverse:yourdomain` -- that bridge's own bot) is treated as a real mention of that bot: a proper intentional mention (most clients' own plain-text fallback for a mention pill is the mentioned user's display name, not their raw mxid, so this is the only reliable signal for an actual pill) OR the literal mxid typed anywhere in the message. Matched ANYWHERE, not just the start, since a full mxid is specific enough that it won't appear in ordinary prose by coincidence.
+
+Either way, a matching message is never federated out by this bridge as an ordinary post, even though (correctly) it's also never treated as addressed to THIS bridge's own bot -- no reply is sent, and no attempt is made to parse it as one of this bridge's own commands. Without this, a command meant for a different bridge would fall straight through this bridge's own "not one of my commands" check and get posted to the fediverse as if it were ordinary content, since this bridge has no way to otherwise recognize another bot's own keyword vocabulary or mention conventions. Leave empty if this room isn't shared with anything else.
 
 ---
 

@@ -54,7 +54,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
-from bridge.commands import is_third_party_still_allowed, message_addresses_bot
+from bridge.commands import is_foreign_bot_command, is_third_party_still_allowed, message_addresses_bot
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -339,14 +339,18 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         return False
     content = normalized_message_content(event)
 
-    if message_addresses_bot(content, request.app.state.config):
+    if message_addresses_bot(content, request.app.state.config) or is_foreign_bot_command(
+        content, request.app.state.config
+    ):
         # bridge.commands.maybe_handle_command runs earlier in the dispatch
         # chain and normally intercepts anything tagging the bot before
         # we're ever even reached -- this is a second, independent
         # guarantee of our own: a reply that's actually addressed to the
-        # bot (e.g. tagging it while replying in a thread) must never be
-        # mistaken for a real reply and federated out. Bot bookkeeping
-        # stays in Matrix, full stop.
+        # bot (e.g. tagging it while replying in a thread) -- or to a
+        # DIFFERENT bot/bridge sharing this room, see
+        # bridge.commands.is_foreign_bot_command -- must never be mistaken
+        # for a real reply and federated out. Bot bookkeeping stays in
+        # Matrix, full stop.
         return True
 
     config = request.app.state.config

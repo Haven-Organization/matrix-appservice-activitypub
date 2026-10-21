@@ -368,7 +368,10 @@ logger = logging.getLogger(__name__)
 # slash commands (/me, /ban, ...) before an event is even sent, so a "/"
 # prefix could never actually reach us as ordinary message text in the first
 # place. ";" is short (one character, matching the brief to keep it as
-# terse as tagging allows) and, in practice, rare as a bot prefix.
+# terse as tagging allows) and, in practice, rare as a bot prefix. Just the
+# module-load-time DEFAULT, though -- see configure_command_prefix below for
+# why this and _PREFIXED_COMMAND_RE are reassigned once for real from
+# bridge.command_prefix, not frozen constants.
 _COMMAND_PREFIX = ";"
 
 _COMMAND_KEYWORDS = (
@@ -393,6 +396,27 @@ _COMMAND_RE = re.compile(rf"\b({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | r
 _PREFIXED_COMMAND_RE = re.compile(
     rf"^{re.escape(_COMMAND_PREFIX)}\s*({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | re.DOTALL
 )
+
+
+def configure_command_prefix(prefix: str) -> None:
+    """Applies ``bridge.command_prefix`` for real, once, at startup (see
+    ``bridge.server.create_app``) -- config isn't loaded yet at the
+    module-import time ``_COMMAND_PREFIX``/``_PREFIXED_COMMAND_RE`` above
+    are first defined, so those are just the pre-config defaults, and this
+    is what actually makes the setting take effect. Every other use of
+    ``_COMMAND_PREFIX`` in this module (help text, usage/error strings) is
+    a plain module-global lookup evaluated at request-handling time, so
+    reassigning it here once is enough for all of them to pick up the
+    configured value -- only the compiled ``_PREFIXED_COMMAND_RE`` regex
+    needs rebuilding alongside it. This bridge has no config-hot-reload
+    story anywhere else either, so calling this more than once with the
+    same value (e.g. constructing a second app in the same process, as
+    tests do) is harmless, just redundant."""
+    global _COMMAND_PREFIX, _PREFIXED_COMMAND_RE
+    _COMMAND_PREFIX = prefix
+    _PREFIXED_COMMAND_RE = re.compile(
+        rf"^{re.escape(_COMMAND_PREFIX)}\s*({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | re.DOTALL
+    )
 
 # _SOCIAL_PROFILE_ROOM_TYPE and _KNOCK_JOIN_RULE now live in
 # bridge.note_mirroring (imported above, aliased to these same names) --
@@ -464,6 +488,64 @@ def message_addresses_bot(content: dict, config) -> bool:
     return _extract_prefixed_command(body) is not None
 
 
+def is_foreign_bot_command(content: dict, config) -> bool:
+    """Whether ``content`` looks like a command meant for a DIFFERENT bot
+    or bridge sharing this room (a Bluesky or Nostr bridge, another
+    Matrix bot, ...), per ``bridge.other_bot_prefixes`` -- never this
+    bridge's own (see ``message_addresses_bot`` for that).
+
+    Each configured entry is matched one of two ways, depending on its
+    shape -- mirroring ``message_addresses_bot``'s own two-tier approach
+    for exactly the same reason:
+    - An entry shaped like a full Matrix ID (``_MXID_RE``, e.g.
+      ``@bluesky:yourdomain``) is treated as that bridge's BOT, addressed
+      the same way ours is: a real intentional mention
+      (``m.mentions.user_ids``, position-independent -- a client's own
+      plain-text fallback for a mention pill is usually the mentioned
+      user's DISPLAY NAME, not their raw mxid, so this structured field is
+      the only reliable signal for an actual pill) OR the literal mxid
+      typed anywhere in the body (for clients that never send intentional
+      mentions, or someone typing it by hand). Safe to match ANYWHERE,
+      unlike the prefix case below -- a full mxid is specific enough that
+      it won't appear in ordinary prose by coincidence.
+    - Anything else is a short/punctuation-style prefix (``;``, ``]``,
+      ``!``, ``nostr:``, ...), matched only at the very START of the
+      first line (same anchoring as ``_PREFIXED_COMMAND_RE``, just
+      without also requiring a recognized keyword after it -- there's no
+      way to know another bot's own keyword vocabulary). Anchoring
+      matters here specifically because a short prefix like ``;`` or
+      ``!`` is common enough in ordinary prose that matching it ANYWHERE
+      would silently swallow real posts that merely contain that
+      character.
+
+    Checked everywhere ``message_addresses_bot`` already is (profile/
+    reply/chat/channel/Lemmy post distribution) as an ADDITIONAL reason to
+    skip federating a message as ordinary content, but kept entirely
+    SEPARATE from that function -- a foreign bot's own command must never
+    be treated as addressed to OUR bot (``maybe_handle_command`` checks
+    this only when ``message_addresses_bot`` already said no, and returns
+    True -- handled, no federation -- without attempting to parse or
+    reply to it; replying "not sure what you mean" to a command that was
+    never meant for us in the first place would just be noise in a room
+    someone else's bridge is also using).
+
+    Empty ``bridge.other_bot_prefixes`` (the default) always returns
+    False with no per-message overhead."""
+    prefixes = config.bridge.other_bot_prefixes
+    if not prefixes:
+        return False
+    mentioned = (content.get("m.mentions") or {}).get("user_ids") or []
+    body = content.get("body") or ""
+    first_line = body.split("\n", 1)[0]
+    for prefix in prefixes:
+        if _MXID_RE.match(prefix):
+            if prefix in mentioned or prefix in body:
+                return True
+        elif first_line.startswith(prefix):
+            return True
+    return False
+
+
 # Single-word commands blocked outright for a third-party sender currently
 # effective-Follow-Only, regardless of argument (see _effective_third_party_mode).
 _FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost", "boost", "publish", "unpublish", "edit"}
@@ -523,7 +605,11 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     """Handle a bot-tagged command event.
 
     Returns True if the message tagged the bot (handled, regardless of
-    whether a recognized command keyword was found in it).
+    whether a recognized command keyword was found in it), OR if it's a
+    command meant for a DIFFERENT bot/bridge sharing this room (see
+    ``is_foreign_bot_command``) -- handled in the sense of "never federate
+    this," but silently: no reply is sent and no command parsing is
+    attempted, since it was never actually addressed to us.
     """
     if event.get("type") != "m.room.message":
         return False
@@ -533,7 +619,7 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     bot_mxid = _bot_mxid(config)
 
     if not message_addresses_bot(content, config):
-        return False
+        return is_foreign_bot_command(content, config)
     body = content.get("body") or ""
 
     sender = event.get("sender", "")

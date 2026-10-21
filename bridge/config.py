@@ -336,6 +336,27 @@ class BridgeSection:
     # custom_identities_enabled is on. A bridge admin (see bridge.admins /
     # use_synapse_admin_api) is never subject to this cap.
     max_identities_per_user: int = 5
+    # The character(s) that start a bot command in chat (";follow ...",
+    # ";help", and so on) -- see bridge.commands._COMMAND_PREFIX /
+    # bridge.commands.configure_command_prefix, which applies this once at
+    # startup. Change this if ";" collides with another bot/bridge sharing
+    # the same room (see other_bot_prefixes below for the other half of
+    # that same room-sharing scenario: recognizing THEIR prefix, not just
+    # picking a different one for yourself).
+    command_prefix: str = ";"
+    # Other bots'/bridges' own command prefixes (e.g. ["!", "nostr:"]), for
+    # a room shared with other bridges (a Bluesky or Nostr bridge, another
+    # Matrix bot, ...) on the same homeserver. A message starting with one
+    # of these is never federated out as an ordinary post by THIS bridge,
+    # even though it's correctly never treated as addressed to this
+    # bridge's own bot either (no reply, no attempted command parsing --
+    # see bridge.commands.is_foreign_bot_command) -- without this, a
+    # command meant for a different bridge would fall straight through
+    # this bridge's own "not one of my commands" check and get posted to
+    # the fediverse as if it were ordinary content, since this bridge has
+    # no way to otherwise recognize another bot's own keyword vocabulary.
+    # Empty (the default) if this room isn't shared with anything else.
+    other_bot_prefixes: list[str] = field(default_factory=list)
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -517,6 +538,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
             "bridge.reply_cross_post_mode must be one of 'off', 'followed', 'always', "
             f"got {reply_cross_post_mode!r}"
         )
+    command_prefix = bridge_raw.get("command_prefix", ";")
+    if not command_prefix:
+        raise ConfigError("bridge.command_prefix cannot be empty -- it would match every message.")
+    # Blank/whitespace-only entries are dropped rather than rejected outright --
+    # harmless either way, no reason to make a stray trailing comma in a YAML
+    # list a hard startup failure.
+    other_bot_prefixes = [p for p in (bridge_raw.get("other_bot_prefixes") or []) if p and p.strip()]
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -552,6 +580,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
         custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
+        command_prefix=command_prefix,
+        other_bot_prefixes=other_bot_prefixes,
     )
 
     synapse_section = SynapseSection(

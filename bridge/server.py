@@ -24,6 +24,7 @@ from bridge.activitypub.routes import router as activitypub_router
 from bridge.activitypub.signatures import ActorKeyCache
 from bridge.activitypub.urls import main_key_id
 from bridge.appservice_routes import router as appservice_router
+from bridge.commands import configure_command_prefix
 from bridge.config import BridgeConfig, ConfigError
 from bridge.ghosts import ensure_ghost_user
 from bridge.outage_recovery import outage_recovery_loop
@@ -115,6 +116,15 @@ def create_app(
     ``InMemoryActorRepository``) for tests, bypassing this selection
     entirely.
     """
+    # Applies bridge.command_prefix for real -- bridge.commands' own
+    # module-level ";" is just the pre-config default (see
+    # configure_command_prefix's own docstring). Done here rather than
+    # inside lifespan below since nothing about it needs the app to
+    # actually be running yet, and every route this process ever serves
+    # should see the configured prefix from the start, not just requests
+    # that happen to arrive after lifespan's startup phase completes.
+    configure_command_prefix(config.bridge.command_prefix)
+
     owns_repository = repository is None
 
     @asynccontextmanager

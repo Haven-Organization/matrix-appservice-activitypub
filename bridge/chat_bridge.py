@@ -31,7 +31,7 @@ from fastapi import Request
 from bridge.activitypub.models import Activity, ChatMessage
 from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.activitypub.urls import actor_url, main_key_id
-from bridge.commands import is_third_party_still_allowed, message_addresses_bot
+from bridge.commands import is_foreign_bot_command, is_third_party_still_allowed, message_addresses_bot
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -53,11 +53,12 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
     content = normalized_message_content(event)
     config = request.app.state.config
 
-    if message_addresses_bot(content, config):
+    if message_addresses_bot(content, config) or is_foreign_bot_command(content, config):
         # Same reasoning as bridge.reply_bridge's identical guard: a
         # message actually addressed to the bot (e.g. tagging it inside a
-        # chat room, unusual but not impossible) must never be mistaken
-        # for real chat content and federated out.
+        # chat room, unusual but not impossible) -- or to a DIFFERENT
+        # bot/bridge sharing this room, see is_foreign_bot_command -- must
+        # never be mistaken for real chat content and federated out.
         return True
 
     sender = event.get("sender", "")

@@ -376,19 +376,20 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
     # bridge.inbox_dispatch, ends up importing from here too), so importing
     # message_addresses_bot from there at module level would be circular --
     # same reasoning as this module's other deferred imports.
-    from bridge.commands import message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
-    if message_addresses_bot(content, config):
+    if message_addresses_bot(content, config) or is_foreign_bot_command(content, config):
         # bridge.commands.maybe_handle_command runs earlier in the
         # dispatch chain and normally intercepts anything tagging the bot
         # before we're ever even reached -- this is a second, independent
         # guarantee of our own (same pattern
         # bridge.profile_posts.maybe_distribute_profile_post's identical
         # check gives Profile Rooms): a "; refresh guild" (or any other)
-        # command must never be mistaken for real channel chat and
-        # federated out to Shoot, full stop.
+        # command -- ours or, via is_foreign_bot_command, a DIFFERENT
+        # bot/bridge sharing this room -- must never be mistaken for real
+        # channel chat and federated out to Shoot, full stop.
         return True
 
     room_id = event.get("room_id", "")

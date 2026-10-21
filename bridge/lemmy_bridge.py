@@ -946,11 +946,11 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
     if event.get("type") != "m.room.message":
         return False
 
-    from bridge.commands import message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
-    if message_addresses_bot(content, config):
+    if message_addresses_bot(content, config) or is_foreign_bot_command(content, config):
         return True
 
     room_id = event.get("room_id", "")
@@ -1480,11 +1480,11 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
     if event.get("type") != "m.room.message":
         return False
 
-    from bridge.commands import message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
-    if message_addresses_bot(content, config):
+    if message_addresses_bot(content, config) or is_foreign_bot_command(content, config):
         return True
 
     room_id = event.get("room_id", "")

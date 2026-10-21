@@ -45,7 +45,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
-from bridge.commands import _effective_third_party_mode, message_addresses_bot
+from bridge.commands import _effective_third_party_mode, is_foreign_bot_command, message_addresses_bot
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -312,13 +312,17 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         return False
 
     content = normalized_message_content(event)
-    if message_addresses_bot(content, request.app.state.config):
+    if message_addresses_bot(content, request.app.state.config) or is_foreign_bot_command(
+        content, request.app.state.config
+    ):
         # bridge.commands.maybe_handle_command runs earlier in the dispatch
         # chain and normally intercepts anything tagging the bot before we're
         # ever even reached -- this is a second, independent guarantee of
         # our own: whatever happens upstream, a message addressed to the bot
-        # must never be mistaken for ordinary post content and federated out
-        # to followers. Bot bookkeeping stays in Matrix, full stop.
+        # -- or to a DIFFERENT bot/bridge sharing this room, see
+        # bridge.commands.is_foreign_bot_command -- must never be mistaken
+        # for ordinary post content and federated out to followers. Bot
+        # bookkeeping stays in Matrix, full stop.
         return True
 
     if (content.get("m.relates_to") or {}).get("rel_type") == "m.replace":
