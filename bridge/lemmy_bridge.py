@@ -60,7 +60,7 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_to_matrix_message
+from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback, strip_to_matrix_message
 from bridge.activitypub.urls import (
     actor_url,
     followers_url,
@@ -508,6 +508,32 @@ def _page_attachments(page: dict) -> list[dict]:
         media_type = item.get("mediaType") or mimetypes.guess_type(url)[0] or "application/octet-stream"
         results.append({"url": url, "media_type": media_type, "name": item.get("name") or ""})
     return results
+
+
+def _lemmy_post_attachment(attachment: dict) -> dict:
+    """Converts ``build_ap_attachment``'s generic shape (``{"type", "url",
+    "mediaType"}``, Note-style, keyed ``url``) into what a real Lemmy
+    instance's own Page parser actually reads -- confirmed against
+    ``LemmyNet/lemmy``'s own source (``crates/apub/objects/src/protocol/
+    page.rs``'s ``Attachment::new``, and ``objects/post.rs``'s
+    ``ApubPost::from_json``): Lemmy reads a post's media/link EXCLUSIVELY
+    from ``page.attachment[0]`` (never a top-level ``page.url`` -- Lemmy's
+    own outbound ``Page`` doesn't even have one), as either an AS2 ``Image``
+    (keyed ``url``) for an image mediaType, or an AS2 ``Link`` (keyed
+    ``href``, not ``url`` -- a bare ``Document``-style ``url`` key is
+    silently never read for anything but Image/Document attachments from
+    lotide/Mobilizon) for everything else, including video. Without this
+    conversion a video/non-image post's media was dropped entirely --
+    confirmed live 2026-10-21, a video post federated out with no
+    attachment at all and showed no media on a real Lemmy instance."""
+    media_type = attachment.get("mediaType") or ""
+    url = attachment["url"]
+    if media_type.startswith("image"):
+        return {"type": "Image", "url": url}
+    result = {"type": "Link", "href": url}
+    if media_type:
+        result["mediaType"] = media_type
+    return result
 
 
 async def import_lemmy_page(
@@ -1135,13 +1161,31 @@ async def push_community_update(request: Request, community: LemmyCommunityRecor
     """Send a signed ``Update(Group)`` carrying ``community``'s CURRENT
     display name/summary/avatar/banner to every one of its followers --
     same "an already-cached copy on a follower's server otherwise silently
-    goes stale" reasoning as ``bridge.peertube.push_channel_update``, whose
-    exact shape this mirrors (just with a single ``attributedTo`` moderators
-    URL instead of a list of owning-account actor ids -- see
-    ``Actor.attributed_to``'s own docstring)."""
+    goes stale" reasoning as ``bridge.peertube.push_channel_update``.
+
+    Signed and ACTORED by the community's OWNER (a ``Person``), never the
+    community itself -- confirmed against ``LemmyNet/lemmy``'s own source
+    (``crates/apub/activities/src/community/update.rs``'s
+    ``send_update_community``, and the wire protocol's own
+    ``actor: ObjectId<ApubPerson>`` field in ``protocol/community/update.rs``):
+    a real Lemmy community's Update is always sent by the editing
+    moderator's own account, never self-signed by the Group actor -- Lemmy's
+    own semantics treat an Update as "a mod changed these settings", not
+    "the community announces itself". A self-signed Update worked fine
+    against Pleroma/Akkoma (generic AS2, doesn't care who signs an Update)
+    but silently never refreshed a real Lemmy instance's cached copy --
+    confirmed live 2026-10-21, a changed room avatar reached poa.st
+    correctly but never appeared on sh.itjust.works's own cached community
+    row despite a 2xx delivery with no warning logged."""
     config = request.app.state.config
     base = config.bridge.public_base_url
     repository = request.app.state.repository
+
+    owner = await repository.get_local_actor(community.owner_username)
+    if owner is None:
+        logger.warning("Community %s has no resolvable owner; cannot sign its Update", community.username)
+        return
+    owner_actor_id = actor_url(base, owner.username)
 
     actor = Actor(
         id=actor_url(base, community.username),
@@ -1166,8 +1210,8 @@ async def push_community_update(request: Request, community: LemmyCommunityRecor
     )
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     update_activity = Activity(
-        id=f"{actor.id}/updates/{uuid.uuid4().hex}", type="Update", actor=actor.id, object=actor.to_dict(),
-        published=published, to=[AS_PUBLIC], cc=[followers_url(base, community.username)],
+        id=f"{actor.id}/updates/{uuid.uuid4().hex}", type="Update", actor=owner_actor_id, object=actor.to_dict(),
+        published=published, to=[AS_PUBLIC], cc=[actor.id], audience=actor.id,
     )
     followers = await repository.list_followers(community.username)
     for follower_actor_id in followers:
@@ -1177,7 +1221,7 @@ async def push_community_update(request: Request, community: LemmyCommunityRecor
         try:
             await deliver_activity(
                 request.app.state.http_client, inbox_url=inbox, activity=update_activity.to_dict(),
-                key_id=main_key_id(base, community.username), private_key_pem=community.private_key_pem,
+                key_id=main_key_id(base, owner.username), private_key_pem=owner.private_key_pem,
             )
         except DeliveryError:
             logger.warning("Failed to deliver community update to %s", follower_actor_id, exc_info=True)
@@ -1493,6 +1537,13 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
         obj_dict = note.to_dict()
         thread_root_event_id = parent.thread_root_event_id or parent.event_id
     else:
+        from bridge.media import build_ap_attachment, resolve_attachment_or_request_confirmation
+
+        if not await resolve_attachment_or_request_confirmation(
+            request, content=content, room_id=room_id, sender=sender, trigger_event_id=matrix_event_id,
+        ):
+            return True  # an encrypted attachment, confirmation requested, nothing federates yet
+
         title, body = _title_and_body_from_message((content.get("body") or "").strip())
         if not title:
             from bridge.commands import _notice
@@ -1509,6 +1560,11 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
             "content": plain_text_body, "mediaType": "text/html", "published": published,
             "to": [community_actor_id, AS_PUBLIC], "cc": [], "audience": community_actor_id,
         }
+
+        attachment = build_ap_attachment(base, content)
+        if attachment is not None:
+            await repository.mark_media_published(content["url"])
+            obj_dict["attachment"] = [_lemmy_post_attachment(attachment)]
         thread_root_event_id = None
 
     create_activity = Activity(
@@ -1537,6 +1593,126 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
             )
         except DeliveryError:
             logger.warning("Failed to deliver community Announce to %s", recipient_actor_id, exc_info=True)
+    return True
+
+
+async def maybe_federate_owned_community_edit(
+    request: Request, *, federated: FederatedEvent, actor_record: ActorRecord, new_content: dict,
+    matrix_event_id: str,
+) -> bool:
+    """Returns False if ``federated.room_id`` isn't one of OUR OWN hosted
+    Lemmy communities -- the caller (``bridge.edit_bridge.maybe_federate_edit``)
+    then falls back to its own generic personal-Note Update.
+
+    A community post/comment was originally sent as ``Create<Page>``/
+    ``Create<Note>`` wrapped in an ``Announce`` SIGNED BY THE COMMUNITY and
+    delivered to the COMMUNITY's own followers (see
+    ``maybe_distribute_owned_community_message`` just above) -- that's the
+    audience a remote instance like sh.itjust.works actually subscribed
+    through. ``edit_bridge``'s generic path instead signs as the editor's
+    own personal actor and delivers to the editor's own personal followers,
+    which is both the wrong actor (a bare ``Note`` has no ``name``, so a
+    ``Page``'s title silently vanishes) and the wrong audience (delivered
+    nowhere a remote Lemmy instance was ever listening) -- confirmed live
+    2026-10-21 against a real edit of this bridge's first post to
+    sh.itjust.works that never showed up there. Mirrors the Create path
+    exactly, just ``Update`` instead of ``Create``, same object id."""
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community_by_room_id(federated.room_id)
+    if community is None:
+        return False
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    own_actor_id = federated.author_actor_id
+    community_actor_id = actor_url(base, community.username)
+    # Same id convention maybe_distribute_owned_community_message minted
+    # the object id with: .../posts/<uuid> for a top-level Page,
+    # .../notes/<uuid> for a reply Note -- nothing else records which one
+    # federated.ap_object_id is, so this is the one place to tell them apart.
+    is_page = "/posts/" in federated.ap_object_id
+
+    from bridge.media import build_ap_attachment, resolve_attachment_or_request_confirmation
+
+    if not await resolve_attachment_or_request_confirmation(
+        request, content=new_content, room_id=federated.room_id, sender=actor_record.matrix_user_id,
+        trigger_event_id=matrix_event_id,
+    ):
+        return True  # an encrypted attachment, confirmation requested, nothing federates yet
+
+    raw_body = strip_reply_fallback(new_content.get("body") or "")
+    updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    attachment = build_ap_attachment(base, new_content)
+    if attachment is not None:
+        await repository.mark_media_published(new_content["url"])
+
+    # The ORIGINAL published timestamp (and, for a comment, its inReplyTo)
+    # isn't carried on the edit event itself -- re-fetch the original event
+    # exactly like edit_bridge.maybe_federate_edit does for a personal post.
+    try:
+        original_event = await request.app.state.synapse.get_event(
+            federated.room_id, federated.event_id,
+            as_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
+        )
+    except SynapseError:
+        original_event = None
+    published = (
+        datetime.fromtimestamp(
+            (original_event.get("origin_server_ts") or 0) / 1000, timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if original_event is not None else updated
+    )
+
+    if is_page:
+        title, body = _title_and_body_from_message(raw_body)
+        if not title:
+            return True  # can't rebuild a titleless Page -- leave the old title/body in place
+        obj_dict = {
+            "id": federated.ap_object_id, "type": "Page", "attributedTo": own_actor_id, "name": title,
+            "content": plain_text_to_note_html(body) if body else "", "mediaType": "text/html",
+            "published": published, "updated": updated, "to": [community_actor_id, AS_PUBLIC], "cc": [],
+            "audience": community_actor_id,
+        }
+        if attachment is not None:
+            obj_dict["attachment"] = [_lemmy_post_attachment(attachment)]
+    else:
+        if not raw_body and attachment is None:
+            return True
+        from bridge.reply_bridge import derive_in_reply_to
+
+        in_reply_to = (
+            await derive_in_reply_to(repository, original_event.get("content") or {})
+            if original_event is not None else None
+        )
+        note = Note(
+            id=federated.ap_object_id, attributed_to=own_actor_id,
+            content=plain_text_to_note_html(raw_body) if raw_body else "", published=published, updated=updated,
+            to=[AS_PUBLIC], cc=[community_actor_id], in_reply_to=in_reply_to, audience=community_actor_id,
+            tag=[{"type": "Mention", "href": community_actor_id}],
+        )
+        obj_dict = note.to_dict()
+        if attachment is not None:
+            obj_dict["attachment"] = [attachment]
+
+    update_activity = Activity(
+        id=f"{federated.ap_object_id}#updates/{uuid.uuid4().hex}", type="Update", actor=own_actor_id,
+        object=obj_dict, published=updated, to=[AS_PUBLIC], cc=[community_actor_id], audience=community_actor_id,
+    )
+    announce_activity = Activity(
+        id=f"{federated.ap_object_id}/announces/{uuid.uuid4().hex}", type="Announce", actor=community_actor_id,
+        object=update_activity.to_dict(), published=updated, to=[AS_PUBLIC],
+        cc=[followers_url(base, community.username)],
+    )
+
+    followers = await repository.list_followers(community.username)
+    for recipient_actor_id in followers:
+        try:
+            await deliver_to_actor_or_followers(
+                request, target_actor_id=recipient_actor_id, activity=announce_activity.to_dict(),
+                key_id=main_key_id(base, community.username), private_key_pem=community.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to deliver community Update-Announce to %s", recipient_actor_id, exc_info=True)
     return True
 
 

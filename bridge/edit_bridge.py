@@ -98,6 +98,14 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
     if await repository.is_ghost_dm_room(federated.room_id) or await repository.is_ghost_chat_room(federated.room_id):
         return True  # see module docstring -- private edits not federated yet
 
+    from bridge.lemmy_bridge import maybe_federate_owned_community_edit
+
+    if await maybe_federate_owned_community_edit(
+        request, federated=federated, actor_record=actor_record, new_content=new_content,
+        matrix_event_id=event.get("event_id") or federated.event_id,
+    ):
+        return True  # one of OUR OWN hosted Lemmy communities -- handled via its own Announce choreography
+
     if not await resolve_attachment_or_request_confirmation(
         request, content=new_content, room_id=federated.room_id, sender=sender,
         trigger_event_id=event.get("event_id") or federated.event_id,
