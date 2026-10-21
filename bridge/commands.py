@@ -243,6 +243,7 @@ from bridge.ghosts import (
     sanitize_localpart_component,
     third_party_username_from_mxid,
 )
+from bridge.identity_resolution import resolve_acting_identity
 from bridge.identity_settings import (
     SettingError,
     apply_set,
@@ -339,6 +340,7 @@ from bridge.note_mirroring import source_post_url as _source_post_url
 from bridge.note_mirroring import sync_remote_room_history_visibility as _sync_remote_room_history_visibility
 from bridge.repository import (
     ActorRecord,
+    ActorRepository,
     FederatedEvent,
     GhostProfile,
     LemmyCommunityRoom,
@@ -372,7 +374,7 @@ _COMMAND_PREFIX = ";"
 _COMMAND_KEYWORDS = (
     r"unlink|unfollow|following|import|follow|link|delete|create|replace|rejoin|banner|"
     r"dm|chat|boost|repost|set|unblock|block|unmute|mute|backfill|widget|leave|help|"
-    r"disallow|allowed|allow|refresh|joinguild|leaveguild|unpublish|publish|edit"
+    r"disallow|allowed|allow|refresh|joinguild|leaveguild|unpublish|publish|edit|id"
 )
 
 
@@ -601,7 +603,9 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         repository = request.app.state.repository
         sender_server = sender.split(":", 1)[1] if ":" in sender else ""
         is_third_party_sender = sender_server != config.synapse.server_name
-        is_delete_profile_command = subcommand == "delete" and argument.lower() == "profile"
+        is_delete_profile_command = subcommand == "delete" and (
+            argument.lower() == "profile" or argument.lower().startswith("profile ")
+        )
         # ";delete profile" is exempt from the allowlist check itself (not
         # just the Follow-Only block below) -- it's their own identity to
         # walk away from, and revoking a grant deliberately never tears one
@@ -701,11 +705,23 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
         elif subcommand == "link" and argument.lower() == "profile":
             await _handle_link_profile(request, sender=sender, room_id=room_id)
         elif subcommand == "unlink" and argument.lower() == "profile":
-            await _handle_unlink_profile(request, sender=sender, room_id=room_id)
+            await _handle_unlink_profile(request, sender=sender, room_id=room_id, selector="")
+        elif subcommand == "unlink" and argument.lower().startswith("profile "):
+            await _handle_unlink_profile(
+                request, sender=sender, room_id=room_id, selector=argument[len("profile"):].strip()
+            )
         elif subcommand == "delete" and argument.lower() == "profile":
-            await _handle_delete_profile(request, sender=sender, room_id=room_id)
+            await _handle_delete_profile(request, sender=sender, room_id=room_id, selector="")
+        elif subcommand == "delete" and argument.lower().startswith("profile "):
+            await _handle_delete_profile(
+                request, sender=sender, room_id=room_id, selector=argument[len("profile"):].strip()
+            )
         elif subcommand == "create" and argument.lower() == "profile":
-            await _handle_create_profile(request, sender=sender, room_id=room_id)
+            await _handle_create_profile(request, sender=sender, room_id=room_id, custom_id="")
+        elif subcommand == "create" and argument.lower().startswith("profile "):
+            await _handle_create_profile(
+                request, sender=sender, room_id=room_id, custom_id=argument[len("profile"):].strip()
+            )
         elif subcommand == "create" and (argument.lower() == "channel" or argument.lower().startswith("channel ")):
             await _handle_create_channel(request, sender=sender, room_id=room_id, argument=argument[len("channel"):].strip())
         elif subcommand == "create" and (
@@ -750,6 +766,8 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_rejoin(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "following":
             await _handle_list_following(request, sender=sender, room_id=room_id)
+        elif subcommand == "id":
+            await _handle_id(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "set":
             await _handle_set(request, sender=sender, room_id=room_id, argument=argument)
         elif subcommand == "block":
@@ -1019,9 +1037,16 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
             "Setting up and maintaining your own linked fediverse identity.",
             [
                 (
-                    f"{_COMMAND_PREFIX}create profile",
-                    f"Set up a new fediverse identity ({config.bridge.domain}) and Matrix room for you in "
-                    "one step.",
+                    f"{_COMMAND_PREFIX}create profile"
+                    + (" [<id>]" if config.bridge.custom_identities_enabled else ""),
+                    f"Set up a new fediverse identity ({config.bridge.domain}, or a custom <id> if enabled) "
+                    "and Matrix room for you in one step.",
+                ),
+                (
+                    f"{_COMMAND_PREFIX}id",
+                    "List your ActivityPub identities (numbered, Active one marked), or switch which one "
+                    f'is Active: "{_COMMAND_PREFIX}id <number|id>". Active is used for anything that '
+                    "doesn't already have an identity implicitly tied to it.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}import follows",
@@ -1155,9 +1180,10 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
             + ".",
             [
                 (
-                    f"{_COMMAND_PREFIX}create channel <id> [display name]",
+                    f"{_COMMAND_PREFIX}create channel <id> [as <number|id>] [display name]",
                     "Set up a real, federating PeerTube-compatible video channel and Matrix room (requires "
-                    "a linked profile first, which becomes the channel's owner).",
+                    "a linked profile first, which becomes the channel's owner -- say which one with "
+                    f'"as <number|id>" if you own more than one).',
                 ),
                 (
                     f"{_COMMAND_PREFIX}publish",
@@ -1199,10 +1225,11 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     "a mirrored post/comment's own thread to pull that thread's replies.",
                 ),
                 (
-                    f"{_COMMAND_PREFIX}create community <id> [display name]"
+                    f"{_COMMAND_PREFIX}create community <id> [as <number|id>] [display name]"
                     + ("" if config.bridge.lemmy_community_hosting_enabled else " (not enabled on this bridge)"),
                     "Mint a real, federating Lemmy-compatible community hosted by this bridge (requires a "
-                    "linked profile first, which becomes its first moderator). Just post a message to "
+                    "linked profile first, which becomes its first moderator -- say which one with "
+                    '"as <number|id>" if you own more than one). Just post a message to '
                     "publish: the first line becomes the title, a blank line, then the body. Reply to an "
                     "existing post/comment to add a comment instead.",
                 ),
@@ -1247,10 +1274,11 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     "instead of creating a new one -- adopts the room's current name/avatar/topic/banner.",
                 ),
                 (
-                    f"{_COMMAND_PREFIX}unlink profile",
+                    f"{_COMMAND_PREFIX}unlink profile [<number|id>]",
                     "Detach this room from your identity without notifying the fediverse. Relinking (even "
                     "in a different room) reattaches the same identity, but this room is immediately open "
-                    "to becoming a DIFFERENT identity in the meantime.",
+                    "to becoming a DIFFERENT identity in the meantime. If you own more than one identity, "
+                    "lists them and asks you to pick which with no selector given.",
                 ),
                 (
                     f"{_COMMAND_PREFIX}replace room",
@@ -1258,9 +1286,10 @@ def _help_sections(config: BridgeConfig) -> dict[str, tuple[str, str, list[tuple
                     "features.",
                 ),
                 (
-                    f"{_COMMAND_PREFIX}delete profile",
-                    "Permanently delete your identity and notify your followers. Irreversible -- unlike "
-                    "everything else in this section.",
+                    f"{_COMMAND_PREFIX}delete profile [<number|id>]",
+                    "Permanently delete an identity and notify its followers. Irreversible -- unlike "
+                    "everything else in this section. If you own more than one identity, lists them and "
+                    "asks you to pick which with no selector given, so this can't land on the wrong one.",
                 ),
             ],
         ),
@@ -1740,7 +1769,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             remote_room_here.display_name if remote_room_here is not None else community_room_here.display_name
         ) or remote_actor_id
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         sender_server = sender.split(":", 1)[1] if ":" in sender else ""
         is_third_party_sender = sender_server != config.synapse.server_name
@@ -1984,7 +2013,7 @@ async def _follow_local_actor(
     repository = request.app.state.repository
     base = config.bridge.public_base_url
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         if not quiet:
             await _notice(
@@ -2257,7 +2286,7 @@ async def _handle_joinguild(request: Request, *, sender: str, room_id: str, argu
     code, domain = argument.split("@", 1)
     code = code.removeprefix("invite:")
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -2368,7 +2397,7 @@ async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> 
         )
         return
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -2541,7 +2570,7 @@ async def _unfollow_local_actor(request: Request, *, sender: str, room_id: str, 
     config = request.app.state.config
     base = config.bridge.public_base_url
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     handle = f"@{target.username}@{config.bridge.domain}"
     if actor_record is None:
         await _notice(request, room_id, f"You're not following {handle}.")
@@ -2583,7 +2612,7 @@ async def _handle_list_following(request: Request, *, sender: str, room_id: str)
     -- following and having a room for someone are tracked separately, so
     it's a best-effort lookup, not guaranteed)."""
     repository = request.app.state.repository
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(request, room_id, "You don't have a linked profile, so you're not following anyone.")
         return
@@ -2623,6 +2652,89 @@ async def _handle_list_following(request: Request, *, sender: str, room_id: str)
     )
 
 
+def _format_identity_lines(
+    identities: list[ActorRecord], *, active_username: str | None, domain: str
+) -> list[str]:
+    """Numbered ``1. handle@domain (active)`` lines for ``identities``
+    (already ordered by ``created_at`` -- see
+    ``ActorRepository.list_local_actors_by_matrix_id``), the one shared
+    rendering ``;id list``, the disambiguation notice in
+    ``;create channel``/``;create community``, and ``;delete profile``/
+    ``;unlink profile`` all reuse, so a user only ever has to learn one
+    numbering convention for "which of my identities is this." This is a
+    deliberately new (numbered, not dash-bulleted) list style for this
+    codebase -- see the design note in the multi-identity plan for why."""
+    lines = []
+    for index, identity in enumerate(identities, start=1):
+        marker = " (active)" if identity.username == active_username else ""
+        lines.append(f"{index}. {identity.username}@{domain}{marker}")
+    return lines
+
+
+def _resolve_identity_selector(identities: list[ActorRecord], token: str) -> ActorRecord | None:
+    """``token`` as either a 1-based index into ``identities`` (same
+    ordering/numbering as ``_format_identity_lines``) or a username,
+    matched case-insensitively. ``None`` if it matches neither."""
+    token = token.strip()
+    if not token:
+        return None
+    if token.isdigit():
+        index = int(token)
+        if 1 <= index <= len(identities):
+            return identities[index - 1]
+        return None
+    lowered = token.lower()
+    for identity in identities:
+        if identity.username.lower() == lowered:
+            return identity
+    return None
+
+
+async def _handle_id(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;id`` / ``;id list``: lists every ActivityPub identity ``sender``
+    owns (numbered, marking which is Active -- see
+    ``_format_identity_lines``). ``;id <number|id>``: switches Active to
+    that identity (``_resolve_identity_selector``).
+
+    Works, and shows a useful (if always one-line) answer, even when
+    ``bridge.custom_identities_enabled`` is off or sender has exactly one
+    identity -- no reason to hide the command just because there's nothing
+    to switch between yet."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    if not identities:
+        await _notice(
+            request, room_id,
+            f'You don\'t have a linked identity yet -- run "{_COMMAND_PREFIX}create profile" first.',
+        )
+        return
+
+    arg = argument.strip()
+    if not arg or arg.lower() == "list":
+        active = await repository.get_active_local_actor(sender)
+        active_username = active.username if active is not None else None
+        lines = ["Your ActivityPub identities:"]
+        lines.extend(
+            _format_identity_lines(identities, active_username=active_username, domain=config.bridge.domain)
+        )
+        if len(identities) > 1:
+            lines.append(f'Switch with "{_COMMAND_PREFIX}id <number|id>".')
+        await _notice(request, room_id, "\n".join(lines))
+        return
+
+    target = _resolve_identity_selector(identities, arg)
+    if target is None:
+        await _notice(
+            request, room_id,
+            f'No identity matching "{arg}" -- run "{_COMMAND_PREFIX}id list" to see yours.',
+        )
+        return
+
+    await repository.set_active_identity(sender, target.username)
+    await _notice(request, room_id, f"Active identity is now {target.username}@{config.bridge.domain}.")
+
+
 async def _resolve_owned_identity(
     request: Request, *, sender: str, room_id: str
 ) -> tuple[str, str] | None:
@@ -2644,11 +2756,20 @@ async def _resolve_owned_identity(
     (e.g. a Matrix-side follower) can also see the traffic in.
 
     ``None`` if ``room_id`` is none of the three, or ``sender`` doesn't own
-    whichever it is."""
+    whichever it is.
+
+    With multi-identity support, ``sender`` may own more than one Profile
+    Room -- this checks every one of their identities' own room, not just
+    a single assumed one (see ``bridge.identity_resolution``, which this
+    function predates and partially overlaps with; the Notifications-DM
+    shortcut below is specific to ``;set`` and deliberately not folded into
+    that shared resolver)."""
     repository = request.app.state.repository
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
-    if actor_record is not None and actor_record.room_id == room_id:
-        return actor_record.username, "profile"
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+
+    for identity in identities:
+        if identity.room_id and identity.room_id == room_id:
+            return identity.username, "profile"
 
     channel = await repository.get_peertube_channel_by_room_id(room_id)
     if channel is not None:
@@ -2656,8 +2777,10 @@ async def _resolve_owned_identity(
         if owner is not None and owner.matrix_user_id == sender:
             return channel.username, "channel"
 
-    if actor_record is not None and await repository.get_bot_dm_room_owner(room_id) == sender:
-        return actor_record.username, "profile"
+    if identities and await repository.get_bot_dm_room_owner(room_id) == sender:
+        active = await repository.get_active_local_actor(sender)
+        if active is not None:
+            return active.username, "profile"
 
     return None
 
@@ -2764,7 +2887,7 @@ async def _handle_block(request: Request, *, sender: str, room_id: str, handle: 
     bot_mxid = _bot_mxid(config)
     synapse = request.app.state.synapse
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -2839,7 +2962,7 @@ async def _handle_unblock(request: Request, *, sender: str, room_id: str, handle
     themselves (``;follow``, ``;dm``, ``;chat``) now that they're able to."""
     repository = request.app.state.repository
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(request, room_id, f'You need a linked profile first -- run "{_COMMAND_PREFIX}link profile".')
         return
@@ -2873,7 +2996,7 @@ async def _handle_mute(request: Request, *, sender: str, room_id: str, handle: s
     inbound interaction they didn't choose."""
     repository = request.app.state.repository
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -2904,7 +3027,7 @@ async def _handle_unmute(request: Request, *, sender: str, room_id: str, handle:
     """Undoes ``;mute``."""
     repository = request.app.state.repository
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(request, room_id, f'You need a linked profile first -- run "{_COMMAND_PREFIX}link profile".')
         return
@@ -2944,7 +3067,7 @@ async def _handle_banner(request: Request, *, sender: str, room_id: str, argumen
     bot_mxid = _bot_mxid(config)
     repository = request.app.state.repository
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None or actor_record.room_id != room_id:
         await _notice(
             request, room_id,
@@ -3092,7 +3215,7 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
         )
         return
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -3116,7 +3239,7 @@ async def _handle_dm(request: Request, *, sender: str, room_id: str, handle: str
     already_existed = await repository.get_ghost_dm_room(remote_actor_id, sender) is not None
     try:
         dm_room_id = await ensure_ghost_dm_room(
-            request, actor_id=remote_actor_id, matrix_user_id=sender,
+            request, actor_id=remote_actor_id, matrix_user_id=sender, local_username=actor_record.username,
             display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
         )
     except RoomForcedEncryptedError:
@@ -3201,7 +3324,7 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
         )
         return
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -3239,7 +3362,7 @@ async def _handle_chat(request: Request, *, sender: str, room_id: str, handle: s
     already_existed = await repository.get_ghost_chat_room(remote_actor_id, sender) is not None
     try:
         chat_room_id = await ensure_ghost_chat_room(
-            request, actor_id=remote_actor_id, matrix_user_id=sender,
+            request, actor_id=remote_actor_id, matrix_user_id=sender, local_username=actor_record.username,
             display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid, respect_silence=False,
         )
     except RoomForcedEncryptedError:
@@ -3347,7 +3470,7 @@ async def _handle_import_follows(request: Request, *, sender: str, room_id: str,
     transaction handler that long would make Synapse re-deliver the whole
     transaction and re-run every event in it mid-import."""
     repository = request.app.state.repository
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id,
@@ -5243,7 +5366,7 @@ async def _handle_repost(
         )
         return
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         await _notice(
             request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".', relates_to=relates_to,
@@ -5458,7 +5581,7 @@ async def _reinvite_to_profile_and_space(
     )
 
 
-async def _handle_create_profile(request: Request, *, sender: str, room_id: str) -> None:
+async def _handle_create_profile(request: Request, *, sender: str, room_id: str, custom_id: str = "") -> None:
     """Do everything ``link profile`` otherwise requires the user to have
     already set up manually themselves (their own room, with the bot
     invited into it and given enough power to set its name/avatar) -- create
@@ -5469,26 +5592,82 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
     actor -- all as a single atomic command. ``link profile`` still exists
     unchanged for anyone who'd rather use their own already-existing room.
 
-    Already linked? Re-invites instead of just refusing (see
-    ``_reinvite_to_profile_and_space``) -- this doubles as the recovery
-    path for someone locked out of (and, if their homeserver admin
-    reactivated them, back into) their own account: still fully linked in
-    our own records, just no longer a member of either room.
+    Already linked (to the SAME username this call resolves to)? Re-invites
+    instead of just refusing (see ``_reinvite_to_profile_and_space``) --
+    this doubles as the recovery path for someone locked out of (and, if
+    their homeserver admin reactivated them, back into) their own account:
+    still fully linked in our own records, just no longer a member of
+    either room.
+
+    ``custom_id`` (``";create profile <id>"``) picks a custom id instead of
+    the Matrix localpart, gated on ``bridge.custom_identities_enabled`` --
+    bare ``";create profile"`` (``custom_id=""``) always derives from the
+    localpart exactly as it always has, REGARDLESS of that setting; the
+    setting only gates whether the ``<id>`` FORM is available at all, never
+    changes what the bare form does. If the resulting username is a
+    genuinely new identity (not a reattach) and the sender already owns at
+    least one other, the new one does NOT become their Active identity
+    (``ActorRepository.register_local_actor`` already enforces this -- see
+    its own docstring) and is subject to ``bridge.max_identities_per_user``
+    (bypassed for a bridge admin, see ``_is_matrix_admin``).
     """
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
     bot_mxid = _bot_mxid(config)
 
-    existing = await repository.get_local_actor_by_matrix_id(sender)
-    if existing is not None and existing.room_id:
-        await _reinvite_to_profile_and_space(request, sender=sender, room_id=room_id, actor_record=existing)
+    custom_id = custom_id.strip()
+    if custom_id and not config.bridge.custom_identities_enabled:
+        await _notice(
+            request, room_id,
+            "Custom identity ids aren't enabled on this bridge -- an admin needs to turn on "
+            f'bridge.custom_identities_enabled first. Run "{_COMMAND_PREFIX}create profile" with no id '
+            "to link your Matrix username instead.",
+        )
         return
+
+    existing_identities = await repository.list_local_actors_by_matrix_id(sender)
+    is_first_identity_ever = not existing_identities
+
+    if custom_id:
+        username = sanitize_localpart_component(custom_id)
+        if not username:
+            await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create profile <id>".')
+            return
+    else:
+        # Bare form -- always the Matrix localpart, unaffected by
+        # custom_identities_enabled either way (see this function's own
+        # docstring).
+        username = sanitize_localpart_component(sender[1:].split(":", 1)[0])
 
     # An `existing` record with no room_id is a previously `unlink profile`d
     # identity -- see _handle_link_profile's identical reasoning: reattach
     # the SAME actor to the freshly-created room instead of minting a new one.
-    username = existing.username if existing is not None else sanitize_localpart_component(sender[1:].split(":", 1)[0])
+    existing = next((identity for identity in existing_identities if identity.username == username), None)
+    if existing is not None and existing.room_id:
+        await _reinvite_to_profile_and_space(request, sender=sender, room_id=room_id, actor_record=existing)
+        return
+
+    if existing is None:
+        # Channels/communities share this same global username namespace
+        # (see _handle_create_channel's identical check) -- a genuinely new
+        # identity must not collide with either.
+        if (
+            await repository.get_local_actor(username) is not None
+            or await repository.get_peertube_channel(username) is not None
+            or await repository.get_lemmy_community(username) is not None
+        ):
+            await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
+            return
+        if not is_first_identity_ever and not await _is_matrix_admin(request, sender):
+            if len(existing_identities) >= config.bridge.max_identities_per_user:
+                await _notice(
+                    request, room_id,
+                    f"You already have {len(existing_identities)} identities, the maximum allowed "
+                    f'({config.bridge.max_identities_per_user}). Run "{_COMMAND_PREFIX}delete profile" '
+                    "to remove one first.",
+                )
+                return
 
     try:
         profile = await synapse.get_profile(sender)
@@ -5590,17 +5769,83 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str)
     if existing is not None:
         message += " Your followers/following from before are preserved."
         html_message += " Your followers/following from before are preserved."
+    elif not is_first_identity_ever:
+        message += (
+            f' This is an additional identity -- it is not your Active one until you switch to it with '
+            f'"{_COMMAND_PREFIX}id <number|id>".'
+        )
+        html_message += (
+            f' This is an additional identity -- it is not your Active one until you switch to it with '
+            f'"{_COMMAND_PREFIX}id &lt;number|id&gt;".'
+        )
     await _notice(request, room_id, message, html_message=html_message)
 
 
+async def _resolve_owner_for_new_identity(
+    repository: ActorRepository, *, sender: str, rest: str, domain: str
+) -> tuple[ActorRecord | None, str, str | None]:
+    """Parses an optional leading ``as <number|id>`` off ``rest`` (the text
+    after a ``;create channel``/``;create community``'s own ``<id>``
+    argument), resolving which of ``sender``'s identities should own the
+    new channel/community. Returns ``(owner, remaining_text, error)``:
+    on success ``error`` is ``None`` and ``remaining_text`` is whatever's
+    left (the display name, if any) with the ``as ...`` token stripped
+    off; on failure ``owner`` is ``None`` and ``error`` is a ready-to-send
+    notice.
+
+    If ``sender`` has exactly one identity, ``as ...`` is accepted (and
+    stripped) but never required -- that one identity is used
+    automatically either way, so existing single-identity muscle-memory
+    syntax with no ``as`` at all keeps working completely unchanged. If
+    they have more than one and no ``as ...`` was given, this is
+    ambiguous: returns an error listing every identity (same numbered
+    format as ``;id list``) asking them to re-run with ``as
+    <number|id>``."""
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    if not identities:
+        return None, rest, (
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" first.'
+        )
+
+    remaining = rest
+    selector: str | None = None
+    if remaining.lower().startswith("as "):
+        selector, _, remaining = remaining[len("as "):].partition(" ")
+
+    if selector is not None:
+        owner = _resolve_identity_selector(identities, selector)
+        if owner is None:
+            return None, rest, f'No identity matching "{selector}" -- run "{_COMMAND_PREFIX}id list" to see yours.'
+        return owner, remaining, None
+
+    if len(identities) == 1:
+        return identities[0], remaining, None
+
+    active = await repository.get_active_local_actor(sender)
+    active_username = active.username if active is not None else None
+    lines = ["You have more than one identity -- say which one owns this:"]
+    lines.extend(_format_identity_lines(identities, active_username=active_username, domain=domain))
+    lines.append('Re-run with "as <number|id>" right after the id, e.g. "... <id> as 2 ...".')
+    return None, rest, "\n".join(lines)
+
+
 async def _handle_create_channel(request: Request, *, sender: str, room_id: str, argument: str) -> None:
-    """``;create channel <id> [display name]``: mints a real, federating
-    PeerTube-compatible video channel (see ``PeerTubeChannelRecord``'s own
-    docstring and the agreed design captured in the
-    ``project_peertube_channels_scoping`` memory). Requires ``sender`` to
-    already have a linked Profile: that Profile's own ``username`` becomes
-    the new channel's ``owner_username``, since a channel is never
-    ownerless, though one Profile can own several channels."""
+    """``;create channel <id> [as <number|id>] [display name]``: mints a
+    real, federating PeerTube-compatible video channel (see
+    ``PeerTubeChannelRecord``'s own docstring and the agreed design
+    captured in the ``project_peertube_channels_scoping`` memory). Requires
+    ``sender`` to already have a linked Profile: that Profile's own
+    ``username`` becomes the new channel's ``owner_username``, since a
+    channel is never ownerless, though one Profile can own several
+    channels.
+
+    With multi-identity support, ``sender`` may own more than one
+    Profile -- if they do, which one owns this channel must be
+    disambiguated via a leading ``as <number|id>`` right after ``<id>``
+    (see ``_resolve_owner_for_new_identity``); with exactly one, that one
+    is used automatically and ``as ...`` stays optional, so existing
+    muscle-memory syntax keeps working unchanged."""
     config = request.app.state.config
     if not config.bridge.peertube_channels_enabled:
         await _notice(request, room_id, "PeerTube channels are not enabled on this bridge.")
@@ -5609,7 +5854,21 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
     repository = request.app.state.repository
     synapse = request.app.state.synapse
 
-    owner = await repository.get_local_actor_by_matrix_id(sender)
+    raw_id, _, rest = argument.partition(" ")
+    channel_id = sanitize_localpart_component(raw_id)
+    if not channel_id:
+        await _notice(
+            request, room_id,
+            f'Usage: "{_COMMAND_PREFIX}create channel <id> [as <number|id>] [display name]".',
+        )
+        return
+
+    owner, rest, error = await _resolve_owner_for_new_identity(
+        repository, sender=sender, rest=rest.strip(), domain=config.bridge.domain
+    )
+    if error is not None:
+        await _notice(request, room_id, error)
+        return
     if owner is None or not owner.room_id:
         await _notice(
             request, room_id,
@@ -5618,12 +5877,7 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
         )
         return
 
-    raw_id, _, rest = argument.partition(" ")
-    channel_id = sanitize_localpart_component(raw_id)
     display_name = rest.strip() or channel_id
-    if not channel_id:
-        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create channel <id> [display name]".')
-        return
 
     # Channels and profiles share one global actor-username namespace (see
     # PeerTubeChannelRecord's docstring; both are ultimately served at
@@ -5685,15 +5939,18 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
 
 
 async def _handle_create_community(request: Request, *, sender: str, room_id: str, argument: str) -> None:
-    """``;create community <id> [display name]``: mints a real, federating
-    Lemmy-compatible community HOSTED by this bridge (see
+    """``;create community <id> [as <number|id>] [display name]``: mints a
+    real, federating Lemmy-compatible community HOSTED by this bridge (see
     ``LemmyCommunityRecord``'s own docstring, and ``bridge.lemmy_bridge``'s
     module-level docstring for the design). Requires ``sender`` to already
     have a linked Profile (explicit user requirement) -- that Profile's own
     ``username`` becomes the community's first moderator; a community has
     no single "owner" beyond that, see ``LemmyCommunityRecord.owner_username``'s
     own docstring. Run ``;link community`` instead to turn an
-    already-existing room into one."""
+    already-existing room into one.
+
+    Same multi-identity disambiguation as ``;create channel`` -- see
+    ``_resolve_owner_for_new_identity``."""
     config = request.app.state.config
     if not config.bridge.lemmy_community_hosting_enabled:
         await _notice(request, room_id, "Hosting Lemmy communities is not enabled on this bridge.")
@@ -5702,7 +5959,21 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
     repository = request.app.state.repository
     synapse = request.app.state.synapse
 
-    owner = await repository.get_local_actor_by_matrix_id(sender)
+    raw_id, _, rest = argument.partition(" ")
+    community_id = sanitize_localpart_component(raw_id)
+    if not community_id:
+        await _notice(
+            request, room_id,
+            f'Usage: "{_COMMAND_PREFIX}create community <id> [as <number|id>] [display name]".',
+        )
+        return
+
+    owner, rest, error = await _resolve_owner_for_new_identity(
+        repository, sender=sender, rest=rest.strip(), domain=config.bridge.domain
+    )
+    if error is not None:
+        await _notice(request, room_id, error)
+        return
     if owner is None or not owner.room_id:
         await _notice(
             request, room_id,
@@ -5711,12 +5982,7 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
         )
         return
 
-    raw_id, _, rest = argument.partition(" ")
-    community_id = sanitize_localpart_component(raw_id)
     display_name = rest.strip() or community_id
-    if not community_id:
-        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create community <id> [display name]".')
-        return
 
     # Shares the same global actor-username namespace as profiles/channels
     # (all ultimately served at /actor/{username}) -- same reasoning as
@@ -5755,16 +6021,16 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
 
     message = (
-        f"Created {new_room_id} as the community {community_id}@{config.bridge.domain} -- you've been "
-        "invited and made its first moderator there. Just post a message to publish it: the first line "
-        "becomes the title, a blank line, then the body. Reply to an existing post/comment to add a "
-        "comment instead."
+        f"Created {new_room_id} as the community {community_id}@{config.bridge.domain}, moderated as "
+        f"{owner.username}@{config.bridge.domain} -- you've been invited and made its first moderator "
+        "there. Just post a message to publish it: the first line becomes the title, a blank line, "
+        "then the body. Reply to an existing post/comment to add a comment instead."
     )
     html_message = (
-        f"Created {room_pill_html(new_room_id)} as the community {community_id}@{config.bridge.domain} -- "
-        "you've been invited and made its first moderator there. Just post a message to publish it: the "
-        "first line becomes the title, a blank line, then the body. Reply to an existing post/comment to "
-        "add a comment instead."
+        f"Created {room_pill_html(new_room_id)} as the community {community_id}@{config.bridge.domain}, "
+        f"moderated as {owner.username}@{config.bridge.domain} -- you've been invited and made its first "
+        "moderator there. Just post a message to publish it: the first line becomes the title, a blank "
+        "line, then the body. Reply to an existing post/comment to add a comment instead."
     )
     await _notice(request, room_id, message, html_message=html_message)
 
@@ -5788,7 +6054,7 @@ async def _handle_link_community(request: Request, *, sender: str, room_id: str,
         return
 
     repository = request.app.state.repository
-    owner = await repository.get_local_actor_by_matrix_id(sender)
+    owner = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if owner is None or not owner.room_id:
         await _notice(
             request, room_id,
@@ -5867,7 +6133,7 @@ async def _execute_link_community(request: Request, *, sender: str, room_id: str
     repository = request.app.state.repository
     synapse = request.app.state.synapse
 
-    owner = await repository.get_local_actor_by_matrix_id(sender)
+    owner = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if owner is None or not owner.room_id:
         await _notice(request, room_id, "You no longer have a linked profile -- link one first, then try again.")
         return
@@ -6849,11 +7115,23 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
     re-check). Added live 2026-08-29: this used to link immediately with
     no warning at all, and a user who didn't understand a Profile Room is
     permanent (not a one-off action) linked a room already serving another
-    purpose entirely -- see issue #6."""
+    purpose entirely -- see issue #6.
+
+    Always derives its username from ``sender``'s Matrix localpart (no
+    ``<id>`` form, unlike ``;create profile <id>``) -- but with
+    multi-identity support, resolves by THAT SPECIFIC username, not by a
+    (now possibly ambiguous) ``matrix_user_id`` lookup, so this correctly
+    links an ADDITIONAL identity if ``sender`` already owns one or more
+    others, subject to the same ``bridge.max_identities_per_user`` cap as
+    ``;create profile``."""
     repository = request.app.state.repository
     config = request.app.state.config
 
-    existing = await repository.get_local_actor_by_matrix_id(sender)
+    username = sanitize_localpart_component(sender[1:].split(":", 1)[0])
+    existing = await repository.get_local_actor(username)
+    if existing is not None and existing.matrix_user_id != sender:
+        await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
+        return
     if existing is not None and existing.room_id:
         await _notice(
             request, room_id,
@@ -6865,6 +7143,18 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
             ),
         )
         return
+
+    if existing is None:
+        other_identities = await repository.list_local_actors_by_matrix_id(sender)
+        if other_identities and not await _is_matrix_admin(request, sender):
+            if len(other_identities) >= config.bridge.max_identities_per_user:
+                await _notice(
+                    request, room_id,
+                    f"You already have {len(other_identities)} identities, the maximum allowed "
+                    f'({config.bridge.max_identities_per_user}). Run "{_COMMAND_PREFIX}delete profile" '
+                    "to remove one first.",
+                )
+                return
 
     already_used_as = await _room_already_bridged_as(request, room_id)
     if already_used_as is not None:
@@ -6929,12 +7219,19 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
     ``maybe_handle_link_profile_confirmation``. Redoes every gating check
     from ``_handle_link_profile`` fresh -- see that function's own
     docstring for why -- so it's just as safe to call this directly as it
-    would be to re-run the command from scratch."""
+    would be to re-run the command from scratch. Same multi-identity
+    by-specific-username (not by-matrix_user_id) resolution and
+    ``bridge.max_identities_per_user`` check as ``_handle_link_profile`` --
+    see its own docstring."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
 
-    existing = await repository.get_local_actor_by_matrix_id(sender)
+    username = sanitize_localpart_component(sender[1:].split(":", 1)[0])
+    existing = await repository.get_local_actor(username)
+    if existing is not None and existing.matrix_user_id != sender:
+        await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
+        return
     if existing is not None and existing.room_id:
         await _notice(
             request, room_id,
@@ -6946,6 +7243,18 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
             ),
         )
         return
+
+    if existing is None:
+        other_identities = await repository.list_local_actors_by_matrix_id(sender)
+        if other_identities and not await _is_matrix_admin(request, sender):
+            if len(other_identities) >= config.bridge.max_identities_per_user:
+                await _notice(
+                    request, room_id,
+                    f"You already have {len(other_identities)} identities, the maximum allowed "
+                    f'({config.bridge.max_identities_per_user}). Run "{_COMMAND_PREFIX}delete profile" '
+                    "to remove one first.",
+                )
+                return
 
     already_used_as = await _room_already_bridged_as(request, room_id)
     if already_used_as is not None:
@@ -6972,7 +7281,7 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
     # following) to this room instead of minting a brand new one, which is
     # what actually lets someone move their profile to a different room
     # without their fediverse followers ever noticing anything changed.
-    username = existing.username if existing is not None else sanitize_localpart_component(sender[1:].split(":", 1)[0])
+    # (`username` was already resolved to this exact value above.)
 
     try:
         profile = await synapse.get_profile(sender)
@@ -7097,10 +7406,72 @@ async def maybe_handle_link_profile_confirmation(request: Request, event: dict) 
     return True
 
 
+async def _resolve_identity_for_destructive_command(
+    request: Request, *, sender: str, room_id: str, selector: str, action_verb: str
+) -> ActorRecord | None:
+    """Shared disambiguation for ``;delete profile``/``;unlink profile``:
+    resolves which of ``sender``'s identities ``selector`` (an optional
+    trailing ``<number|id>`` -- "" if none was given) names, or sends the
+    appropriate notice and returns ``None`` if it can't be resolved
+    unambiguously.
+
+    With exactly one identity, ``selector`` is accepted (and still works)
+    but never required -- that one identity is used automatically, exactly
+    as this command always worked before multi-identity existed. With more
+    than one and no ``selector``, this is deliberately NOT inferred from
+    room context (even though the command conceptually happens "in" a
+    specific identity's room): the whole point is forcing an explicit,
+    deliberate choice so a destructive command never accidentally lands on
+    the wrong identity -- so every identity is listed (same numbered
+    format as ``;id list``) and nothing is deleted/unlinked yet.
+    ``action_verb`` ("delete"/"unlink") only phrases the notices."""
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    if not identities:
+        await _notice(request, room_id, f"You don't have a linked profile to {action_verb}.")
+        return None
+
+    if selector:
+        target = _resolve_identity_selector(identities, selector)
+        if target is None:
+            await _notice(
+                request, room_id,
+                f'No identity matching "{selector}" -- run "{_COMMAND_PREFIX}id list" to see yours.',
+            )
+            return None
+        return target
+
+    if len(identities) == 1:
+        return identities[0]
+
+    config = request.app.state.config
+    active = await repository.get_active_local_actor(sender)
+    active_username = active.username if active is not None else None
+    lines = [f"You have more than one identity -- say which one to {action_verb}:"]
+    lines.extend(_format_identity_lines(identities, active_username=active_username, domain=config.bridge.domain))
+    lines.append(f'Re-run as "{_COMMAND_PREFIX}{action_verb} profile <number|id>".')
+    await _notice(request, room_id, "\n".join(lines))
+    return None
+
+
+def _extract_warned_username(marker: str, body: str) -> str | None:
+    """Pulls the ``username`` back out of a
+    ``f"{marker} ({username}@{domain})."``-shaped warning body (see
+    ``_handle_delete_profile``/``_handle_unlink_profile``) -- so the
+    "confirm" reply, sent well after the identity was chosen, acts on the
+    SAME identity that was actually warned about, not whatever ambiguous
+    thing a fresh ``sender``-only lookup might resolve to once multiple
+    identities exist. ``None`` if the body doesn't match the expected
+    shape at all (shouldn't happen for a body that already matched the
+    marker check right before this is called)."""
+    match = re.search(rf"{re.escape(marker)} \(([^@\s]+)@", body)
+    return match.group(1) if match else None
+
+
 _UNLINK_PROFILE_WARNING_MARKER = "This will detach this room from your fediverse identity"
 
 
-async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str) -> None:
+async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str, selector: str = "") -> None:
     """First half of a two-step, confirmation-gated unlink: sends a
     warning and tells the sender to reply "confirm" -- nothing is unlinked
     yet just from running this command. See
@@ -7112,12 +7483,15 @@ async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str)
     ``_execute_unlink_profile``'s own docstring), it still detaches a room
     someone may not have meant to, and immediately opens that room back up
     to being linked as something else entirely by ANYONE with enough
-    power in it."""
-    repository = request.app.state.repository
+    power in it.
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
+    ``selector`` (``";unlink profile <number|id>"``) picks which identity
+    when ``sender`` owns more than one -- see
+    ``_resolve_identity_for_destructive_command``."""
+    record = await _resolve_identity_for_destructive_command(
+        request, sender=sender, room_id=room_id, selector=selector, action_verb="unlink"
+    )
     if record is None:
-        await _notice(request, room_id, "You don't have a linked profile to unlink.")
         return
 
     warning = (
@@ -7150,13 +7524,15 @@ async def _handle_unlink_profile(request: Request, *, sender: str, room_id: str)
         logger.warning("Failed to send unlink-profile warning to %s", room_id, exc_info=True)
 
 
-async def _execute_unlink_profile(request: Request, *, sender: str, room_id: str) -> None:
+async def _execute_unlink_profile(request: Request, *, sender: str, room_id: str, username: str) -> None:
     """The actual unlinking, only ever reached via a confirmed
     ``maybe_handle_unlink_profile_confirmation``. Detaches this room from
-    the sender's linked fediverse identity WITHOUT telling the fediverse
-    side anything at all -- no Delete is sent, and followers/following/
-    keys are all left exactly as they are. This is what lets someone move
-    their identity to a different room (unlink here, then
+    the IDENTITY NAMED IN THE ORIGINAL WARNING (``username``, extracted via
+    ``_extract_warned_username`` -- not re-derived from ``sender`` alone,
+    which is ambiguous once multiple identities exist) WITHOUT telling the
+    fediverse side anything at all -- no Delete is sent, and followers/
+    following/keys are all left exactly as they are. This is what lets
+    someone move their identity to a different room (unlink here, then
     `link profile`/`create profile` in the new one to reattach the same
     actor) with nobody on the other end ever noticing the room changed.
     For a permanent, fediverse-visible removal instead, use `delete profile`.
@@ -7164,8 +7540,8 @@ async def _execute_unlink_profile(request: Request, *, sender: str, room_id: str
     repository = request.app.state.repository
     config = request.app.state.config
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
-    if record is None:
+    record = await repository.get_local_actor(username)
+    if record is None or record.matrix_user_id != sender:
         await _notice(request, room_id, "You don't have a linked profile to unlink.")
         return
 
@@ -7209,12 +7585,16 @@ async def maybe_handle_unlink_profile_confirmation(request: Request, event: dict
         return False
     if target_event.get("sender") != bot_mxid:
         return False
-    if _UNLINK_PROFILE_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+    warned_body = (target_event.get("content") or {}).get("body") or ""
+    if _UNLINK_PROFILE_WARNING_MARKER not in warned_body:
+        return False
+    username = _extract_warned_username(_UNLINK_PROFILE_WARNING_MARKER, warned_body)
+    if username is None:
         return False
 
     token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
     try:
-        await _execute_unlink_profile(request, sender=sender, room_id=room_id)
+        await _execute_unlink_profile(request, sender=sender, room_id=room_id, username=username)
     finally:
         _command_relates_to_var.reset(token)
     return True
@@ -7223,27 +7603,39 @@ async def maybe_handle_unlink_profile_confirmation(request: Request, event: dict
 _DELETE_PROFILE_WARNING_MARKER = "This will permanently delete your fediverse identity"
 
 
-async def _handle_delete_profile(request: Request, *, sender: str, room_id: str) -> None:
+async def _handle_delete_profile(request: Request, *, sender: str, room_id: str, selector: str = "") -> None:
     """First half of a two-step, confirmation-gated deletion: sends an
     itemized warning of everything this is about to do (irreversible) and
     tells the sender to reply "confirm" to it to actually go through --
     nothing is deleted yet just from running this command. See
     ``maybe_handle_delete_confirmation`` for how that reply is recognized
     (deliberately not tied to any DB state -- see its own docstring), and
-    ``_execute_delete_profile`` for what actually runs once confirmed."""
+    ``_execute_delete_profile`` for what actually runs once confirmed.
+
+    ``selector`` (``";delete profile <number|id>"``) picks which identity
+    when ``sender`` owns more than one -- see
+    ``_resolve_identity_for_destructive_command``."""
     repository = request.app.state.repository
     config = request.app.state.config
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
+    record = await _resolve_identity_for_destructive_command(
+        request, sender=sender, room_id=room_id, selector=selector, action_verb="delete"
+    )
     if record is None:
-        await _notice(request, room_id, "You don't have a linked profile to delete.")
         return
 
+    other_identities_remain = len(await repository.list_local_actors_by_matrix_id(sender)) > 1
+    kick_step = (
+        "Kick you from every ghost DM/Chat room this identity specifically has open (other "
+        "identities you still have keep theirs) -- except this room."
+        if other_identities_remain else
+        "Kick you from every other fediverse room the bridge put you in (accounts you follow, "
+        "any fediverse DMs/Chats) -- except this room."
+    )
     steps = [
         "Notify your followers with a signed Delete, so their side actually cleans up "
         "(no more endless retries or a stale follow of an identity that's about to 404).",
-        "Kick you from every other fediverse room the bridge put you in (accounts you follow, "
-        "any fediverse DMs/Chats) -- except this room.",
+        kick_step,
         "Kick you from your Fediverse space.",
         "Unlink this room from your fediverse identity.",
         'Rename this room to end in " (Deleted)".',
@@ -7292,12 +7684,14 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
     Deliberately stateless (no DB row recording "a deletion is pending"):
     the replied-to event is fetched and checked for
     ``_DELETE_PROFILE_WARNING_MARKER`` (only ever present in a message this
-    bridge itself sent, from ``_handle_delete_profile``) instead. This also
-    means the actual deletion always acts on whoever SENT "confirm", not
-    whoever originally ran ``delete profile`` -- fine, since that's just
-    ``_execute_delete_profile`` looking up its own sender's linked profile
-    same as any other command; someone else replying "confirm" in the same
-    room can only ever delete THEIR OWN profile, never someone else's."""
+    bridge itself sent, from ``_handle_delete_profile``) instead, and the
+    identity actually acted on is whichever one was named in that warning's
+    own text (``_extract_warned_username`` -- see its own docstring for why
+    a fresh ``sender``-only lookup isn't enough once multiple identities can
+    exist). ``_execute_delete_profile`` still independently verifies that
+    identity actually belongs to whoever sent "confirm" -- so someone else
+    replying "confirm" in the same room can never delete an identity that
+    isn't theirs."""
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
@@ -7324,7 +7718,11 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
         return False
     if target_event.get("sender") != bot_mxid:
         return False
-    if _DELETE_PROFILE_WARNING_MARKER not in ((target_event.get("content") or {}).get("body") or ""):
+    warned_body = (target_event.get("content") or {}).get("body") or ""
+    if _DELETE_PROFILE_WARNING_MARKER not in warned_body:
+        return False
+    username = _extract_warned_username(_DELETE_PROFILE_WARNING_MARKER, warned_body)
+    if username is None:
         return False
 
     # A "confirm" reply is its own separate dispatch entry point (this
@@ -7335,7 +7733,7 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
     # whether the original ";delete profile" was also sent in-thread).
     token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
     try:
-        await _execute_delete_profile(request, sender=sender, room_id=room_id)
+        await _execute_delete_profile(request, sender=sender, room_id=room_id, username=username)
     finally:
         _command_relates_to_var.reset(token)
     return True
@@ -7445,20 +7843,39 @@ async def _list_bridge_managed_rooms(request: Request, sender: str) -> list[str]
     return rooms
 
 
-async def _execute_delete_profile(request: Request, *, sender: str, room_id: str) -> None:
+async def _execute_delete_profile(request: Request, *, sender: str, room_id: str, username: str) -> None:
     """The actual, irreversible deletion -- only ever reached via a
     confirmed ``maybe_handle_delete_confirmation``. See
     ``_handle_delete_profile``'s warning message for the itemized list of
-    what this does; kept in that same order here."""
+    what this does; kept in that same order here.
+
+    Acts on the specific identity ``username`` (extracted from the
+    original warning -- see ``_extract_warned_username``), independently
+    re-verified here as actually belonging to ``sender`` -- never a fresh
+    ``sender``-only lookup, which is ambiguous once multiple identities can
+    exist."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
     bot_mxid = _bot_mxid(config)
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
-    if record is None:
+    record = await repository.get_local_actor(username)
+    if record is None or record.matrix_user_id != sender:
         await _notice(request, room_id, "You don't have a linked profile to delete.")
         return
+
+    # Whether sender has any OTHER identity left besides this one -- their
+    # Fediverse space (one per Matrix user, shared across every identity
+    # they have) and Remote User Rooms (shared with whoever else follows
+    # that same account, possibly including one of their OTHER identities)
+    # are NOT identity-specific, so both must be left alone unless this is
+    # genuinely their last identity disappearing -- only ghost DM/Chat
+    # rooms this SPECIFIC identity opened (see the new local_username
+    # binding) are unambiguously safe to tear down regardless.
+    other_identities_remain = any(
+        identity.username != record.username
+        for identity in await repository.list_local_actors_by_matrix_id(sender)
+    )
 
     base = config.bridge.public_base_url
     actor_id = actor_url(base, record.username)
@@ -7509,6 +7926,19 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
     except _RoomListingUnreliable:
         other_room_ids = []
         room_sweep_incomplete = True
+    if other_identities_remain:
+        # Narrow the sweep to ghost DM/Chat rooms specifically bound (at
+        # creation) to THIS identity -- a Remote User Room isn't
+        # identity-specific, so leave those for the identity/ies that
+        # remain to keep using.
+        scoped_room_ids = []
+        for other_room_id in other_room_ids:
+            bound_username = await repository.get_ghost_dm_room_local_username(other_room_id)
+            if bound_username is None:
+                bound_username = await repository.get_ghost_chat_room_local_username(other_room_id)
+            if bound_username == record.username:
+                scoped_room_ids.append(other_room_id)
+        other_room_ids = scoped_room_ids
     for other_room_id in other_room_ids:
         if other_room_id in (profile_room_id, space_room_id):
             continue
@@ -7517,8 +7947,10 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
         except SynapseError:
             logger.warning("Could not kick %s from %s while deleting profile", sender, other_room_id, exc_info=True)
 
-    # 3. Kick from their Fediverse space.
-    if space_room_id:
+    # 3. Kick from their Fediverse space -- only once every identity is
+    # gone (see other_identities_remain above; the space is shared across
+    # all of a Matrix user's identities, not one per identity).
+    if space_room_id and not other_identities_remain:
         try:
             await synapse.kick_user(space_room_id, sender, as_user_id=bot_mxid, reason="Fediverse profile deleted")
         except SynapseError:
@@ -7587,10 +8019,14 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
 
 
 async def _list_unfollowed_ghost_rooms(
-    request: Request, *, sender: str, username: str
+    request: Request, *, sender: str, usernames: list[str]
 ) -> list[tuple[str, str, str]]:
-    """Every Remote User Room ``sender`` currently belongs to that they do
-    NOT (or no longer) follow -- ``(room_id, actor_id, handle)`` tuples.
+    """Every Remote User Room ``sender`` currently belongs to that NONE of
+    ``usernames`` (every identity ``sender`` owns -- see
+    ``ActorRepository.list_local_actors_by_matrix_id``) follow --
+    ``(room_id, actor_id, handle)`` tuples. A room followed by even ONE of
+    sender's identities is deliberately kept: the Matrix user still has a
+    real reason to be there, even if it isn't via their Active one.
     Membership (``_list_bridge_managed_rooms``, shared with
     ``_execute_delete_profile``) and following (``ActorRepository.is_following``)
     are two genuinely independent things in this bridge: a room invite can
@@ -7610,7 +8046,12 @@ async def _list_unfollowed_ghost_rooms(
         remote_room = await repository.get_remote_actor_room_by_room_id(candidate_room_id)
         if remote_room is None:
             continue  # not a Remote User Room at all (a DM/Chat room)
-        if await repository.is_following(username, remote_room.actor_id):
+        followed_by_any_identity = False
+        for username in usernames:
+            if await repository.is_following(username, remote_room.actor_id):
+                followed_by_any_identity = True
+                break
+        if followed_by_any_identity:
             continue
         handle = remote_room.display_name or remote_room.actor_id
         unfollowed.append((candidate_room_id, remote_room.actor_id, handle))
@@ -7633,15 +8074,17 @@ async def _handle_leave_unfollowed(request: Request, *, sender: str, room_id: st
     repository = request.app.state.repository
     relates_to = _command_relates_to_var.get()
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
-    if record is None:
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    if not identities:
         await _notice(
             request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".', relates_to=relates_to,
         )
         return
 
     try:
-        unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+        unfollowed = await _list_unfollowed_ghost_rooms(
+            request, sender=sender, usernames=[identity.username for identity in identities]
+        )
     except _RoomListingUnreliable:
         await _notice(
             request, room_id,
@@ -7756,12 +8199,14 @@ async def _execute_leave_unfollowed(request: Request, *, sender: str, room_id: s
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
 
-    record = await repository.get_local_actor_by_matrix_id(sender)
-    if record is None:
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    if not identities:
         await _notice(request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".')
         return
 
-    unfollowed = await _list_unfollowed_ghost_rooms(request, sender=sender, username=record.username)
+    unfollowed = await _list_unfollowed_ghost_rooms(
+        request, sender=sender, usernames=[identity.username for identity in identities]
+    )
     if not unfollowed:
         await _notice(
             request, room_id, "Nothing to leave anymore -- looks like this already changed since you asked.",
@@ -8828,31 +9273,47 @@ async def _handle_rejoin(request: Request, *, sender: str, room_id: str, argumen
             await _notice(request, room_id, "Only a Matrix server admin can invite someone other than themselves.")
             return
 
-        target_record = await repository.get_local_actor_by_matrix_id(target_mxid)
-        if target_record is None or not target_record.room_id:
+        if keyword == "profile":
+            # With multi-identity support, target_mxid may own more than
+            # one Profile Room -- re-invite to EVERY one that currently has
+            # a room (never just a single assumed one), since this is a
+            # recovery command: inviting to a room they're already in is a
+            # harmless no-op (see _rejoin_invite's own docstring), so
+            # "re-invite to everything you own" is strictly more useful
+            # than forcing a choice here.
+            target_identities = [
+                identity
+                for identity in await repository.list_local_actors_by_matrix_id(target_mxid)
+                if identity.room_id
+            ]
+            if not target_identities:
+                await _notice(
+                    request, room_id,
+                    f"{target_mxid} doesn't have a linked profile -- nothing to rejoin."
+                    if target_mxid != sender else
+                    "You don't have a linked profile yet -- nothing to rejoin.",
+                )
+                return
+            for identity in target_identities:
+                await _rejoin_invite(
+                    request, room_id=room_id, target_room_id=identity.room_id,
+                    target_mxid=target_mxid, as_user_id=bot_mxid,
+                )
+            return
+
+        space_room_id = await repository.get_user_space(target_mxid)
+        if space_room_id is None:
             await _notice(
                 request, room_id,
-                f"{target_mxid} doesn't have a linked profile -- nothing to rejoin."
+                f"{target_mxid} doesn't have a Fediverse space yet."
                 if target_mxid != sender else
-                "You don't have a linked profile yet -- nothing to rejoin.",
+                "You don't have a Fediverse space yet.",
             )
             return
 
-        if keyword == "profile":
-            target_room_id = target_record.room_id
-        else:
-            space_room_id = await repository.get_user_space(target_mxid)
-            if space_room_id is None:
-                await _notice(
-                    request, room_id,
-                    f"{target_mxid} doesn't have a Fediverse space yet."
-                    if target_mxid != sender else
-                    "You don't have a Fediverse space yet.",
-                )
-                return
-            target_room_id = space_room_id
-
-        await _rejoin_invite(request, room_id=room_id, target_room_id=target_room_id, target_mxid=target_mxid, as_user_id=bot_mxid)
+        await _rejoin_invite(
+            request, room_id=room_id, target_room_id=space_room_id, target_mxid=target_mxid, as_user_id=bot_mxid
+        )
         return
 
     target_room_id = parts[0] if parts else ""

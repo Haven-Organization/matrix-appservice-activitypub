@@ -73,6 +73,7 @@ from bridge.activitypub.urls import (
     username_from_actor_url,
 )
 from bridge.crypto import generate_keypair
+from bridge.identity_resolution import resolve_acting_identity
 from bridge.note_mirroring import (
     KNOCK_JOIN_RULE,
     PROFILE_BANNER_STATE_TYPE,
@@ -1501,7 +1502,7 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
     if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
         return True  # our own bot's/a ghost's echo of a mirrored post -- never re-federate
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:
         from bridge.commands import _notice
 

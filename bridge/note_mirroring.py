@@ -1971,8 +1971,8 @@ class RoomForcedEncryptedError(Exception):
 
 
 async def ensure_ghost_dm_room(
-    request: Request, *, actor_id: str, matrix_user_id: str, display_name: str, avatar_mxc: str | None, mxid: str,
-    respect_silence: bool = True,
+    request: Request, *, actor_id: str, matrix_user_id: str, local_username: str, display_name: str,
+    avatar_mxc: str | None, mxid: str, respect_silence: bool = True,
 ) -> str | None:
     """Get-or-create the 1:1 Note-based DM room (``ActorRepository.get_ghost_dm_room``)
     between the ghost for ``actor_id`` and ``matrix_user_id``, re-inviting
@@ -1986,7 +1986,14 @@ async def ensure_ghost_dm_room(
     one just so a silenced account can start pulling them into it.
     ``bridge.commands``'s ``;dm`` command passes ``respect_silence=False``:
     that's the local user's own deliberate choice to reach out, not an
-    inbound interaction they didn't choose, so it's never silenced."""
+    inbound interaction they didn't choose, so it's never silenced.
+
+    ``local_username`` is WHICH of ``matrix_user_id``'s own (possibly
+    several) identities this DM belongs to -- stamped once, on first
+    creation, and never changed afterward even if that identity's owner
+    later switches their Active identity elsewhere (see
+    ``bridge.identity_resolution``'s module docstring). Ignored on an
+    already-existing room (the column is set once, at row creation)."""
     repository = request.app.state.repository
     synapse = request.app.state.synapse
     config = request.app.state.config
@@ -2032,7 +2039,7 @@ async def ensure_ghost_dm_room(
                 dm_room_id, actor_id, matrix_user_id,
             )
             raise RoomForcedEncryptedError(dm_room_id)
-        await repository.register_ghost_dm_room(actor_id, matrix_user_id, dm_room_id)
+        await repository.register_ghost_dm_room(actor_id, matrix_user_id, dm_room_id, local_username=local_username)
         await send_bridge_info(
             request, room_id=dm_room_id, actor_id=actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
@@ -2064,7 +2071,7 @@ async def ensure_ghost_dm_room(
 
 async def mirror_direct_message(
     request: Request, *, note: dict, author_actor_id: str, recipient_matrix_user_id: str,
-    reply_header: tuple[str, str] | None = None,
+    recipient_username: str, reply_header: tuple[str, str] | None = None,
 ) -> FederatedEvent | None:
     """Mirror an inbound Note addressed as a private/direct message (see
     ``note_is_direct_message``) into a dedicated 1:1 Matrix DM room between
@@ -2103,6 +2110,12 @@ async def mirror_direct_message(
 
     Returns the recorded ``FederatedEvent``, or None if the author's domain
     couldn't be determined or actually sending into Matrix failed.
+
+    ``recipient_username`` is the specific local identity (of possibly
+    several ``recipient_matrix_user_id`` owns) this Note was actually
+    addressed to -- resolved by the caller (``_resolve_dm_recipient``) from
+    the inbound Note's own addressing, not guessed here. See
+    ``ensure_ghost_dm_room``'s ``local_username`` parameter.
     """
     repository = request.app.state.repository
     synapse = request.app.state.synapse
@@ -2121,7 +2134,7 @@ async def mirror_direct_message(
     try:
         dm_room_id = await ensure_ghost_dm_room(
             request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
+            local_username=recipient_username, display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
         )
     except RoomForcedEncryptedError:
         # warn_if_encrypted already left an explanation in the room itself
@@ -2210,8 +2223,8 @@ async def mirror_direct_message(
 
 
 async def ensure_ghost_chat_room(
-    request: Request, *, actor_id: str, matrix_user_id: str, display_name: str, avatar_mxc: str | None, mxid: str,
-    respect_silence: bool = True,
+    request: Request, *, actor_id: str, matrix_user_id: str, local_username: str, display_name: str,
+    avatar_mxc: str | None, mxid: str, respect_silence: bool = True,
 ) -> str | None:
     """The ``ChatMessage`` counterpart of ``ensure_ghost_dm_room`` --
     identical get-or-create-and-re-invite (and ``respect_silence``-gated)
@@ -2221,7 +2234,8 @@ async def ensure_ghost_chat_room(
     "(DM)" so the two are distinguishable in a room list if someone has both
     with the same person. Returns None only if room creation itself failed,
     or (see ``ensure_ghost_dm_room``'s identical case) it was skipped
-    because the recipient has silenced ``actor_id`` and no room exists yet."""
+    because the recipient has silenced ``actor_id`` and no room exists yet.
+    ``local_username`` -- see ``ensure_ghost_dm_room``'s identical parameter."""
     repository = request.app.state.repository
     synapse = request.app.state.synapse
     config = request.app.state.config
@@ -2257,7 +2271,9 @@ async def ensure_ghost_chat_room(
                 chat_room_id, actor_id, matrix_user_id,
             )
             raise RoomForcedEncryptedError(chat_room_id)
-        await repository.register_ghost_chat_room(actor_id, matrix_user_id, chat_room_id)
+        await repository.register_ghost_chat_room(
+            actor_id, matrix_user_id, chat_room_id, local_username=local_username
+        )
         await send_bridge_info(
             request, room_id=chat_room_id, actor_id=actor_id,
             display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
@@ -2281,7 +2297,8 @@ async def ensure_ghost_chat_room(
 
 
 async def mirror_chat_message(
-    request: Request, *, chat_message: dict, author_actor_id: str, recipient_matrix_user_id: str
+    request: Request, *, chat_message: dict, author_actor_id: str, recipient_matrix_user_id: str,
+    recipient_username: str,
 ) -> FederatedEvent | None:
     """Mirror an inbound ``ChatMessage`` (see ``Actor.accepts_chat_messages``
     and ``bridge.chat_bridge``) into a dedicated 1:1 Matrix room between the
@@ -2296,6 +2313,9 @@ async def mirror_chat_message(
     Returns the recorded ``FederatedEvent``, or None if the author's ghost
     couldn't be provisioned, the room couldn't be created, or actually
     sending into Matrix failed.
+
+    ``recipient_username`` -- see ``mirror_direct_message``'s identical
+    parameter.
     """
     repository = request.app.state.repository
     synapse = request.app.state.synapse
@@ -2314,7 +2334,7 @@ async def mirror_chat_message(
     try:
         chat_room_id = await ensure_ghost_chat_room(
             request, actor_id=author_actor_id, matrix_user_id=recipient_matrix_user_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
+            local_username=recipient_username, display_name=display_name, avatar_mxc=avatar_mxc, mxid=mxid,
         )
     except RoomForcedEncryptedError:
         # See mirror_direct_message's identical reasoning: no interactive

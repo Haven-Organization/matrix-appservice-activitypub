@@ -91,6 +91,7 @@ from bridge.commands import (
     _run_community_auto_backfill,
     handle_guild_auto_join,
 )
+from bridge.identity_resolution import resolve_acting_identity
 from bridge.matrix_links import matrix_to_room_link
 from bridge.note_mirroring import (
     resolve_actor_matrix_identity,
@@ -190,7 +191,7 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
         )
         if not already_known:
             inviter = event.get("sender", "")
-            actor_record = await repository.get_local_actor_by_matrix_id(inviter)
+            actor_record = await resolve_acting_identity(request, sender=inviter, room_id=room_id)
             if actor_record is None:
                 logger.info(
                     "Ignoring invite for ghost %s into %s from %s -- no linked profile",
@@ -199,7 +200,9 @@ async def maybe_accept_invite(request: Request, event: dict) -> bool:
                 return True  # handled -- deliberately not joining
             ghost_profile = await repository.get_ghost_profile_by_mxid(invited_user)
             if ghost_profile is not None:
-                await repository.register_ghost_chat_room(ghost_profile.actor_id, inviter, room_id)
+                await repository.register_ghost_chat_room(
+                    ghost_profile.actor_id, inviter, room_id, local_username=actor_record.username
+                )
 
     try:
         await request.app.state.synapse.join_room(room_id, as_user_id=invited_user)

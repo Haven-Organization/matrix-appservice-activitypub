@@ -44,9 +44,17 @@ from bridge.repository import (
 )
 
 _SCHEMA = """
+-- matrix_user_id is deliberately NOT UNIQUE here (a fresh database creates
+-- this table without the constraint from the start) -- a Matrix user may
+-- own several identities once bridge.custom_identities_enabled is on. See
+-- _migrate() for the one-time rebuild that drops this constraint from an
+-- EXISTING database that still has it (sqlite can't ALTER TABLE a column
+-- constraint away), and idx_local_actors_matrix_user_id just below for the
+-- lookup index that replaces what the UNIQUE constraint used to provide
+-- for free.
 CREATE TABLE IF NOT EXISTS local_actors (
     username TEXT PRIMARY KEY,
-    matrix_user_id TEXT NOT NULL UNIQUE,
+    matrix_user_id TEXT NOT NULL,
     room_id TEXT NOT NULL,
     public_key_pem TEXT NOT NULL,
     private_key_pem TEXT NOT NULL,
@@ -56,7 +64,19 @@ CREATE TABLE IF NOT EXISTS local_actors (
     banner_url TEXT,
     hide_followers INTEGER NOT NULL DEFAULT 0,
     hide_following INTEGER NOT NULL DEFAULT 0,
-    is_third_party INTEGER NOT NULL DEFAULT 0
+    is_third_party INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_actors_matrix_user_id ON local_actors (matrix_user_id);
+
+-- Sparse: a row only exists for a Matrix user who currently has >1
+-- identity or has ever explicitly switched via ";id" -- see
+-- ActorRepository.get_active_local_actor's docstring for the fallback
+-- when no row exists.
+CREATE TABLE IF NOT EXISTS active_identity (
+    matrix_user_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL
 );
 
 -- Admin-granted third-party access (see ActorRecord.is_third_party and the
@@ -207,10 +227,17 @@ CREATE TABLE IF NOT EXISTS bot_dm_rooms (
     room_id TEXT NOT NULL
 );
 
+-- local_username is the identity that was Active (or room-bound) when this
+-- DM room was first started -- stamped once at creation, never changed
+-- afterward, even by a later ";id" Active switch (see
+-- ActorRepository.register_ghost_dm_room's docstring). Nullable: a row
+-- predating this column (backfilled during migration, see _migrate()) or
+-- one somehow never stamped falls back to None, not an error.
 CREATE TABLE IF NOT EXISTS ghost_dm_rooms (
     actor_id TEXT NOT NULL,
     matrix_user_id TEXT NOT NULL,
     room_id TEXT NOT NULL UNIQUE,
+    local_username TEXT,
     PRIMARY KEY (actor_id, matrix_user_id)
 );
 
@@ -223,6 +250,7 @@ CREATE TABLE IF NOT EXISTS ghost_chat_rooms (
     actor_id TEXT NOT NULL,
     matrix_user_id TEXT NOT NULL,
     room_id TEXT NOT NULL UNIQUE,
+    local_username TEXT,
     PRIMARY KEY (actor_id, matrix_user_id)
 );
 
@@ -458,6 +486,87 @@ class SqliteActorRepository:
         if "is_third_party" not in columns:
             self._conn.execute("ALTER TABLE local_actors ADD COLUMN is_third_party INTEGER NOT NULL DEFAULT 0")
             self._conn.commit()
+        if "created_at" not in columns:
+            self._conn.execute("ALTER TABLE local_actors ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+            self._conn.commit()
+
+        # Multi-identity support: an existing database may still have the
+        # OLD "matrix_user_id TEXT NOT NULL UNIQUE" constraint (a plain
+        # column constraint, not droppable via ALTER TABLE -- same
+        # situation federated_events' is_primary_event migration above
+        # already had to solve the same way). A brand new database never
+        # hits this branch -- _SCHEMA's own CREATE TABLE already omits
+        # UNIQUE from the start. Detected by checking the table's own
+        # stored CREATE statement for the constraint text rather than a
+        # separate "have we migrated" flag, so this is naturally a no-op
+        # (and safe to run on every startup) once it's already been done.
+        table_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'local_actors'"
+        ).fetchone()
+        if table_sql_row is not None and "UNIQUE" in (table_sql_row["sql"] or ""):
+            self._conn.execute("ALTER TABLE local_actors RENAME TO local_actors_old")
+            self._conn.execute(
+                """
+                CREATE TABLE local_actors (
+                    username TEXT PRIMARY KEY,
+                    matrix_user_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    public_key_pem TEXT NOT NULL,
+                    private_key_pem TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    icon_url TEXT,
+                    banner_url TEXT,
+                    hide_followers INTEGER NOT NULL DEFAULT 0,
+                    hide_following INTEGER NOT NULL DEFAULT 0,
+                    is_third_party INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO local_actors
+                    (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
+                     display_name, summary, icon_url, banner_url, hide_followers, hide_following,
+                     is_third_party, created_at)
+                SELECT username, matrix_user_id, room_id, public_key_pem, private_key_pem,
+                       display_name, summary, icon_url, banner_url, hide_followers, hide_following,
+                       is_third_party, created_at
+                FROM local_actors_old
+                """
+            )
+            self._conn.execute("DROP TABLE local_actors_old")
+            self._conn.commit()
+        # Recreated unconditionally (IF NOT EXISTS) regardless of whether
+        # the rebuild above ran this time -- DROP TABLE above also drops
+        # any index still attached to the renamed-away old table, so a
+        # rebuild always needs this re-created; a database that already
+        # has the new table but was created before this index existed
+        # needs it created for the first time either way.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_local_actors_matrix_user_id ON local_actors (matrix_user_id)")
+        self._conn.commit()
+        # Backfill created_at for any row that doesn't have one yet (every
+        # pre-existing row, plus the rebuild above, which copies across
+        # whatever was already there -- empty string for a row that's
+        # never had one). The "0000-00-00-legacy-" prefix is deliberately
+        # chosen to sort BEFORE any real ISO-8601 created_at (which always
+        # starts with a 4-digit year >= current), so every legacy row still
+        # counts as "oldest" per ActorRecord.created_at's documented
+        # ordering contract -- the zero-padded rowid suffix then preserves
+        # each one's relative original-insertion order among themselves.
+        # rowid is the least-bad available proxy for insertion order on a
+        # database old enough to have no real created_at at all; a fresh
+        # database never has empty values here since _register_local_actor
+        # always stamps a real one.
+        self._conn.execute(
+            """
+            UPDATE local_actors SET created_at = (
+                '0000-00-00-legacy-' || printf('%020d', rowid)
+            ) WHERE created_at = ''
+            """
+        )
+        self._conn.commit()
 
         # is_current gives profile_room_history the same DB-enforced "only
         # one current room per identity" guarantee as the three newer
@@ -640,6 +749,66 @@ class SqliteActorRepository:
         )
         self._conn.commit()
 
+        # Multi-identity support: which local identity a ghost DM/Chat room
+        # is permanently bound to (see ActorRepository.register_ghost_dm_room's
+        # docstring). Nullable additive column, both on the primary tables
+        # and their history counterparts for the same reason the rest of
+        # this table's columns are mirrored there. Backfilled from each
+        # row's matrix_user_id's single identity AT MIGRATION TIME -- the
+        # only thing it could possibly have been, since multiple identities
+        # per user didn't exist before this feature.
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(ghost_dm_rooms)")}
+        if "local_username" not in columns:
+            self._conn.execute("ALTER TABLE ghost_dm_rooms ADD COLUMN local_username TEXT")
+            self._conn.commit()
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(ghost_chat_rooms)")}
+        if "local_username" not in columns:
+            self._conn.execute("ALTER TABLE ghost_chat_rooms ADD COLUMN local_username TEXT")
+            self._conn.commit()
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(ghost_dm_room_history)")}
+        if "local_username" not in columns:
+            self._conn.execute("ALTER TABLE ghost_dm_room_history ADD COLUMN local_username TEXT")
+            self._conn.commit()
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(ghost_chat_room_history)")}
+        if "local_username" not in columns:
+            self._conn.execute("ALTER TABLE ghost_chat_room_history ADD COLUMN local_username TEXT")
+            self._conn.commit()
+        self._conn.execute(
+            """
+            UPDATE ghost_dm_rooms SET local_username = (
+                SELECT username FROM local_actors WHERE local_actors.matrix_user_id = ghost_dm_rooms.matrix_user_id
+                LIMIT 1
+            ) WHERE local_username IS NULL
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE ghost_chat_rooms SET local_username = (
+                SELECT username FROM local_actors WHERE local_actors.matrix_user_id = ghost_chat_rooms.matrix_user_id
+                LIMIT 1
+            ) WHERE local_username IS NULL
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE ghost_dm_room_history SET local_username = (
+                SELECT username FROM local_actors
+                WHERE local_actors.matrix_user_id = ghost_dm_room_history.matrix_user_id
+                LIMIT 1
+            ) WHERE local_username IS NULL
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE ghost_chat_room_history SET local_username = (
+                SELECT username FROM local_actors
+                WHERE local_actors.matrix_user_id = ghost_chat_room_history.matrix_user_id
+                LIMIT 1
+            ) WHERE local_username IS NULL
+            """
+        )
+        self._conn.commit()
+
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_actor_room_history_current "
             "ON remote_actor_room_history (actor_id) WHERE is_current = 1"
@@ -708,13 +877,60 @@ class SqliteActorRepository:
         return await self._run(self._get_local_actor, username)
 
     def _get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None:
+        # ORDER BY created_at picks the oldest deterministically when a
+        # user has >1 identity -- see this method's Protocol docstring
+        # (implementation-defined at >1, never an error).
         row = self._conn.execute(
-            "SELECT * FROM local_actors WHERE matrix_user_id = ?", (matrix_user_id,)
+            "SELECT * FROM local_actors WHERE matrix_user_id = ? ORDER BY created_at ASC LIMIT 1",
+            (matrix_user_id,),
         ).fetchone()
         return self._row_to_actor(row) if row else None
 
     async def get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None:
         return await self._run(self._get_local_actor_by_matrix_id, matrix_user_id)
+
+    def _list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM local_actors WHERE matrix_user_id = ? ORDER BY created_at ASC", (matrix_user_id,)
+        ).fetchall()
+        return [self._row_to_actor(row) for row in rows]
+
+    async def list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
+        return await self._run(self._list_local_actors_by_matrix_id, matrix_user_id)
+
+    def _get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
+        row = self._conn.execute(
+            "SELECT username FROM active_identity WHERE matrix_user_id = ?", (matrix_user_id,)
+        ).fetchone()
+        if row is not None:
+            actor = self._get_local_actor(row["username"])
+            if actor is not None:
+                return actor
+        identities = self._list_local_actors_by_matrix_id(matrix_user_id)
+        return identities[0] if len(identities) == 1 else None
+
+    async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
+        return await self._run(self._get_active_local_actor, matrix_user_id)
+
+    def _set_active_identity(self, matrix_user_id: str, username: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO active_identity (matrix_user_id, username) VALUES (?, ?)
+            ON CONFLICT(matrix_user_id) DO UPDATE SET username = excluded.username
+            """,
+            (matrix_user_id, username),
+        )
+        self._conn.commit()
+
+    async def set_active_identity(self, matrix_user_id: str, username: str) -> None:
+        await self._run(self._set_active_identity, matrix_user_id, username)
+
+    def _clear_active_identity(self, matrix_user_id: str) -> None:
+        self._conn.execute("DELETE FROM active_identity WHERE matrix_user_id = ?", (matrix_user_id,))
+        self._conn.commit()
+
+    async def clear_active_identity(self, matrix_user_id: str) -> None:
+        await self._run(self._clear_active_identity, matrix_user_id)
 
     def _get_local_actor_by_room_id(self, room_id: str) -> ActorRecord | None:
         if not room_id:
@@ -752,12 +968,21 @@ class SqliteActorRepository:
         # see this project's additive-only schema convention) but are no
         # longer read or written. That per-identity state now lives in
         # identity_settings, see bridge.identity_settings.
+        #
+        # created_at is NEVER overwritten by the ON CONFLICT branch below
+        # (deliberately absent from its SET list) -- a re-registration of
+        # an existing username (display-field edit, room replace, unlink)
+        # must keep the identity's original creation time. For a genuinely
+        # new username, stamp one now if the caller didn't already supply
+        # one (callers constructing a fresh ActorRecord never do).
+        existing_is_new = self._get_local_actor(record.username) is None
+        created_at = record.created_at or datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             """
             INSERT INTO local_actors
                 (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
-                 display_name, summary, icon_url, banner_url, is_third_party)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 display_name, summary, icon_url, banner_url, is_third_party, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(username) DO UPDATE SET
                 matrix_user_id=excluded.matrix_user_id,
                 room_id=excluded.room_id,
@@ -773,9 +998,45 @@ class SqliteActorRepository:
                 record.username, record.matrix_user_id, record.room_id,
                 record.public_key_pem, record.private_key_pem,
                 record.display_name, record.summary, record.icon_url, record.banner_url,
-                int(record.is_third_party),
+                int(record.is_third_party), created_at,
             ),
         )
+        if existing_is_new:
+            # First identity this matrix_user_id has ever had -- always has
+            # an Active identity once it has at least one. A row already
+            # existing for a DIFFERENT username under the same
+            # matrix_user_id means this genuinely is an additional
+            # identity, which must NOT steal Active away from whichever one
+            # already has it.
+            other_identities = self._conn.execute(
+                "SELECT username FROM local_actors WHERE matrix_user_id = ? AND username <> ? ORDER BY created_at ASC",
+                (record.matrix_user_id, record.username),
+            ).fetchall()
+            if not other_identities:
+                self._conn.execute(
+                    """
+                    INSERT INTO active_identity (matrix_user_id, username) VALUES (?, ?)
+                    ON CONFLICT(matrix_user_id) DO NOTHING
+                    """,
+                    (record.matrix_user_id, record.username),
+                )
+            else:
+                # An additional identity, not the first. If no explicit
+                # active_identity row exists yet, this matrix_user_id's
+                # previously-only identity was Active purely through
+                # get_active_local_actor's "exactly one -> implicit"
+                # fallback -- that fallback stops applying the moment
+                # there's >1, so make it explicit now (to the oldest
+                # pre-existing identity, never the brand new one) rather
+                # than silently losing their Active identity.
+                has_active_row = self._conn.execute(
+                    "SELECT 1 FROM active_identity WHERE matrix_user_id = ?", (record.matrix_user_id,)
+                ).fetchone()
+                if has_active_row is None:
+                    self._conn.execute(
+                        "INSERT INTO active_identity (matrix_user_id, username) VALUES (?, ?)",
+                        (record.matrix_user_id, other_identities[0]["username"]),
+                    )
         if record.room_id:
             # Permanent, unlike local_actors.room_id itself -- a `replace
             # room` overwrites that column with the new room, but this room
@@ -804,12 +1065,34 @@ class SqliteActorRepository:
         await self._run(self._register_local_actor, record)
 
     def _unregister_local_actor(self, username: str) -> None:
+        existing = self._get_local_actor(username)
         self._conn.execute("DELETE FROM local_actors WHERE username = ?", (username,))
         self._conn.execute("DELETE FROM followers WHERE username = ?", (username,))
         self._conn.execute("DELETE FROM following WHERE username = ?", (username,))
         self._conn.execute("DELETE FROM blocked_actors WHERE username = ?", (username,))
         self._conn.execute("DELETE FROM muted_actors WHERE username = ?", (username,))
         self._conn.execute("DELETE FROM identity_settings WHERE username = ?", (username,))
+        if existing is not None:
+            active_row = self._conn.execute(
+                "SELECT username FROM active_identity WHERE matrix_user_id = ?", (existing.matrix_user_id,)
+            ).fetchone()
+            was_active = active_row is not None and active_row["username"] == username
+            if was_active:
+                remaining = self._conn.execute(
+                    "SELECT username FROM local_actors WHERE matrix_user_id = ? ORDER BY created_at ASC LIMIT 1",
+                    (existing.matrix_user_id,),
+                ).fetchone()
+                if remaining is not None:
+                    # Always has an Active identity once it has at least
+                    # one -- promote the oldest remaining one.
+                    self._conn.execute(
+                        "UPDATE active_identity SET username = ? WHERE matrix_user_id = ?",
+                        (remaining["username"], existing.matrix_user_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "DELETE FROM active_identity WHERE matrix_user_id = ?", (existing.matrix_user_id,)
+                    )
         self._conn.commit()
 
     async def unregister_local_actor(self, username: str) -> None:
@@ -828,6 +1111,7 @@ class SqliteActorRepository:
             icon_url=row["icon_url"],
             banner_url=row["banner_url"],
             is_third_party=bool(row["is_third_party"]),
+            created_at=row["created_at"],
         )
 
     # -- PeerTube channels ----------------------------------------------------
@@ -2094,13 +2378,20 @@ class SqliteActorRepository:
     async def get_ghost_dm_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         return await self._run(self._get_ghost_dm_room, actor_id, matrix_user_id)
 
-    def _register_ghost_dm_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    def _register_ghost_dm_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        # local_username is deliberately absent from the ON CONFLICT SET
+        # clause -- stamped once, at this room's first-ever registration,
+        # and never overwritten by a later call for the same
+        # (actor_id, matrix_user_id) (e.g. a `;replace dm` moving room_id
+        # on). See register_ghost_dm_room's Protocol docstring.
         self._conn.execute(
             """
-            INSERT INTO ghost_dm_rooms (actor_id, matrix_user_id, room_id) VALUES (?, ?, ?)
+            INSERT INTO ghost_dm_rooms (actor_id, matrix_user_id, room_id, local_username) VALUES (?, ?, ?, ?)
             ON CONFLICT(actor_id, matrix_user_id) DO UPDATE SET room_id = excluded.room_id
             """,
-            (actor_id, matrix_user_id, room_id),
+            (actor_id, matrix_user_id, room_id, local_username),
         )
         # Permanent history row -- see get_ghost_dm_room_history's
         # docstring. Clear the old "current" flag first so the partial
@@ -2114,16 +2405,27 @@ class SqliteActorRepository:
         )
         self._conn.execute(
             """
-            INSERT INTO ghost_dm_room_history (room_id, actor_id, matrix_user_id, is_current)
-            VALUES (?, ?, ?, 1)
+            INSERT INTO ghost_dm_room_history (room_id, actor_id, matrix_user_id, is_current, local_username)
+            VALUES (?, ?, ?, 1, ?)
             ON CONFLICT(room_id) DO UPDATE SET is_current = 1
             """,
-            (room_id, actor_id, matrix_user_id),
+            (room_id, actor_id, matrix_user_id, local_username),
         )
         self._conn.commit()
 
-    async def register_ghost_dm_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
-        await self._run(self._register_ghost_dm_room, actor_id, matrix_user_id, room_id)
+    async def register_ghost_dm_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        await self._run(self._register_ghost_dm_room, actor_id, matrix_user_id, room_id, local_username)
+
+    def _get_ghost_dm_room_local_username(self, room_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT local_username FROM ghost_dm_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        return row["local_username"] if row else None
+
+    async def get_ghost_dm_room_local_username(self, room_id: str) -> str | None:
+        return await self._run(self._get_ghost_dm_room_local_username, room_id)
 
     def _get_ghost_dm_room_history(self, room_id: str) -> tuple[str, str] | None:
         row = self._conn.execute(
@@ -2191,13 +2493,17 @@ class SqliteActorRepository:
     async def get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         return await self._run(self._get_ghost_chat_room, actor_id, matrix_user_id)
 
-    def _register_ghost_chat_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    def _register_ghost_chat_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        # local_username semantics match register_ghost_dm_room exactly --
+        # see its comment above.
         self._conn.execute(
             """
-            INSERT INTO ghost_chat_rooms (actor_id, matrix_user_id, room_id) VALUES (?, ?, ?)
+            INSERT INTO ghost_chat_rooms (actor_id, matrix_user_id, room_id, local_username) VALUES (?, ?, ?, ?)
             ON CONFLICT(actor_id, matrix_user_id) DO UPDATE SET room_id = excluded.room_id
             """,
-            (actor_id, matrix_user_id, room_id),
+            (actor_id, matrix_user_id, room_id, local_username),
         )
         # Permanent history row -- see get_ghost_chat_room_history's
         # docstring. Clear the old "current" flag first so the partial
@@ -2211,16 +2517,27 @@ class SqliteActorRepository:
         )
         self._conn.execute(
             """
-            INSERT INTO ghost_chat_room_history (room_id, actor_id, matrix_user_id, is_current)
-            VALUES (?, ?, ?, 1)
+            INSERT INTO ghost_chat_room_history (room_id, actor_id, matrix_user_id, is_current, local_username)
+            VALUES (?, ?, ?, 1, ?)
             ON CONFLICT(room_id) DO UPDATE SET is_current = 1
             """,
-            (room_id, actor_id, matrix_user_id),
+            (room_id, actor_id, matrix_user_id, local_username),
         )
         self._conn.commit()
 
-    async def register_ghost_chat_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
-        await self._run(self._register_ghost_chat_room, actor_id, matrix_user_id, room_id)
+    async def register_ghost_chat_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        await self._run(self._register_ghost_chat_room, actor_id, matrix_user_id, room_id, local_username)
+
+    def _get_ghost_chat_room_local_username(self, room_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT local_username FROM ghost_chat_rooms WHERE room_id = ?", (room_id,)
+        ).fetchone()
+        return row["local_username"] if row else None
+
+    async def get_ghost_chat_room_local_username(self, room_id: str) -> str | None:
+        return await self._run(self._get_ghost_chat_room_local_username, room_id)
 
     def _get_ghost_chat_room_history(self, room_id: str) -> tuple[str, str] | None:
         row = self._conn.execute(

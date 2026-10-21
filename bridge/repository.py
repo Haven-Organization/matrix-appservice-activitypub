@@ -59,6 +59,17 @@ class ActorRecord:
     # whether room_id is set, never cached, so flipping that config back and
     # forth never requires migrating or mutating any existing record.
     is_third_party: bool = False
+    # ISO-8601 UTC timestamp, stamped once at insert time by the repository
+    # implementation (never by a caller) and never changed afterward, even
+    # by a later re-registration (room replace, display-field edit, unlink).
+    # Exists solely to give multiple identities owned by the same
+    # ``matrix_user_id`` a stable creation order -- see
+    # ``ActorRepository.list_local_actors_by_matrix_id`` and the ``;id list``
+    # command's numbering (bridge.commands). Empty string for any row
+    # written before this field existed and never since re-registered;
+    # callers that need a real ordering should treat an empty value as
+    # "oldest" (sorts first) rather than erroring.
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -416,7 +427,77 @@ class ActorRepository(Protocol):
 
     async def get_local_actor(self, username: str) -> ActorRecord | None: ...
 
-    async def get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None: ...
+    async def get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None:
+        """The one ``ActorRecord`` for ``matrix_user_id``, IF this user has
+        exactly one. Historically (and still true when
+        ``bridge.custom_identities_enabled`` is off) a Matrix user has at
+        most one local identity, which is what every existing call site of
+        this method was written assuming. Now that a user MAY own several
+        (see ``list_local_actors_by_matrix_id``), this method's behavior at
+        >1 identity is implementation-defined (each backend picks something
+        reasonable, e.g. the oldest) rather than a real answer -- it exists
+        for backward compatibility and for genuinely single-identity
+        contexts (service actors, tests), not as the general "who is
+        acting" resolver. New code resolving a Matrix user's acting
+        identity should go through ``bridge.identity_resolution.resolve_acting_identity``
+        (which itself calls ``list_local_actors_by_matrix_id``/
+        ``get_active_local_actor``), not this method."""
+        ...
+
+    async def list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
+        """Every ``ActorRecord`` ``matrix_user_id`` owns, oldest first (by
+        ``ActorRecord.created_at``, empty-string values sorting first).
+        Empty list if they have none. This is the real multi-identity
+        counterpart of ``get_local_actor_by_matrix_id`` -- callers that need
+        "all of this user's identities" (``;id list``, ``;leave unfollowed``,
+        ``;create channel``/``;create community`` owner disambiguation, the
+        per-user identity count check against
+        ``config.bridge.max_identities_per_user``) use this; callers that
+        need "whichever identity is acting right now" use
+        ``bridge.identity_resolution.resolve_acting_identity`` instead,
+        which falls back to ``get_active_local_actor``, not to the first
+        entry of this list."""
+        ...
+
+    async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
+        """``matrix_user_id``'s current Active identity -- the one used for
+        any outgoing action that doesn't already have an implicit identity
+        bound to it (see ``bridge.identity_resolution.resolve_acting_identity``,
+        which is almost always the right thing to call instead of this
+        method directly, since it also handles the room-bound cases this
+        method knows nothing about).
+
+        Reads the sparse ``active_identity`` sidecar row if one exists.
+        If there isn't one -- the common case, since a row is only ever
+        written on an actual multi-identity event (a second identity
+        created, or an explicit ``;id`` switch) -- falls back to
+        ``list_local_actors_by_matrix_id``: if it returns exactly one
+        identity, that one is implicitly Active (no row needed); if it
+        returns zero or more than one with no explicit row, returns None
+        (zero identities genuinely has no Active; more than one with no
+        row set is a state the rest of this feature's invariants should
+        prevent from persisting, but this method does not repair it --
+        callers that create a user's first identity, or that delete their
+        currently-Active one while others remain, are what's responsible
+        for calling ``set_active_identity`` to keep that invariant true,
+        not this read path)."""
+        ...
+
+    async def set_active_identity(self, matrix_user_id: str, username: str) -> None:
+        """Upsert ``matrix_user_id``'s Active identity to ``username``.
+        Does not validate that ``username`` is actually one of
+        ``matrix_user_id``'s own identities -- callers (the ``;id <n|username>``
+        command, and the auto-promotion logic on deleting the current
+        Active identity) are expected to have already confirmed that via
+        ``list_local_actors_by_matrix_id``."""
+        ...
+
+    async def clear_active_identity(self, matrix_user_id: str) -> None:
+        """Remove ``matrix_user_id``'s ``active_identity`` row entirely --
+        called when their last remaining identity is deleted, so a
+        zero-identity user has no stale Active pointer left over for a
+        future identity to silently inherit. No-op if there wasn't one."""
+        ...
 
     async def get_local_actor_by_room_id(self, room_id: str) -> ActorRecord | None:
         """Look up the actor whose linked Profile Room is ``room_id`` (never matches
@@ -1062,9 +1143,29 @@ class ActorRepository(Protocol):
         hasn't been created yet."""
         ...
 
-    async def register_ghost_dm_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_dm_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
         """Record ``room_id`` as the DM room between the ghost for
-        ``actor_id`` and ``matrix_user_id``."""
+        ``actor_id`` and ``matrix_user_id``, started under the local
+        identity ``local_username``. ``local_username`` is stamped ONCE,
+        at creation, and never changed by a later call for the same
+        ``room_id`` -- per the confirmed multi-identity design, a DM/Chat
+        room binds permanently to whichever identity was acting when it
+        was first started, independent of any later ``;id`` Active switch
+        (a remote contact should never see who they're talking to change
+        mid-conversation). See ``get_ghost_dm_room_local_username``."""
+        ...
+
+    async def get_ghost_dm_room_local_username(self, room_id: str) -> str | None:
+        """The local identity ``room_id`` (a ghost DM room) is permanently
+        bound to, as stamped by ``register_ghost_dm_room`` -- used by
+        ``bridge.identity_resolution.resolve_acting_identity`` to resolve
+        the acting identity for a message sent in this room without
+        consulting Active. None if ``room_id`` isn't a ghost DM room, or
+        predates this column (a pre-multi-identity row backfilled during
+        migration to that matrix_user_id's one identity at the time, so in
+        practice this should only be None for the former case)."""
         ...
 
     async def is_ghost_dm_room(self, room_id: str) -> bool:
@@ -1145,9 +1246,18 @@ class ActorRepository(Protocol):
         room, never one room serving both."""
         ...
 
-    async def register_ghost_chat_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_chat_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
         """Record ``room_id`` as the ``ChatMessage`` room between the ghost
-        for ``actor_id`` and ``matrix_user_id``."""
+        for ``actor_id`` and ``matrix_user_id``, started under the local
+        identity ``local_username``. Same permanent-binding-at-creation
+        semantics as ``register_ghost_dm_room``'s ``local_username`` --
+        see its docstring and ``get_ghost_chat_room_local_username``."""
+        ...
+
+    async def get_ghost_chat_room_local_username(self, room_id: str) -> str | None:
+        """The ``ChatMessage`` counterpart of ``get_ghost_dm_room_local_username``."""
         ...
 
     async def is_ghost_chat_room(self, room_id: str) -> bool:
@@ -1197,7 +1307,12 @@ class InMemoryActorRepository:
 
     def __init__(self) -> None:
         self._actors: dict[str, _LocalActorState] = {}
-        self._actors_by_matrix_id: dict[str, str] = {}
+        # One Matrix user can now own several identities -- list, not a
+        # single username, in creation order (also re-sorted by created_at
+        # wherever it's read, so insertion order is a convenience, not the
+        # source of truth).
+        self._actors_by_matrix_id: dict[str, list[str]] = {}
+        self._active_identity: dict[str, str] = {}  # matrix_user_id -> username
         self._actors_by_room_id: dict[str, str] = {}
         self._room_history: dict[str, str] = {}  # room_id -> matrix_user_id, never popped
         self._remote_rooms: dict[str, RemoteActorRoom] = {}
@@ -1223,9 +1338,11 @@ class InMemoryActorRepository:
         self._ghost_dm_rooms: dict[tuple[str, str], str] = {}
         self._ghost_dm_room_ids: set[str] = set()
         self._ghost_dm_room_history: dict[str, tuple[str, str]] = {}  # room_id -> (actor_id, matrix_user_id)
+        self._ghost_dm_room_local_username: dict[str, str] = {}  # room_id -> local_username
         self._ghost_chat_rooms: dict[tuple[str, str], str] = {}
         self._ghost_chat_room_ids: set[str] = set()
         self._ghost_chat_room_history: dict[str, tuple[str, str]] = {}  # room_id -> (actor_id, matrix_user_id)
+        self._ghost_chat_room_local_username: dict[str, str] = {}  # room_id -> local_username
         self._third_party_allows: dict[tuple[str, str], ThirdPartyAllowRecord] = {}
         self._pending_guild_follows: dict[str, PendingGuildFollow] = {}
         self._guild_memberships: dict[tuple[str, str], GuildMembership] = {}
@@ -1262,8 +1379,39 @@ class InMemoryActorRepository:
         return state.record if state else None
 
     async def get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None:
-        username = self._actors_by_matrix_id.get(matrix_user_id)
-        return await self.get_local_actor(username) if username else None
+        usernames = self._actors_by_matrix_id.get(matrix_user_id)
+        if not usernames:
+            return None
+        if len(usernames) == 1:
+            return await self.get_local_actor(usernames[0])
+        # Ambiguous (>1 identity) -- see this method's Protocol docstring:
+        # implementation-defined, picks the oldest, never an error. New
+        # code should use list_local_actors_by_matrix_id/
+        # get_active_local_actor instead of landing here at all.
+        records = sorted(
+            (self._actors[u].record for u in usernames if u in self._actors), key=lambda r: r.created_at
+        )
+        return records[0] if records else None
+
+    async def list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
+        usernames = self._actors_by_matrix_id.get(matrix_user_id, [])
+        records = [self._actors[u].record for u in usernames if u in self._actors]
+        return sorted(records, key=lambda r: r.created_at)
+
+    async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
+        username = self._active_identity.get(matrix_user_id)
+        if username is not None:
+            record = await self.get_local_actor(username)
+            if record is not None:
+                return record
+        identities = await self.list_local_actors_by_matrix_id(matrix_user_id)
+        return identities[0] if len(identities) == 1 else None
+
+    async def set_active_identity(self, matrix_user_id: str, username: str) -> None:
+        self._active_identity[matrix_user_id] = username
+
+    async def clear_active_identity(self, matrix_user_id: str) -> None:
+        self._active_identity.pop(matrix_user_id, None)
 
     async def get_local_actor_by_room_id(self, room_id: str) -> ActorRecord | None:
         username = self._actors_by_room_id.get(room_id) if room_id else None
@@ -1279,23 +1427,71 @@ class InMemoryActorRepository:
         # so a stale room_id doesn't keep resolving to this actor.
         if existing is not None and existing.record.room_id and existing.record.room_id != record.room_id:
             self._actors_by_room_id.pop(existing.record.room_id, None)
+        if not record.created_at:
+            # Preserve an existing row's created_at across a mere field
+            # update (display-name edit, room replace, unlink); stamp a
+            # genuinely new identity's created_at the first time it's seen.
+            preserved = existing.record.created_at if existing is not None else ""
+            record = replace(record, created_at=preserved or datetime.now(timezone.utc).isoformat())
         self._actors[record.username] = _LocalActorState(record=record)
-        self._actors_by_matrix_id[record.matrix_user_id] = record.username
+        usernames = self._actors_by_matrix_id.setdefault(record.matrix_user_id, [])
+        other_usernames_before_this_insert = [u for u in usernames if u != record.username]
+        is_first_identity_ever = not other_usernames_before_this_insert and record.username not in usernames
+        if record.username not in usernames:
+            usernames.append(record.username)
         if record.room_id:
             self._actors_by_room_id[record.room_id] = record.username
             # Unlike the reverse index above, this is never popped -- a room
             # that was genuinely someone's Profile Room stays "theirs" for
             # ownership checks even after a `replace room` moves them on.
             self._room_history.setdefault(record.room_id, record.matrix_user_id)
+        if is_first_identity_ever:
+            # Always has an Active identity once it has at least one --
+            # see bridge.repository.ActorRepository.get_active_local_actor.
+            self._active_identity.setdefault(record.matrix_user_id, record.username)
+        elif other_usernames_before_this_insert and record.matrix_user_id not in self._active_identity:
+            # An additional identity, not the first. If no explicit Active
+            # has ever been set, the previously-only identity was Active
+            # purely through get_active_local_actor's "exactly one ->
+            # implicit" fallback, which stops applying the moment there's
+            # >1 -- make it explicit now, to the oldest pre-existing
+            # identity, never this brand new one.
+            oldest = min(
+                (self._actors[u].record for u in other_usernames_before_this_insert if u in self._actors),
+                key=lambda r: r.created_at,
+                default=None,
+            )
+            if oldest is not None:
+                self._active_identity[record.matrix_user_id] = oldest.username
 
     async def unregister_local_actor(self, username: str) -> None:
         state = self._actors.pop(username, None)
         if state is None:
             return
-        if self._actors_by_matrix_id.get(state.record.matrix_user_id) == username:
-            del self._actors_by_matrix_id[state.record.matrix_user_id]
+        matrix_user_id = state.record.matrix_user_id
+        remaining_usernames: list[str] = []
+        if matrix_user_id in self._actors_by_matrix_id:
+            remaining_usernames = [u for u in self._actors_by_matrix_id[matrix_user_id] if u != username]
+            if remaining_usernames:
+                self._actors_by_matrix_id[matrix_user_id] = remaining_usernames
+            else:
+                del self._actors_by_matrix_id[matrix_user_id]
         if state.record.room_id and self._actors_by_room_id.get(state.record.room_id) == username:
             del self._actors_by_room_id[state.record.room_id]
+        if self._active_identity.get(matrix_user_id) == username:
+            if remaining_usernames:
+                # Promote the oldest remaining identity -- always has an
+                # Active identity once it has at least one.
+                remaining_records = sorted(
+                    (self._actors[u].record for u in remaining_usernames if u in self._actors),
+                    key=lambda r: r.created_at,
+                )
+                if remaining_records:
+                    self._active_identity[matrix_user_id] = remaining_records[0].username
+                else:
+                    del self._active_identity[matrix_user_id]
+            else:
+                del self._active_identity[matrix_user_id]
 
     async def get_peertube_channel(self, username: str) -> PeerTubeChannelRecord | None:
         return self._peertube_channels.get(username)
@@ -1697,10 +1893,17 @@ class InMemoryActorRepository:
     async def get_ghost_dm_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         return self._ghost_dm_rooms.get((actor_id, matrix_user_id))
 
-    async def register_ghost_dm_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_dm_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
         self._ghost_dm_rooms[(actor_id, matrix_user_id)] = room_id
         self._ghost_dm_room_ids.add(room_id)
         self._ghost_dm_room_history[room_id] = (actor_id, matrix_user_id)
+        # Stamped once, never changed by a later call for the same room_id.
+        self._ghost_dm_room_local_username.setdefault(room_id, local_username)
+
+    async def get_ghost_dm_room_local_username(self, room_id: str) -> str | None:
+        return self._ghost_dm_room_local_username.get(room_id)
 
     async def get_ghost_dm_room_history(self, room_id: str) -> tuple[str, str] | None:
         return self._ghost_dm_room_history.get(room_id)
@@ -1737,10 +1940,16 @@ class InMemoryActorRepository:
     async def get_ghost_chat_room(self, actor_id: str, matrix_user_id: str) -> str | None:
         return self._ghost_chat_rooms.get((actor_id, matrix_user_id))
 
-    async def register_ghost_chat_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_chat_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
         self._ghost_chat_rooms[(actor_id, matrix_user_id)] = room_id
         self._ghost_chat_room_ids.add(room_id)
         self._ghost_chat_room_history[room_id] = (actor_id, matrix_user_id)
+        self._ghost_chat_room_local_username.setdefault(room_id, local_username)
+
+    async def get_ghost_chat_room_local_username(self, room_id: str) -> str | None:
+        return self._ghost_chat_room_local_username.get(room_id)
 
     async def get_ghost_chat_room_history(self, room_id: str) -> tuple[str, str] | None:
         return self._ghost_chat_room_history.get(room_id)

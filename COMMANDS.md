@@ -14,7 +14,8 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 ## Contents
 
 - [Profile](#profile)
-  - [`;create profile`](#create-profile)
+  - [`;create profile [<id>]`](#create-profile-id)
+  - [`;id`](#id)
   - [`;import follows`](#import-follows-or-import-following)
   - [`;banner`](#banner-mxcservermediaid)
 - [General](#general)
@@ -43,11 +44,14 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;refresh guild`](#refresh-guild)
   - [`;refresh guild invite`](#refresh-guild-invite-codedomain)
 - [PeerTube](#peertube)
-  - [`;create channel`](#create-channel-id-display-name)
+  - [`;create channel`](#create-channel-id-as-numberid-display-name)
   - [`;publish`](#publish-reply-to-a-video-message)
   - [`;unpublish`](#unpublish-reply-to-an-already-published-video)
   - [`;edit`](#edit-reply-to-an-already-published-video)
   - [`;replace video`](#replace-video-mxcservermediaid)
+- [Lemmy communities](#lemmy-communities)
+  - [`;create community`](#create-community-id-as-numberid-display-name)
+  - [`;link community`](#link-community-id)
 - [Admin](#admin)
   - [`;allow`](#allow-mxidroomhomeserver-value)
   - [`;disallow`](#disallow-mxidroomhomeserver-value)
@@ -56,10 +60,10 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [Widget vs. commands](#widget-vs-commands)
 - [Danger Zone](#danger-zone)
   - [`;link profile`](#link-profile)
-  - [`;unlink profile`](#unlink-profile)
+  - [`;unlink profile`](#unlink-profile--unlink-profile-numberid)
   - [`;replace room`](#replace-room)
   - [`;replace dm`/`;replace chat`](#replace-dmchat-userinstanceorg)
-  - [`;delete profile`](#delete-profile)
+  - [`;delete profile`](#delete-profile--delete-profile-numberid)
 
 ---
 
@@ -67,15 +71,27 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 
 Setting up and maintaining your own linked fediverse identity.
 
-### `;create profile`
+### `;create profile [<id>]`
 
-**Syntax:** `;create profile`, no other argument.
+**Syntax:** `;create profile`, no other argument -- or, with multi-identity support enabled (`bridge.custom_identities_enabled`, see [CONFIG.md](CONFIG.md#bridge-custom_identities_enabled)), `;create profile <id>` to pick a custom id instead.
 
-**What it does:** One-shot setup that would otherwise take several manual steps. Creates a brand-new Matrix room (bot as creator/admin), invites you and sets your power level to 99 (one below the bot), copies your current Matrix display name and avatar onto the room, tags it as a bridge-made Profile Room, adds the room widget, adds it to your personal Fediverse space, and mints (or, if you'd previously run `;unlink profile`, reattaches) your actual ActivityPub actor (`username@bridge-domain`) to it. Your username is derived from your Matrix localpart.
+**What it does:** One-shot setup that would otherwise take several manual steps. Creates a brand-new Matrix room (bot as creator/admin), invites you and sets your power level to 99 (one below the bot), copies your current Matrix display name and avatar onto the room, tags it as a bridge-made Profile Room, adds the room widget, adds it to your personal Fediverse space, and mints (or, if you'd previously run `;unlink profile`, reattaches) your actual ActivityPub actor to it. With no `<id>`, your username is always derived from your Matrix localpart (`username@bridge-domain`), exactly as it always has been, regardless of whether custom identities are enabled -- `<id>` is purely an additional option, never required.
 
-**Who can run it:** Any local Matrix user. If you already have a linked profile, this doesn't create a second one -- it re-invites you to your existing profile room and Fediverse space instead (harmless no-op if you're already in either). Useful if a Matrix account deactivation force-left you from both; your linked identity itself isn't affected by that, only your Matrix-side room membership. See [`;rejoin profile`/`;rejoin space`](#rejoin-room_idprofilespace-othermatrixid) for the same recovery without recreating anything.
+**Who can run it:** Any local Matrix user. If you already have a linked profile under the SAME username this resolves to, this doesn't create a second one -- it re-invites you to your existing profile room and Fediverse space instead (harmless no-op if you're already in either). Useful if a Matrix account deactivation force-left you from both; your linked identity itself isn't affected by that, only your Matrix-side room membership. See [`;rejoin profile`/`;rejoin space`](#rejoin-room_idprofilespace-othermatrixid) for the same recovery without recreating anything.
 
-**Notes:** Reattaching an unlinked identity preserves its followers and following exactly as before. If room creation fails, you're told you can make your own room and use `;link profile` instead (see [Danger Zone](#danger-zone)).
+**Notes:** Reattaching an unlinked identity preserves its followers and following exactly as before. If room creation fails, you're told you can make your own room and use `;link profile` instead (see [Danger Zone](#danger-zone)). With multi-identity support on, creating an identity beyond your first is capped at `bridge.max_identities_per_user` (bridge admins are exempt) and never becomes your Active identity automatically -- switch to it with [`;id`](#id).
+
+---
+
+### `;id`
+
+**Syntax:** `;id` or `;id list` to see your identities; `;id <number|id>` to switch which one is Active.
+
+**What it does:** With multi-identity support enabled, a Matrix user can own more than one ActivityPub identity (see [`;create profile <id>`](#create-profile-id) above). Your **Active** identity is the one used for anything that doesn't already have an identity implicitly tied to it -- `;follow`, `;dm`, `;chat`, reacting/replying outside your own rooms, and so on. Posting in a specific Profile Room, or publishing to a PeerTube channel/Lemmy community already tied to one identity at creation, always uses THAT identity instead, regardless of Active. `;id`/`;id list` shows every identity you own, numbered, with the Active one marked. `;id <number|id>` switches Active to the one named, by its number in that list or by its username directly.
+
+**Who can run it:** Any local Matrix user with at least one linked identity -- works (and still shows something useful) even with only one identity, or with multi-identity support off.
+
+**Notes:** A newly created identity never becomes Active automatically unless it's your very first one -- you always keep the Active identity you already had until you explicitly switch. You always have an Active identity once you have at least one (deleting the Active one promotes another automatically -- see [`;delete profile`](#delete-profile)).
 
 ---
 
@@ -274,7 +290,7 @@ One-off account/room-recovery operations and other things almost nobody needs da
 
 **Syntax:** `;rejoin <room_id>` to invite yourself into a specific room, or `;rejoin profile`/`;rejoin space` to invite yourself into your own linked Profile Room or Fediverse space without needing to know its room ID at all. Add `@other:matrix.id` to any form to invite someone else instead.
 
-**What it does:** Force-attempts a fresh invite into a room the bridge manages, a manual recovery tool for a lockout -- a room's join rule got switched to knock-only with nobody left to approve one, or (the reason `profile`/`space` exist) a Matrix account deactivation force-left you from every room you were in. Your linked identity itself (keys, followers, following, room pointer) survives that untouched on the bridge's own side -- deactivation only ever affects Matrix-side room membership -- so once you're back (a homeserver admin can reverse a deactivation onto the same account), this is how you get back into the rooms themselves. Inviting someone already a member is a harmless no-op. Never triggers an ActivityPub `Follow` as a side effect; following only ever happens via `;follow` itself.
+**What it does:** Force-attempts a fresh invite into a room the bridge manages, a manual recovery tool for a lockout -- a room's join rule got switched to knock-only with nobody left to approve one, or (the reason `profile`/`space` exist) a Matrix account deactivation force-left you from every room you were in. Your linked identity itself (keys, followers, following, room pointer) survives that untouched on the bridge's own side -- deactivation only ever affects Matrix-side room membership -- so once you're back (a homeserver admin can reverse a deactivation onto the same account), this is how you get back into the rooms themselves. `profile` invites you into EVERY Profile Room you currently own (if you have more than one identity), not just one. Inviting someone already a member is a harmless no-op. Never triggers an ActivityPub `Follow` as a side effect; following only ever happens via `;follow` itself.
 
 **Who can run it:**
 - Inviting only yourself: any Remote User Room (even an already-replaced one no longer live-tracked), your own linked Profile Room (`profile`, or its literal room ID, current or past), or your own Fediverse space (`space`).
@@ -286,7 +302,7 @@ One-off account/room-recovery operations and other things almost nobody needs da
 
 **Syntax:** `;leave unfollowed`, no argument.
 
-**What it does:** Finds every Remote User Room you're currently a member of for an account you don't (or no longer) follow -- room membership and following are tracked independently, so this can happen via an old unfollow that never kicked you out, or various on-demand imports (a mention, a reply's ancestor chain, someone else's repost) landing you in a room you never actually ran `;follow` in. Shows the count and a list first and asks you to reply "confirm" before removing anything -- nothing happens just from running the command. Removes you (kicks, via the bot) from each one; your own Profile Room, DMs, and Chats are never touched, only Remote User Rooms.
+**What it does:** Finds every Remote User Room you're currently a member of for an account that NONE of your identities follow -- room membership and following are tracked independently, so this can happen via an old unfollow that never kicked you out, or various on-demand imports (a mention, a reply's ancestor chain, someone else's repost) landing you in a room you never actually ran `;follow` in. If you own more than one identity, a room is only offered up here if nobody of yours follows it -- one of your other identities still following is reason enough to keep it. Shows the count and a list first and asks you to reply "confirm" before removing anything -- nothing happens just from running the command. Removes you (kicks, via the bot) from each one; your own Profile Room, DMs, and Chats are never touched, only Remote User Rooms.
 
 **Who can run it:** Requires a linked profile.
 
@@ -382,15 +398,15 @@ Shoot guild and channel commands -- FEP-bebd guild join/leave and channel manage
 
 Publishing and managing a PeerTube-compatible video channel. Opt-in (`bridge.peertube_channels_enabled`, off by default -- see [CONFIG.md](CONFIG.md#peertube-video-channels), and [FEATURES.md](FEATURES.md#peertube-video-channels) for how channel bridging works overall). Every command below responds with a plain notice if that setting is off.
 
-### `;create channel <id> [display name]`
+### `;create channel <id> [as <number|id>] [display name]`
 
-**Syntax:** `;create channel <id> [display name]`. `<id>` becomes the channel's fediverse username (`id@bridge-domain`); everything after it, if given, becomes its display name (defaults to `<id>` itself).
+**Syntax:** `;create channel <id> [as <number|id>] [display name]`. `<id>` becomes the channel's fediverse username (`id@bridge-domain`); everything after it, if given, becomes its display name (defaults to `<id>` itself).
 
-**What it does:** Mints a real, federating PeerTube-compatible video channel: a `Group`-typed ActivityPub actor with its own keypair, owned by your already-linked Profile. Creates a brand-new Matrix room (bot as creator/admin), invites you and sets your power level to 99, adds the room widget, and adds it to your personal Fediverse space. Channels and profiles share one global actor-username namespace (both are ultimately served at the same `/actor/{username}` URL shape), so an `<id>` already taken by either kind is rejected.
+**What it does:** Mints a real, federating PeerTube-compatible video channel: a `Group`-typed ActivityPub actor with its own keypair, owned by one of your already-linked Profiles. Creates a brand-new Matrix room (bot as creator/admin), invites you and sets your power level to 99, adds the room widget, and adds it to your personal Fediverse space. Channels and profiles share one global actor-username namespace (both are ultimately served at the same `/actor/{username}` URL shape), so an `<id>` already taken by either kind is rejected.
 
 **Who can run it:** Any local user with a linked profile.
 
-**Notes:** One profile can own several channels. Send a video into the room, then reply to it with `;publish` to actually federate it.
+**Notes:** One profile can own several channels. Send a video into the room, then reply to it with `;publish` to actually federate it. If you own more than one identity (see [`;id`](#id)), say which one owns this channel with `as <number|id>` right after `<id>` -- with exactly one identity, it's used automatically and `as ...` stays optional.
 
 ---
 
@@ -454,15 +470,15 @@ Description text here.
 
 Following/mirroring a remote Lemmy community (`bridge.lemmy_communities_enabled`), and -- separately -- hosting your own, authoritative one (`bridge.lemmy_community_hosting_enabled`). See `;follow` above for mirroring a remote community, and `;backfill` for pulling its history.
 
-### `;create community <id> [display name]`
+### `;create community <id> [as <number|id>] [display name]`
 
-**Syntax:** `;create community <id> [display name]`. `<id>` becomes the community's fediverse username (`id@bridge-domain`); everything after it, if given, becomes its display name (defaults to `<id>` itself).
+**Syntax:** `;create community <id> [as <number|id>] [display name]`. `<id>` becomes the community's fediverse username (`id@bridge-domain`); everything after it, if given, becomes its display name (defaults to `<id>` itself).
 
-**What it does:** Mints a real, federating Lemmy-compatible community: a `Group`-typed ActivityPub actor with its own keypair, hosted by this bridge itself (unlike mirroring, this bridge is the authoritative home instance). Creates a brand-new Matrix room (bot as creator/admin), invites you and makes you its first moderator (power level 50 -- a community has no single all-powerful owner, matching real Lemmy's own model), adds the room widget, and adds it to your personal Fediverse space. Shares the same global actor-username namespace as profiles/channels (all ultimately served at `/actor/{username}`), so an `<id>` already taken by any of them is rejected.
+**What it does:** Mints a real, federating Lemmy-compatible community: a `Group`-typed ActivityPub actor with its own keypair, hosted by this bridge itself (unlike mirroring, this bridge is the authoritative home instance). Creates a brand-new Matrix room (bot as creator/admin), invites you and makes one of your Profiles its first moderator (power level 50 -- a community has no single all-powerful owner, matching real Lemmy's own model), adds the room widget, and adds it to your personal Fediverse space. Shares the same global actor-username namespace as profiles/channels (all ultimately served at `/actor/{username}`), so an `<id>` already taken by any of them is rejected.
 
 **Who can run it:** Any local user with a linked profile.
 
-**Notes:** To post, just send an ordinary message: the first line becomes the post's title, a blank line, then the rest becomes the body. Reply to an existing post/comment to add a comment instead. Raising someone's Matrix power level to 50+ in the room makes them a real moderator (announced to followers); dropping it back below does the reverse. Banning a ghost sends a real `Block`; redacting someone else's post/comment sends a `Delete` signed as the moderator.
+**Notes:** To post, just send an ordinary message: the first line becomes the post's title, a blank line, then the rest becomes the body. Reply to an existing post/comment to add a comment instead. Raising someone's Matrix power level to 50+ in the room makes them a real moderator (announced to followers); dropping it back below does the reverse. Banning a ghost sends a real `Block`; redacting someone else's post/comment sends a `Delete` signed as the moderator. If you own more than one identity, say which one moderates it with `as <number|id>` right after `<id>`, same as [`;create channel`](#create-channel-id-as-numberid-display-name).
 
 ---
 
@@ -557,21 +573,21 @@ Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` 
 
 **Who can run it:** Any local user without an already-linked profile, on a room they actually control that isn't already used by the bridge for something else -- both checked before the warning is even sent.
 
-**Notes:** Unlike [`;create profile`](#create-profile), this doesn't make a room for you. You need to already own or control one and have invited the bot with sufficient power. It's the option for people who'd rather use a room they already have. This isn't a one-off action -- it's a lasting change to what the room IS.
+**Notes:** Unlike [`;create profile [<id>]`](#create-profile-id), this doesn't make a room for you. You need to already own or control one and have invited the bot with sufficient power. It's the option for people who'd rather use a room they already have. This isn't a one-off action -- it's a lasting change to what the room IS.
 
 ---
 
-### `;unlink profile`
+### `;unlink profile` / `;unlink profile <number|id>`
 
-**Syntax:** `;unlink profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated.
+**Syntax:** `;unlink profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. If you own more than one identity, `;unlink profile` alone lists them (numbered, same format as [`;id`](#id)) instead of warning about any one of them -- re-run as `;unlink profile <number|id>` to pick which.
 
 **What it does:**
-1. `;unlink profile` alone sends a warning that this room stops publishing for your identity immediately, and becomes linkable as a DIFFERENT identity by anyone with enough power here. Nothing is unlinked yet.
-2. Replying "confirm" detaches your current room from your identity without telling the fediverse anything. No `Delete` is sent, and your followers, following, and keys are all preserved untouched. This is how you move your profile to a different room: unlink here, then `;link profile`/`;create profile` in the new room to reattach the exact same identity.
+1. `;unlink profile` (or, with more than one identity, `;unlink profile <number|id>`) sends a warning that this room stops publishing for that identity immediately, and becomes linkable as a DIFFERENT identity by anyone with enough power here. Nothing is unlinked yet.
+2. Replying "confirm" detaches your current room from that identity without telling the fediverse anything. No `Delete` is sent, and its followers, following, and keys are all preserved untouched. This is how you move a profile to a different room: unlink here, then `;link profile`/`;create profile` in the new room to reattach the exact same identity.
 
 **Who can run it:** Any local user with a currently-linked profile.
 
-**Notes:** The identity itself survives, so it's reversible in that sense -- but the room is immediately left open to becoming a completely different identity the moment anyone with enough power runs `;link profile` in it, so don't unlink until you're actually ready to relink somewhere. Contrast with `;delete profile`, which erases the identity itself and is not reversible at all.
+**Notes:** The identity itself survives, so it's reversible in that sense -- but the room is immediately left open to becoming a completely different identity the moment anyone with enough power runs `;link profile` in it, so don't unlink until you're actually ready to relink somewhere. Contrast with `;delete profile`, which erases the identity itself and is not reversible at all. With more than one identity, the explicit selection step exists specifically so this can't land on the wrong one by mistake.
 
 ---
 
@@ -604,14 +620,14 @@ Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` 
 
 ---
 
-### `;delete profile`
+### `;delete profile` / `;delete profile <number|id>`
 
-**Syntax:** `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated.
+**Syntax:** `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. If you own more than one identity, `;delete profile` alone lists them (numbered, same format as [`;id`](#id)) instead of warning about any one of them -- re-run as `;delete profile <number|id>` to pick which; with exactly one identity, it goes straight to the warning as always.
 
 **What it does:**
-1. `;delete profile` alone sends an itemized warning of exactly what will happen, and nothing else yet.
-2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion: sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room you're in (except the Profile Room itself), kicks you from your Fediverse space, unlinks the room, renames it to add "(Deleted)", and permanently erases the identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
+1. `;delete profile` (or, with more than one identity, `;delete profile <number|id>`) sends an itemized warning of exactly what will happen to that identity, and nothing else yet.
+2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion: sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room that identity specifically has open (if you have other identities left, their own rooms and your shared Fediverse space are left alone), kicks you from your Fediverse space only if this was your last identity, unlinks the room, renames it to add "(Deleted)", and permanently erases that identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
 
-**Who can run it:** Any local user with a currently-linked profile. It always acts on whoever sends "confirm" and their own profile, never someone else's.
+**Who can run it:** Any local user with a currently-linked profile. It always acts on whoever sends "confirm" and an identity that's actually theirs, never someone else's.
 
-**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message. Of everything in this Danger Zone, this is the only one that can't be undone by any other command -- `;link`/`;unlink`/`;replace` all leave the underlying identity itself intact.
+**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message. Of everything in this Danger Zone, this is the only one that can't be undone by any other command -- `;link`/`;unlink`/`;replace` all leave the underlying identity itself intact. Deleting your Active identity automatically promotes another of your remaining identities to Active; deleting your last identity leaves you with none (a valid state, not an error).

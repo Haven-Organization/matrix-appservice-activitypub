@@ -47,6 +47,9 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
     - [Enable PeerTube channels (`bridge.peertube_channels_enabled`)](#bridge-peertube_channels_enabled)
     - [Followed video media mode (`bridge.follow_video_media_mode`)](#bridge-follow_video_media_mode)
     - [Max embedded video size (`bridge.follow_video_max_embed_mb`)](#bridge-follow_video_max_embed_mb)
+  - [Multi-identity support](#multi-identity-support)
+    - [Enable custom identities (`bridge.custom_identities_enabled`)](#bridge-custom_identities_enabled)
+    - [Max identities per user (`bridge.max_identities_per_user`)](#bridge-max_identities_per_user)
 - [`synapse`](#synapse)
   - [Admin token (`synapse.admin_token`)](#synapse-admin_token)
 - [`storage`](#storage)
@@ -354,6 +357,28 @@ How a followed PeerTube channel/account's videos show up as posts. `link` always
 **Default:** `100`
 
 Only consulted in `embed` mode, checked against the video's own declared file size before ever starting a download.
+
+---
+
+### Multi-identity support
+
+<a id="bridge-custom_identities_enabled"></a>
+
+#### Enable custom identities (`bridge.custom_identities_enabled`)
+
+**Default:** `false`
+
+Whether a Matrix user may own more than one ActivityPub identity, and pick a custom id for one instead of always being stuck with their Matrix localpart (`;create profile <id>`, `;id`, and friends; see [FEATURES.md](FEATURES.md)). Off by default: with this off, the bridge behaves exactly as it always has -- one identity per Matrix user, username always equal to the localpart, no selection/switching commands exposed at all.
+
+---
+
+<a id="bridge-max_identities_per_user"></a>
+
+#### Max identities per user (`bridge.max_identities_per_user`)
+
+**Default:** `5`
+
+Per-user cap on how many ActivityPub identities they may create once [`bridge.custom_identities_enabled`](#bridge-custom_identities_enabled) is on. A bridge admin (see [`bridge.admins`](#bridge-admins) / [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api)) is never subject to this cap.
 
 ---
 

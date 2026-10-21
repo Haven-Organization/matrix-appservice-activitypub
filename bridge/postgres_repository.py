@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 import asyncpg
 
@@ -46,10 +47,20 @@ from bridge.repository import (
 logger = logging.getLogger(__name__)
 
 _SCHEMA_STATEMENTS = [
+    # matrix_user_id is deliberately NOT UNIQUE here -- a fresh database
+    # creates this table without the constraint from the start, since a
+    # Matrix user may own several identities once
+    # bridge.custom_identities_enabled is on. See the
+    # "DROP CONSTRAINT IF EXISTS local_actors_matrix_user_id_key" migration
+    # statement below for dropping it from an EXISTING database that still
+    # has it (same technique already used for
+    # federated_events_ap_object_id_key just above), and
+    # idx_local_actors_matrix_user_id for the lookup index that replaces
+    # what the UNIQUE constraint used to provide for free.
     """
     CREATE TABLE IF NOT EXISTS local_actors (
         username TEXT PRIMARY KEY,
-        matrix_user_id TEXT NOT NULL UNIQUE,
+        matrix_user_id TEXT NOT NULL,
         room_id TEXT NOT NULL,
         public_key_pem TEXT NOT NULL,
         private_key_pem TEXT NOT NULL,
@@ -59,7 +70,19 @@ _SCHEMA_STATEMENTS = [
         banner_url TEXT,
         hide_followers BOOLEAN NOT NULL DEFAULT FALSE,
         hide_following BOOLEAN NOT NULL DEFAULT FALSE,
-        is_third_party BOOLEAN NOT NULL DEFAULT FALSE
+        is_third_party BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_local_actors_matrix_user_id ON local_actors (matrix_user_id)",
+    # Sparse: a row only exists for a Matrix user who currently has >1
+    # identity or has ever explicitly switched via ";id" -- see
+    # ActorRepository.get_active_local_actor's docstring for the fallback
+    # when no row exists.
+    """
+    CREATE TABLE IF NOT EXISTS active_identity (
+        matrix_user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL
     )
     """,
     # Admin-granted third-party access (see ActorRecord.is_third_party and
@@ -229,11 +252,18 @@ _SCHEMA_STATEMENTS = [
         room_id TEXT NOT NULL
     )
     """,
+    # local_username is the identity that was Active (or room-bound) when
+    # this DM room was first started -- stamped once at creation, never
+    # changed afterward, even by a later ";id" Active switch (see
+    # ActorRepository.register_ghost_dm_room's docstring). Nullable: a row
+    # predating this column (backfilled during migration below) or one
+    # somehow never stamped falls back to None, not an error.
     """
     CREATE TABLE IF NOT EXISTS ghost_dm_rooms (
         actor_id TEXT NOT NULL,
         matrix_user_id TEXT NOT NULL,
         room_id TEXT NOT NULL UNIQUE,
+        local_username TEXT,
         PRIMARY KEY (actor_id, matrix_user_id)
     )
     """,
@@ -247,6 +277,7 @@ _SCHEMA_STATEMENTS = [
         actor_id TEXT NOT NULL,
         matrix_user_id TEXT NOT NULL,
         room_id TEXT NOT NULL UNIQUE,
+        local_username TEXT,
         PRIMARY KEY (actor_id, matrix_user_id)
     )
     """,
@@ -316,7 +347,8 @@ _SCHEMA_STATEMENTS = [
         room_id TEXT PRIMARY KEY,
         actor_id TEXT NOT NULL,
         matrix_user_id TEXT NOT NULL,
-        is_current BOOLEAN NOT NULL DEFAULT FALSE
+        is_current BOOLEAN NOT NULL DEFAULT FALSE,
+        local_username TEXT
     )
     """,
     """
@@ -324,7 +356,8 @@ _SCHEMA_STATEMENTS = [
         room_id TEXT PRIMARY KEY,
         actor_id TEXT NOT NULL,
         matrix_user_id TEXT NOT NULL,
-        is_current BOOLEAN NOT NULL DEFAULT FALSE
+        is_current BOOLEAN NOT NULL DEFAULT FALSE,
+        local_username TEXT
     )
     """,
     # Shoot Guild/Channel bridging (see bridge.channel_bridge) -- an
@@ -401,6 +434,25 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_followers BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS hide_following BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS is_third_party BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE local_actors ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT ''",
+    # Multi-identity support: drops the OLD UNIQUE constraint an existing
+    # database may still have on matrix_user_id (Postgres's default name
+    # for a single-column inline UNIQUE is "{table}_{column}_key" -- same
+    # technique as federated_events_ap_object_id_key's drop above). IF
+    # EXISTS makes this a no-op both against a database that's already
+    # been through this migration and against a brand new one (whose
+    # CREATE TABLE above never declares the constraint in the first place).
+    "ALTER TABLE local_actors DROP CONSTRAINT IF EXISTS local_actors_matrix_user_id_key",
+    # Backfill created_at for any row that doesn't have one yet. The
+    # "0000-00-00-legacy-" prefix sorts BEFORE any real ISO-8601 created_at
+    # (which always starts with a 4-digit year), so every legacy row still
+    # counts as "oldest" per ActorRecord.created_at's documented ordering
+    # contract; ctid (this row's current physical location) is the
+    # least-bad available proxy for relative insertion order on a database
+    # old enough to have no real created_at at all -- a fresh database
+    # never has empty values here since _register_local_actor always
+    # stamps a real one.
+    "UPDATE local_actors SET created_at = '0000-00-00-legacy-' || ctid::text WHERE created_at = ''",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS icon_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS banner_url TEXT",
     "ALTER TABLE remote_actor_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
@@ -485,6 +537,33 @@ _SCHEMA_STATEMENTS = [
     "ON ghost_dm_room_history (actor_id, matrix_user_id) WHERE is_current",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_chat_room_history_current "
     "ON ghost_chat_room_history (actor_id, matrix_user_id) WHERE is_current",
+    "ALTER TABLE ghost_dm_rooms ADD COLUMN IF NOT EXISTS local_username TEXT",
+    "ALTER TABLE ghost_chat_rooms ADD COLUMN IF NOT EXISTS local_username TEXT",
+    "ALTER TABLE ghost_dm_room_history ADD COLUMN IF NOT EXISTS local_username TEXT",
+    "ALTER TABLE ghost_chat_room_history ADD COLUMN IF NOT EXISTS local_username TEXT",
+    # Backfilled from each row's matrix_user_id's single identity AT
+    # MIGRATION TIME -- the only thing it could possibly have been, since
+    # multiple identities per user didn't exist before this feature.
+    """
+    UPDATE ghost_dm_rooms r SET local_username = a.username
+    FROM local_actors a
+    WHERE a.matrix_user_id = r.matrix_user_id AND r.local_username IS NULL
+    """,
+    """
+    UPDATE ghost_chat_rooms r SET local_username = a.username
+    FROM local_actors a
+    WHERE a.matrix_user_id = r.matrix_user_id AND r.local_username IS NULL
+    """,
+    """
+    UPDATE ghost_dm_room_history h SET local_username = a.username
+    FROM local_actors a
+    WHERE a.matrix_user_id = h.matrix_user_id AND h.local_username IS NULL
+    """,
+    """
+    UPDATE ghost_chat_room_history h SET local_username = a.username
+    FROM local_actors a
+    WHERE a.matrix_user_id = h.matrix_user_id AND h.local_username IS NULL
+    """,
     # Backfill each history table (added 2026-07) from its primary table's
     # CURRENT rows -- same reasoning/limitation as the profile_room_history
     # backfill above: cheap, idempotent, recovers only what's live right
@@ -600,10 +679,42 @@ class PostgresActorRepository:
         return self._row_to_actor(row) if row else None
 
     async def get_local_actor_by_matrix_id(self, matrix_user_id: str) -> ActorRecord | None:
+        # ORDER BY created_at picks the oldest deterministically when a
+        # user has >1 identity -- see this method's Protocol docstring
+        # (implementation-defined at >1, never an error).
         row = await self._pool.fetchrow(
-            "SELECT * FROM local_actors WHERE matrix_user_id = $1", matrix_user_id
+            "SELECT * FROM local_actors WHERE matrix_user_id = $1 ORDER BY created_at ASC LIMIT 1", matrix_user_id
         )
         return self._row_to_actor(row) if row else None
+
+    async def list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM local_actors WHERE matrix_user_id = $1 ORDER BY created_at ASC", matrix_user_id
+        )
+        return [self._row_to_actor(row) for row in rows]
+
+    async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
+        row = await self._pool.fetchrow(
+            "SELECT username FROM active_identity WHERE matrix_user_id = $1", matrix_user_id
+        )
+        if row is not None:
+            actor = await self.get_local_actor(row["username"])
+            if actor is not None:
+                return actor
+        identities = await self.list_local_actors_by_matrix_id(matrix_user_id)
+        return identities[0] if len(identities) == 1 else None
+
+    async def set_active_identity(self, matrix_user_id: str, username: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO active_identity (matrix_user_id, username) VALUES ($1, $2)
+            ON CONFLICT (matrix_user_id) DO UPDATE SET username = EXCLUDED.username
+            """,
+            matrix_user_id, username,
+        )
+
+    async def clear_active_identity(self, matrix_user_id: str) -> None:
+        await self._pool.execute("DELETE FROM active_identity WHERE matrix_user_id = $1", matrix_user_id)
 
     async def get_local_actor_by_room_id(self, room_id: str) -> ActorRecord | None:
         if not room_id:
@@ -632,14 +743,21 @@ class PostgresActorRepository:
         # see this project's additive-only schema convention) but are no
         # longer read or written. That per-identity state now lives in
         # identity_settings, see bridge.identity_settings.
+        #
+        # created_at is NEVER overwritten by the ON CONFLICT branch below
+        # (deliberately absent from its SET list) -- see
+        # SqliteActorRepository._register_local_actor's identical reasoning.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                existing = await conn.fetchrow("SELECT 1 FROM local_actors WHERE username = $1", record.username)
+                existing_is_new = existing is None
+                created_at = record.created_at or datetime.now(timezone.utc).isoformat()
                 await conn.execute(
                     """
                     INSERT INTO local_actors
                         (username, matrix_user_id, room_id, public_key_pem, private_key_pem,
-                         display_name, summary, icon_url, banner_url, is_third_party)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         display_name, summary, icon_url, banner_url, is_third_party, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (username) DO UPDATE SET
                         matrix_user_id = EXCLUDED.matrix_user_id,
                         room_id = EXCLUDED.room_id,
@@ -654,8 +772,36 @@ class PostgresActorRepository:
                     record.username, record.matrix_user_id, record.room_id,
                     record.public_key_pem, record.private_key_pem,
                     record.display_name, record.summary, record.icon_url, record.banner_url,
-                    record.is_third_party,
+                    record.is_third_party, created_at,
                 )
+                if existing_is_new:
+                    # Always has an Active identity once it has at least
+                    # one -- see SqliteActorRepository._register_local_actor's
+                    # identical reasoning, including the "an additional
+                    # identity makes an implicit single-identity Active
+                    # explicit" branch.
+                    other_identities = await conn.fetch(
+                        "SELECT username FROM local_actors WHERE matrix_user_id = $1 AND username <> $2 "
+                        "ORDER BY created_at ASC",
+                        record.matrix_user_id, record.username,
+                    )
+                    if not other_identities:
+                        await conn.execute(
+                            """
+                            INSERT INTO active_identity (matrix_user_id, username) VALUES ($1, $2)
+                            ON CONFLICT (matrix_user_id) DO NOTHING
+                            """,
+                            record.matrix_user_id, record.username,
+                        )
+                    else:
+                        has_active_row = await conn.fetchrow(
+                            "SELECT 1 FROM active_identity WHERE matrix_user_id = $1", record.matrix_user_id
+                        )
+                        if has_active_row is None:
+                            await conn.execute(
+                                "INSERT INTO active_identity (matrix_user_id, username) VALUES ($1, $2)",
+                                record.matrix_user_id, other_identities[0]["username"],
+                            )
                 if record.room_id:
                     # Permanent, unlike local_actors.room_id itself -- see
                     # SqliteActorRepository._register_local_actor's
@@ -680,12 +826,35 @@ class PostgresActorRepository:
     async def unregister_local_actor(self, username: str) -> None:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                existing = await conn.fetchrow("SELECT matrix_user_id FROM local_actors WHERE username = $1", username)
                 await conn.execute("DELETE FROM local_actors WHERE username = $1", username)
                 await conn.execute("DELETE FROM followers WHERE username = $1", username)
                 await conn.execute("DELETE FROM following WHERE username = $1", username)
                 await conn.execute("DELETE FROM blocked_actors WHERE username = $1", username)
                 await conn.execute("DELETE FROM muted_actors WHERE username = $1", username)
                 await conn.execute("DELETE FROM identity_settings WHERE username = $1", username)
+                if existing is not None:
+                    matrix_user_id = existing["matrix_user_id"]
+                    active_row = await conn.fetchrow(
+                        "SELECT username FROM active_identity WHERE matrix_user_id = $1", matrix_user_id
+                    )
+                    if active_row is not None and active_row["username"] == username:
+                        remaining = await conn.fetchrow(
+                            "SELECT username FROM local_actors WHERE matrix_user_id = $1 "
+                            "ORDER BY created_at ASC LIMIT 1",
+                            matrix_user_id,
+                        )
+                        if remaining is not None:
+                            # Always has an Active identity once it has at
+                            # least one -- promote the oldest remaining one.
+                            await conn.execute(
+                                "UPDATE active_identity SET username = $1 WHERE matrix_user_id = $2",
+                                remaining["username"], matrix_user_id,
+                            )
+                        else:
+                            await conn.execute(
+                                "DELETE FROM active_identity WHERE matrix_user_id = $1", matrix_user_id
+                            )
 
     @staticmethod
     def _row_to_actor(row: asyncpg.Record) -> ActorRecord:
@@ -700,6 +869,7 @@ class PostgresActorRepository:
             icon_url=row["icon_url"],
             banner_url=row["banner_url"],
             is_third_party=row["is_third_party"],
+            created_at=row["created_at"],
         )
 
     # -- PeerTube channels ----------------------------------------------------
@@ -1599,15 +1769,23 @@ class PostgresActorRepository:
         )
         return row["room_id"] if row else None
 
-    async def register_ghost_dm_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_dm_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        # local_username is deliberately absent from both ON CONFLICT SET
+        # clauses below -- stamped once, at this room's first-ever
+        # registration, and never overwritten by a later call for the same
+        # (actor_id, matrix_user_id). See register_ghost_dm_room's Protocol
+        # docstring.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     """
-                    INSERT INTO ghost_dm_rooms (actor_id, matrix_user_id, room_id) VALUES ($1, $2, $3)
+                    INSERT INTO ghost_dm_rooms (actor_id, matrix_user_id, room_id, local_username)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (actor_id, matrix_user_id) DO UPDATE SET room_id = EXCLUDED.room_id
                     """,
-                    actor_id, matrix_user_id, room_id,
+                    actor_id, matrix_user_id, room_id, local_username,
                 )
                 # Permanent history row -- see get_ghost_dm_room_history's
                 # docstring. Clear the old "current" flag first so the
@@ -1621,12 +1799,16 @@ class PostgresActorRepository:
                 )
                 await conn.execute(
                     """
-                    INSERT INTO ghost_dm_room_history (room_id, actor_id, matrix_user_id, is_current)
-                    VALUES ($1, $2, $3, TRUE)
+                    INSERT INTO ghost_dm_room_history (room_id, actor_id, matrix_user_id, is_current, local_username)
+                    VALUES ($1, $2, $3, TRUE, $4)
                     ON CONFLICT (room_id) DO UPDATE SET is_current = TRUE
                     """,
-                    room_id, actor_id, matrix_user_id,
+                    room_id, actor_id, matrix_user_id, local_username,
                 )
+
+    async def get_ghost_dm_room_local_username(self, room_id: str) -> str | None:
+        row = await self._pool.fetchrow("SELECT local_username FROM ghost_dm_rooms WHERE room_id = $1", room_id)
+        return row["local_username"] if row else None
 
     async def get_ghost_dm_room_history(self, room_id: str) -> tuple[str, str] | None:
         row = await self._pool.fetchrow(
@@ -1665,15 +1847,20 @@ class PostgresActorRepository:
         )
         return row["room_id"] if row else None
 
-    async def register_ghost_chat_room(self, actor_id: str, matrix_user_id: str, room_id: str) -> None:
+    async def register_ghost_chat_room(
+        self, actor_id: str, matrix_user_id: str, room_id: str, local_username: str
+    ) -> None:
+        # local_username semantics match register_ghost_dm_room exactly --
+        # see its comment above.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     """
-                    INSERT INTO ghost_chat_rooms (actor_id, matrix_user_id, room_id) VALUES ($1, $2, $3)
+                    INSERT INTO ghost_chat_rooms (actor_id, matrix_user_id, room_id, local_username)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (actor_id, matrix_user_id) DO UPDATE SET room_id = EXCLUDED.room_id
                     """,
-                    actor_id, matrix_user_id, room_id,
+                    actor_id, matrix_user_id, room_id, local_username,
                 )
                 # Permanent history row -- see get_ghost_chat_room_history's
                 # docstring. Clear the old "current" flag first so the
@@ -1687,12 +1874,16 @@ class PostgresActorRepository:
                 )
                 await conn.execute(
                     """
-                    INSERT INTO ghost_chat_room_history (room_id, actor_id, matrix_user_id, is_current)
-                    VALUES ($1, $2, $3, TRUE)
+                    INSERT INTO ghost_chat_room_history (room_id, actor_id, matrix_user_id, is_current, local_username)
+                    VALUES ($1, $2, $3, TRUE, $4)
                     ON CONFLICT (room_id) DO UPDATE SET is_current = TRUE
                     """,
-                    room_id, actor_id, matrix_user_id,
+                    room_id, actor_id, matrix_user_id, local_username,
                 )
+
+    async def get_ghost_chat_room_local_username(self, room_id: str) -> str | None:
+        row = await self._pool.fetchrow("SELECT local_username FROM ghost_chat_rooms WHERE room_id = $1", room_id)
+        return row["local_username"] if row else None
 
     async def get_ghost_chat_room_history(self, room_id: str) -> tuple[str, str] | None:
         row = await self._pool.fetchrow(

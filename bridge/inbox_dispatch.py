@@ -1586,7 +1586,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             return
         await mirror_chat_message(
             request, chat_message=obj, author_actor_id=activity.actor,
-            recipient_matrix_user_id=actor_record.matrix_user_id,
+            recipient_matrix_user_id=actor_record.matrix_user_id, recipient_username=actor_record.username,
         )
         return
 
@@ -1678,7 +1678,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             dm_reply_header = _render_reply_header(dm_context)
         await mirror_direct_message(
             request, note=obj, author_actor_id=activity.actor, recipient_matrix_user_id=actor_record.matrix_user_id,
-            reply_header=dm_reply_header,
+            recipient_username=actor_record.username, reply_header=dm_reply_header,
         )
         return
 

@@ -325,6 +325,17 @@ class BridgeSection:
     # who runs the instance. Must already be a registered local actor (i.e.
     # has linked a Profile Room). Leave unset to omit contact_account entirely.
     instance_admin_username: str | None = None
+    # Whether a Matrix user may own more than one ActivityPub identity, and
+    # pick a custom id for one instead of always being stuck with their
+    # Matrix localpart (";create profile <id>", ";id", and friends). Off by
+    # default: with this off, the bridge behaves exactly as it always has --
+    # one identity per Matrix user, username always equal to the localpart,
+    # no selection/switching commands exposed at all.
+    custom_identities_enabled: bool = False
+    # Per-user cap on how many ActivityPub identities they may create once
+    # custom_identities_enabled is on. A bridge admin (see bridge.admins /
+    # use_synapse_admin_api) is never subject to this cap.
+    max_identities_per_user: int = 5
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -539,6 +550,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
             bridge_raw.get("lemmy_community_resync_min_interval_seconds", 60)
         ),
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
+        custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
+        max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
     )
 
     synapse_section = SynapseSection(
