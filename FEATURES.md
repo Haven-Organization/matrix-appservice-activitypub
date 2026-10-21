@@ -83,7 +83,7 @@ Opt-in (`bridge.peertube_channels_enabled`, off by default -- every remote view/
 
 ## Lemmy communities
 
-**Experimental -- still under active development and not fully working yet.** Outbound delivery and the activity shapes below are correct and tested, but real-world interop is inconsistent: a hosted community's posts reliably reach and render on remote Pleroma/Mastodon/Akkoma instances, but don't consistently show up as *coming from the community* there (attribution/boost rendering varies by remote software and hasn't been confirmed against a real Lemmy instance yet). Treat this as a work in progress, not a finished feature.
+A hosted or mirrored community's activity shapes match real Lemmy's own wire format (confirmed against captured Lemmy outbox/post/community JSON) and have been verified live against a real Lemmy instance: resolve, subscribe, posting, and comments all work correctly in both directions. One cross-platform quirk worth knowing: a community's own posts only show up consistently as *coming from the community* on another Lemmy instance (or another matrix-appservice-activitypub bridge) -- on Mastodon/Pleroma/Akkoma the content itself federates fine but renders under the original poster's account instead, and on Misskey/Sharkey it shows up as a boost on the community's "All" tab rather than a first-class post. This is a limitation of those platforms' own Group-actor handling, not something fixable by changing what this bridge sends -- see the implementation notes below for exactly what's been confirmed.
 
 ### Mirroring a remote community (Phase 1)
 

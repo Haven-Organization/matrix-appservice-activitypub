@@ -452,8 +452,6 @@ Description text here.
 
 ## Lemmy communities
 
-**Experimental -- still under active development and not fully working yet.** Posting from a hosted community doesn't reliably show up as coming from the community on real remote instances yet (content federates, but community attribution is inconsistent across Pleroma/Mastodon/Akkoma). Expect rough edges.
-
 Following/mirroring a remote Lemmy community (`bridge.lemmy_communities_enabled`), and -- separately -- hosting your own, authoritative one (`bridge.lemmy_community_hosting_enabled`). See `;follow` above for mirroring a remote community, and `;backfill` for pulling its history.
 
 ### `;create community <id> [display name]`
