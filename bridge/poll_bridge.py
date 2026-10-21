@@ -45,7 +45,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note, Question
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
-from bridge.commands import _effective_third_party_mode, is_third_party_still_allowed
+from bridge.commands import _effective_third_party_mode, is_foreign_bridge_user, is_third_party_still_allowed
 from bridge.note_mirroring import deliver_to_actor_or_followers, refresh_poll_tallies
 from bridge.repository import FederatedEvent, PollVoteRecord
 from bridge.synapse_client import SynapseError
@@ -183,8 +183,15 @@ async def maybe_federate_poll_vote(request: Request, event: dict) -> bool:
     sender = event.get("sender", "")
     room_id = event.get("room_id", "")
     bot_mxid = _bot_mxid(config)
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # never re-federate our own ghosts'/bot's own events
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Never re-federate our own ghosts'/bot's own events -- or a
+        # sibling bridge's own ghost mirroring a vote in, same reasoning
+        # as bridge.reply_bridge's identical guard.
+        return False
 
     repository = request.app.state.repository
     target = await repository.get_federated_event_by_matrix_event(target_event_id)
@@ -313,7 +320,11 @@ async def maybe_federate_poll_close(request: Request, event: dict) -> bool:
     sender = event.get("sender", "")
     room_id = event.get("room_id", "")
     bot_mxid = _bot_mxid(config)
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
         return False
 
     repository = request.app.state.repository

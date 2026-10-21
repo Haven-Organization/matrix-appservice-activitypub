@@ -54,7 +54,12 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
-from bridge.commands import is_foreign_bot_command, is_third_party_still_allowed, message_addresses_bot
+from bridge.commands import (
+    is_foreign_bot_command,
+    is_foreign_bridge_user,
+    is_third_party_still_allowed,
+    message_addresses_bot,
+)
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -357,8 +362,18 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
     sender = event.get("sender", "")
     room_id = event.get("room_id", "")
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # never re-federate our own ghosts'/bot's own messages
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Never re-federate our own ghosts'/bot's own messages -- or, via
+        # is_foreign_bridge_user, a SIBLING bridge's own ghost mirroring a
+        # reply into a room this bridge also tracks. Without this, a
+        # foreign ghost's reply (an entity that could never act on it)
+        # would reach the "link a profile first" notice further down and
+        # spam it into a room shared with that other bridge.
+        return False
 
     repository = request.app.state.repository
     if await repository.get_lemmy_community_room_by_room_id(room_id) is not None:

@@ -7,6 +7,7 @@ validated dataclasses so the rest of the codebase never touches raw dicts.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -357,6 +358,23 @@ class BridgeSection:
     # no way to otherwise recognize another bot's own keyword vocabulary.
     # Empty (the default) if this room isn't shared with anything else.
     other_bot_prefixes: list[str] = field(default_factory=list)
+    # Regex patterns matching OTHER bridges' own ghost/bot mxid namespaces
+    # sharing a room with this one (e.g. "@bsky_.*:yourdomain" for a
+    # Bluesky bridge's ghosts, "@nostr:yourdomain" for its bot) -- each
+    # matched with a full match, not a search, so write a pattern that
+    # describes the ENTIRE mxid. Lets this bridge recognize that a
+    # message/reaction/vote/membership-event came from an ENTITY THAT CAN
+    # NEVER ACT ON A REPLY (a puppet account, not a real human), so it's
+    # never mistaken for "a genuine local Matrix user who just hasn't
+    # linked a profile yet" -- without this, every post/reaction/vote from
+    # another bridge's ghost in a shared room would spam a "link a profile
+    # first" notice that ghost obviously can't do anything about. Distinct
+    # from other_bot_prefixes above (command-prefix recognition): this is
+    # about recognizing GHOSTS, not commands. Matches the same convention
+    # already used for this by the sibling Bluesky/Nostr bridges sharing
+    # this same homeserver, for exactly the same reason. Empty (the
+    # default) if this room isn't shared with anything else.
+    other_bridge_users: list[str] = field(default_factory=list)
 
     def resolved_internal_base_url(self) -> str:
         return self.internal_base_url or f"http://{self.listen_host}:{self.listen_port}"
@@ -545,6 +563,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
     # harmless either way, no reason to make a stray trailing comma in a YAML
     # list a hard startup failure.
     other_bot_prefixes = [p for p in (bridge_raw.get("other_bot_prefixes") or []) if p and p.strip()]
+    other_bridge_users = [p for p in (bridge_raw.get("other_bridge_users") or []) if p and p.strip()]
+    for pattern in other_bridge_users:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(f"bridge.other_bridge_users entry {pattern!r} isn't a valid regex: {exc}") from exc
     bridge_section = BridgeSection(
         domain=_require(bridge_raw, "domain", "bridge"),
         public_base_url=_require(bridge_raw, "public_base_url", "bridge").rstrip("/"),
@@ -582,6 +606,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
         command_prefix=command_prefix,
         other_bot_prefixes=other_bot_prefixes,
+        other_bridge_users=other_bridge_users,
     )
 
     synapse_section = SynapseSection(

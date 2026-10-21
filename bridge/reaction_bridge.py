@@ -51,7 +51,7 @@ from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
-from bridge.commands import is_third_party_still_allowed
+from bridge.commands import is_foreign_bridge_user, is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
 from bridge.note_mirroring import (
@@ -570,8 +570,15 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
     sender = event.get("sender", "")
     room_id = event.get("room_id", "")
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # never re-federate our own ghosts'/bot's own reactions
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Never re-federate our own ghosts'/bot's own reactions -- or a
+        # sibling bridge's own ghost mirroring one in, same reasoning as
+        # bridge.reply_bridge's identical guard.
+        return False
 
     repository = request.app.state.repository
     parent = await repository.get_federated_event_by_matrix_event(target_event_id)

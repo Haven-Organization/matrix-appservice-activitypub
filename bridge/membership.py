@@ -90,6 +90,7 @@ from bridge.commands import (
     _run_auto_backfill,
     _run_community_auto_backfill,
     handle_guild_auto_join,
+    is_foreign_bridge_user,
 )
 from bridge.identity_resolution import resolve_acting_identity
 from bridge.matrix_links import matrix_to_room_link
@@ -237,7 +238,15 @@ def _is_fresh_dm_invite(config, content: dict, *, invited_user: str, inviter: st
         return False
     if ":" not in inviter:
         return False
-    if inviter == invited_user or inviter.startswith(f"@{config.appservice.user_prefix}"):
+    if (
+        inviter == invited_user
+        or inviter.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(inviter, config)
+    ):
+        # Not just our own ghosts/bot -- a SIBLING bridge's own ghost
+        # sending an is_direct invite (e.g. acting as a ghost via some
+        # client) would otherwise pass the same-homeserver check below and
+        # be mistaken for a genuine human starting a Matrix-native DM.
         return False
     return inviter.split(":", 1)[1] == config.synapse.server_name
 
@@ -377,8 +386,12 @@ async def maybe_handle_knock(request: Request, event: dict) -> bool:
 
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if knocker == bot_mxid or knocker.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # our own bot/ghosts never knock
+    if (
+        knocker == bot_mxid
+        or knocker.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(knocker, config)
+    ):
+        return False  # our own bot/ghosts -- or a sibling bridge's own ghost -- never knock
 
     knocker_server = knocker.partition(":")[2]
     if knocker_server != config.synapse.server_name and not config.bridge.accept_federated_knocks:
@@ -443,8 +456,12 @@ async def maybe_handle_join(request: Request, event: dict) -> bool:
 
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if joined_user == bot_mxid or joined_user.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # our own bot/ghosts joining isn't meaningful here
+    if (
+        joined_user == bot_mxid
+        or joined_user.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(joined_user, config)
+    ):
+        return False  # our own bot/ghosts -- or a sibling bridge's own ghost -- joining isn't meaningful here
 
     repository = request.app.state.repository
     remote_room = await resolve_old_remote_actor_room(request, room_id)
@@ -766,8 +783,12 @@ async def maybe_handle_leave(request: Request, event: dict) -> bool:
 
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if left_user == bot_mxid or left_user.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # our own bot/ghosts leaving isn't meaningful here
+    if (
+        left_user == bot_mxid
+        or left_user.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(left_user, config)
+    ):
+        return False  # our own bot/ghosts -- or a sibling bridge's own ghost -- leaving isn't meaningful here
 
     repository = request.app.state.repository
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)

@@ -31,7 +31,12 @@ from fastapi import Request
 from bridge.activitypub.models import Activity, ChatMessage
 from bridge.activitypub.sanitize import strip_reply_fallback
 from bridge.activitypub.urls import actor_url, main_key_id
-from bridge.commands import is_foreign_bot_command, is_third_party_still_allowed, message_addresses_bot
+from bridge.commands import (
+    is_foreign_bot_command,
+    is_foreign_bridge_user,
+    is_third_party_still_allowed,
+    message_addresses_bot,
+)
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -64,8 +69,15 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
     sender = event.get("sender", "")
     room_id = event.get("room_id", "")
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return False  # never re-federate our own ghosts'/bot's own messages
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Never re-federate our own ghosts'/bot's own messages -- or a
+        # sibling bridge's own ghost, same reasoning as bridge.reply_bridge's
+        # identical guard.
+        return False
 
     repository = request.app.state.repository
     if not await repository.is_ghost_chat_room(room_id):

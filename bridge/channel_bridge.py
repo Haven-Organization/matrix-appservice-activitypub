@@ -376,7 +376,7 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
     # bridge.inbox_dispatch, ends up importing from here too), so importing
     # message_addresses_bot from there at module level would be circular --
     # same reasoning as this module's other deferred imports.
-    from bridge.commands import is_foreign_bot_command, message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, is_foreign_bridge_user, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
@@ -404,8 +404,14 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
         return False  # not a Channel room at all
 
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return True  # our own bot's/a ghost's echo of a mirrored message -- never re-federate
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Our own bot's/a ghost's echo of a mirrored message -- or a
+        # sibling bridge's own ghost -- never re-federate.
+        return True
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:

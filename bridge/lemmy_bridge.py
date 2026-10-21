@@ -946,7 +946,7 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
     if event.get("type") != "m.room.message":
         return False
 
-    from bridge.commands import is_foreign_bot_command, message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, is_foreign_bridge_user, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
@@ -965,8 +965,14 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
         return False
 
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return True  # our own bot's/a ghost's echo of a mirrored post -- never re-federate
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Our own bot's/a ghost's echo of a mirrored post -- or a sibling
+        # bridge's own ghost -- never re-federate.
+        return True
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:
@@ -1480,7 +1486,7 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
     if event.get("type") != "m.room.message":
         return False
 
-    from bridge.commands import is_foreign_bot_command, message_addresses_bot
+    from bridge.commands import is_foreign_bot_command, is_foreign_bridge_user, message_addresses_bot
 
     content = event.get("content") or {}
     config = request.app.state.config
@@ -1499,8 +1505,14 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
         return False
 
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-        return True  # our own bot's/a ghost's echo of a mirrored post -- never re-federate
+    if (
+        sender == bot_mxid
+        or sender.startswith(f"@{config.appservice.user_prefix}")
+        or is_foreign_bridge_user(sender, config)
+    ):
+        # Our own bot's/a ghost's echo of a mirrored post -- or a sibling
+        # bridge's own ghost -- never re-federate.
+        return True
 
     actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if actor_record is None:

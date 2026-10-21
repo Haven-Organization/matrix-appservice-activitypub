@@ -53,6 +53,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
   - [Multi-bridge rooms](#multi-bridge-rooms)
     - [Command prefix (`bridge.command_prefix`)](#bridge-command_prefix)
     - [Other bots' prefixes (`bridge.other_bot_prefixes`)](#bridge-other_bot_prefixes)
+    - [Other bridges' users (`bridge.other_bridge_users`)](#bridge-other_bridge_users)
 - [`synapse`](#synapse)
   - [Admin token (`synapse.admin_token`)](#synapse-admin_token)
 - [`storage`](#storage)
@@ -411,6 +412,18 @@ Other bots'/bridges' own command prefixes (e.g. `["!", "nostr:"]`), for a room s
 - A full Matrix ID (e.g. `@bluesky:yourdomain`, `@fediverse:yourdomain` -- that bridge's own bot) is treated as a real mention of that bot: a proper intentional mention (most clients' own plain-text fallback for a mention pill is the mentioned user's display name, not their raw mxid, so this is the only reliable signal for an actual pill) OR the literal mxid typed anywhere in the message. Matched ANYWHERE, not just the start, since a full mxid is specific enough that it won't appear in ordinary prose by coincidence.
 
 Either way, a matching message is never federated out by this bridge as an ordinary post, even though (correctly) it's also never treated as addressed to THIS bridge's own bot -- no reply is sent, and no attempt is made to parse it as one of this bridge's own commands. Without this, a command meant for a different bridge would fall straight through this bridge's own "not one of my commands" check and get posted to the fediverse as if it were ordinary content, since this bridge has no way to otherwise recognize another bot's own keyword vocabulary or mention conventions. Leave empty if this room isn't shared with anything else.
+
+---
+
+<a id="bridge-other_bridge_users"></a>
+
+#### Other bridges' users (`bridge.other_bridge_users`)
+
+**Default:** `[]` (empty)
+
+Regex patterns matching OTHER bridges' own ghost/bot mxid namespaces sharing a room with this one -- e.g. `@bsky_.*:yourdomain` for a Bluesky bridge's ghosts, `@nostr:yourdomain` for its bot. Each pattern is matched against the WHOLE mxid (a full match, not a search), so write a pattern that describes the entire string, not just part of it.
+
+This is a different problem from [`bridge.other_bot_prefixes`](#bridge-other_bot_prefixes) above: that one recognizes another bridge's *commands* so they aren't federated as posts; this one recognizes another bridge's *ghosts* (puppet accounts for remote users, not real humans) so a message/reaction/vote/membership-event from one of them is never mistaken for "a genuine local Matrix user who just hasn't linked a profile yet." Without this, every post, reaction, or vote a sibling bridge mirrors into a shared room would make this bridge try to resolve a linked profile for that ghost, fail, and send a "link a profile first" notice into the room -- which that ghost obviously can never act on, repeated on every single message. Leave empty if this room isn't shared with anything else. Matches the same convention already used for this by the sibling Bluesky/Nostr bridges sharing the same homeserver, for exactly the same reason.
 
 ---
 

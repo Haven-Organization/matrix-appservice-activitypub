@@ -546,6 +546,40 @@ def is_foreign_bot_command(content: dict, config) -> bool:
     return False
 
 
+def is_foreign_bridge_user(mxid: str, config) -> bool:
+    """Whether ``mxid`` belongs to a DIFFERENT bridge's own bot/ghost
+    namespace sharing this room, per ``bridge.other_bridge_users`` (a list
+    of regex patterns, e.g. ``@bsky_.*:yourdomain`` for a Bluesky bridge's
+    ghosts, matched in full -- the whole mxid must match the pattern, not
+    just part of it).
+
+    Checked everywhere this module's existing "is this sender OUR OWN
+    bot/ghost" pattern (``sender == bot_mxid or
+    sender.startswith(f"@{{config.appservice.user_prefix}}")``) already is
+    -- extending that SAME check, not a separate one, since the two are
+    the same question ("should this sender's message be treated as
+    ordinary content from a real local Matrix user, or skipped") just
+    widened to recognize ghosts/bots from sibling bridges too, not only
+    this bridge's own.
+
+    Without this, a message/reaction/vote from another bridge's ghost in
+    a shared room -- a puppet account, not a real human, who could never
+    act on a reply -- falls through to this bridge's own "does this
+    sender have a linked profile" check, finds none (a foreign ghost is
+    never one of THIS bridge's own ``ActorRecord``s), and sends a "link a
+    profile first" notice that ghost obviously can't do anything about --
+    confirmed as the concrete, repeated-every-message failure mode this
+    exists to prevent, discovered via the sibling Bluesky bridge's own
+    equivalent ``other_bridge_users`` setting for exactly this reason.
+
+    Empty ``bridge.other_bridge_users`` (the default) always returns
+    False with no per-message overhead."""
+    patterns = config.bridge.other_bridge_users
+    if not patterns:
+        return False
+    return any(re.fullmatch(pattern, mxid) for pattern in patterns)
+
+
 # Single-word commands blocked outright for a third-party sender currently
 # effective-Follow-Only, regardless of argument (see _effective_third_party_mode).
 _FOLLOW_ONLY_BLOCKED_ANY_ARG = {"banner", "dm", "chat", "backfill", "repost", "boost", "publish", "unpublish", "edit"}
@@ -633,8 +667,12 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     # ever being mistaken for a ;command: a mirrored post always arrives
     # here as a message from that account's ghost, so it's caught right
     # here regardless of which form (tag or ;prefix) made
-    # message_addresses_bot return True for it.
-    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
+    # message_addresses_bot return True for it. Same reasoning extends to
+    # a SIBLING bridge's own ghost (see is_foreign_bridge_user) -- its
+    # mirrored content could coincidentally start with ";<keyword>" too.
+    if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}") or is_foreign_bridge_user(
+        sender, config
+    ):
         return True
 
     # The ;prefix form is checked first and, unlike _extract_command, only

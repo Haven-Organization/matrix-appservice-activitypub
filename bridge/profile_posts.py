@@ -45,7 +45,12 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
-from bridge.commands import _effective_third_party_mode, is_foreign_bot_command, message_addresses_bot
+from bridge.commands import (
+    _effective_third_party_mode,
+    is_foreign_bot_command,
+    is_foreign_bridge_user,
+    message_addresses_bot,
+)
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -348,8 +353,12 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     room_owner = actor_record
     if actor_record.matrix_user_id != sender:
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-        if sender == bot_mxid or sender.startswith(f"@{config.appservice.user_prefix}"):
-            return False  # the bot's / a ghost's own messages are never guest posts
+        if (
+            sender == bot_mxid
+            or sender.startswith(f"@{config.appservice.user_prefix}")
+            or is_foreign_bridge_user(sender, config)
+        ):
+            return False  # the bot's / a ghost's own messages -- ours or a sibling bridge's -- are never guest posts
         guest_record = await repository.get_local_actor_by_matrix_id(sender)
         if guest_record is None:
             return False  # a Matrix user with no linked fediverse profile -- stays Matrix-only, as ever
