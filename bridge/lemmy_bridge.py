@@ -1,4 +1,6 @@
-"""Lemmy community bridging (Phase 1: mirroring an existing remote community).
+"""Lemmy community bridging: mirroring a remote community this bridge
+doesn't own (this section of the module) and hosting one it does (see
+this module's own "Hosting our own Lemmy communities" section below).
 
 A Lemmy community is a ``Group`` actor, same AP type PeerTube uses for a
 channel -- but unlike a PeerTube channel (which only ever posts as itself,
@@ -13,8 +15,8 @@ reusing its ``channel_room_members`` table (``is_channel_member_known``/
 ``record_channel_member``) for member tracking: that table is already keyed
 purely by ``(room_id, member_actor_id)``, nothing Shoot-specific about it.
 
-We never own a community ourselves in Phase 1 (that's the separate,
-not-yet-built Phase 2) -- we're always the non-owning side, so:
+For a MIRRORED community (one we don't own -- see below for one we do),
+we're always the non-owning side, so:
 
 - Inbound posts/comments always arrive as an ``Announce`` whose ``actor`` IS
   the community, wrapping a ``Page`` (post) or ``Note`` (comment) --
@@ -22,10 +24,11 @@ not-yet-built Phase 2) -- we're always the non-owning side, so:
 - Outbound (a Matrix member replying inside the mirrored room) is always a
   plain ``Create<Note>`` addressed directly to the community's own inbox,
   never an ``Announce`` -- ``maybe_distribute_community_message``. A brand
-  new top-level post from the Matrix side isn't supported yet (Lemmy's
-  ``Page`` requires a title, which a plain ``m.room.message`` has no
-  convention for) -- that reply gets a notice instead of being dropped
-  silently.
+  new top-level post from the Matrix side isn't supported for a mirrored
+  community (Lemmy's ``Page`` requires a title, which a plain
+  ``m.room.message`` has no convention for) -- that reply gets a notice
+  instead of being dropped silently. Starting a new top-level post IS
+  supported for a community this bridge hosts itself, see below.
 
 A real Lemmy moderator of the community is mapped to Matrix power level 50
 (``_MOD_POWER_LEVEL``) in the room -- a LOCAL Matrix user who is a genuine
@@ -1092,7 +1095,7 @@ async def maybe_handle_community_ban(request: Request, event: dict) -> bool:
 
 
 # ============================================================================
-# Phase 2: hosting our own Lemmy communities
+# Hosting our own Lemmy communities
 # ============================================================================
 #
 # Unlike everything above (which only ever MIRRORS a remote community we

@@ -89,7 +89,7 @@ A hosted or mirrored community's activity shapes match real Lemmy's own wire for
 
 A community's own posts only show up consistently as *coming from the community* on another Lemmy instance (or another matrix-appservice-activitypub bridge) -- on Mastodon/Pleroma/Akkoma the content itself federates fine but renders under the original poster's account instead, and on Misskey/Sharkey it shows up as a boost on the community's "All" tab rather than a first-class post. This is a limitation of those platforms' own Group-actor handling, not something fixable by changing what this bridge sends.
 
-### Mirroring a remote community (Phase 1)
+### Mirroring a remote community
 
 Opt-in (`bridge.lemmy_communities_enabled`, off by default -- same "real, substantial behavior change" reasoning as PeerTube channels).
 
@@ -99,7 +99,7 @@ Opt-in (`bridge.lemmy_communities_enabled`, off by default -- same "real, substa
 - The community's own first-ever follow on this server triggers a one-time auto-backfill of its latest posts, same as an ordinary followed account. `;backfill [N]` also works by hand afterward -- bare, it pulls the community's outbox (unwrapping its `Announce<Create<Page>>` fan-out shape); run as a reply inside a mirrored post/comment's own thread, it pulls that specific thread's comments instead (with the same Mastodon-API discovery fallback for an under-reporting `replies` collection that an ordinary account's thread backfill already has).
 - `;refresh`, run bare inside a mirrored community room, resyncs its name/topic/avatar and moderator list immediately. The same resync also runs (debounced, `bridge.lemmy_community_resync_min_interval_seconds`) on an inbound profile `Update` and on any moderator Add/Remove, and is always serialized per-room so two triggers never resync concurrently.
 
-### Hosting your own community (Phase 2)
+### Hosting your own community
 
 Opt-in separately (`bridge.lemmy_community_hosting_enabled`, off by default) -- hosting means this bridge is the authoritative home instance for the community, a real responsibility mirroring never has: it must accept posts/comments from anyone (local or remote) and re-`Announce` them to its own followers itself, since nobody else does that for it.
 
