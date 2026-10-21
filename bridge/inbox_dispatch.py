@@ -820,10 +820,14 @@ async def _notify_post_owner(
     # below) rather than a generic reaction emoji, so the notification shows
     # what someone reacted with instead of making the reader open the
     # linked post to find out. Follows (\U0001F464) and mentions
-    # (\U0001F514) get theirs at their own send sites.
+    # (\U0001F514) get theirs at their own send sites, and a plain
+    # heart-less Dislike gets \U0001F44E rather than falling through to the
+    # generic \U0001F44D like default below it, so a dislike notification
+    # reads distinctly from a like one at a glance.
     type_emoji = (
         "\U0001F501" if verb_phrase.startswith("reposted")
         else reaction_emoji if verb_phrase.startswith("reacted") and reaction_emoji
+        else "\U0001F44E" if verb_phrase.startswith("disliked")
         else "\U0001F44D"
     )
     body = f"{type_emoji} {handle} {verb_phrase}"
@@ -2620,7 +2624,7 @@ async def _handle_like_or_emoji_react(request: Request, username: str, activity:
     if activity.content:
         verb_phrase = f"reacted to your post with {key}"
     elif activity.type == "Dislike":
-        verb_phrase = "disliked your video"
+        verb_phrase = "disliked your post"
     else:
         verb_phrase = "liked your post"
     await _notify_post_owner(
