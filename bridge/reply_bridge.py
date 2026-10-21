@@ -75,6 +75,7 @@ from bridge.mentions import (
 )
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
+from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +495,49 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             if root_event_id and root_event_id != target_event_id:
                 parent = await repository.get_federated_event_by_matrix_event(root_event_id)
         if parent is None:
+            # Still untracked -- but the immediate target might be a
+            # SIBLING bridge's own ghost mirroring in native Bluesky/Nostr
+            # content, which this bridge never tracks a FederatedEvent for
+            # by definition. Without this check, the reply would fall
+            # through all the way to maybe_distribute_profile_post and get
+            # published as a decontextualized fresh top-level post instead
+            # -- see bridge.reaction_bridge.send_cross_bridge_quote, the
+            # same cross-bridge path a 🔁-react/";repost" of foreign
+            # content uses, reused here with the reply's own text as the
+            # caption instead of a repost's optional one.
+            target_sender: str | None = None
+            try:
+                target_event = await request.app.state.synapse.get_event(
+                    room_id, target_event_id, as_user_id=bot_mxid
+                )
+                target_sender = target_event.get("sender")
+            except SynapseError:
+                pass
+            if target_sender and is_foreign_bridge_user(target_sender, config):
+                reply_actor_record = await repository.get_local_actor_by_matrix_id(sender)
+                if reply_actor_record is None:
+                    try:
+                        await request.app.state.synapse.send_message_event(
+                            room_id,
+                            {
+                                "msgtype": "m.notice",
+                                "body": f"This reply wasn't sent to the fediverse: link a profile first by "
+                                f'tagging me with "{bot_mxid} link profile".',
+                            },
+                            as_user_id=bot_mxid,
+                        )
+                    except Exception:
+                        logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
+                elif await is_third_party_still_allowed(request, reply_actor_record, room_id=room_id):
+                    from bridge.reaction_bridge import send_cross_bridge_quote
+
+                    caption = strip_reply_fallback(content.get("body") or "")
+                    await send_cross_bridge_quote(
+                        request, actor_record=reply_actor_record, target_room_id=room_id,
+                        target_event_id=target_event_id, caption=caption, reactor_matrix_user_id=sender,
+                        matrix_event_id=event.get("event_id"),
+                    )
+                return True
             return False  # replying to a purely-local Matrix message; nothing to federate
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)

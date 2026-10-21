@@ -5484,10 +5484,43 @@ async def _handle_repost(
 
     parent = await repository.get_federated_event_by_matrix_event(target_event_id)
     if parent is None:
-        await _notice(
-            request, room_id, "That message isn't a fediverse post I'm tracking, so there's nothing to repost.",
-            relates_to=relates_to,
+        # Not a federated post we track -- but it might still be a
+        # SIBLING bridge's own ghost mirroring in native Bluesky/Nostr
+        # content (see bridge.reaction_bridge.send_cross_bridge_quote, the
+        # same cross-bridge path reacting with 🔁 uses). A reply's target
+        # is always an event in the SAME room the reply itself was sent in
+        # (Matrix's own reply/thread relations have no cross-room form),
+        # so target_event_id is looked up in room_id directly.
+        target_sender: str | None = None
+        try:
+            target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+            target_sender = target_event.get("sender")
+        except SynapseError:
+            pass
+        if not (target_sender and is_foreign_bridge_user(target_sender, config)):
+            await _notice(
+                request, room_id,
+                "That message isn't a fediverse post I'm tracking, so there's nothing to repost.",
+                relates_to=relates_to,
+            )
+            return
+
+        actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
+        if actor_record is None:
+            await _notice(
+                request, room_id, f'Link a profile first: run "{_COMMAND_PREFIX}link profile".',
+                relates_to=relates_to,
+            )
+            return
+
+        from bridge.reaction_bridge import send_cross_bridge_quote
+
+        await send_cross_bridge_quote(
+            request, actor_record=actor_record, target_room_id=room_id, target_event_id=target_event_id,
+            caption=caption, reactor_matrix_user_id=sender, matrix_event_id=event_id,
         )
+        if room_id != actor_record.room_id:
+            await _notice(request, room_id, "Reposted.", relates_to=relates_to)
         return
 
     actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
@@ -5611,6 +5644,11 @@ async def _handle_repost(
         plain_body=plain_body, formatted_caption=formatted_caption,
         preview_image=preview_image, preview_video=preview_video,
     )
+    # Same reasoning as bridge.reaction_bridge.send_repost's identical
+    # addition: a real web permalink for the ORIGINAL post, so a sibling
+    # bridge sharing this room can build its own link/repost without a
+    # separate (room-visibility-dependent) fetch of its own.
+    echo_content["external_url"] = (preview_full_content or {}).get("external_url") or target_object_id
     if config.bridge.set_msc4501_relates_to and preview_full_content and original_sender is not None:
         echo_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
             SOCIAL_REL_TYPE_REPOST,
@@ -7461,12 +7499,36 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id, order=PROFILE_ROOM_SPACE_ORDER)
 
     # Best-effort: this requires the bot to have a high enough power level in
-    # the user's room, which it won't by default unless granted one.
+    # the user's room, which it won't by default unless granted one. Same
+    # "preserve whatever this pre-existing room already has" reasoning as
+    # the topic/bio adoption above -- NEVER overwrite an already-set
+    # name/avatar with the sender's own Matrix profile, only fill in
+    # whichever one is still blank. Without this, linking a room a
+    # DIFFERENT bridge already branded (e.g. a Bluesky or Nostr bridge's
+    # own name/avatar on a room now being shared as this bridge's identity
+    # too) would immediately clobber that branding -- confirmed as a real
+    # risk once rooms started being shared across bridges, not just a
+    # single-bridge concern.
     room_styling_failed = False
     try:
-        await synapse.send_state_event(room_id, "m.room.name", "", {"name": display_name})
+        existing_name = ""
+        try:
+            name_content = await synapse.get_room_state(room_id, "m.room.name", as_user_id=_bot_mxid(config))
+            existing_name = (name_content.get("name") or "").strip()
+        except SynapseError:
+            pass
+        if not existing_name:
+            await synapse.send_state_event(room_id, "m.room.name", "", {"name": display_name})
+
         if matrix_avatar_mxc:
-            await synapse.send_state_event(room_id, "m.room.avatar", "", {"url": matrix_avatar_mxc})
+            existing_avatar = ""
+            try:
+                avatar_content = await synapse.get_room_state(room_id, "m.room.avatar", as_user_id=_bot_mxid(config))
+                existing_avatar = (avatar_content.get("url") or "").strip()
+            except SynapseError:
+                pass
+            if not existing_avatar:
+                await synapse.send_state_event(room_id, "m.room.avatar", "", {"url": matrix_avatar_mxc})
     except SynapseError:
         logger.info("Could not set room name/avatar for %s's profile room", sender, exc_info=True)
         room_styling_failed = True

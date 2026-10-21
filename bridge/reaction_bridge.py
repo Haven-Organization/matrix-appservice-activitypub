@@ -49,17 +49,19 @@ from datetime import datetime, timezone
 
 from fastapi import Request
 
-from bridge.activitypub.models import AS_PUBLIC, Activity
+from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import is_foreign_bridge_user, is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
 from bridge.note_mirroring import (
+    EXTERNAL_HANDLE_FIELD,
     SOCIAL_BODY_FIELD,
     SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
+    build_repost_note_content,
     deliver_to_actor_or_followers,
     resolve_actor_matrix_identity,
     social_relates_to,
@@ -405,10 +407,12 @@ async def send_repost(
     notice_event_id: str | None = None
     if actor_record.room_id and not already_has_native_record:
         preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
-        # preview_full_content unused here -- content_inline=True below
-        # means this card's own attached media stands in for it, no
-        # separate copy needed (see that assignment's own comment).
-        preview_text, _preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+        # preview_full_content otherwise unused here -- content_inline=True
+        # below means this card's own attached media stands in for it, no
+        # separate copy needed (see that assignment's own comment) -- EXCEPT
+        # for the external_url read right below, which needs whatever the
+        # original mirrored post's own content carried.
+        preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
             request, preview_target
         )
         post_link = matrix_to_link(preview_target.room_id, preview_target.event_id, via=[config.synapse.server_name])
@@ -480,6 +484,20 @@ async def send_repost(
             formatted_caption=formatted_caption,
             preview_image=preview_image, preview_video=preview_video,
         )
+        # A real web permalink for the ORIGINAL post, same field/convention
+        # as every mirrored post already carries (bridge.note_mirroring.
+        # source_post_url) -- a sibling bridge sharing this room (e.g. the
+        # Bluesky bridge mirroring an AP-side repost back out) reads this
+        # to build its own link card, without needing its own separate
+        # fetch of the original event (which only works at all while the
+        # room it lives in is world-readable). Set regardless of whether
+        # social.relates_to is attached -- a non-MSC4501-aware sibling
+        # bridge has no other way to find this. Prefers whatever the
+        # ORIGINAL mirrored post's own content already carried (set when
+        # IT was first mirrored in) over target_object_id, since many AP
+        # implementations' real human-viewable permalink differs from
+        # their bare object id.
+        notice_content["external_url"] = preview_full_content.get("external_url") or target_object_id
         if use_relates_to:
             notice_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
                 SOCIAL_REL_TYPE_REPOST,
@@ -552,6 +570,167 @@ async def send_repost(
     return activity_id
 
 
+async def send_cross_bridge_quote(
+    request: Request,
+    *,
+    actor_record: ActorRecord,
+    target_room_id: str,
+    target_event_id: str,
+    caption: str,
+    reactor_matrix_user_id: str,
+    matrix_event_id: str | None,
+) -> bool:
+    """Represents reposting (🔁-react, or ``;repost``) or replying to a
+    message authored by a DIFFERENT bridge's own ghost (see
+    ``bridge.commands.is_foreign_bridge_user``) sensibly on the
+    ActivityPub side, for a room shared with a sibling bridge (Bluesky/
+    Nostr) -- the target is native, non-ActivityPub content a sibling
+    bridge mirrored into Matrix, never anything THIS bridge itself
+    federated or tracked, so there is no real foreign AP object to
+    ``Announce`` (a repost/boost) or set ``Note.quote_uri`` against at
+    all (see ``send_repost``'s own docstring for what that real path
+    does when one DOES exist).
+
+    Always sent as a plain, standalone ``Create<Note>`` instead -- never
+    an ``Announce`` -- quoting the target's own Matrix body text and, if
+    present, its ``external_url`` (the real web permalink both the
+    Bluesky and Nostr bridges already stamp on everything they mirror in,
+    same convention this bridge's own ``source_post_url`` uses) as a real
+    working link, plus whatever MSC4503 ``external_handle`` attribution
+    the target's own content carries (the same field this bridge uses for
+    its own ghosts, confirmed deployed by both sibling bridges too) --
+    falling back to a bare matrix.to permalink and a generic "a post"
+    attribution if neither is present. Does NOT resolve Matrix mention
+    pills in ``caption`` into AP ``Mention`` tags (unlike
+    ``bridge.commands._handle_repost``'s captioned path) -- a deliberate
+    simplification for this first pass, since the caption itself still
+    renders correctly either way, just without AP-side tag-mentions.
+
+    ``caption`` is the reposter's/replier's own added text -- "" for a
+    bare repost, the reply's own body for a reply. Either way this is
+    recorded and delivered exactly like an ordinary standalone post (see
+    ``bridge.profile_posts``), so redacting it later sends a real
+    ``Delete`` -- there is no ``Announce``/``Undo`` bookkeeping to
+    maintain here, since nothing is actually being boosted.
+
+    Also posts the usual "🔁 reposted X's post" echo card into
+    ``actor_record``'s own Profile Room, same convention as
+    ``send_repost``/``bridge.commands._handle_repost``'s identical cards
+    (including their own ``external_url``, for the same reason those
+    carry it). Callers are responsible for their own "Reposted."/thread
+    acknowledgement notice wherever the triggering command actually ran
+    from, if anywhere -- this function only ever touches
+    ``actor_record.room_id``.
+
+    Returns False only if the target event couldn't be fetched at all
+    (e.g. already redacted, or a transient homeserver error) -- nothing
+    sent in that case. True otherwise, even if some step below failed
+    best-effort."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    base = config.bridge.public_base_url
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+
+    # _fetch_post_preview only ever reads .room_id/.event_id off its
+    # `target` argument -- the other FederatedEvent fields are irrelevant
+    # here (there's no real tracked record for this target at all, by
+    # definition), so a throwaway one with empty placeholders is safe.
+    preview_target = FederatedEvent(
+        event_id=target_event_id, room_id=target_room_id, ap_object_id="", author_actor_id="",
+    )
+    preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
+        request, preview_target
+    )
+    if not preview_full_content and not preview_text and preview_image is None and preview_video is None:
+        return False
+
+    post_link = matrix_to_link(target_room_id, target_event_id, via=[config.synapse.server_name])
+    external_url = preview_full_content.get("external_url")
+    link_for_note = external_url or post_link
+
+    handle_meta = preview_full_content.get(EXTERNAL_HANDLE_FIELD) or {}
+    per_message_profile = preview_full_content.get(_PER_MESSAGE_PROFILE_FIELD) or {}
+    original_handle = handle_meta.get("handle") or per_message_profile.get("displayname") or "a post"
+
+    own_actor_id = actor_url(base, actor_record.username)
+    note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
+
+    # Claimed BEFORE any of the slow delivery work below, same reasoning as
+    # send_repost's own identical claim_reaction call (see its docstring
+    # for the live 2026-08-10 duplicate-Announce incident this pattern
+    # exists to prevent) -- a redelivered AppService transaction for the
+    # SAME triggering reaction/command/reply must never produce a second
+    # duplicate quote-post. target_ap_object_id/activity_id are synthetic
+    # here (there's no real Announce to key this on) -- this ReactionRecord
+    # exists purely for the atomic claim, not for Undo-matching; un-quoting
+    # is handled by ordinary post-redaction on the echo FederatedEvent
+    # recorded further down instead.
+    if matrix_event_id and not await repository.claim_reaction(
+        ReactionRecord(
+            activity_id=note_id, room_id=target_room_id, event_id=matrix_event_id,
+            target_ap_object_id=note_id, reactor_matrix_user_id=reactor_matrix_user_id,
+        )
+    ):
+        return True
+
+    published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    note_html = build_repost_note_content(caption, link_for_note)
+    note = Note(
+        id=note_id, attributed_to=own_actor_id, content=note_html, published=published,
+        to=[AS_PUBLIC], cc=[followers_url(base, actor_record.username)],
+    )
+    create_activity = Activity(
+        id=f"{note_id}/activity", type="Create", actor=own_actor_id, object=note,
+        published=published, to=note.to, cc=note.cc,
+    )
+    await deliver_to_actor_or_followers(
+        request, target_actor_id=own_actor_id, activity=create_activity.to_dict(),
+        key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
+    )
+
+    quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
+    plain_body = f"\U0001F501 reposted {original_handle}'s post:"
+    if preview_text:
+        plain_body += f"\n> {preview_text}"
+    plain_body += f"\n{post_link}"
+    if caption:
+        plain_body = f"{caption}\n\n{plain_body}"
+    post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
+    caption_html = f"<p>{html.escape(caption)}</p>" if caption else ""
+    formatted_caption = (
+        caption_html
+        + f"<p>\U0001F501 reposted {html.escape(original_handle)}'s {post_pill_html}</p>{quote_block_html}"
+    )
+    echo_content = build_preview_media_content(
+        plain_body=plain_body, formatted_caption=formatted_caption,
+        preview_image=preview_image, preview_video=preview_video,
+    )
+    echo_content["external_url"] = link_for_note
+    echo_event_id: str | None = None
+    if actor_record.room_id:
+        try:
+            echo_event_id = await synapse.send_message_event(actor_record.room_id, echo_content, as_user_id=bot_mxid)
+        except SynapseError:
+            logger.warning("Failed to post cross-bridge quote echo in %s", actor_record.room_id, exc_info=True)
+
+    if echo_event_id:
+        # The echo card IS this quote-post's own real Matrix representation
+        # (same as an ordinary top-level post's own event) -- recording it
+        # as a normal, primary FederatedEvent means redacting it already
+        # sends a real Delete through the existing generic post-redaction
+        # path, with no separate Announce/Undo bookkeeping to maintain
+        # (there never was a real Announce here at all -- see this
+        # function's own docstring).
+        await repository.record_federated_event(
+            FederatedEvent(
+                event_id=echo_event_id, room_id=actor_record.room_id, ap_object_id=note_id,
+                author_actor_id=own_actor_id,
+            )
+        )
+    return True
+
+
 async def maybe_federate_reaction(request: Request, event: dict) -> bool:
     """Returns True if this event was a reaction to a federated post (handled,
     successfully or not) -- callers should not process it any further."""
@@ -582,8 +761,24 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
 
     repository = request.app.state.repository
     parent = await repository.get_federated_event_by_matrix_event(target_event_id)
+    target_sender: str | None = None
     if parent is None:
-        return False  # reacting to a purely-local Matrix message; nothing to federate
+        # Not a federated post we track -- but it might still be a
+        # SIBLING bridge's own ghost mirroring in native Bluesky/Nostr
+        # content, which has no FederatedEvent record here by definition
+        # (this bridge never touched it) but is still worth reacting to
+        # sensibly for the one reaction that has a meaningful cross-bridge
+        # equivalent -- a repost (see the _is_repost_emoji branch below,
+        # which calls send_cross_bridge_quote instead of bailing out).
+        # Any other reaction key still has nothing sensible to federate
+        # (there's no real foreign AP actor to Like/EmojiReact at all).
+        try:
+            target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+            target_sender = target_event.get("sender")
+        except SynapseError:
+            pass
+        if not (target_sender and is_foreign_bridge_user(target_sender, config)):
+            return False  # reacting to a purely-local Matrix message; nothing to federate
 
     matrix_event_id = event.get("event_id")
     if matrix_event_id and await repository.get_reaction_by_matrix_event(matrix_event_id) is not None:
@@ -624,6 +819,16 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         return True
 
     if _is_repost_emoji(key):
+        if parent is None:
+            # A sibling bridge's own ghost content -- see this function's
+            # own earlier comment. No real Announce is possible (there's
+            # no foreign AP object to boost); send_cross_bridge_quote
+            # sends a plain standalone quote-post instead.
+            await send_cross_bridge_quote(
+                request, actor_record=actor_record, target_room_id=room_id, target_event_id=target_event_id,
+                caption="", reactor_matrix_user_id=sender, matrix_event_id=event.get("event_id"),
+            )
+            return True
         # A repost is its own activity type (Announce), not a Like/EmojiReact
         # variant -- see send_repost, shared with a caption-less ";repost"
         # (or its ";boost" alias). send_repost already posts a visible "you
@@ -637,6 +842,13 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
             room_id=room_id,
             reactor_matrix_user_id=sender,
         )
+        return True
+
+    if parent is None:
+        # A non-repost reaction (Like/EmojiReact) to a sibling bridge's own
+        # ghost content -- no real foreign AP actor to address one to at
+        # all, so there's nothing sensible to federate; same as reacting
+        # to a purely-local Matrix message.
         return True
 
     # A mirrored repost's own ap_object_id/author_actor_id deliberately name
