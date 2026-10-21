@@ -147,6 +147,21 @@ _SCHEMA_STATEMENTS = [
         processed_at DOUBLE PRECISION NOT NULL
     )
     """,
+    # Per-Matrix-event idempotency -- see has_processed_matrix_event's own
+    # docstring for why this exists ALONGSIDE processed_transactions above,
+    # not as a mere duplicate of it: Synapse's own AppService txn_id
+    # counter (on a Synapse instance backed by sqlite) resets to 1 after a
+    # Synapse restart, so a brand new transaction can be handed a txn_id
+    # that collides with an ancient one already recorded above -- gating
+    # on txn_id alone would then silently discard every event in it.
+    # event_id is a real content-derived identifier Synapse never reuses,
+    # restart or not.
+    """
+    CREATE TABLE IF NOT EXISTS processed_matrix_events (
+        event_id TEXT PRIMARY KEY,
+        processed_at DOUBLE PRECISION NOT NULL
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS published_media (
         mxc_uri TEXT PRIMARY KEY,
@@ -453,6 +468,10 @@ _SCHEMA_STATEMENTS = [
     # largest table here by a wide margin.
     "CREATE INDEX IF NOT EXISTS idx_processed_transactions_processed_at "
     "ON processed_transactions (processed_at)",
+    # Same reasoning -- mark_matrix_event_processed's own opportunistic
+    # cleanup runs on every single Matrix event this bridge is ever handed.
+    "CREATE INDEX IF NOT EXISTS idx_processed_matrix_events_processed_at "
+    "ON processed_matrix_events (processed_at)",
     # Same backfill as SqliteActorRepository._migrate -- cheap and
     # idempotent, so it just runs unconditionally on every startup.
     """
@@ -1111,6 +1130,28 @@ class PostgresActorRepository:
                 # separate sweep task, same as the sqlite version.
                 await conn.execute(
                     "DELETE FROM processed_transactions WHERE processed_at < $1",
+                    now - _TRANSACTION_RETENTION_SECONDS,
+                )
+
+    async def has_processed_matrix_event(self, event_id: str) -> bool:
+        row = await self._pool.fetchrow(
+            "SELECT 1 FROM processed_matrix_events WHERE event_id = $1", event_id
+        )
+        return row is not None
+
+    async def mark_matrix_event_processed(self, event_id: str) -> None:
+        now = time.time()
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO processed_matrix_events (event_id, processed_at) VALUES ($1, $2) "
+                    "ON CONFLICT DO NOTHING",
+                    event_id, now,
+                )
+                # Opportunistic cleanup -- same pattern as
+                # mark_transaction_processed's identical cleanup.
+                await conn.execute(
+                    "DELETE FROM processed_matrix_events WHERE processed_at < $1",
                     now - _TRANSACTION_RETENTION_SECONDS,
                 )
 

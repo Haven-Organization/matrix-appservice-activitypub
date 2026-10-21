@@ -953,10 +953,40 @@ class ActorRepository(Protocol):
         Synapse retries a transaction it didn't get a 200 for; this check
         (together with ``mark_transaction_processed``) makes that safe even
         across a bridge restart between the original attempt and the retry.
-        """
+
+        NOT safe to use as the sole gate before even looking at a
+        transaction's own events, despite how it reads -- a Synapse
+        instance backed by sqlite resets its own ``txn_id`` counter to 1
+        after a SYNAPSE restart (a different event from the bridge restart
+        above), so a brand new transaction can be handed a ``txn_id`` that
+        collides with an ancient one already recorded here, well outside
+        any genuine retry window. Confirmed as a real, silent bug in the
+        sibling matrix-appservice-nostr bridge (same dedup shape, found and
+        fixed there first): gating on this alone discarded every event in
+        the colliding transaction with no error and no retry.
+        ``bridge.appservice_routes._handle_transaction`` no longer uses
+        this as an early-return gate for exactly that reason --
+        ``has_processed_matrix_event``/``mark_matrix_event_processed``
+        below, keyed by each event's own never-reused ``event_id``, is
+        what actually guards against reprocessing now. This method/table
+        stay for the genuine retry-dedup value they still have once a
+        transaction's events are being looked at anyway, not removed since
+        nothing here is unsafe to keep, just unsafe to use as the ONLY
+        check before parsing a transaction's own events."""
         ...
 
     async def mark_transaction_processed(self, txn_id: str) -> None: ...
+
+    async def has_processed_matrix_event(self, event_id: str) -> bool:
+        """Whether this specific Matrix event has already been handled --
+        see ``has_processed_transaction``'s docstring for why this exists
+        as the real idempotency guard, checked PER EVENT, rather than
+        trusting the transaction-level check alone. ``event_id`` is a
+        content-derived identifier Synapse never reuses, restart or not,
+        unlike a transaction's own small, restart-resettable counter."""
+        ...
+
+    async def mark_matrix_event_processed(self, event_id: str) -> None: ...
 
     async def is_media_published(self, mxc_uri: str) -> bool:
         """Whether ``mxc_uri`` is one the bridge has actually published as public
@@ -1149,6 +1179,10 @@ class _LocalActorState:
     record: ActorRecord
 
 
+# Shared bound for both the transaction-id and the matrix-event-id
+# in-memory dedup sets below -- this implementation isn't durable anyway
+# (see InMemoryActorRepository's own docstring), so one generic cap is
+# fine for both.
 _MAX_TRACKED_TRANSACTIONS = 10_000
 
 
@@ -1173,6 +1207,8 @@ class InMemoryActorRepository:
         self._federated_by_ap_object: dict[str, FederatedEvent] = {}
         self._processed_txn_ids: set[str] = set()
         self._processed_txn_order: deque[str] = deque()
+        self._processed_event_ids: set[str] = set()
+        self._processed_event_order: deque[str] = deque()
         self._published_media: set[str] = set()
         self._outage_recoveries: list[tuple[float, int, int]] = []
         self._reactions_by_activity: dict[str, ReactionRecord] = {}
@@ -1531,6 +1567,15 @@ class InMemoryActorRepository:
         self._processed_txn_order.append(txn_id)
         while len(self._processed_txn_order) > _MAX_TRACKED_TRANSACTIONS:
             self._processed_txn_ids.discard(self._processed_txn_order.popleft())
+
+    async def has_processed_matrix_event(self, event_id: str) -> bool:
+        return event_id in self._processed_event_ids
+
+    async def mark_matrix_event_processed(self, event_id: str) -> None:
+        self._processed_event_ids.add(event_id)
+        self._processed_event_order.append(event_id)
+        while len(self._processed_event_order) > _MAX_TRACKED_TRANSACTIONS:
+            self._processed_event_ids.discard(self._processed_event_order.popleft())
 
     async def is_media_published(self, mxc_uri: str) -> bool:
         return mxc_uri in self._published_media

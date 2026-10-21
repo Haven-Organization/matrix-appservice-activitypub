@@ -282,18 +282,27 @@ async def _handle_transaction(
     _check_hs_token(request, authorization, access_token)
     repository = request.app.state.repository
 
-    # Synapse retries a transaction it didn't get a 200 for; per spec we must
-    # treat a repeat of the same txnId as already-handled rather than reprocessing it.
-    if await repository.has_processed_transaction(txn_id):
-        logger.debug("Ignoring already-processed transaction %s", txn_id)
-        return Response(**_EMPTY_JSON_RESPONSE_KWARGS)
-
     try:
         body: dict[str, Any] = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Malformed transaction body: {exc}") from exc
 
     for event in body.get("events", []):
+        # Per-event idempotency, not the transaction-level check this used
+        # to gate on before even parsing the body -- see
+        # ActorRepository.has_processed_transaction's own docstring for why
+        # that was a real, silent event-dropping bug (confirmed first in
+        # the sibling matrix-appservice-nostr bridge): a Synapse instance
+        # backed by sqlite resets its own txn_id counter to 1 after a
+        # Synapse restart, so a brand new transaction can collide with an
+        # ancient already-processed txn_id -- event_id never gets reused
+        # that way. A missing event_id (shouldn't normally happen for a
+        # real persistent room event) just skips dedup entirely rather
+        # than blocking on it.
+        event_id = event.get("event_id")
+        if event_id and await repository.has_processed_matrix_event(event_id):
+            logger.debug("Ignoring already-processed event %s", event_id)
+            continue
         try:
             handled_as_invite = await maybe_accept_invite(request, event)
             if handled_as_invite:
@@ -422,6 +431,13 @@ async def _handle_transaction(
                 event.get("type"),
                 event.get("room_id"),
             )
+        if event_id:
+            # Marked regardless of whether the try block above raised --
+            # same "attempted it, move on" semantics mark_transaction_processed
+            # already had for the whole transaction (an exception here is
+            # already logged and swallowed, never surfaced as a non-200
+            # that would make Synapse retry this transaction anyway).
+            await repository.mark_matrix_event_processed(event_id)
 
     await repository.mark_transaction_processed(txn_id)
     return Response(**_EMPTY_JSON_RESPONSE_KWARGS)

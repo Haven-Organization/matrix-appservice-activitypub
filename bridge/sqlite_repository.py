@@ -136,6 +136,19 @@ CREATE TABLE IF NOT EXISTS processed_transactions (
     processed_at REAL NOT NULL
 );
 
+-- Per-Matrix-event idempotency -- see has_processed_matrix_event's own
+-- docstring for why this exists ALONGSIDE processed_transactions above,
+-- not as a mere duplicate of it: Synapse's own AppService txn_id counter
+-- (on a Synapse instance backed by sqlite) resets to 1 after a Synapse
+-- restart, so a brand new transaction can be handed a txn_id that
+-- collides with an ancient one already recorded above -- gating on
+-- txn_id alone would then silently discard every event in it. event_id is
+-- a real content-derived identifier Synapse never reuses, restart or not.
+CREATE TABLE IF NOT EXISTS processed_matrix_events (
+    event_id TEXT PRIMARY KEY,
+    processed_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS published_media (
     mxc_uri TEXT PRIMARY KEY,
     published_at REAL NOT NULL
@@ -589,6 +602,15 @@ class SqliteActorRepository:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_processed_transactions_processed_at "
             "ON processed_transactions (processed_at)"
+        )
+        self._conn.commit()
+
+        # Same reasoning as idx_processed_transactions_processed_at just
+        # above -- mark_matrix_event_processed's own opportunistic cleanup
+        # runs on every single Matrix event this bridge is ever handed.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processed_matrix_events_processed_at "
+            "ON processed_matrix_events (processed_at)"
         )
         self._conn.commit()
 
@@ -1394,6 +1416,32 @@ class SqliteActorRepository:
 
     async def mark_transaction_processed(self, txn_id: str) -> None:
         await self._run(self._mark_transaction_processed, txn_id)
+
+    def _has_processed_matrix_event(self, event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM processed_matrix_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row is not None
+
+    async def has_processed_matrix_event(self, event_id: str) -> bool:
+        return await self._run(self._has_processed_matrix_event, event_id)
+
+    def _mark_matrix_event_processed(self, event_id: str) -> None:
+        now = time.time()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO processed_matrix_events (event_id, processed_at) VALUES (?, ?)",
+            (event_id, now),
+        )
+        # Opportunistic cleanup -- same pattern as _mark_transaction_processed's
+        # identical cleanup, bounds table growth without a separate sweep task.
+        self._conn.execute(
+            "DELETE FROM processed_matrix_events WHERE processed_at < ?",
+            (now - _TRANSACTION_RETENTION_SECONDS,),
+        )
+        self._conn.commit()
+
+    async def mark_matrix_event_processed(self, event_id: str) -> None:
+        await self._run(self._mark_matrix_event_processed, event_id)
 
     # -- published-media allowlist ------------------------------------------
 
