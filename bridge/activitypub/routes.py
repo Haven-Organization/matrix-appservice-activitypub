@@ -659,6 +659,7 @@ async def get_actor(request: Request, username: str) -> Response:
             following_hidden=hide_following,
             following=following,
             rss_url=f"/actor/{username}.rss",
+            profile_url=actor_url(config.bridge.public_base_url, username),
         )
         return HTMLResponse(html_doc)
     actor = await _build_actor(request, record)

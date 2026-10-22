@@ -26,6 +26,18 @@ from email.utils import formatdate
 _VARIATION_SELECTOR_16 = "️"
 _THUMBS_UP = "\U0001F44D"
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_OG_DESCRIPTION_MAX_LEN = 200
+
+
+def _plain_text_snippet(content_html: str, *, max_len: int = _OG_DESCRIPTION_MAX_LEN) -> str:
+    """Strips tags and collapses whitespace from already-sanitized post/
+    profile-summary HTML, for use anywhere plain text is needed instead
+    (an OpenGraph/Twitter Card ``description``, an RSS item ``title`` --
+    see ``_rss_item_title``, which reuses this)."""
+    plain = " ".join(html.unescape(_TAG_RE.sub("", content_html)).split())
+    return plain if len(plain) <= max_len else plain[: max_len - 1] + "…"
+
 # The standard RSS feed symbol (a quarter-circle broadcast icon plus a
 # dot) -- fill="currentColor" so .rss-link's own CSS color (including its
 # :hover swap to the conventional RSS orange) controls it, same as any
@@ -677,7 +689,51 @@ img.person-row-emoji { width: 22px; height: 22px; object-fit: contain; }
 """
 
 
-def _page_shell(*, title: str, body: str, wide: bool = False) -> str:
+@dataclass
+class OpenGraphMeta:
+    """Rich-link-preview metadata for one HTML page -- consumed by a URL
+    scraper (Synapse's own ``url_preview`` resource, fetching on behalf of
+    an Element client building a message's preview card; equally by any
+    other fediverse software that scrapes OpenGraph tags for a link
+    unfurl) rather than by a human reading the page itself, unlike
+    everything else ``_page_shell`` renders. Matches what a Mastodon-
+    compatible profile/post page already emits, which is why e.g. a
+    ``bsky.app`` post link already shows an image+text card in Matrix
+    while this bridge's own note/profile links didn't -- this is the gap
+    that closes."""
+
+    description: str = ""
+    image_url: str | None = None
+    url: str | None = None
+    # "profile" / "article" are the real OpenGraph types for these two page
+    # kinds (https://ogp.me/#types); every other page here just uses the
+    # default "website".
+    type: str = "website"
+
+
+def _og_meta_html(title: str, og: "OpenGraphMeta | None") -> str:
+    if og is None:
+        return ""
+    tags = [
+        f'<meta property="og:type" content="{html.escape(og.type, quote=True)}">',
+        f'<meta property="og:title" content="{html.escape(title, quote=True)}">',
+    ]
+    if og.description:
+        tags.append(f'<meta property="og:description" content="{html.escape(og.description, quote=True)}">')
+    if og.url:
+        tags.append(f'<meta property="og:url" content="{html.escape(og.url, quote=True)}">')
+    if og.image_url:
+        tags.append(f'<meta property="og:image" content="{html.escape(og.image_url, quote=True)}">')
+        tags.append('<meta name="twitter:card" content="summary_large_image">')
+    else:
+        tags.append('<meta name="twitter:card" content="summary">')
+    tags.append(f'<meta name="twitter:title" content="{html.escape(title, quote=True)}">')
+    if og.description:
+        tags.append(f'<meta name="twitter:description" content="{html.escape(og.description, quote=True)}">')
+    return "\n".join(tags) + "\n"
+
+
+def _page_shell(*, title: str, body: str, wide: bool = False, og: "OpenGraphMeta | None" = None) -> str:
     page_class = "page page-wide" if wide else "page"
     return f"""<!doctype html>
 <html lang="en">
@@ -685,7 +741,7 @@ def _page_shell(*, title: str, body: str, wide: bool = False) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
-<style>{_BASE_CSS}</style>
+{_og_meta_html(title, og)}<style>{_BASE_CSS}</style>
 </head>
 <body>
 <div class="{page_class}">
@@ -717,7 +773,7 @@ def render_profile_page(
     posts: list[PostView], older_posts_url: str | None = None, newer_posts_url: str | None = None,
     followers_count: int = 0, followers_hidden: bool = True, followers: list[PersonRef] | None = None,
     following_count: int = 0, following_hidden: bool = True, following: list[PersonRef] | None = None,
-    rss_url: str | None = None, pinned_posts: list[PostView] | None = None,
+    rss_url: str | None = None, pinned_posts: list[PostView] | None = None, profile_url: str | None = None,
 ) -> str:
     banner_style = f' style="background-image:url(\'{html.escape(banner_url, quote=True)}\')"' if banner_url else ""
     followers_stat = _follow_stat_html(
@@ -781,7 +837,13 @@ def render_profile_page(
         f"{header}\n{dialogs}\n{pinned_section}\n{timeline}\n{pagination}"
         + '<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
     )
-    return _page_shell(title=f"{display_name} ({handle})", body=body)
+    og = OpenGraphMeta(
+        description=_plain_text_snippet(summary_html) if summary_html else f"{handle} on the fediverse",
+        image_url=avatar_url,
+        url=profile_url,
+        type="profile",
+    )
+    return _page_shell(title=f"{display_name} ({handle})", body=body, og=og)
 
 
 # Matches Mastodon's own /@user.rss convention exactly (confirmed against
@@ -790,7 +852,6 @@ def render_profile_page(
 _RSS_NAMESPACES = 'xmlns:webfeeds="http://webfeeds.org/rss/1.0" xmlns:media="http://search.yahoo.com/mrss/"'
 _RSS_ATTACHMENT_MEDIUM = {"Image": "image", "Video": "video", "Audio": "audio"}
 _RSS_TITLE_ATTACHMENT_FALLBACK = {"Image": "Photo", "Video": "Video", "Audio": "Audio"}
-_RSS_TAG_RE = re.compile(r"<[^>]+>")
 _RSS_TITLE_MAX_LEN = 100
 
 
@@ -801,9 +862,9 @@ def _rss_item_title(post: PostView) -> str:
     ``content_html``. Confirmed live 2026-08-08: Thunderbird's feed reader
     only kept one item out of a feed entirely made of caption-less media
     posts, almost certainly for exactly this reason."""
-    plain = " ".join(html.unescape(_RSS_TAG_RE.sub("", post.content_html)).split())
+    plain = _plain_text_snippet(post.content_html, max_len=_RSS_TITLE_MAX_LEN)
     if plain:
-        return plain if len(plain) <= _RSS_TITLE_MAX_LEN else plain[: _RSS_TITLE_MAX_LEN - 1] + "…"
+        return plain
     if post.attachment:
         return _RSS_TITLE_ATTACHMENT_FALLBACK.get(post.attachment.get("type"), "Post")
     return "Post"
@@ -898,6 +959,26 @@ def render_thread_page(
     focused = next((p for p in posts if p.ap_object_id == focused_ap_object_id), posts[0])
     title = f"{focused.author_display_name} ({focused.author_handle})"
 
+    og_description = _plain_text_snippet(focused.content_html)
+    if not og_description:
+        og_description = (
+            _RSS_TITLE_ATTACHMENT_FALLBACK.get((focused.attachment or {}).get("type"), "Post")
+            if focused.attachment else f"A post by {focused.author_display_name}"
+        )
+    og_image = None
+    if focused.attachment:
+        attachment_kind = focused.attachment.get("type")
+        if attachment_kind == "Image":
+            og_image = focused.attachment.get("url")
+        elif attachment_kind == "Video":
+            og_image = focused.attachment.get("thumbnail_url")
+    og = OpenGraphMeta(
+        description=og_description,
+        image_url=og_image or focused.author_avatar_url,
+        url=focused.ap_object_id,
+        type="article",
+    )
+
     pagination = ""
     if total_pages > 1:
         prev_link = (
@@ -917,7 +998,7 @@ def render_thread_page(
         )
 
     body = f'<div class="timeline">{cards}</div>\n{pagination}\n<div class="page-footer"><a href="https://github.com/Haven-Organization/matrix-appservice-activitypub">matrix-appservice-activitypub</a></div>'
-    return _page_shell(title=title, body=body)
+    return _page_shell(title=title, body=body, og=og)
 
 
 def _duration_display(duration_seconds: int | None) -> str | None:
