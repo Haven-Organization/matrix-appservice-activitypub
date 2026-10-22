@@ -763,17 +763,33 @@ def _prefers_html(request: Request) -> bool:
 
     Falls back to sniffing ``User-Agent`` for "mozilla" (present in
     essentially every real browser's UA string for historical reasons, and
-    essentially never in a server-side HTTP client's) when the Accept
-    header is missing, empty, or contains nothing more decisive than a
-    bare ``*/*``. Confirmed live 2026-07-25: this used to default straight
-    to HTML for that case on the theory that "a real AP fetcher reliably
-    states its own preference explicitly", but PeerTube's own "resolve a
-    remote URL" search feature does exactly this (no decisive Accept
-    header at all), so a real channel actor could never actually be
+    essentially never in a server-side HTTP client's) or "synapse" when
+    the Accept header is missing, empty, or contains nothing more decisive
+    than a bare ``*/*``. Confirmed live 2026-07-25: this used to default
+    straight to HTML for that case on the theory that "a real AP fetcher
+    reliably states its own preference explicitly", but PeerTube's own
+    "resolve a remote URL" search feature does exactly this (no decisive
+    Accept header at all), so a real channel actor could never actually be
     resolved by anyone searching for it from another PeerTube instance:
     this bridge served its own HTML page back instead of the AP JSON
     PeerTube needed, which PeerTube (correctly, from its own side) then
     treated as "not an ActivityPub actor at all".
+
+    The "synapse" branch is for the exact same reason in reverse: Synapse's
+    own URL-preview fetcher (``synapse.media.url_previewer.UrlPreviewer``,
+    what builds a message's link-preview card for Element and friends) is
+    equally non-decisive -- its ``get_file`` call (``synapse/http/client.py``)
+    sends no ``Accept`` header at all, only a ``User-Agent`` of
+    ``Synapse/<version>`` (optionally with a configured suffix). Without
+    this it fell into the same "server-side, not a browser" bucket as a
+    real AP crawler and got served raw ``application/ld+json`` back, which
+    Synapse's previewer then flatly refuses to parse for OpenGraph tags
+    (confirmed live 2026-10-22 against the homeserver's own
+    ``/_matrix/media/v3/preview_url``: ``"Requested file's content type not
+    allowed for this operation: application/ld+json; ..."``) -- so a note
+    or profile permalink posted into a room never got a preview card at
+    all, independent of whether this page's own OpenGraph tags were
+    correct.
     """
     accept = request.headers.get("accept", "")
     for part in accept.split(","):
@@ -787,7 +803,7 @@ def _prefers_html(request: Request) -> bool:
         # the header for a real decisive entry, then falls through to the
         # User-Agent tiebreaker below if none ever shows up.
     user_agent = request.headers.get("user-agent", "").lower()
-    return "mozilla" in user_agent
+    return "mozilla" in user_agent or "synapse" in user_agent
 
 
 async def _resolve_post_author(request: Request, actor_id: str) -> tuple[str, str, str, str | None, str | None]:
