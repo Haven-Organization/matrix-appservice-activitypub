@@ -60,6 +60,7 @@ from bridge.commands import (
     is_third_party_still_allowed,
     message_addresses_bot,
 )
+from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -274,6 +275,7 @@ async def _send_outbound_dm(
         mention_tags += mxid_tags
         mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -293,7 +295,7 @@ async def _send_outbound_dm(
         cc=mention_cc,
         in_reply_to=in_reply_to,
         attachment=[attachment] if attachment else [],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
     )
     create_activity = Activity(
         id=f"{note_id}/activity",
@@ -672,6 +674,7 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
     # themselves; ours builds content from a plain Matrix body instead, so
     # it has to add that anchor itself -- see plain_text_to_note_html.
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -687,7 +690,7 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         cc=list(dict.fromkeys([reply_cc_target, *mention_cc])),
         in_reply_to=_effective_ap_object_id(parent),
         attachment=[attachment] if attachment else [],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
     )
     create_activity = Activity(
         id=f"{note_id}/activity",

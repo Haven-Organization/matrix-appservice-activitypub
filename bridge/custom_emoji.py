@@ -30,11 +30,14 @@ import re
 
 import httpx
 
+from bridge.activitypub.urls import media_url
 from bridge.media import fetch_and_upload_media
 from bridge.repository import ActorRepository
 from bridge.synapse_client import SynapseClient
 
 _SHORTCODE_RE = re.compile(r":[\w+-]+:")
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"([^"]*)"')
 
 
 async def resolve_custom_emoji_image(
@@ -174,3 +177,72 @@ def emoji_img_html(shortcode: str, mxc_or_url: str, *, with_text: bool = True) -
         f'width="20" height="20" style="vertical-align:middle">'
     )
     return f"{img} {escaped}" if with_text else img
+
+
+async def extract_outbound_emoji_tags(
+    repository: ActorRepository, base: str, formatted_body: str | None,
+) -> list[dict]:
+    """Scans a Matrix message's own ``formatted_body`` for MSC2545 image-pack
+    emoticons (``<img data-mx-emoticon ... src="mxc://..." alt=":name:">``,
+    what a Matrix client auto-inserts when someone types a custom emoji
+    shortcode with an image pack enabled) and builds the matching outbound
+    AS2 ``Emoji`` tag entries -- the same ``{type: Emoji, name, icon: {type:
+    Image, url}}`` shape a remote Pleroma/Misskey/Akkoma server needs to
+    actually render the image instead of the literal ``:shortcode:``
+    fallback text that's already in the post's plain-text ``body`` either
+    way. Without this, a post/reply/edit written with a local image pack
+    federated with no tag describing what the shortcode even meant --
+    confirmed live 2026-10-22, reported from the REMOTE side (a Pleroma
+    user asking whether the bare ``:shortcode:`` text they saw was "some
+    ActivityPub thing" this bridge hadn't implemented, when actually this
+    bridge had simply never sent the tag describing it at all).
+
+    This is the OUTBOUND mirror of this module's other functions, which all
+    resolve the inbound direction (an incoming Note's own ``tag`` data).
+    Each distinct mxc is published through the bridge's own public media
+    proxy (``mark_media_published``) and recorded via ``record_custom_emoji_mxc``
+    UNLESS it's already a known local copy of some REMOTE emoji
+    (``get_custom_emoji_source`` finds a row -- e.g. replying using the very
+    custom emoji just seen in an incoming post), in which case the
+    ORIGINAL remote icon URL and name are reused instead of minting a
+    second, differently-hosted identity for the same image under this
+    bridge's own domain -- same reasoning, and the same real Pleroma/Akkoma
+    "treated as an entirely separate emoji" bug (2026-10-12), that
+    ``bridge.reaction_bridge``'s own outbound custom-image-reaction
+    handling already works around."""
+    if not formatted_body:
+        return []
+    tags: list[dict] = []
+    seen: set[str] = set()
+    for img_tag in _IMG_TAG_RE.findall(formatted_body):
+        if "data-mx-emoticon" not in img_tag:
+            continue
+        attrs = dict(_HTML_ATTR_RE.findall(img_tag))
+        src = attrs.get("src")
+        if not src or not src.startswith("mxc://"):
+            continue
+        raw_name = attrs.get("alt") or attrs.get("title")
+        if not raw_name:
+            continue
+        name = html.unescape(raw_name).strip()
+        if not name:
+            continue
+        name = name if name.startswith(":") and name.endswith(":") else f":{name.strip(':')}:"
+        if name in seen:
+            continue
+        seen.add(name)
+
+        remembered = await repository.get_custom_emoji_source(src)
+        if remembered:
+            remembered_icon_url, remembered_name = remembered
+            tags.append({
+                "type": "Emoji", "name": remembered_name or name,
+                "icon": {"type": "Image", "url": remembered_icon_url},
+            })
+            continue
+
+        await repository.mark_media_published(src)
+        icon_url = media_url(base, src)
+        await repository.record_custom_emoji_mxc(icon_url, src, name)
+        tags.append({"type": "Emoji", "name": name, "icon": {"type": "Image", "url": icon_url}})
+    return tags

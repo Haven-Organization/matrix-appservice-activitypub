@@ -51,6 +51,7 @@ from bridge.commands import (
     is_foreign_bridge_user,
     message_addresses_bot,
 )
+from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
     build_ap_attachment,
@@ -263,6 +264,7 @@ async def _maybe_handle_msc4501_quote_post(
     mention_tags += mxid_tags
     mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -273,7 +275,7 @@ async def _maybe_handle_msc4501_quote_post(
         published=published,
         to=[AS_PUBLIC],
         cc=[followers_url(base, actor_record.username), target_author_actor_id, *mention_cc],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
         quote_uri=target_object_id,
     )
     create_activity = Activity(
@@ -479,6 +481,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     # themselves; ours builds content from a plain Matrix body instead, so
     # it has to add that anchor itself -- see plain_text_to_note_html.
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -491,7 +494,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         to=[AS_PUBLIC],
         cc=[followers_url(base, actor_record.username), *mention_cc],
         attachment=[attachment] if attachment else [],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
     )
     create_activity = Activity(
         id=f"{note_id}/activity",

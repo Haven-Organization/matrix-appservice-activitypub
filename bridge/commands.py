@@ -236,6 +236,7 @@ from bridge.activitypub.webfinger import (
 )
 from bridge.config import BridgeConfig
 from bridge.crypto import generate_keypair
+from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.ghosts import (
     ensure_ghost_user,
     ghost_localpart,
@@ -5566,6 +5567,7 @@ async def _handle_repost(
     mention_tags += mxid_tags
     mention_cc += mxid_cc
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -5581,7 +5583,7 @@ async def _handle_repost(
         published=published,
         to=[AS_PUBLIC],
         cc=[followers_url(base, actor_record.username), target_author_actor_id, *mention_cc],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
         quote_uri=target_object_id,
     )
     create_activity = Activity(

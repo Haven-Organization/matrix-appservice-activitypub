@@ -39,6 +39,7 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
+from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
 from bridge.mentions import (
     collect_reply_participants,
@@ -173,6 +174,7 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         mention_cc += participant_cc
 
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
+    emoji_tags = await extract_outbound_emoji_tags(repository, base, new_content.get("formatted_body"))
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     note = Note(
@@ -185,7 +187,7 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         cc=list(dict.fromkeys([followers_url(base, actor_record.username), *mention_cc])),
         in_reply_to=in_reply_to,
         attachment=[attachment] if attachment else [],
-        tag=mention_tags,
+        tag=mention_tags + emoji_tags,
     )
     update_activity = Activity(
         id=f"{federated.ap_object_id}#updates/{uuid.uuid4().hex}",
