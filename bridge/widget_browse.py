@@ -34,8 +34,10 @@ new ways to discover a URL worth importing.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -68,6 +70,71 @@ _COMPATIBLE_SOFTWARE = {
 # Matches the Mastodon API's own default page size for timelines/search.
 _PAGE_SIZE = 20
 
+_EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_+-]+):")
+
+
+def _substitute_emoji_html(body_html: str, emoji_map: dict[str, str]) -> str:
+    """Replace every ``:shortcode:`` run in ``body_html`` that matches a key
+    in ``emoji_map`` (shortcode -> image URL) with an inline ``<img>``,
+    leaving an unrecognized ``:shortcode:`` (or plain text with none at
+    all) untouched. Used for both Mastodon-API ``emojis`` lists and AS2
+    ``tag`` arrays once normalized into the same shortcode->URL shape --
+    see ``_mastodon_emoji_map``/``_as2_emoji_map``. Callers pass already-
+    escaped/already-HTML text; this never escapes anything itself."""
+    if not emoji_map:
+        return body_html
+
+    def _replace(match: re.Match[str]) -> str:
+        code = match.group(1)
+        url = emoji_map.get(code)
+        if not url:
+            return match.group(0)
+        safe_url = html.escape(url, quote=True)
+        return f'<img class="emoji" src="{safe_url}" alt=":{code}:" title=":{code}:">'
+
+    return _EMOJI_SHORTCODE_RE.sub(_replace, body_html)
+
+
+def _mastodon_emoji_map(emojis: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for e in emojis or []:
+        if not isinstance(e, dict):
+            continue
+        code = e.get("shortcode")
+        url = e.get("url") or e.get("static_url")
+        if isinstance(code, str) and isinstance(url, str):
+            result[code] = url
+    return result
+
+
+def _as2_emoji_map(doc: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for t in doc.get("tag") or []:
+        if not isinstance(t, dict) or t.get("type") != "Emoji":
+            continue
+        name = t.get("name")
+        icon = t.get("icon")
+        url = icon.get("url") if isinstance(icon, dict) else None
+        if isinstance(name, str) and isinstance(url, str):
+            result[name.strip(":")] = url
+    return result
+
+
+def _as2_collection_count(value: Any) -> int:
+    """``totalItems`` off an embedded AS2 collection (``likes``/``shares``/
+    ``replies``) -- Mastodon inlines these with the count already present,
+    no separate fetch needed; anything else (a bare URL string, missing,
+    malformed) just counts as 0 rather than triggering an extra request."""
+    if isinstance(value, dict):
+        total = value.get("totalItems")
+        if isinstance(total, int):
+            return total
+    return 0
+
+
+def _display_name_html(raw_name: str, emoji_map: dict[str, str]) -> str:
+    return _substitute_emoji_html(html.escape(raw_name), emoji_map)
+
 
 async def _is_compatible(request: Request, domain: str) -> bool:
     name = await remote_software_name(request, domain)
@@ -95,16 +162,43 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
         if isinstance(m, dict) and isinstance(m.get("url"), str)
     ]
     booster = status.get("account") if (reblog is not None and isinstance(status.get("account"), dict)) else None
+    content_html = base.get("content") if isinstance(base.get("content"), str) else ""
+    content_html = _substitute_emoji_html(content_html, _mastodon_emoji_map(base.get("emojis")))
+    author_name = account.get("display_name") or account.get("username") or "(unknown)"
+    booster_name = (booster.get("display_name") or booster.get("username") or "") if booster is not None else ""
+
+    # A reply's author isn't in the status object itself (Mastodon only
+    # gives `in_reply_to_id`, a numeric id meaningless off that instance) --
+    # `mentions[0]` is the standard client-side heuristic for "who this is
+    # replying to" (a reply's own content always mentions its parent's
+    # author first), avoiding an extra fetch per reply in a feed. The
+    # thread view (browse_thread) resolves the REAL parent via a fresh AS2
+    # fetch regardless, so this is only ever a display hint, never load-
+    # bearing for navigation -- opening a thread always uses this post's
+    # own `uri`, not this hint.
+    is_reply = bool(base.get("in_reply_to_id"))
+    mentions = base.get("mentions") if isinstance(base.get("mentions"), list) else []
+    first_mention = mentions[0] if mentions and isinstance(mentions[0], dict) else None
+    reply_hint_handle = ("@" + first_mention["acct"]) if first_mention and isinstance(first_mention.get("acct"), str) else None
+
+    pleroma = base.get("pleroma") if isinstance(base.get("pleroma"), dict) else {}
+    reactions = [
+        {"name": r.get("name") or "", "count": r.get("count") or 0, "url": r.get("url") if isinstance(r.get("url"), str) else None}
+        for r in (pleroma.get("emoji_reactions") or [])
+        if isinstance(r, dict)
+    ]
+
     return {
         "uri": uri,
         "url": base.get("url") or uri,
         "created_at": base.get("created_at"),
-        "content_html": base.get("content") if isinstance(base.get("content"), str) else "",
+        "content_html": content_html,
         "sensitive": bool(base.get("sensitive")),
         "spoiler_text": base.get("spoiler_text") if isinstance(base.get("spoiler_text"), str) else "",
         "author": {
             "actor_id": account.get("uri"),
-            "display_name": account.get("display_name") or account.get("username") or "(unknown)",
+            "display_name": author_name,
+            "display_name_html": _display_name_html(author_name, _mastodon_emoji_map(account.get("emojis"))),
             "handle": account.get("acct") or account.get("username") or "",
             "avatar_url": account.get("avatar") or account.get("avatar_static"),
             "url": account.get("url"),
@@ -115,10 +209,15 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
             "reblogs": base.get("reblogs_count") or 0,
             "favourites": base.get("favourites_count") or 0,
         },
+        "reactions": reactions,
+        "in_reply_to": is_reply,
+        "reply_hint_display_name": None,
+        "reply_hint_handle": reply_hint_handle,
         "boosted_by": (
             {
                 "actor_id": booster.get("uri"),
-                "display_name": booster.get("display_name") or booster.get("username") or "",
+                "display_name": booster_name,
+                "display_name_html": _display_name_html(booster_name, _mastodon_emoji_map(booster.get("emojis"))),
                 "handle": booster.get("acct") or "",
             }
             if booster is not None else None
@@ -292,13 +391,15 @@ async def browse_search(request: Request, q: str, domain: str = "") -> JSONRespo
         name = doc.get("name") if isinstance(doc.get("name"), str) else None
         icon = doc.get("icon")
         avatar_url = icon.get("url") if isinstance(icon, dict) else None
+        display_name = name or doc.get("preferredUsername") or handle
         return JSONResponse(
             {
                 "accounts": [
                     {
                         "actor_id": actor_id,
                         "handle": "@" + handle.lstrip("@"),
-                        "display_name": name or doc.get("preferredUsername") or handle,
+                        "display_name": display_name,
+                        "display_name_html": _display_name_html(display_name, _as2_emoji_map(doc)),
                         "avatar_url": avatar_url,
                     }
                 ]
@@ -329,11 +430,13 @@ async def browse_search(request: Request, q: str, domain: str = "") -> JSONRespo
         if not isinstance(a, dict):
             continue
         acct = a.get("acct") or a.get("username") or ""
+        display_name = a.get("display_name") or a.get("username") or acct
         accounts.append(
             {
                 "actor_id": a.get("uri") or a.get("url"),
                 "handle": "@" + acct if "@" in acct else f"@{acct}@{domain}",
-                "display_name": a.get("display_name") or a.get("username") or acct,
+                "display_name": display_name,
+                "display_name_html": _display_name_html(display_name, _mastodon_emoji_map(a.get("emojis"))),
                 "avatar_url": a.get("avatar") or a.get("avatar_static"),
             }
         )
@@ -356,7 +459,13 @@ def _actor_handle(doc: dict[str, Any], actor_id: str) -> str:
     return f"@{username or actor_id}@{domain}" if domain else f"@{username or actor_id}"
 
 
-def _normalize_ap_item(item: dict[str, Any]) -> dict[str, Any] | None:
+def _normalize_ap_item(item: dict[str, Any], *, author: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """A bare AS2 Note (or an Activity wrapping one, e.g. an outbox page's
+    ``Create``) -> the widget's post shape. ``author`` is optional -- a
+    profile's own outbox page has the frontend inject one shared author
+    for every post (it's always the same account); the thread endpoint
+    (``browse_thread``) instead resolves and passes a real per-post author
+    here, since ancestors/replies can each be by someone different."""
     obj = item.get("object") if isinstance(item.get("object"), dict) else item
     if not isinstance(obj, dict):
         return None
@@ -371,15 +480,38 @@ def _normalize_ap_item(item: dict[str, Any]) -> dict[str, Any] | None:
         kind = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "audio" if mime.startswith("audio/") else "unknown"
         media.append({"type": kind, "url": a["url"], "description": a.get("name") if isinstance(a.get("name"), str) else ""})
     summary = obj.get("summary") if isinstance(obj.get("summary"), str) else ""
+    emoji_map = _as2_emoji_map(obj)
+    content_html = obj.get("content") if isinstance(obj.get("content"), str) else ""
+    content_html = _substitute_emoji_html(content_html, emoji_map)
+    in_reply_to_uri = obj.get("inReplyTo") if isinstance(obj.get("inReplyTo"), str) else None
     return {
         "uri": uri,
         "url": obj.get("url") or uri,
         "created_at": obj.get("published"),
-        "content_html": obj.get("content") if isinstance(obj.get("content"), str) else "",
+        "content_html": content_html,
         "sensitive": bool(obj.get("sensitive")) or bool(summary),
         "spoiler_text": summary,
+        "author": author,
         "media": media,
-        "counts": {"replies": 0, "reblogs": 0, "favourites": 0},
+        "counts": {
+            "replies": _as2_collection_count(obj.get("replies")),
+            "reblogs": _as2_collection_count(obj.get("shares")),
+            "favourites": _as2_collection_count(obj.get("likes")),
+        },
+        # AS2 has no standard custom-reaction concept of its own (Pleroma's
+        # emoji_reactions are exposed only via its Mastodon-compatible
+        # status API, not on the bare Note -- see _normalize_status for
+        # where those actually come from).
+        "reactions": [],
+        "in_reply_to": in_reply_to_uri is not None,
+        "in_reply_to_uri": in_reply_to_uri,
+        # No cheap per-item author hint here (unlike the Mastodon-API
+        # mentions[0] heuristic) -- resolving the real parent's author
+        # would mean an extra fetch per reply just to render a feed. Left
+        # None; the thread view resolves and shows the real name once you
+        # actually open it.
+        "reply_hint_display_name": None,
+        "reply_hint_handle": None,
         "boosted_by": None,
         "instance": urlparse(uri).hostname or "",
     }
@@ -415,6 +547,126 @@ async def _fetch_outbox_page(
     return posts, next_cursor
 
 
+# -- thread view (ancestors up to the root, plus immediate replies) --------
+#
+# Deliberately re-resolves everything via a fresh, generic AS2 fetch of the
+# focused post's own `uri` -- never the Mastodon-API `in_reply_to_id` (only
+# meaningful on the instance that issued it) and never whatever the
+# frontend happened to already have cached. This is what makes thread
+# opening work identically for a post discovered via a Mastodon-API
+# timeline/search AND one discovered via a profile's own AS2 outbox page.
+
+_THREAD_MAX_ANCESTORS = 15
+_THREAD_MAX_REPLIES = 15
+
+
+def _unwrap_activity(doc: dict[str, Any]) -> dict[str, Any]:
+    """A fetched AS2 URL sometimes resolves to the bare object (the common
+    case for an object's own canonical URL) and sometimes to an Activity
+    wrapping it (a `Create`, if a server instead serves the activity at
+    that URL) -- normalize to the bare object either way."""
+    inner = doc.get("object")
+    if doc.get("type") == "Create" and isinstance(inner, dict):
+        return inner
+    return doc
+
+
+async def _resolve_as2_author(request: Request, attributed_to: Any) -> dict[str, Any] | None:
+    if not isinstance(attributed_to, str):
+        return None
+    try:
+        actor_doc = await fetch_actor(request, attributed_to)
+    except RemoteActorFetchError:
+        return {
+            "actor_id": attributed_to, "display_name": "(unknown)", "display_name_html": "(unknown)",
+            "handle": "", "avatar_url": None, "url": attributed_to,
+        }
+    icon = actor_doc.get("icon") if isinstance(actor_doc.get("icon"), dict) else {}
+    name = actor_doc.get("name") if isinstance(actor_doc.get("name"), str) and actor_doc.get("name") else (actor_doc.get("preferredUsername") or attributed_to)
+    return {
+        "actor_id": attributed_to,
+        "display_name": name,
+        "display_name_html": _display_name_html(name, _as2_emoji_map(actor_doc)),
+        "handle": _actor_handle(actor_doc, attributed_to),
+        "avatar_url": icon.get("url"),
+        "url": actor_doc.get("url") if isinstance(actor_doc.get("url"), str) else attributed_to,
+    }
+
+
+async def _normalize_as2_note_full(request: Request, note_doc: dict[str, Any]) -> dict[str, Any] | None:
+    author = await _resolve_as2_author(request, note_doc.get("attributedTo"))
+    return _normalize_ap_item(note_doc, author=author)
+
+
+async def _fetch_as2_note(request: Request, uri: str) -> dict[str, Any] | None:
+    try:
+        doc = await fetch_actor(request, uri)
+    except RemoteActorFetchError:
+        return None
+    return _unwrap_activity(doc)
+
+
+async def _fetch_reply_uris(request: Request, note_doc: dict[str, Any]) -> list[str]:
+    replies = note_doc.get("replies")
+    if not isinstance(replies, dict):
+        return []
+    first = replies.get("first")
+    page: dict[str, Any] | None = None
+    if isinstance(first, dict):
+        page = first
+    elif isinstance(first, str):
+        page = await _fetch_as2_note(request, first)
+    if not isinstance(page, dict):
+        return []
+    items = page.get("items") if isinstance(page.get("items"), list) else page.get("orderedItems")
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, str)][:_THREAD_MAX_REPLIES]
+
+
+@router.get("/widget/api/browse/thread")
+async def browse_thread(request: Request, uri: str) -> JSONResponse:
+    _session_user(request)
+    focus_doc = await _fetch_as2_note(request, uri)
+    if focus_doc is None:
+        raise HTTPException(502, "Couldn't load that post.")
+
+    ancestors: list[dict[str, Any]] = []
+    seen = {uri}
+    current = focus_doc
+    for _ in range(_THREAD_MAX_ANCESTORS):
+        parent_uri = current.get("inReplyTo")
+        if not isinstance(parent_uri, str) or parent_uri in seen:
+            break
+        seen.add(parent_uri)
+        parent_doc = await _fetch_as2_note(request, parent_uri)
+        if parent_doc is None:
+            break
+        ancestors.append(parent_doc)
+        current = parent_doc
+    ancestors.reverse()  # root first, immediate parent last
+
+    reply_uris = await _fetch_reply_uris(request, focus_doc)
+    reply_docs = [d for d in await asyncio.gather(*(_fetch_as2_note(request, u) for u in reply_uris)) if d is not None]
+
+    normalized_ancestors = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in ancestors)) if p is not None]
+    normalized_focus = await _normalize_as2_note_full(request, focus_doc)
+    normalized_replies = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in reply_docs)) if p is not None]
+
+    await _mark_imported(request, normalized_ancestors)
+    if normalized_focus is not None:
+        await _mark_imported(request, [normalized_focus])
+    await _mark_imported(request, normalized_replies)
+
+    if normalized_focus is None:
+        raise HTTPException(502, "That post is missing something required to show it.")
+
+    return JSONResponse(
+        {"ancestors": normalized_ancestors, "post": normalized_focus, "replies": normalized_replies},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/widget/api/browse/profile")
 async def browse_profile(request: Request, actor_id: str) -> JSONResponse:
     matrix_user_id = _session_user(request)
@@ -425,13 +677,17 @@ async def browse_profile(request: Request, actor_id: str) -> JSONResponse:
         raise HTTPException(502, "Couldn't reach that account's instance right now.")
     icon = doc.get("icon") if isinstance(doc.get("icon"), dict) else {}
     image = doc.get("image") if isinstance(doc.get("image"), dict) else {}
+    emoji_map = _as2_emoji_map(doc)
+    display_name = doc.get("name") if isinstance(doc.get("name"), str) and doc.get("name") else (doc.get("preferredUsername") or actor_id)
+    bio_html = doc.get("summary") if isinstance(doc.get("summary"), str) else ""
     profile: dict[str, Any] = {
         "actor_id": actor_id,
-        "display_name": doc.get("name") if isinstance(doc.get("name"), str) and doc.get("name") else (doc.get("preferredUsername") or actor_id),
+        "display_name": display_name,
+        "display_name_html": _display_name_html(display_name, emoji_map),
         "handle": _actor_handle(doc, actor_id),
         "avatar_url": icon.get("url"),
         "banner_url": image.get("url"),
-        "bio_html": doc.get("summary") if isinstance(doc.get("summary"), str) else "",
+        "bio_html": _substitute_emoji_html(bio_html, emoji_map),
         "url": doc.get("url") if isinstance(doc.get("url"), str) else actor_id,
         "has_posts": isinstance(doc.get("outbox"), str),
     }
