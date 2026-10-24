@@ -1170,23 +1170,31 @@ _WIDGET_HTML = r"""<!doctype html>
       return;
     }
     const active = identityState.active;
-    const card = el("button", {
-      class: "identity-card", title: active ? active.handle : "",
-      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
-    }, [
+    const otherIdentities = identityState.identities.filter((i) => !i.is_active);
+    // Nothing to put in the dropdown when there's only this one identity
+    // and this bridge doesn't allow creating more -- showing the chevron
+    // (and an empty popover when clicked) would just be a dead end.
+    const hasDropdownContent = otherIdentities.length > 0 || ctx.custom_identities_enabled;
+    const cardChildren = [
       avatarEl(active && active.icon_url, active && (active.display_name || active.handle)),
       el("div", { class: "identity-meta" }, [
         el("div", { class: "name", text: active ? (active.display_name || active.handle) : "…" }),
         el("div", { class: "handle muted", text: active ? active.handle : "" }),
       ]),
-      el("span", {
+    ];
+    if (hasDropdownContent) {
+      cardChildren.push(el("span", {
         class: "identity-dropdown-btn", text: "⌄",
         onclick: (e) => { e.stopPropagation(); identityDropdownOpen = !identityDropdownOpen; renderSidebar(); },
-      }),
-    ]);
-    if (identityDropdownOpen) {
+      }));
+    }
+    const card = el("button", {
+      class: "identity-card", title: active ? active.handle : "",
+      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
+    }, cardChildren);
+    if (hasDropdownContent && identityDropdownOpen) {
       const pop = el("div", { class: "identity-dropdown" });
-      identityState.identities.filter((i) => !i.is_active).forEach((i) => {
+      otherIdentities.forEach((i) => {
         pop.appendChild(el("button", {
           class: "nav-item", text: i.display_name || i.handle,
           onclick: () => {
