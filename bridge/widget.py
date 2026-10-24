@@ -45,6 +45,7 @@ from bridge.commands import (
     _handle_block,
     _handle_chat,
     _handle_create_profile,
+    _execute_leave_unfollowed,
     _handle_delete_profile,
     _handle_disallow,
     _handle_dm,
@@ -54,6 +55,8 @@ from bridge.commands import (
     _handle_link_profile,
     _handle_mute,
     _handle_rejoin,
+    _list_unfollowed_ghost_rooms,
+    _RoomListingUnreliable,
     _handle_replace_room,
     _handle_set,
     _handle_unblock,
@@ -309,6 +312,36 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.get("/widget/api/leave_unfollowed/preview")
+async def widget_leave_unfollowed_preview(request: Request) -> JSONResponse:
+    """Read-only half of ";leave unfollowed"'s two-step confirm flow --
+    the widget shows this list itself and gets its own explicit confirm
+    click, so it calls _execute_leave_unfollowed directly below rather
+    than going through _handle_leave_unfollowed's chat-reply-based
+    "confirm" mechanic, which the widget has no way to satisfy."""
+    matrix_user_id = _session_user(request)
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    if not identities:
+        return JSONResponse({"rooms": [], "unreliable": False}, headers={"Cache-Control": "no-store"})
+    try:
+        unfollowed = await _list_unfollowed_ghost_rooms(
+            request, sender=matrix_user_id, usernames=[i.username for i in identities]
+        )
+    except _RoomListingUnreliable:
+        return JSONResponse({"rooms": [], "unreliable": True}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        {"rooms": [{"handle": handle} for _room_id, _actor_id, handle in unfollowed], "unreliable": False},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/leave_unfollowed/execute")
+async def widget_leave_unfollowed_execute(request: Request) -> JSONResponse:
+    body = await request.json()
+    return await _dispatch(request, body.get("room_id", ""), _execute_leave_unfollowed)
 
 
 @router.post("/widget/api/rejoin")
@@ -1235,6 +1268,48 @@ _WIDGET_HTML = r"""<!doctype html>
           plainButton("Rejoin my rooms", (e) => doAction("/widget/api/rejoin", {}, e.target)),
         ]),
       ]));
+
+      const leaveCard = el("div", { class: "card" }, [
+        el("h2", { text: "Leave unfollowed rooms" }),
+        el("div", { class: "sub", text: "Remove yourself from every Remote User Room for an account none of your identities follow." }),
+        el("div", { class: "row" }, [
+          plainButton("Preview", async (e) => {
+            e.target.disabled = true;
+            try {
+              const data = await api("/widget/api/leave_unfollowed/preview");
+              const old = leaveCard.querySelector("#leave-unfollowed-result");
+              if (old) old.remove();
+              const result = el("div", { id: "leave-unfollowed-result" });
+              if (data.unreliable) {
+                result.appendChild(el("div", { class: "muted", text: "Couldn't reliably check right now -- try again shortly." }));
+              } else if (!data.rooms.length) {
+                result.appendChild(el("div", { class: "muted", text: "Nothing to leave." }));
+              } else {
+                const shown = data.rooms.slice(0, 10);
+                result.appendChild(el("div", { class: "list" }, shown.map((r) =>
+                  el("div", { class: "list-item" }, [el("span", { text: r.handle })])
+                )));
+                if (data.rooms.length > shown.length) {
+                  result.appendChild(el("div", { class: "muted", text: "...and " + (data.rooms.length - shown.length) + " more" }));
+                }
+                result.appendChild(el("div", { class: "row" }, [
+                  dangerButton("Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"), (e2) => {
+                    if (confirm("Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.")) {
+                      doAction("/widget/api/leave_unfollowed/execute", {}, e2.target);
+                    }
+                  }),
+                ]));
+              }
+              leaveCard.appendChild(result);
+            } catch (err) {
+              toast(err.message, false);
+            } finally {
+              e.target.disabled = false;
+            }
+          }),
+        ]),
+      ]);
+      app.appendChild(leaveCard);
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
   }
 
