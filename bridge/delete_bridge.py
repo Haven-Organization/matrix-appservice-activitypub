@@ -28,6 +28,7 @@ by the time ``_maybe_federate_community_mod_delete`` runs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -37,6 +38,7 @@ from bridge.activitypub.delivery import DeliveryError, deliver_activity
 from bridge.activitypub.models import Activity
 from bridge.activitypub.remote_actor import resolve_actor_inbox
 from bridge.activitypub.urls import actor_url, main_key_id, username_from_actor_url
+from bridge.note_mirroring import _DELIVERY_SEMAPHORE
 from bridge.repository import FederatedEvent
 
 logger = logging.getLogger(__name__)
@@ -90,20 +92,36 @@ async def maybe_federate_delete(request: Request, event: dict) -> bool:
     if owned_community is not None:
         followers |= set(await repository.list_followers(owned_community.username))
 
-    for follower_actor_id in followers:
-        inbox = await resolve_actor_inbox(request, follower_actor_id)
-        if inbox is None:
-            continue
-        try:
-            await deliver_activity(
-                http_client,
-                inbox_url=inbox,
-                activity=delete_activity.to_dict(),
-                key_id=main_key_id(base, username),
-                private_key_pem=actor_record.private_key_pem,
-            )
-        except DeliveryError:
-            logger.warning("Failed to deliver Delete(post) to follower %s", follower_actor_id, exc_info=True)
+    async def _deliver_one(follower_actor_id: str) -> None:
+        async with _DELIVERY_SEMAPHORE:
+            inbox = await resolve_actor_inbox(request, follower_actor_id)
+            if inbox is None:
+                return
+            try:
+                await deliver_activity(
+                    http_client,
+                    inbox_url=inbox,
+                    activity=delete_activity.to_dict(),
+                    key_id=main_key_id(base, username),
+                    private_key_pem=actor_record.private_key_pem,
+                )
+            except DeliveryError:
+                logger.warning("Failed to deliver Delete(post) to follower %s", follower_actor_id, exc_info=True)
+
+    # Fanned out (bounded by the shared _DELIVERY_SEMAPHORE, same as
+    # bridge.note_mirroring.deliver_to_actor_or_followers) rather than one
+    # follower at a time -- a sequential loop here scales this function's
+    # own wall-clock time linearly with follower count, which for a post
+    # with many followers can run well past Synapse's AS-transaction retry
+    # window and get the SAME transaction redelivered mid-flight (confirmed
+    # live 2026-10-24: a 53-follower Delete fanout stalled the whole
+    # appservice transaction queue -- every later event, including unrelated
+    # commands, silently queued behind it for hours since Synapse won't
+    # attempt the next transaction until this one's HTTP response returns).
+    # note_mirroring's own sequential-loop version of this exact bug was
+    # already fixed the same way back in 2026-08-10; this module just never
+    # got the same fix applied to it.
+    await asyncio.gather(*(_deliver_one(follower_actor_id) for follower_actor_id in followers))
     return True
 
 
