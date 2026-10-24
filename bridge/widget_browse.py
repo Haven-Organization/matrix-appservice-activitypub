@@ -558,6 +558,7 @@ async def _fetch_outbox_page(
 
 _THREAD_MAX_ANCESTORS = 15
 _THREAD_MAX_REPLIES = 15
+_THREAD_MAX_NESTED_CANDIDATES = 3
 
 
 def _unwrap_activity(doc: dict[str, Any]) -> dict[str, Any]:
@@ -607,15 +608,32 @@ async def _fetch_as2_note(request: Request, uri: str) -> dict[str, Any] | None:
 
 
 async def _fetch_reply_uris(request: Request, note_doc: dict[str, Any]) -> list[str]:
+    """Every immediate reply's own uri, as leniently as real-world AS2
+    varies this: ``replies`` itself can be an embedded collection (the
+    Mastodon convention, confirmed live) or a bare collection-id string
+    needing its own fetch; that collection's first page can be embedded
+    under ``first``, a ``first`` URL needing a fetch, or -- some software
+    skips the page wrapper entirely -- items inlined directly on the
+    collection. Each of those pages can name its items ``items`` or
+    ``orderedItems``. Returns ``[]`` (never raises) for anything that
+    doesn't match one of these, same best-effort posture as the rest of
+    this module."""
     replies = note_doc.get("replies")
-    if not isinstance(replies, dict):
+    collection: dict[str, Any] | None = None
+    if isinstance(replies, dict):
+        collection = replies
+    elif isinstance(replies, str):
+        collection = await _fetch_as2_note(request, replies)
+    if not isinstance(collection, dict):
         return []
-    first = replies.get("first")
+    first = collection.get("first")
     page: dict[str, Any] | None = None
     if isinstance(first, dict):
         page = first
     elif isinstance(first, str):
         page = await _fetch_as2_note(request, first)
+    elif isinstance(collection.get("items"), list) or isinstance(collection.get("orderedItems"), list):
+        page = collection
     if not isinstance(page, dict):
         return []
     items = page.get("items") if isinstance(page.get("items"), list) else page.get("orderedItems")
@@ -625,6 +643,26 @@ async def _fetch_reply_uris(request: Request, note_doc: dict[str, Any]) -> list[
 
 
 @router.get("/widget/api/browse/thread")
+async def _find_op_reply(request: Request, reply_doc: dict[str, Any], focus_author_id: Any) -> dict[str, Any] | None:
+    """The one reply-of-reply (if any) that's authored by the FOCUSED
+    post's own author continuing the conversation with this particular
+    direct reply -- the 'OP replying back' pattern Haven Desktop/Poa.st
+    show nested with a connecting line, deliberately not a full nested
+    reply tree (every other reply-of-reply, by anyone else, stays
+    uncollapsed/unshown rather than growing this into a full thread
+    tree)."""
+    if not isinstance(focus_author_id, str):
+        return None
+    candidate_uris = (await _fetch_reply_uris(request, reply_doc))[:_THREAD_MAX_NESTED_CANDIDATES]
+    if not candidate_uris:
+        return None
+    candidate_docs = await asyncio.gather(*(_fetch_as2_note(request, u) for u in candidate_uris))
+    for doc in candidate_docs:
+        if doc is not None and doc.get("attributedTo") == focus_author_id:
+            return doc
+    return None
+
+
 async def browse_thread(request: Request, uri: str) -> JSONResponse:
     _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
@@ -648,15 +686,23 @@ async def browse_thread(request: Request, uri: str) -> JSONResponse:
 
     reply_uris = await _fetch_reply_uris(request, focus_doc)
     reply_docs = [d for d in await asyncio.gather(*(_fetch_as2_note(request, u) for u in reply_uris)) if d is not None]
+    op_reply_docs = await asyncio.gather(*(_find_op_reply(request, d, focus_doc.get("attributedTo")) for d in reply_docs))
 
     normalized_ancestors = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in ancestors)) if p is not None]
     normalized_focus = await _normalize_as2_note_full(request, focus_doc)
-    normalized_replies = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in reply_docs)) if p is not None]
+    normalized_replies = []
+    for reply_doc, op_reply_doc in zip(reply_docs, op_reply_docs):
+        normalized_reply = await _normalize_as2_note_full(request, reply_doc)
+        if normalized_reply is None:
+            continue
+        normalized_reply["op_reply"] = await _normalize_as2_note_full(request, op_reply_doc) if op_reply_doc is not None else None
+        normalized_replies.append(normalized_reply)
 
     await _mark_imported(request, normalized_ancestors)
     if normalized_focus is not None:
         await _mark_imported(request, [normalized_focus])
-    await _mark_imported(request, normalized_replies)
+    flat_replies = normalized_replies + [r["op_reply"] for r in normalized_replies if r.get("op_reply") is not None]
+    await _mark_imported(request, flat_replies)
 
     if normalized_focus is None:
         raise HTTPException(502, "That post is missing something required to show it.")
