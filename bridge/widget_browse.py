@@ -642,7 +642,6 @@ async def _fetch_reply_uris(request: Request, note_doc: dict[str, Any]) -> list[
     return [i for i in items if isinstance(i, str)][:_THREAD_MAX_REPLIES]
 
 
-@router.get("/widget/api/browse/thread")
 async def _find_op_reply(request: Request, reply_doc: dict[str, Any], focus_author_id: Any) -> dict[str, Any] | None:
     """The one reply-of-reply (if any) that's authored by the FOCUSED
     post's own author continuing the conversation with this particular
@@ -663,6 +662,7 @@ async def _find_op_reply(request: Request, reply_doc: dict[str, Any], focus_auth
     return None
 
 
+@router.get("/widget/api/browse/thread")
 async def browse_thread(request: Request, uri: str) -> JSONResponse:
     _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
