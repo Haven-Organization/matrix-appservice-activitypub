@@ -50,6 +50,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
   - [Multi-identity support](#multi-identity-support)
     - [Enable custom identities (`bridge.custom_identities_enabled`)](#bridge-custom_identities_enabled)
     - [Max identities per user (`bridge.max_identities_per_user`)](#bridge-max_identities_per_user)
+    - [Default timeline domains (`bridge.default_timeline_domains`)](#bridge-default_timeline_domains)
   - [Multi-bridge rooms](#multi-bridge-rooms)
     - [Command prefix (`bridge.command_prefix`)](#bridge-command_prefix)
     - [Other bots' prefixes (`bridge.other_bot_prefixes`)](#bridge-other_bot_prefixes)
@@ -383,6 +384,16 @@ Whether a Matrix user may own more than one ActivityPub identity, and pick a cus
 **Default:** `5`
 
 Per-user cap on how many ActivityPub identities they may create once [`bridge.custom_identities_enabled`](#bridge-custom_identities_enabled) is on. A bridge admin (see [`bridge.admins`](#bridge-admins) / [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api)) is never subject to this cap.
+
+---
+
+<a id="bridge-default_timeline_domains"></a>
+
+#### Default timeline domains (`bridge.default_timeline_domains`)
+
+**Default:** `[]` (falls back to just this bridge's own domain)
+
+Instance domain(s) whose "whole known network" (federated) timeline the widget's Home tab shows by default -- a single popular instance, or several merged together by recency. Only instances running Mastodon-API-compatible software (Mastodon, Pleroma/Akkoma, GoToSocial, Misskey-family) can supply one; a bare ActivityPub server (including another install of this bridge) has no site-wide timeline to browse at all, and is silently skipped.
 
 ---
 

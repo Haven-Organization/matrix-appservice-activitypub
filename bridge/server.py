@@ -34,6 +34,7 @@ from bridge.sqlite_repository import SqliteActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
 from bridge.third_party_sync import third_party_profile_sync_loop
 from bridge.widget import router as widget_router
+from bridge.widget_browse import router as widget_browse_router
 
 logger = logging.getLogger(__name__)
 
@@ -229,4 +230,5 @@ def create_app(
     app.include_router(activitypub_router)
     app.include_router(appservice_router)
     app.include_router(widget_router)
+    app.include_router(widget_browse_router)
     return app

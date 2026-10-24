@@ -46,6 +46,7 @@ from bridge.commands import (
     _handle_delete_profile,
     _handle_dm,
     _handle_follow,
+    _handle_id,
     _handle_import,
     _handle_link_profile,
     _handle_mute,
@@ -200,6 +201,9 @@ async def widget_context(request: Request, room_id: str) -> JSONResponse:
             "own_username": own_actor.username if own_actor else None,
             "backfill_default_count": config.bridge.backfill_default_count,
             "command_prefix": _COMMAND_PREFIX,
+            "custom_identities_enabled": config.bridge.custom_identities_enabled,
+            "peertube_channels_enabled": config.bridge.peertube_channels_enabled,
+            "lemmy_community_hosting_enabled": config.bridge.lemmy_community_hosting_enabled,
             "room": room,
         },
         headers={"Cache-Control": "no-store"},
@@ -236,6 +240,71 @@ async def widget_following(request: Request) -> JSONResponse:
             }
         )
     return JSONResponse({"following": entries}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/widget/api/identities")
+async def widget_identities(request: Request) -> JSONResponse:
+    """Every ActivityPub identity the session's Matrix user owns, and which
+    one is Active -- the widget's own equivalent of ``;id list``, global
+    (not room-scoped) same as the command itself. Works, and lists exactly
+    one entry, even for an account that's never touched
+    ``custom_identities_enabled`` at all."""
+    matrix_user_id = _session_user(request)
+    repository = request.app.state.repository
+    config = request.app.state.config
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    active = await repository.get_active_local_actor(matrix_user_id)
+    active_username = active.username if active is not None else None
+    entries = [
+        {
+            "username": a.username,
+            "display_name": a.display_name,
+            "handle": f"@{a.username}@{config.bridge.domain}",
+            "is_active": a.username == active_username,
+        }
+        for a in identities
+    ]
+    return JSONResponse({"identities": entries}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/identities/switch")
+async def widget_identities_switch(request: Request) -> JSONResponse:
+    body = await request.json()
+    username = body.get("username", "")
+    if not isinstance(username, str) or not username:
+        raise HTTPException(400, "username is required")
+    # _handle_id doesn't use room_id for anything but posting its own
+    # confirmation notice -- any room this session's widget happens to be
+    # in works; it's never consulted to resolve WHICH identity, unlike
+    # _handle_set below.
+    return await _dispatch(request, body.get("room_id", ""), _handle_id, argument=username)
+
+
+@router.get("/widget/api/identities/settings")
+async def widget_identity_settings(request: Request, username: str) -> JSONResponse:
+    """One identity's own profile-level settings + public info, keyed by
+    username rather than room -- the Identity tab isn't tied to any one
+    Profile Room the way the Home tab's room-kind view is."""
+    matrix_user_id = _session_user(request)
+    repository = request.app.state.repository
+    config = request.app.state.config
+    actor = await repository.get_local_actor(username)
+    if actor is None or actor.matrix_user_id != matrix_user_id:
+        raise HTTPException(404, "No such identity on this account")
+    settings = await get_effective_settings(repository, actor.username, "profile")
+    return JSONResponse(
+        {
+            "username": actor.username,
+            "display_name": actor.display_name,
+            "handle": f"@{actor.username}@{config.bridge.domain}",
+            "public_url": actor_url(config.bridge.public_base_url, actor.username),
+            "room_id": actor.room_id,
+            "hide_followers": settings.get("hide_followers", False),
+            "hide_following": settings.get("hide_following", False),
+            "discoverable": settings.get("discoverable", True),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # -- actions -------------------------------------------------------------------
@@ -447,13 +516,32 @@ async def widget_visibility(request: Request) -> JSONResponse:
     # dispatches to. See this module's own docstring on why every widget
     # action goes through bridge.commands's real handlers rather than
     # talking to the repository directly.
+    #
+    # _handle_set resolves WHICH identity from room context alone (see
+    # _resolve_owned_identity in bridge.commands) -- it has no explicit
+    # selector argument the way _handle_id does. For a multi-identity
+    # account the Identity tab isn't bound to any one identity's own room,
+    # so an optional `username` here is resolved to THAT identity's own
+    # Profile Room and used as the dispatch room_id instead of the widget's
+    # embedding room -- a legitimate use of the exact same room-ownership
+    # check _resolve_owned_identity already does, not a workaround of it.
     body = await request.json()
     which = body.get("which")
+    target_room_id = body.get("room_id", "")
+    username = body.get("username")
+    if username:
+        repository = request.app.state.repository
+        identity = await repository.get_local_actor(username)
+        if identity is not None and identity.room_id:
+            target_room_id = identity.room_id
+    if which == "discoverable":
+        value = "on" if body.get("value") else "off"
+        return await _dispatch(request, target_room_id, _handle_set, argument=f"discoverable {value}")
     if which not in ("followers", "following"):
-        raise HTTPException(400, "which must be 'followers' or 'following'")
+        raise HTTPException(400, "which must be 'followers', 'following', or 'discoverable'")
     key = "hide_followers" if which == "followers" else "hide_following"
     value = "on" if body.get("hidden") else "off"
-    return await _dispatch(request, body["room_id"], _handle_set, argument=f"{key} {value}")
+    return await _dispatch(request, target_room_id, _handle_set, argument=f"{key} {value}")
 
 
 # -- icon ----------------------------------------------------------------------
@@ -577,23 +665,72 @@ _WIDGET_HTML = r"""<!doctype html>
   a { color: var(--accent); }
   .toggle-on { background: var(--ok-bg); color: var(--ok-text); border-color: var(--ok-bg); }
 
-  /* -- tab bar ------------------------------------------------------------ */
-  #tabbar {
-    display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border);
-    background: var(--card); position: sticky; top: 0; z-index: 5; overflow-x: auto;
+  /* -- app shell: collapsible left sidebar, Haven Desktop style ----------- */
+  #shell { display: flex; min-height: 100vh; align-items: stretch; }
+  #sidebar {
+    display: flex; flex-direction: column; gap: 2px; padding: 12px 8px; width: 176px; flex-shrink: 0;
+    border-right: 1px solid var(--border); background: var(--card);
+    position: sticky; top: 0; align-self: flex-start; height: 100vh; overflow-y: auto;
+    transition: width .15s ease;
   }
-  .tab {
-    font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: none; border: none;
-    border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 12px; cursor: pointer; white-space: nowrap;
+  #shell.collapsed #sidebar { width: 56px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px; font: inherit; font-size: 13px; font-weight: 600;
+    color: var(--muted); background: none; border: none; border-radius: var(--radius-inner);
+    padding: 10px; cursor: pointer; white-space: nowrap; text-align: left; width: 100%; overflow: hidden;
   }
-  .tab:hover { background: var(--hover); color: var(--text); }
-  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .nav-item:hover { background: var(--hover); color: var(--text); }
+  .nav-item.active { background: var(--hover); color: var(--accent); }
+  .nav-item .icon { flex-shrink: 0; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+  .nav-item .label { overflow: hidden; text-overflow: ellipsis; }
+  #shell.collapsed .nav-item .label { display: none; }
+  #shell.collapsed .nav-item { justify-content: center; }
+  #sidebar-toggle { margin-top: auto; }
+  #content { padding: 16px; flex: 1; min-width: 0; max-width: 640px; }
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
+
+  /* -- post cards (timeline) ----------------------------------------------- */
+  .post-card { display: flex; gap: 12px; padding: 16px; }
+  .post-card + .post-card { border-top: 1px solid var(--border); }
+  .avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; background: var(--hover); object-fit: cover; }
+  .avatar.sm { width: 24px; height: 24px; }
+  .post-body { flex: 1; min-width: 0; }
+  .post-header { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+  .post-header .name { font-weight: 600; color: var(--text); }
+  .post-header .handle, .post-header .time { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .post-header .time { margin-left: auto; flex-shrink: 0; }
+  .boosted-by { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .post-content { font-size: 15px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
+  .post-content p { margin: 0 0 8px; }
+  .post-content p:last-child { margin-bottom: 0; }
+  .post-content a { color: var(--accent); }
+  .post-media { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 8px 0; border-radius: var(--radius-inner); overflow: hidden; }
+  .post-media img { width: 100%; max-height: 300px; object-fit: cover; display: block; background: var(--hover); }
+  .post-actions { display: flex; gap: 4px; margin-top: 8px; }
+  .post-actions button {
+    border: none; background: none; padding: 6px 8px; font-size: 12px; color: var(--muted);
+    display: flex; align-items: center; gap: 4px; border-radius: var(--radius-chip);
+  }
+  .post-actions button:hover { background: var(--hover); color: var(--text); }
+  .post-actions button.imported { color: var(--ok-text); }
+  .skel { background: var(--border); opacity: .5; border-radius: 4px; height: 12px; }
+  .skel-card { display: flex; gap: 12px; padding: 16px; }
+  .skel-card + .skel-card { border-top: 1px solid var(--border); }
+  .skel-lines { flex: 1; display: flex; flex-direction: column; gap: 8px; }
+  .account-card { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-inner); }
+  .account-card .meta { flex: 1; min-width: 0; }
+  .account-card .name { font-weight: 600; font-size: 13px; }
+  .account-card .handle { color: var(--muted); font-size: 12px; }
+  .scope-toggle { display: flex; gap: 2px; background: var(--hover); border-radius: var(--radius-inner); padding: 2px; }
+  .scope-toggle button { border: none; background: none; }
+  .scope-toggle button.active { background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 </style>
 </head>
 <body>
-  <div id="tabbar"></div>
-  <div id="content"><div id="app"><div class="spinner">Connecting&hellip;</div></div></div>
+  <div id="shell">
+    <div id="sidebar"></div>
+    <div id="content"><div id="app"><div class="spinner">Connecting&hellip;</div></div></div>
+  </div>
   <div id="toast" class="toast"></div>
 
 <script>
@@ -723,27 +860,47 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   let ctx = null;
-  const TABS = [
-    { id: "home", label: "Home" },
-    { id: "browse", label: "Browse" },
-    { id: "identity", label: "Identity" },
-    { id: "publish", label: "Publish" },
-    { id: "admin", label: "Admin" },
+  const NAV_ITEMS = [
+    { id: "home", label: "Home", icon: "\u{1F3E0}" },
+    { id: "room", label: "This Room", icon: "\u{1F9E9}" },
+    { id: "identity", label: "Identity", icon: "\u{1F464}" },
+    { id: "publish", label: "Publish", icon: "\u{1F4E1}" },
+    { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
   let currentTab = "home";
+  let sidebarCollapsed = (function () {
+    try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
+  })();
 
-  function renderTabBar() {
-    const bar = document.getElementById("tabbar");
+  function renderSidebar() {
+    const shell = document.getElementById("shell");
+    shell.classList.toggle("collapsed", sidebarCollapsed);
+    const bar = document.getElementById("sidebar");
     bar.innerHTML = "";
     if (!ctx) return;
-    TABS.forEach((t) => {
+    NAV_ITEMS.forEach((t) => {
       if (t.id === "admin" && !ctx.is_admin) return;
+      if (t.id === "publish" && !ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) return;
       bar.appendChild(el("button", {
-        class: "tab" + (t.id === currentTab ? " active" : ""),
-        text: t.label,
+        class: "nav-item" + (t.id === currentTab ? " active" : ""),
+        title: t.label,
         onclick: () => { currentTab = t.id; render(); },
-      }));
+      }, [
+        el("span", { class: "icon", text: t.icon }),
+        el("span", { class: "label", text: t.label }),
+      ]));
     });
+    bar.appendChild(el("button", {
+      id: "sidebar-toggle", class: "nav-item", title: sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
+      onclick: () => {
+        sidebarCollapsed = !sidebarCollapsed;
+        try { localStorage.setItem("fediverse-bridge-sidebar-collapsed", sidebarCollapsed ? "1" : "0"); } catch (e) {}
+        renderSidebar();
+      },
+    }, [
+      el("span", { class: "icon", text: sidebarCollapsed ? "»" : "«" }),
+      el("span", { class: "label", text: "Collapse" }),
+    ]));
   }
 
   function placeholder(app, text) {
@@ -751,19 +908,262 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   function render() {
-    renderTabBar();
+    renderSidebar();
     const app = document.getElementById("app");
     app.innerHTML = "";
     if (!ctx) return;
 
-    if (currentTab === "home") renderHome(app);
-    else if (currentTab === "browse") placeholder(app, "Browse is coming soon.");
-    else if (currentTab === "identity") placeholder(app, "Identity management is coming soon.");
+    if (currentTab === "home") renderHomeTimeline(app);
+    else if (currentTab === "room") renderRoomTab(app);
+    else if (currentTab === "identity") renderIdentityTab(app);
     else if (currentTab === "publish") placeholder(app, "Channel/community publishing is coming soon.");
     else if (currentTab === "admin") placeholder(app, "The admin panel is coming soon.");
   }
 
-  function renderHome(app) {
+  // -- Home: fediverse timeline -------------------------------------------
+
+  function timeAgo(iso) {
+    if (!iso) return "";
+    const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (diff < 60) return "now";
+    if (diff < 3600) return Math.floor(diff / 60) + "m";
+    if (diff < 86400) return Math.floor(diff / 3600) + "h";
+    if (diff < 86400 * 7) return Math.floor(diff / 86400) + "d";
+    return new Date(iso).toLocaleDateString();
+  }
+
+  function renderSkeletonCard() {
+    return el("div", { class: "skel-card" }, [
+      el("div", { class: "avatar skel" }),
+      el("div", { class: "skel-lines" }, [
+        el("div", { class: "skel", style: "width:40%" }),
+        el("div", { class: "skel", style: "width:90%" }),
+        el("div", { class: "skel", style: "width:65%" }),
+      ]),
+    ]);
+  }
+
+  function importPost(post, btn, onDone) {
+    if (btn) btn.disabled = true;
+    api("/widget/api/import", { method: "POST", body: { url: post.uri, room_id: roomId } })
+      .then(() => { toast("Imported.", true); post.already_imported = true; if (onDone) onDone(); })
+      .catch((e) => { toast(e.message, false); })
+      .finally(() => { if (btn) btn.disabled = false; });
+  }
+
+  function renderPostCard(post, onChange) {
+    const children = [];
+    if (post.boosted_by) {
+      children.push(el("div", {
+        class: "boosted-by",
+        text: "\u{1F501} " + (post.boosted_by.display_name || post.boosted_by.handle) + " boosted",
+      }));
+    }
+    const header = el("div", { class: "post-header" }, [
+      el("span", { class: "name", text: post.author.display_name }),
+      el("span", { class: "handle", text: post.author.handle }),
+      el("span", { class: "time", text: timeAgo(post.created_at) }),
+    ]);
+    const content = el("div", { class: "post-content" });
+    content.innerHTML = post.content_html || "";
+    children.push(header, content);
+    if (post.media && post.media.length) {
+      children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) =>
+        el("img", { src: m.url, alt: m.description || "", loading: "lazy" })
+      )));
+    }
+    const actions = el("div", { class: "post-actions" }, [
+      el("button", { text: "↗ View", onclick: () => window.open(post.url, "_blank", "noopener") }),
+    ]);
+    if (post.already_imported) {
+      actions.appendChild(el("button", {
+        class: "imported", text: "✓ Imported",
+        onclick: () => window.open("https://matrix.to/#/" + post.matrix_room_id, "_blank", "noopener"),
+      }));
+    } else {
+      actions.appendChild(el("button", {
+        text: "⬇ Import",
+        onclick: (e) => importPost(post, e.target, onChange),
+      }));
+    }
+    children.push(actions);
+    return el("div", { class: "post-card" }, [
+      el("img", { class: "avatar", src: post.author.avatar_url || "", alt: "" }),
+      el("div", { class: "post-body" }, children),
+    ]);
+  }
+
+  let homeState = null;
+
+  function renderHomeTimeline(app) {
+    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false };
+    const state = homeState;
+
+    const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, or a name" });
+    const searchResults = el("div", { class: "list" });
+    const domainInput = el("input", { type: "text", value: state.domain, placeholder: "instance.example (blank = your default feed)" });
+
+    function scopeBtn(label, value) {
+      return el("button", {
+        class: state.scope === value ? "active" : "", text: label,
+        onclick: () => { state.scope = value; render(); },
+      });
+    }
+
+    const controlsChildren = [
+      el("h2", { text: "Browse the fediverse" }),
+      el("div", { class: "row" }, [
+        searchInput,
+        primaryButton("Search", async () => {
+          const q = searchInput.value.trim();
+          if (!q) return;
+          searchResults.innerHTML = "";
+          try {
+            const data = await api("/widget/api/browse/search?q=" + encodeURIComponent(q) + "&domain=" + encodeURIComponent(state.domain || ctx.domain));
+            if (!data.accounts.length) { searchResults.appendChild(el("div", { class: "muted", text: "No accounts found." })); return; }
+            data.accounts.forEach((a) => {
+              searchResults.appendChild(el("div", { class: "account-card" }, [
+                el("img", { class: "avatar sm", src: a.avatar_url || "", alt: "" }),
+                el("div", { class: "meta" }, [
+                  el("div", { class: "name", text: a.display_name }),
+                  el("div", { class: "handle", text: a.handle }),
+                ]),
+                plainButton("Follow", (e) => doAction("/widget/api/follow", { handle: a.handle }, e.target)),
+              ]));
+            });
+          } catch (e) { toast(e.message, false); }
+        }),
+      ]),
+      searchResults,
+      el("div", { class: "row" }, [
+        domainInput,
+        el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
+        primaryButton("Browse", () => {
+          const d = domainInput.value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
+          state.mode = d ? "instance" : "home";
+          state.domain = d;
+          state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false;
+          render();
+        }),
+      ]),
+    ];
+    if (state.mode === "instance") {
+      controlsChildren.push(el("div", { class: "sub" }, [
+        el("span", { text: "Browsing " + state.domain + " (" + state.scope + ") — " }),
+        el("a", {
+          href: "#", text: "back to your default feed",
+          onclick: (e) => { e.preventDefault(); state.mode = "home"; state.domain = ""; state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; render(); },
+        }),
+      ]));
+    }
+    app.appendChild(el("div", { class: "card" }, controlsChildren));
+
+    const feed = el("div", { class: "card" });
+    app.appendChild(feed);
+    const sentinel = el("div");
+    app.appendChild(sentinel);
+
+    function renderFeedList() {
+      feed.innerHTML = "";
+      if (!state.posts.length && !state.loading) {
+        feed.appendChild(el("div", {
+          class: "placeholder",
+          text: state.unsupported
+            ? "Browsing isn't available there (it doesn't run Mastodon-compatible software, or public preview is turned off)."
+            : "Nothing to show yet.",
+        }));
+        return;
+      }
+      state.posts.forEach((p) => feed.appendChild(renderPostCard(p, renderFeedList)));
+      if (state.loading) { for (let i = 0; i < 3; i++) feed.appendChild(renderSkeletonCard()); }
+    }
+
+    async function loadMore() {
+      if (state.loading || state.done) return;
+      state.loading = true;
+      renderFeedList();
+      try {
+        let data;
+        if (state.mode === "home") {
+          data = await api("/widget/api/browse/home?max_id_map=" + encodeURIComponent(state.homeCursorMap || ""));
+          state.homeCursorMap = data.next_max_id_map || "";
+          state.done = !data.next_max_id_map;
+          state.unsupported = !data.supported;
+        } else {
+          data = await api(
+            "/widget/api/browse/timeline?domain=" + encodeURIComponent(state.domain) + "&scope=" + state.scope +
+            (state.cursor ? "&max_id=" + encodeURIComponent(state.cursor) : "")
+          );
+          state.cursor = data.next_max_id || "";
+          state.done = !data.next_max_id;
+          state.unsupported = !data.supported;
+        }
+        state.posts = state.posts.concat(data.posts);
+      } catch (e) {
+        state.done = true;
+      } finally {
+        state.loading = false;
+        renderFeedList();
+      }
+    }
+
+    renderFeedList();
+    if (!state.posts.length) loadMore();
+
+    if (window.__timelineObserver) window.__timelineObserver.disconnect();
+    window.__timelineObserver = new IntersectionObserver((entries) => { if (entries[0].isIntersecting) loadMore(); });
+    window.__timelineObserver.observe(sentinel);
+  }
+
+  // -- Identity -------------------------------------------------------------
+
+  function renderIdentityTab(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "Your identities" }), list]));
+
+    api("/widget/api/identities").then((data) => {
+      list.innerHTML = "";
+      if (!data.identities.length) {
+        list.appendChild(el("div", { class: "muted", text: "No identity yet." }));
+        app.appendChild(el("div", { class: "card" }, [
+          primaryButton("Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
+        ]));
+        return;
+      }
+      data.identities.forEach((idn) => {
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("span", { text: (idn.display_name || idn.handle) + (idn.is_active ? "  • active" : "") }),
+          idn.is_active ? null : plainButton("Make active", (e) => doAction("/widget/api/identities/switch", { username: idn.username }, e.target)),
+        ].filter(Boolean)));
+      });
+      const active = data.identities.find((i) => i.is_active) || data.identities[0];
+      api("/widget/api/identities/settings?username=" + encodeURIComponent(active.username)).then((s) => {
+        app.appendChild(el("div", { class: "card" }, [
+          el("h2", { text: "Settings for " + s.handle }),
+          el("div", { class: "kv" }, [el("span", { text: "Display name" }), el("span", { text: s.display_name || "—" })]),
+          el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]),
+          el("div", { class: "row" }, [
+            toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) =>
+              doAction("/widget/api/visibility", { which: "followers", hidden: !s.hide_followers, username: s.username }, e.target)),
+            toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) =>
+              doAction("/widget/api/visibility", { which: "following", hidden: !s.hide_following, username: s.username }, e.target)),
+            toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) =>
+              doAction("/widget/api/visibility", { which: "discoverable", value: !s.discoverable, username: s.username }, e.target)),
+          ]),
+        ]));
+      }).catch(() => {});
+      if (ctx.custom_identities_enabled) {
+        app.appendChild(el("div", { class: "card" }, [
+          el("h2", { text: "Add another identity" }),
+          el("div", { class: "sub", text: "Only works inside a room you want to become that identity's own Profile Room -- switch to the \"This Room\" tab there and use \"Create profile\"." }),
+        ]));
+      }
+    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  // -- This Room (room-kind actions, unchanged from before) -----------------
+
+  function renderRoomTab(app) {
     app.appendChild(el("div", { class: "card" }, [
       el("h1", {}, [
         el("span", { text: "\u{1F30D} Fediverse Bridge" }),

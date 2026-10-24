@@ -337,6 +337,14 @@ class BridgeSection:
     # custom_identities_enabled is on. A bridge admin (see bridge.admins /
     # use_synapse_admin_api) is never subject to this cap.
     max_identities_per_user: int = 5
+    # Instance domain(s) whose "whole known network" (federated) timeline
+    # feeds the widget's own default Home view -- e.g. ["mastodon.social"],
+    # or several merged together by recency. Only instances running
+    # Mastodon-API-compatible software (Mastodon, Pleroma/Akkoma, GoToSocial,
+    # Misskey-family) can supply one; this bridge's own AS2-only outbox has
+    # no site-wide timeline concept to browse at all. Defaults to just this
+    # bridge's own domain if left unset.
+    default_timeline_domains: list[str] = field(default_factory=list)
     # The character(s) that start a bot command in chat (";follow ...",
     # ";help", and so on) -- see bridge.commands._COMMAND_PREFIX /
     # bridge.commands.configure_command_prefix, which applies this once at
@@ -604,6 +612,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
         custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
+        default_timeline_domains=[d for d in (bridge_raw.get("default_timeline_domains") or []) if d and d.strip()],
         command_prefix=command_prefix,
         other_bot_prefixes=other_bot_prefixes,
         other_bridge_users=other_bridge_users,
