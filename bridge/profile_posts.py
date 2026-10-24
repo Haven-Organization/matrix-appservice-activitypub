@@ -62,6 +62,7 @@ from bridge.media import (
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.note_mirroring import (
     PROFILE_BANNER_STATE_TYPE,
+    SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     build_repost_note_content,
@@ -394,6 +395,22 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     # permalink text as a new post in the owner's name -- see
     # _maybe_suppress_msc4501_repost_record for the full reasoning.
     relates_to = content.get(SOCIAL_RELATES_TO_FIELD)
+
+    # A genuine reply typed from inside the Profile Room itself (e.g.
+    # hitting "reply" on a ghost's mirrored message there) previously fell
+    # straight through to the ordinary fresh-post path below with no
+    # in_reply_to ever set -- federating as a context-free standalone post
+    # with no sign it was ever a reply to anything (confirmed live
+    # 2026-10-24, a reply to a ghost's post appearing as an unrelated top-
+    # level post on a remote instance). The Profile Room was never a
+    # supported place to compose a real threaded reply from -- that's what
+    # a Remote User Room's own conversation is for, see bridge.reply_bridge
+    # -- and the user explicitly doesn't want these sent out at all, so
+    # this suppresses them rather than building a second, partial reply-
+    # threading pipeline here.
+    if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPLY:
+        return True
+
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
         social_repost_body = (content.get("body") or "").strip()
         if await _maybe_suppress_msc4501_repost_record(
