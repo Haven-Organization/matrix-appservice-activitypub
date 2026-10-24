@@ -33,6 +33,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    InstanceLoginRecord,
     LemmyCommunityRecord,
     LemmyCommunityRoom,
     PeerTubeChannelRecord,
@@ -88,6 +89,24 @@ CREATE TABLE IF NOT EXISTS third_party_allowlist (
     granted_by TEXT NOT NULL,
     granted_at TEXT NOT NULL,
     PRIMARY KEY (rule_type, value)
+);
+
+-- One bridge user's login to a remote instance (widget Browse feature --
+-- see InstanceLoginRecord's own docstring). auth_method is 'oauth' or
+-- 'password'. refresh_token/expires_at are NULL for a non-expiring token.
+CREATE TABLE IF NOT EXISTS instance_logins (
+    matrix_user_id TEXT NOT NULL,
+    instance_domain TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    token_type TEXT NOT NULL DEFAULT 'Bearer',
+    scope TEXT NOT NULL DEFAULT '',
+    account_handle TEXT NOT NULL DEFAULT '',
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (matrix_user_id, instance_domain)
 );
 
 CREATE TABLE IF NOT EXISTS profile_room_history (
@@ -1509,6 +1528,93 @@ class SqliteActorRepository:
 
     async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
         return await self._run(self._is_third_party_allowed, mxid, homeserver, room_id)
+
+    # -- instance logins -------------------------------------------------------
+
+    def _save_instance_login(self, record: InstanceLoginRecord) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO instance_logins (
+                matrix_user_id, instance_domain, auth_method, access_token,
+                refresh_token, token_type, scope, account_handle, expires_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(matrix_user_id, instance_domain) DO UPDATE SET
+                auth_method=excluded.auth_method,
+                access_token=excluded.access_token,
+                refresh_token=excluded.refresh_token,
+                token_type=excluded.token_type,
+                scope=excluded.scope,
+                account_handle=excluded.account_handle,
+                expires_at=excluded.expires_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                record.matrix_user_id,
+                record.instance_domain,
+                record.auth_method,
+                record.access_token,
+                record.refresh_token,
+                record.token_type,
+                record.scope,
+                record.account_handle,
+                record.expires_at,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+        self._conn.commit()
+
+    async def save_instance_login(self, record: InstanceLoginRecord) -> None:
+        await self._run(self._save_instance_login, record)
+
+    @staticmethod
+    def _row_to_instance_login(row: sqlite3.Row) -> InstanceLoginRecord:
+        return InstanceLoginRecord(
+            matrix_user_id=row["matrix_user_id"],
+            instance_domain=row["instance_domain"],
+            auth_method=row["auth_method"],
+            access_token=row["access_token"],
+            refresh_token=row["refresh_token"],
+            token_type=row["token_type"],
+            scope=row["scope"],
+            account_handle=row["account_handle"],
+            expires_at=row["expires_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _get_instance_login(self, matrix_user_id: str, instance_domain: str) -> InstanceLoginRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM instance_logins WHERE matrix_user_id = ? AND instance_domain = ?",
+            (matrix_user_id, instance_domain),
+        ).fetchone()
+        return self._row_to_instance_login(row) if row is not None else None
+
+    async def get_instance_login(
+        self, matrix_user_id: str, instance_domain: str
+    ) -> InstanceLoginRecord | None:
+        return await self._run(self._get_instance_login, matrix_user_id, instance_domain)
+
+    def _list_instance_logins(self, matrix_user_id: str) -> list[InstanceLoginRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM instance_logins WHERE matrix_user_id = ? ORDER BY instance_domain",
+            (matrix_user_id,),
+        ).fetchall()
+        return [self._row_to_instance_login(row) for row in rows]
+
+    async def list_instance_logins(self, matrix_user_id: str) -> list[InstanceLoginRecord]:
+        return await self._run(self._list_instance_logins, matrix_user_id)
+
+    def _delete_instance_login(self, matrix_user_id: str, instance_domain: str) -> None:
+        self._conn.execute(
+            "DELETE FROM instance_logins WHERE matrix_user_id = ? AND instance_domain = ?",
+            (matrix_user_id, instance_domain),
+        )
+        self._conn.commit()
+
+    async def delete_instance_login(self, matrix_user_id: str, instance_domain: str) -> None:
+        await self._run(self._delete_instance_login, matrix_user_id, instance_domain)
 
     # -- remote actor rooms --------------------------------------------------
 

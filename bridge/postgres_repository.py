@@ -34,6 +34,7 @@ from bridge.repository import (
     GhostProfile,
     GuildChannel,
     GuildMembership,
+    InstanceLoginRecord,
     LemmyCommunityRecord,
     LemmyCommunityRoom,
     PeerTubeChannelRecord,
@@ -96,6 +97,28 @@ _SCHEMA_STATEMENTS = [
         granted_by TEXT NOT NULL,
         granted_at TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (rule_type, value)
+    )
+    """,
+    # One bridge user's login to a remote instance (widget Browse feature
+    # -- see InstanceLoginRecord's own docstring). Timestamps stored as
+    # plain TEXT (ISO 8601, written by the application) rather than
+    # TIMESTAMPTZ, matching local_actors.created_at's existing convention
+    # -- the value always originates as a Python isoformat() string, so
+    # there's no round-trip conversion to get right either way.
+    """
+    CREATE TABLE IF NOT EXISTS instance_logins (
+        matrix_user_id TEXT NOT NULL,
+        instance_domain TEXT NOT NULL,
+        auth_method TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        token_type TEXT NOT NULL DEFAULT 'Bearer',
+        scope TEXT NOT NULL DEFAULT '',
+        account_handle TEXT NOT NULL DEFAULT '',
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (matrix_user_id, instance_domain)
     )
     """,
     """
@@ -1147,6 +1170,77 @@ class PostgresActorRepository:
             if row is not None:
                 return True
         return False
+
+    # -- instance logins -------------------------------------------------------
+
+    async def save_instance_login(self, record: InstanceLoginRecord) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO instance_logins (
+                matrix_user_id, instance_domain, auth_method, access_token,
+                refresh_token, token_type, scope, account_handle, expires_at,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (matrix_user_id, instance_domain) DO UPDATE SET
+                auth_method = EXCLUDED.auth_method,
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                token_type = EXCLUDED.token_type,
+                scope = EXCLUDED.scope,
+                account_handle = EXCLUDED.account_handle,
+                expires_at = EXCLUDED.expires_at,
+                updated_at = EXCLUDED.updated_at
+            """,
+            record.matrix_user_id,
+            record.instance_domain,
+            record.auth_method,
+            record.access_token,
+            record.refresh_token,
+            record.token_type,
+            record.scope,
+            record.account_handle,
+            record.expires_at,
+            record.created_at,
+            record.updated_at,
+        )
+
+    @staticmethod
+    def _row_to_instance_login(row) -> InstanceLoginRecord:
+        return InstanceLoginRecord(
+            matrix_user_id=row["matrix_user_id"],
+            instance_domain=row["instance_domain"],
+            auth_method=row["auth_method"],
+            access_token=row["access_token"],
+            refresh_token=row["refresh_token"],
+            token_type=row["token_type"],
+            scope=row["scope"],
+            account_handle=row["account_handle"],
+            expires_at=row["expires_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def get_instance_login(
+        self, matrix_user_id: str, instance_domain: str
+    ) -> InstanceLoginRecord | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM instance_logins WHERE matrix_user_id = $1 AND instance_domain = $2",
+            matrix_user_id, instance_domain,
+        )
+        return self._row_to_instance_login(row) if row else None
+
+    async def list_instance_logins(self, matrix_user_id: str) -> list[InstanceLoginRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM instance_logins WHERE matrix_user_id = $1 ORDER BY instance_domain",
+            matrix_user_id,
+        )
+        return [self._row_to_instance_login(row) for row in rows]
+
+    async def delete_instance_login(self, matrix_user_id: str, instance_domain: str) -> None:
+        await self._pool.execute(
+            "DELETE FROM instance_logins WHERE matrix_user_id = $1 AND instance_domain = $2",
+            matrix_user_id, instance_domain,
+        )
 
     # -- remote actor rooms --------------------------------------------------
 

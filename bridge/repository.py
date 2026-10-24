@@ -167,6 +167,45 @@ class ThirdPartyAllowRecord:
 
 
 @dataclass(frozen=True)
+class InstanceLoginRecord:
+    """One bridge user's login to a remote Mastodon-API-compatible
+    instance, used by the widget's Browse feature to view timelines/
+    profiles that instance requires authentication for (see
+    ``bridge/instance_auth.py``).
+
+    Keyed by ``(matrix_user_id, instance_domain)`` -- a bridge user can be
+    logged into any number of different instances, one login each. Looking
+    this up by the bridge's own ``matrix_user_id`` (rather than a browser
+    cookie) is deliberate: it's already how every widget session resolves
+    identity (``_session_user``'s OpenID-verified Matrix session), so a
+    login done once is available from any device/browser the user opens
+    the widget from, not just the one that completed the OAuth flow.
+
+    ``auth_method`` is ``"oauth"`` or ``"password"`` (the password grant --
+    offered as a fallback since several instances still support it, but
+    OAuth is steered towards first wherever available). ``refresh_token``/
+    ``expires_at`` are ``None`` when the instance issued a non-expiring
+    token (the common case for Mastodon's own authorization-code grant).
+    Tokens are stored in plaintext, consistent with this repository's
+    existing handling of ``ActorRecord.private_key_pem`` -- the database
+    file/connection's own access control is the trust boundary here, not a
+    separate application-level encryption layer.
+    """
+
+    matrix_user_id: str
+    instance_domain: str
+    auth_method: str
+    access_token: str
+    refresh_token: str | None
+    token_type: str
+    scope: str
+    account_handle: str
+    expires_at: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class RemoteActorRoom:
     """Maps a remote (fediverse) actor to the Matrix "Remote User Room" mirroring them.
 
@@ -652,6 +691,32 @@ class ActorRepository(Protocol):
         ``bridge.commands.is_third_party_still_allowed``) call, so a
         revoked grant takes effect everywhere at once, live, with nothing
         cached."""
+        ...
+
+    async def save_instance_login(self, record: InstanceLoginRecord) -> None:
+        """Upsert a login for ``(record.matrix_user_id,
+        record.instance_domain)`` -- replaces any existing login to the
+        same instance by the same bridge user (re-logging in, or
+        refreshing a token, both just call this again)."""
+        ...
+
+    async def get_instance_login(
+        self, matrix_user_id: str, instance_domain: str
+    ) -> InstanceLoginRecord | None:
+        """The stored login for this bridge user at this instance, if any.
+        ``bridge.widget_browse`` checks this before an unauthenticated
+        timeline/search/profile call to decide whether to attach
+        ``Authorization: Bearer <access_token>``."""
+        ...
+
+    async def list_instance_logins(self, matrix_user_id: str) -> list[InstanceLoginRecord]:
+        """Every instance this bridge user is currently logged into --
+        backs the widget's "manage your logins" list."""
+        ...
+
+    async def delete_instance_login(self, matrix_user_id: str, instance_domain: str) -> None:
+        """Log out of (or forget, if the instance itself is unreachable to
+        properly revoke) one instance. No-op if no such login exists."""
         ...
 
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
@@ -1344,6 +1409,7 @@ class InMemoryActorRepository:
         self._ghost_chat_room_history: dict[str, tuple[str, str]] = {}  # room_id -> (actor_id, matrix_user_id)
         self._ghost_chat_room_local_username: dict[str, str] = {}  # room_id -> local_username
         self._third_party_allows: dict[tuple[str, str], ThirdPartyAllowRecord] = {}
+        self._instance_logins: dict[tuple[str, str], InstanceLoginRecord] = {}
         self._pending_guild_follows: dict[str, PendingGuildFollow] = {}
         self._guild_memberships: dict[tuple[str, str], GuildMembership] = {}
         self._guild_spaces: dict[str, str] = {}
@@ -1594,6 +1660,23 @@ class InMemoryActorRepository:
         if homeserver and ("homeserver", homeserver) in self._third_party_allows:
             return True
         return False
+
+    async def save_instance_login(self, record: InstanceLoginRecord) -> None:
+        self._instance_logins[(record.matrix_user_id, record.instance_domain)] = record
+
+    async def get_instance_login(
+        self, matrix_user_id: str, instance_domain: str
+    ) -> InstanceLoginRecord | None:
+        return self._instance_logins.get((matrix_user_id, instance_domain))
+
+    async def list_instance_logins(self, matrix_user_id: str) -> list[InstanceLoginRecord]:
+        return sorted(
+            (r for (uid, _), r in self._instance_logins.items() if uid == matrix_user_id),
+            key=lambda r: r.instance_domain,
+        )
+
+    async def delete_instance_login(self, matrix_user_id: str, instance_domain: str) -> None:
+        self._instance_logins.pop((matrix_user_id, instance_domain), None)
 
     async def is_blocked(self, username: str, remote_actor_id: str) -> bool:
         return remote_actor_id in self._blocked.get(username, ())
