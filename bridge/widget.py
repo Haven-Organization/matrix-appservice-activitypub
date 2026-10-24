@@ -940,7 +940,8 @@ _WIDGET_HTML = r"""<!doctype html>
   .post-content a { color: var(--accent); }
   img.emoji { width: 1.2em; height: 1.2em; vertical-align: -0.2em; object-fit: contain; }
   .post-media { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 8px 0; border-radius: var(--radius-inner); overflow: hidden; }
-  .post-media img { width: 100%; max-height: 300px; object-fit: cover; display: block; background: var(--hover); }
+  .post-media img, .post-media video { width: 100%; max-height: 300px; object-fit: cover; display: block; background: var(--hover); }
+  .post-media-audio { width: 100%; grid-column: 1 / -1; }
   .post-counts { display: flex; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
   .post-counts .count-item { display: flex; align-items: center; gap: 4px; }
   .post-reactions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
@@ -950,12 +951,19 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .reaction-chip img.emoji { width: 14px; height: 14px; }
   .post-actions { display: flex; gap: 4px; margin-top: 8px; }
-  .post-actions button {
+  .post-actions button, .post-actions a {
     border: none; background: none; padding: 6px 8px; font-size: 12px; color: var(--muted);
     display: flex; align-items: center; gap: 4px; border-radius: var(--radius-chip);
+    text-decoration: none; cursor: pointer;
   }
-  .post-actions button:hover { background: var(--hover); color: var(--text); }
-  .post-actions button.imported { color: var(--ok-text); }
+  .post-actions button:hover, .post-actions a:hover { background: var(--hover); color: var(--text); }
+  .post-actions button.imported, .post-actions a.imported { color: var(--ok-text); }
+  a.link-button {
+    font: inherit; font-size: 13px; font-weight: 600; border: 1px solid var(--border); background: var(--card);
+    color: var(--text); border-radius: var(--radius-inner); padding: 8px 14px; cursor: pointer;
+    display: inline-block; text-decoration: none;
+  }
+  a.link-button:hover { background: var(--hover); }
   .post-card.open-thread { cursor: pointer; }
   .post-card.thread-ancestor { opacity: .8; }
   .post-card.thread-focus { background: var(--hover); border-radius: var(--radius-card); cursor: default; }
@@ -1068,11 +1076,14 @@ _WIDGET_HTML = r"""<!doctype html>
   if (theme.indexOf("dark") !== -1) document.documentElement.setAttribute("data-theme", "dark");
   else if (theme.indexOf("light") !== -1) document.documentElement.setAttribute("data-theme", "light");
 
-  // -- Matrix Widget API (postMessage) -- minimal hand-rolled client, just
-  // enough to do the OpenID handshake. No other widget capability is ever
-  // requested: every bridge action goes through our own backend API
-  // (authenticated via the verified OpenID identity), not through the
-  // widget's own room read/write capabilities.
+  // -- Matrix Widget API (postMessage) -- minimal hand-rolled client.
+  // Every bridge action still goes through our own backend API
+  // (authenticated via the verified OpenID identity), never through a
+  // widget room read/write capability -- the one capability this widget
+  // DOES request, MSC2931 navigate, only ever lets the host jump to a
+  // matrix.to link on the user's behalf (see matrixToUrl's click
+  // handling below), nothing else.
+  const NAVIGATE_CAPABILITY = "org.matrix.msc2931.navigate";
   let reqCounter = 0;
   const pending = {};
 
@@ -1088,7 +1099,7 @@ _WIDGET_HTML = r"""<!doctype html>
       return;
     }
     if (msg.api === "toWidget" && msg.action === "capabilities") {
-      window.parent.postMessage(Object.assign({}, msg, { response: { capabilities: [] } }), "*");
+      window.parent.postMessage(Object.assign({}, msg, { response: { capabilities: [NAVIGATE_CAPABILITY] } }), "*");
       return;
     }
     if (msg.api === "toWidget" && msg.action === "openid_credentials") {
@@ -1114,6 +1125,45 @@ _WIDGET_HTML = r"""<!doctype html>
       window.parent.postMessage({ api: "fromWidget", widgetId, requestId, action, data: data || {} }, "*");
     });
   }
+
+  // MSC2931 navigate -- resolves {} on success, {error:{...}} if the host
+  // rejected it (capability not approved, or it just doesn't support the
+  // action). sendFromWidget's own Promise never rejects and never times
+  // out on its own, so a host that silently ignores an action it doesn't
+  // recognize would otherwise hang this forever -- the timeout here is
+  // what lets the caller fall back to opening a new window instead.
+  function navigateViaWidgetApi(uri) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ error: { message: "timed out" } });
+      }, 2000);
+      sendFromWidget(NAVIGATE_CAPABILITY, { uri }).then((response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(response);
+      });
+    });
+  }
+
+  // One delegated listener for every matrix.to link in the widget (post
+  // cards' "Imported" badge, "Manage in room" on Publish, ...) instead of
+  // wiring each one individually -- asks the host to jump straight to it
+  // (room, or room+event when there is one) via MSC2931 navigate, falling
+  // back to opening it in a new browser tab/window exactly as before if
+  // the host doesn't support/approve navigate or the call times out.
+  document.addEventListener("click", (e) => {
+    const anchor = e.target.closest('a[href^="https://matrix.to/#"]');
+    if (!anchor) return;
+    e.preventDefault();
+    const uri = anchor.href;
+    navigateViaWidgetApi(uri).then((response) => {
+      if (!response || response.error) window.open(uri, "_blank", "noopener");
+    });
+  });
 
   let openIdResolve = null;
 
@@ -1229,6 +1279,20 @@ _WIDGET_HTML = r"""<!doctype html>
     if (nameHtml) node.innerHTML = nameHtml; else node.textContent = plain;
     if (onclick) node.addEventListener("click", onclick);
     return node;
+  }
+
+  // roomId/eventId go straight into the URL fragment per the matrix.to
+  // spec -- encodeURIComponent each part separately (not the URL as a
+  // whole) so a literal "/" inside, say, a room alias can't be confused
+  // with the roomId/eventId separator.
+  function matrixToUrl(roomId, eventId) {
+    let url = "https://matrix.to/#/" + encodeURIComponent(roomId);
+    if (eventId) url += "/" + encodeURIComponent(eventId);
+    return url;
+  }
+
+  function linkButton(label, href) {
+    return el("a", { class: "link-button", text: label, href: href, target: "_blank", rel: "noopener" });
   }
 
   let ctx = null;
@@ -1491,9 +1555,11 @@ _WIDGET_HTML = r"""<!doctype html>
     content.innerHTML = post.content_html || "";
     children.push(header, content);
     if (post.media && post.media.length) {
-      children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) =>
-        el("img", { src: m.url, alt: m.description || "", loading: "lazy" })
-      )));
+      children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) => {
+        if (m.type === "video") return el("video", { src: m.url, controls: "", preload: "metadata" });
+        if (m.type === "audio") return el("audio", { class: "post-media-audio", src: m.url, controls: "" });
+        return el("img", { src: m.url, alt: m.description || "", loading: "lazy" });
+      })));
     }
     if (focused) {
       children.push(el("div", { class: "post-timestamp-full", text: fullDateTime(post.created_at) }));
@@ -1514,9 +1580,15 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     const actions = el("div", { class: "post-actions" });
     if (post.already_imported) {
-      actions.appendChild(el("button", {
+      // A real <a>, not a button+window.open -- the document-level
+      // matrix.to click listener (MSC2931 navigate) only intercepts
+      // actual anchor clicks; the post-card's own click-to-thread
+      // handler already ignores anything matching closest("a"), so this
+      // needs no onclick of its own at all.
+      actions.appendChild(el("a", {
         class: "imported", text: "✓ Imported",
-        onclick: (e) => { e.stopPropagation(); window.open("https://matrix.to/#/" + post.matrix_room_id, "_blank", "noopener"); },
+        href: matrixToUrl(post.matrix_room_id, post.matrix_event_id),
+        target: "_blank", rel: "noopener",
       }));
     } else {
       actions.appendChild(el("button", {
@@ -2211,7 +2283,7 @@ _WIDGET_HTML = r"""<!doctype html>
       data.channels.forEach((c) => {
         list.appendChild(el("div", { class: "list-item" }, [
           el("span", { text: c.display_name || c.username }),
-          plainButton("Manage in room", () => window.open("https://matrix.to/#/" + c.room_id, "_blank", "noopener")),
+          linkButton("Manage in room", matrixToUrl(c.room_id, null)),
         ]));
       });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
@@ -2229,7 +2301,7 @@ _WIDGET_HTML = r"""<!doctype html>
       data.communities.forEach((c) => {
         list.appendChild(el("div", { class: "list-item" }, [
           el("span", { text: c.display_name || c.username }),
-          plainButton("Manage in room", () => window.open("https://matrix.to/#/" + c.room_id, "_blank", "noopener")),
+          linkButton("Manage in room", matrixToUrl(c.room_id, null)),
         ]));
       });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
