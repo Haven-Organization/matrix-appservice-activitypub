@@ -846,7 +846,7 @@ _WIDGET_HTML = r"""<!doctype html>
   button:not(:disabled):hover { background: var(--hover); }
   button.primary:not(:disabled):hover { filter: brightness(1.08); }
   button:not(:disabled):active { transform: translateY(1px); }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], input[type=password], select {
     font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
     border-radius: var(--radius-inner); padding: 8px 10px; flex: 1; min-width: 120px;
   }
@@ -927,6 +927,39 @@ _WIDGET_HTML = r"""<!doctype html>
   .scope-toggle { display: flex; gap: 2px; background: var(--hover); border-radius: var(--radius-inner); padding: 2px; }
   .scope-toggle button { border: none; background: none; }
   .scope-toggle button.active { background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+
+  /* -- sidebar identity card ------------------------------------------------ */
+  .identity-card {
+    display: flex; align-items: center; gap: 8px; padding: 8px; margin-top: auto;
+    border-radius: var(--radius-inner); cursor: pointer; position: relative; width: 100%;
+    border: none; background: none; text-align: left;
+  }
+  .identity-card:hover { background: var(--hover); }
+  .identity-card .avatar { width: 28px; height: 28px; }
+  .identity-meta { flex: 1; min-width: 0; overflow: hidden; }
+  .identity-meta .name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .identity-meta .handle { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #shell.collapsed .identity-meta, #shell.collapsed .identity-dropdown-btn { display: none; }
+  #shell.collapsed .identity-card { justify-content: center; }
+  .identity-dropdown-btn {
+    border: none; background: none; color: var(--muted); padding: 4px; cursor: pointer; font-size: 12px; flex-shrink: 0;
+  }
+  .identity-dropdown {
+    position: absolute; bottom: 100%; left: 8px; right: 8px; margin-bottom: 4px;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-inner);
+    box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px; z-index: 20;
+  }
+  #shell.collapsed .identity-dropdown { left: 4px; right: auto; width: 200px; }
+
+  /* -- modals (account profile, my profile, following list, password login) */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center;
+    justify-content: center; z-index: 50; padding: 16px;
+  }
+  .modal-backdrop .card { max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; margin-bottom: 0; }
+  .profile-banner { width: 100%; max-height: 140px; object-fit: cover; border-radius: var(--radius-inner); margin-bottom: 8px; }
+  .modal-close { border: none; background: none; color: var(--muted); font-size: 16px; padding: 4px 8px; cursor: pointer; }
+  .clickable { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -1066,14 +1099,105 @@ _WIDGET_HTML = r"""<!doctype html>
   const NAV_ITEMS = [
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
     { id: "room", label: "This Room", icon: "\u{1F9E9}" },
-    { id: "identity", label: "Identity", icon: "\u{1F464}" },
     { id: "publish", label: "Publish", icon: "\u{1F4E1}" },
+    { id: "settings", label: "Settings", icon: "\u{2699}️" },
     { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
   let currentTab = "home";
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
+
+  // -- modal ------------------------------------------------------------------
+
+  function openModal(contentNode) {
+    closeModal();
+    const backdrop = el("div", {
+      id: "modal-backdrop", class: "modal-backdrop",
+      onclick: (e) => { if (e.target.id === "modal-backdrop") closeModal(); },
+    }, [contentNode]);
+    document.body.appendChild(backdrop);
+  }
+  function closeModal() {
+    const existing = document.getElementById("modal-backdrop");
+    if (existing) existing.remove();
+  }
+
+  // -- identity (sidebar card + "My Profile") --------------------------------
+
+  let identityState = { identities: [], active: null };
+
+  async function loadIdentityState() {
+    if (!ctx || !ctx.has_profile) { identityState = { identities: [], active: null }; return; }
+    const data = await api("/widget/api/identities");
+    identityState.identities = data.identities;
+    const active = data.identities.find((i) => i.is_active) || data.identities[0];
+    identityState.active = active ? await api("/widget/api/identities/settings?username=" + encodeURIComponent(active.username)) : null;
+  }
+
+  let identityDropdownOpen = false;
+
+  function renderIdentityCard(bar) {
+    if (!ctx) return;
+    if (!ctx.has_profile) {
+      bar.appendChild(el("button", {
+        class: "identity-card", title: "Create your fediverse profile",
+        onclick: (e) => { e.stopPropagation(); createNewIdentity(""); },
+      }, [
+        el("span", { class: "icon", text: "\u{2795}" }),
+        el("div", { class: "identity-meta" }, [el("div", { class: "name", text: "Create profile" })]),
+      ]));
+      return;
+    }
+    const active = identityState.active;
+    const card = el("button", {
+      class: "identity-card", title: active ? active.handle : "",
+      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
+    }, [
+      el("img", { class: "avatar", src: (active && active.icon_url) || "", alt: "" }),
+      el("div", { class: "identity-meta" }, [
+        el("div", { class: "name", text: active ? (active.display_name || active.handle) : "…" }),
+        el("div", { class: "handle muted", text: active ? active.handle : "" }),
+      ]),
+      el("span", {
+        class: "identity-dropdown-btn", text: "⌄",
+        onclick: (e) => { e.stopPropagation(); identityDropdownOpen = !identityDropdownOpen; renderSidebar(); },
+      }),
+    ]);
+    if (identityDropdownOpen) {
+      const pop = el("div", { class: "identity-dropdown" });
+      identityState.identities.filter((i) => !i.is_active).forEach((i) => {
+        pop.appendChild(el("button", {
+          class: "nav-item", text: i.display_name || i.handle,
+          onclick: () => {
+            identityDropdownOpen = false;
+            api("/widget/api/identities/switch", { method: "POST", body: { room_id: roomId, username: i.username } })
+              .then(() => loadContext()).catch((e) => toast(e.message, false));
+          },
+        }));
+      });
+      if (ctx.custom_identities_enabled) {
+        pop.appendChild(el("button", {
+          class: "nav-item", text: "+ New identity",
+          onclick: () => { identityDropdownOpen = false; createNewIdentity(); },
+        }));
+      }
+      card.appendChild(pop);
+    }
+    bar.appendChild(card);
+  }
+
+  function createNewIdentity(promptOverride) {
+    const needsId = ctx.has_profile; // the very first identity uses the bare form (your Matrix localpart)
+    let customId = "";
+    if (needsId) {
+      customId = (promptOverride !== undefined ? promptOverride : prompt("Choose an id for your new identity (letters, numbers, underscores):")) || "";
+      if (!customId.trim()) return;
+    }
+    api("/widget/api/create_profile", { method: "POST", body: { room_id: roomId, custom_id: customId.trim() } })
+      .then(() => { toast("Identity created.", true); return loadContext(); })
+      .catch((e) => toast(e.message, false));
+  }
 
   function renderSidebar() {
     const shell = document.getElementById("shell");
@@ -1093,6 +1217,7 @@ _WIDGET_HTML = r"""<!doctype html>
         el("span", { class: "label", text: t.label }),
       ]));
     });
+    renderIdentityCard(bar);
     bar.appendChild(el("button", {
       id: "sidebar-toggle", class: "nav-item", title: sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
       onclick: () => {
@@ -1118,8 +1243,8 @@ _WIDGET_HTML = r"""<!doctype html>
 
     if (currentTab === "home") renderHomeTimeline(app);
     else if (currentTab === "room") renderRoomTab(app);
-    else if (currentTab === "identity") renderIdentityTab(app);
-    else if (currentTab === "publish") placeholder(app, "Channel/community publishing is coming soon.");
+    else if (currentTab === "publish") renderPublishTab(app);
+    else if (currentTab === "settings") renderSettingsTab(app);
     else if (currentTab === "admin") renderAdminTab(app);
   }
 
@@ -1157,14 +1282,18 @@ _WIDGET_HTML = r"""<!doctype html>
   function renderPostCard(post, onChange) {
     const children = [];
     if (post.boosted_by) {
+      const boostedText = (post.boosted_by.display_name || post.boosted_by.handle) + " boosted";
       children.push(el("div", {
-        class: "boosted-by",
-        text: "\u{1F501} " + (post.boosted_by.display_name || post.boosted_by.handle) + " boosted",
+        class: "boosted-by" + (post.boosted_by.actor_id ? " clickable" : ""),
+        text: "\u{1F501} " + boostedText,
+        onclick: post.boosted_by.actor_id ? () => openAccountProfile(post.boosted_by.actor_id) : function () {},
       }));
     }
+    const hasAuthorProfile = !!post.author.actor_id;
+    const openAuthor = hasAuthorProfile ? () => openAccountProfile(post.author.actor_id) : function () {};
     const header = el("div", { class: "post-header" }, [
-      el("span", { class: "name", text: post.author.display_name }),
-      el("span", { class: "handle", text: post.author.handle }),
+      el("span", { class: "name" + (hasAuthorProfile ? " clickable" : ""), text: post.author.display_name, onclick: openAuthor }),
+      el("span", { class: "handle" + (hasAuthorProfile ? " clickable" : ""), text: post.author.handle, onclick: openAuthor }),
       el("span", { class: "time", text: timeAgo(post.created_at) }),
     ]);
     const content = el("div", { class: "post-content" });
@@ -1191,7 +1320,10 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     children.push(actions);
     return el("div", { class: "post-card" }, [
-      el("img", { class: "avatar", src: post.author.avatar_url || "", alt: "" }),
+      el("img", {
+        class: "avatar" + (hasAuthorProfile ? " clickable" : ""), src: post.author.avatar_url || "", alt: "",
+        onclick: openAuthor,
+      }),
       el("div", { class: "post-body" }, children),
     ]);
   }
@@ -1225,13 +1357,14 @@ _WIDGET_HTML = r"""<!doctype html>
             const data = await api("/widget/api/browse/search?q=" + encodeURIComponent(q) + "&domain=" + encodeURIComponent(state.domain || ctx.domain));
             if (!data.accounts.length) { searchResults.appendChild(el("div", { class: "muted", text: "No accounts found." })); return; }
             data.accounts.forEach((a) => {
-              searchResults.appendChild(el("div", { class: "account-card" }, [
+              searchResults.appendChild(el("div", {
+                class: "account-card clickable", onclick: () => openAccountProfile(a.actor_id),
+              }, [
                 el("img", { class: "avatar sm", src: a.avatar_url || "", alt: "" }),
                 el("div", { class: "meta" }, [
                   el("div", { class: "name", text: a.display_name }),
                   el("div", { class: "handle", text: a.handle }),
                 ]),
-                plainButton("Follow", (e) => doAction("/widget/api/follow", { handle: a.handle }, e.target)),
               ]));
             });
           } catch (e) { toast(e.message, false); }
@@ -1318,99 +1451,404 @@ _WIDGET_HTML = r"""<!doctype html>
     window.__timelineObserver.observe(sentinel);
   }
 
-  // -- Identity -------------------------------------------------------------
+  // -- account profile modal (any browsed/followed account) -----------------
 
-  function renderIdentityTab(app) {
-    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
-    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "Your identities" }), list]));
+  function modalCard(extraClass) {
+    return el("div", { class: "card profile-modal" + (extraClass ? " " + extraClass : "") }, [
+      el("div", { class: "muted", text: "Loading…" }),
+    ]);
+  }
 
-    api("/widget/api/identities").then((data) => {
-      list.innerHTML = "";
-      if (!data.identities.length) {
-        list.appendChild(el("div", { class: "muted", text: "No identity yet." }));
-        app.appendChild(el("div", { class: "card" }, [
-          primaryButton("Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
-        ]));
+  function modalHeader(body, avatarUrl, name, handle) {
+    body.appendChild(el("div", { class: "row", style: "align-items:flex-start" }, [
+      el("img", { class: "avatar", style: "width:56px;height:56px", src: avatarUrl || "", alt: "" }),
+      el("div", {}, [
+        el("div", { style: "font-weight:600;font-size:15px", text: name }),
+        el("div", { class: "muted", text: handle }),
+      ]),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+  }
+
+  function openAccountProfile(actorId) {
+    if (!actorId) return;
+    const body = modalCard();
+    openModal(body);
+
+    function profileAction(path, p, btn) {
+      if (btn) btn.disabled = true;
+      api(path, { method: "POST", body: { room_id: roomId, handle: p.handle } })
+        .then(() => { toast("Done.", true); return refresh(); })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { if (btn) btn.disabled = false; });
+    }
+
+    function renderBody(p) {
+      body.innerHTML = "";
+      if (p.banner_url) body.appendChild(el("img", { class: "profile-banner", src: p.banner_url, alt: "" }));
+      modalHeader(body, p.avatar_url, p.display_name, p.handle);
+      const bio = el("div", { class: "post-content" });
+      bio.innerHTML = p.bio_html || "";
+      body.appendChild(bio);
+      body.appendChild(el("div", { class: "sub" }, [el("a", { href: p.url, target: "_blank", text: "View on their instance →" })]));
+      body.appendChild(el("div", { class: "row" }, [
+        p.is_following
+          ? dangerButton("Unfollow", (e) => profileAction("/widget/api/unfollow", p, e.target))
+          : primaryButton("Follow", (e) => profileAction("/widget/api/follow", p, e.target)),
+        plainButton("DM", (e) => profileAction("/widget/api/dm", p, e.target)),
+        plainButton("Chat", (e) => profileAction("/widget/api/chat", p, e.target)),
+      ]));
+      body.appendChild(el("div", { class: "row" }, [
+        toggleButton(p.is_muted ? "Muted" : "Mute", p.is_muted, (e) =>
+          profileAction(p.is_muted ? "/widget/api/unmute" : "/widget/api/mute", p, e.target)),
+        p.is_blocked
+          ? plainButton("Unblock", (e) => profileAction("/widget/api/unblock", p, e.target))
+          : dangerButton("Block", (e) => {
+              if (confirm("Block this account? This cuts any follow and kicks you from their rooms.")) profileAction("/widget/api/block", p, e.target);
+            }),
+      ]));
+      if (p.has_posts) {
+        body.appendChild(el("h2", { text: "Posts" }));
+        const feed = el("div", {});
+        const sentinel = el("div");
+        body.appendChild(feed);
+        body.appendChild(sentinel);
+        let cursor = "", loading = false, done = false;
+        const author = { actor_id: p.actor_id, display_name: p.display_name, handle: p.handle, avatar_url: p.avatar_url, url: p.url };
+        function loadMorePosts() {
+          if (loading || done) return;
+          loading = true;
+          api("/widget/api/browse/profile/timeline?actor_id=" + encodeURIComponent(p.actor_id) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""))
+            .then((data) => {
+              data.posts.forEach((post) => { post.author = author; feed.appendChild(renderPostCard(post, function () {})); });
+              cursor = data.next_cursor || "";
+              done = !cursor;
+            })
+            .catch(() => { done = true; })
+            .finally(() => { loading = false; });
+        }
+        loadMorePosts();
+        const observer = new IntersectionObserver((entries) => { if (entries[0].isIntersecting) loadMorePosts(); });
+        observer.observe(sentinel);
+      }
+    }
+
+    function refresh() {
+      return api("/widget/api/browse/profile?actor_id=" + encodeURIComponent(actorId)).then((p) => { renderBody(p); return p; });
+    }
+
+    refresh().catch(() => {
+      body.innerHTML = "";
+      body.appendChild(el("div", { class: "muted", text: "Couldn't load that profile." }));
+    });
+  }
+
+  // -- my profile modal (active identity, opened from the sidebar card) -----
+
+  function openMyProfile() {
+    const body = modalCard();
+    openModal(body);
+    refreshMyProfile(body);
+  }
+
+  function refreshMyProfile(body) {
+    loadIdentityState().then(() => {
+      const s = identityState.active;
+      body.innerHTML = "";
+      if (!s) {
+        body.appendChild(el("div", { class: "muted", text: "No identity yet." }));
         return;
       }
-      data.identities.forEach((idn) => {
-        list.appendChild(el("div", { class: "list-item" }, [
-          el("span", { text: (idn.display_name || idn.handle) + (idn.is_active ? "  • active" : "") }),
-          idn.is_active ? null : plainButton("Make active", (e) => doAction("/widget/api/identities/switch", { username: idn.username }, e.target)),
-        ].filter(Boolean)));
-      });
-      const active = data.identities.find((i) => i.is_active) || data.identities[0];
-      api("/widget/api/identities/settings?username=" + encodeURIComponent(active.username)).then((s) => {
-        app.appendChild(el("div", { class: "card" }, [
-          el("h2", { text: "Settings for " + s.handle }),
-          el("div", { class: "kv" }, [el("span", { text: "Display name" }), el("span", { text: s.display_name || "—" })]),
-          el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]),
-          el("div", { class: "row" }, [
-            toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) =>
-              doAction("/widget/api/visibility", { which: "followers", hidden: !s.hide_followers, username: s.username }, e.target)),
-            toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) =>
-              doAction("/widget/api/visibility", { which: "following", hidden: !s.hide_following, username: s.username }, e.target)),
-            toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) =>
-              doAction("/widget/api/visibility", { which: "discoverable", value: !s.discoverable, username: s.username }, e.target)),
-          ]),
-        ]));
-      }).catch(() => {});
-      if (ctx.custom_identities_enabled) {
-        app.appendChild(el("div", { class: "card" }, [
-          el("h2", { text: "Add another identity" }),
-          el("div", { class: "sub", text: "Only works inside a room you want to become that identity's own Profile Room -- switch to the \"This Room\" tab there and use \"Create profile\"." }),
-        ]));
+      modalHeader(body, s.icon_url, s.display_name || s.handle, s.handle);
+      if (s.public_url) body.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
+      const followingRow = el("div", { class: "kv clickable" }, [
+        el("span", { text: "Following" }),
+        el("span", { text: "…" }),
+      ]);
+      followingRow.addEventListener("click", openFollowingList);
+      body.appendChild(followingRow);
+      api("/widget/api/following").then((d) => { followingRow.lastChild.textContent = d.following.length + "  ›"; }).catch(() => {});
+
+      function visAction(btn, which, hidden, value) {
+        btn.disabled = true;
+        const payload = { username: s.username, which: which };
+        if (hidden !== undefined) payload.hidden = hidden;
+        if (value !== undefined) payload.value = value;
+        api("/widget/api/visibility", { method: "POST", body: payload })
+          .then(() => { toast("Done.", true); refreshMyProfile(body); })
+          .catch((e) => toast(e.message, false))
+          .finally(() => { btn.disabled = false; });
       }
-      app.appendChild(el("div", { class: "card" }, [
-        el("h2", { text: "Account recovery" }),
-        el("div", { class: "sub", text: "Locked out of your Profile Room or Space (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
-        el("div", { class: "row" }, [
-          plainButton("Rejoin my rooms", (e) => doAction("/widget/api/rejoin", {}, e.target)),
-        ]),
+      body.appendChild(el("div", { class: "row" }, [
+        toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
+        toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
+        toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
       ]));
 
-      const leaveCard = el("div", { class: "card" }, [
-        el("h2", { text: "Leave unfollowed rooms" }),
-        el("div", { class: "sub", text: "Remove yourself from every Remote User Room for an account none of your identities follow." }),
+      const fileInput = el("input", { type: "file", accept: "image/*" });
+      body.appendChild(el("h2", { text: "Profile banner" }));
+      body.appendChild(el("div", { class: "row" }, [
+        fileInput,
+        primaryButton("Upload banner", async (e) => {
+          const file = fileInput.files[0];
+          if (!file) { toast("Choose an image first.", false); return; }
+          e.target.disabled = true;
+          try {
+            await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(s.room_id), {
+              method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
+            });
+            toast("Banner updated.", true);
+          } catch (err) {
+            toast(err.message, false);
+          } finally {
+            e.target.disabled = false;
+          }
+        }),
+      ]));
+    });
+  }
+
+  function openFollowingList() {
+    const body = modalCard();
+    openModal(body);
+    function load() {
+      api("/widget/api/following").then((data) => {
+        body.innerHTML = "";
+        body.appendChild(el("div", { class: "row" }, [
+          el("h2", { text: "Following" }),
+          el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+        ]));
+        if (!data.following.length) { body.appendChild(el("div", { class: "muted", text: "Not following anyone yet." })); return; }
+        body.appendChild(el("div", { class: "list" }, data.following.map((f) =>
+          el("div", { class: "list-item" }, [
+            el("span", { class: "clickable", text: f.display_name || f.handle, onclick: () => openAccountProfile(f.actor_id) }),
+            plainButton("Unfollow", (e) => doAction("/widget/api/unfollow", { handle: f.handle }, e.target).then(load)),
+          ])
+        )));
+      }).catch(() => { body.innerHTML = ""; body.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    }
+    load();
+  }
+
+  // -- instance sign-in (OAuth + password fallback) --------------------------
+
+  function startOAuthLogin(domain, btn, onDone) {
+    if (!domain) { toast("Enter an instance domain first.", false); return; }
+    if (btn) btn.disabled = true;
+    api("/widget/api/browse/login/start", { method: "POST", body: { domain: domain } })
+      .then((data) => {
+        window.open(data.authorize_url, "fediverse-bridge-login", "width=500,height=700");
+        function onMessage(ev) {
+          if (!ev.data || ev.data.type !== "fediverse-bridge-login") return;
+          window.removeEventListener("message", onMessage);
+          if (ev.data.ok) { toast("Signed in.", true); if (onDone) onDone(); }
+          else toast("Sign-in failed or was cancelled.", false);
+        }
+        window.addEventListener("message", onMessage);
+      })
+      .catch((e) => toast(e.message, false))
+      .finally(() => { if (btn) btn.disabled = false; });
+  }
+
+  function openPasswordLoginForm(domain, onDone) {
+    const body = el("div", { class: "card profile-modal" });
+    const domainInput = el("input", { type: "text", value: domain || "", placeholder: "instance.example" });
+    const userInput = el("input", { type: "text", placeholder: "username" });
+    const passInput = el("input", { type: "password", placeholder: "password" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Sign in with username & password" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "Prefer OAuth above when the instance supports it -- your password goes directly to that instance over HTTPS and is never stored here, only the resulting access token is." }));
+    body.appendChild(el("div", { class: "row" }, [domainInput]));
+    body.appendChild(el("div", { class: "row" }, [userInput, passInput]));
+    body.appendChild(el("div", { class: "row" }, [
+      primaryButton("Sign in", (e) => {
+        if (!domainInput.value.trim() || !userInput.value || !passInput.value) return;
+        e.target.disabled = true;
+        api("/widget/api/browse/login/password", {
+          method: "POST",
+          body: { domain: domainInput.value.trim(), username: userInput.value, password: passInput.value },
+        })
+          .then(() => { toast("Signed in.", true); closeModal(); if (onDone) onDone(); })
+          .catch((err) => toast(err.message, false))
+          .finally(() => { e.target.disabled = false; });
+      }),
+    ]));
+    openModal(body);
+  }
+
+  function renderInstanceLoginsCard(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    function loadLogins() {
+      api("/widget/api/browse/login/list").then((data) => {
+        list.innerHTML = "";
+        if (!data.logins.length) { list.appendChild(el("div", { class: "muted", text: "Not signed into any instance." })); return; }
+        data.logins.forEach((l) => {
+          list.appendChild(el("div", { class: "list-item" }, [
+            el("span", { text: l.domain + (l.account_handle ? " (" + l.account_handle + ")" : "") + " — " + l.auth_method }),
+            plainButton("Log out", (e) => doAction("/widget/api/browse/login/logout", { domain: l.domain }, e.target).then(loadLogins)),
+          ]));
+        });
+      }).catch(() => {});
+    }
+    const domainInput = el("input", { type: "text", placeholder: "instance.example" });
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Instance sign-ins" }),
+      el("div", { class: "sub", text: "Sign in to view a locked-down instance's timeline or search in the Browse/Home tabs." }),
+      list,
+      el("div", { class: "row" }, [
+        domainInput,
+        primaryButton("Sign in with OAuth", (e) => startOAuthLogin(domainInput.value.trim(), e.target, loadLogins)),
+      ]),
+      el("div", { class: "row" }, [
+        plainButton("Use username/password instead", () => openPasswordLoginForm(domainInput.value.trim(), loadLogins)),
+      ]),
+    ]));
+    loadLogins();
+  }
+
+  // -- Settings ---------------------------------------------------------------
+  //
+  // Everything left over once identity switching/creation moved to the
+  // sidebar card and profile display/visibility/banner moved to "My
+  // Profile": account-wide, not-room-bound, not identity-display tools.
+
+  function renderSettingsTab(app) {
+    if (!ctx.has_profile) {
+      app.appendChild(el("div", { class: "card" }, [
+        el("h2", { text: "Get started" }),
+        el("div", { class: "sub", text: "You don't have a fediverse profile yet." }),
         el("div", { class: "row" }, [
-          plainButton("Preview", async (e) => {
-            e.target.disabled = true;
-            try {
-              const data = await api("/widget/api/leave_unfollowed/preview");
-              const old = leaveCard.querySelector("#leave-unfollowed-result");
-              if (old) old.remove();
-              const result = el("div", { id: "leave-unfollowed-result" });
-              if (data.unreliable) {
-                result.appendChild(el("div", { class: "muted", text: "Couldn't reliably check right now -- try again shortly." }));
-              } else if (!data.rooms.length) {
-                result.appendChild(el("div", { class: "muted", text: "Nothing to leave." }));
-              } else {
-                const shown = data.rooms.slice(0, 10);
-                result.appendChild(el("div", { class: "list" }, shown.map((r) =>
-                  el("div", { class: "list-item" }, [el("span", { text: r.handle })])
-                )));
-                if (data.rooms.length > shown.length) {
-                  result.appendChild(el("div", { class: "muted", text: "...and " + (data.rooms.length - shown.length) + " more" }));
-                }
-                result.appendChild(el("div", { class: "row" }, [
-                  dangerButton("Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"), (e2) => {
-                    if (confirm("Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.")) {
-                      doAction("/widget/api/leave_unfollowed/execute", {}, e2.target);
-                    }
-                  }),
-                ]));
-              }
-              leaveCard.appendChild(result);
-            } catch (err) {
-              toast(err.message, false);
-            } finally {
-              e.target.disabled = false;
-            }
-          }),
+          primaryButton("Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
         ]),
-      ]);
-      app.appendChild(leaveCard);
+      ]));
+      return;
+    }
+
+    renderInstanceLoginsCard(app);
+
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Account recovery" }),
+      el("div", { class: "sub", text: "Locked out of your Profile Room or Space (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
+      el("div", { class: "row" }, [
+        plainButton("Rejoin my rooms", (e) => doAction("/widget/api/rejoin", {}, e.target)),
+      ]),
+    ]));
+
+    const leaveCard = el("div", { class: "card" }, [
+      el("h2", { text: "Leave unfollowed rooms" }),
+      el("div", { class: "sub", text: "Remove yourself from every Remote User Room for an account none of your identities follow." }),
+      el("div", { class: "row" }, [
+        plainButton("Preview", async (e) => {
+          e.target.disabled = true;
+          try {
+            const data = await api("/widget/api/leave_unfollowed/preview");
+            const old = leaveCard.querySelector("#leave-unfollowed-result");
+            if (old) old.remove();
+            const result = el("div", { id: "leave-unfollowed-result" });
+            if (data.unreliable) {
+              result.appendChild(el("div", { class: "muted", text: "Couldn't reliably check right now -- try again shortly." }));
+            } else if (!data.rooms.length) {
+              result.appendChild(el("div", { class: "muted", text: "Nothing to leave." }));
+            } else {
+              const shown = data.rooms.slice(0, 10);
+              result.appendChild(el("div", { class: "list" }, shown.map((r) =>
+                el("div", { class: "list-item" }, [el("span", { text: r.handle })])
+              )));
+              if (data.rooms.length > shown.length) {
+                result.appendChild(el("div", { class: "muted", text: "...and " + (data.rooms.length - shown.length) + " more" }));
+              }
+              result.appendChild(el("div", { class: "row" }, [
+                dangerButton("Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"), (e2) => {
+                  if (confirm("Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.")) {
+                    doAction("/widget/api/leave_unfollowed/execute", {}, e2.target);
+                  }
+                }),
+              ]));
+            }
+            leaveCard.appendChild(result);
+          } catch (err) {
+            toast(err.message, false);
+          } finally {
+            e.target.disabled = false;
+          }
+        }),
+      ]),
+    ]);
+    app.appendChild(leaveCard);
+  }
+
+  // -- Publish (PeerTube channels + Lemmy communities) ------------------------
+
+  function renderCreateForm(app, title, sub, onCreate) {
+    const idInput = el("input", { type: "text", placeholder: "id (e.g. my-show)" });
+    const nameInput = el("input", { type: "text", placeholder: "Display name (optional)" });
+    const identitySelect = identityState.identities.length > 1
+      ? el("select", {}, identityState.identities.map((i) => el("option", { value: i.username, text: i.display_name || i.handle })))
+      : null;
+    const row = [idInput, nameInput];
+    if (identitySelect) row.push(identitySelect);
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: title }),
+      el("div", { class: "sub", text: sub }),
+      el("div", { class: "row" }, row),
+      el("div", { class: "row" }, [
+        primaryButton("Create", (e) => {
+          if (!idInput.value.trim()) return;
+          onCreate({
+            id: idInput.value.trim(),
+            display_name: nameInput.value.trim(),
+            as_identity: identitySelect ? identitySelect.value : "",
+          }, e.target);
+        }),
+      ]),
+    ]));
+  }
+
+  function renderChannelsSection(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "PeerTube channels" }), list]));
+    api("/widget/api/channels").then((data) => {
+      list.innerHTML = "";
+      if (!data.channels.length) { list.appendChild(el("div", { class: "muted", text: "No channels yet." })); return; }
+      data.channels.forEach((c) => {
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("span", { text: c.display_name || c.username }),
+          plainButton("Manage in room", () => window.open("https://matrix.to/#/" + c.room_id, "_blank", "noopener")),
+        ]));
+      });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    renderCreateForm(app, "Create a channel", "Hosts a PeerTube-compatible video channel as a Matrix room.", (vals, btn) => {
+      doAction("/widget/api/channels/create", vals, btn);
+    });
+  }
+
+  function renderCommunitiesSection(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "Lemmy communities" }), list]));
+    api("/widget/api/communities").then((data) => {
+      list.innerHTML = "";
+      if (!data.communities.length) { list.appendChild(el("div", { class: "muted", text: "No communities yet." })); return; }
+      data.communities.forEach((c) => {
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("span", { text: c.display_name || c.username }),
+          plainButton("Manage in room", () => window.open("https://matrix.to/#/" + c.room_id, "_blank", "noopener")),
+        ]));
+      });
+    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    renderCreateForm(app, "Create a community", "Hosts a Lemmy-compatible community as a Matrix room.", (vals, btn) => {
+      doAction("/widget/api/communities/create", vals, btn);
+    });
+  }
+
+  function renderPublishTab(app) {
+    if (!ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) {
+      placeholder(app, "Publishing isn't enabled on this bridge.");
+      return;
+    }
+    if (ctx.peertube_channels_enabled) renderChannelsSection(app);
+    if (ctx.lemmy_community_hosting_enabled) renderCommunitiesSection(app);
   }
 
   // -- Admin ------------------------------------------------------------------
@@ -1495,12 +1933,12 @@ _WIDGET_HTML = r"""<!doctype html>
     renderFollowing(app);
     renderImportPost(app);
     if (ctx.has_profile) {
-      // Follow/block/mute-by-handle and follows-import work from ANY
-      // room, same as their ";follow"/";block"/";mute"/";import follows"
-      // command counterparts -- only the banner (which needs to run
-      // inside your own Profile Room specifically, per _handle_banner)
-      // stays scoped to renderProfile's is_owner branch.
-      renderManageAccount(app);
+      // Follow/block/mute now live on the account profile modal (opened
+      // via search, a post author, or "View full profile" below) --
+      // follows-import stays here since it's a file upload, not a
+      // single-handle action. The banner (which needs to run inside your
+      // own Profile Room specifically, per _handle_banner) lives on "My
+      // Profile" in the sidebar instead.
       renderImportFollows(app);
     }
 
@@ -1586,21 +2024,6 @@ _WIDGET_HTML = r"""<!doctype html>
     }
   }
 
-  function renderManageAccount(app) {
-    const input = el("input", { type: "text", placeholder: "@user@instance.org" });
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Follow, block, or mute an account" }),
-      el("div", { class: "row" }, [input]),
-      el("div", { class: "row" }, [
-        primaryButton("Follow", (e) => { if (input.value) doAction("/widget/api/follow", { handle: input.value }, e.target); }),
-        dangerButton("Block", (e) => {
-          if (input.value && confirm("Block " + input.value + "? This cuts any follow and kicks you from their rooms.")) doAction("/widget/api/block", { handle: input.value }, e.target);
-        }),
-        plainButton("Mute", (e) => { if (input.value) doAction("/widget/api/mute", { handle: input.value }, e.target); }),
-      ]),
-    ]));
-  }
-
   function renderBanner(app) {
     const fileInput = el("input", { type: "file", accept: "image/*" });
     app.appendChild(el("div", { class: "card" }, [
@@ -1660,22 +2083,13 @@ _WIDGET_HTML = r"""<!doctype html>
       el("div", { class: "sub", text: r.actor_id }),
     ]);
     if (!ctx.has_profile) { app.appendChild(card); return; }
+    // Follow/DM/Chat/Mute/Block now live on the account profile modal --
+    // this just links there, so this account's full state (and its own
+    // posts) are one click away instead of duplicating the action set.
     card.appendChild(el("div", { class: "row" }, [
-      r.is_following
-        ? dangerButton("Unfollow", (e) => doAction("/widget/api/unfollow", {}, e.target))
-        : primaryButton("Follow", (e) => doAction("/widget/api/follow", {}, e.target)),
-      plainButton("DM", (e) => doAction("/widget/api/dm", {}, e.target)),
-      plainButton("Chat", (e) => doAction("/widget/api/chat", {}, e.target)),
-    ]));
-    card.appendChild(el("div", { class: "row" }, [
-      toggleButton(r.is_muted ? "Muted" : "Mute", r.is_muted, (e) =>
-        doAction(r.is_muted ? "/widget/api/unmute" : "/widget/api/mute", {}, e.target)),
-      r.is_blocked
-        ? plainButton("Unblock", (e) => doAction("/widget/api/unblock", {}, e.target))
-        : dangerButton("Block", (e) => {
-            if (confirm("Block this account? This cuts any follow and kicks you from their rooms.")) doAction("/widget/api/block", {}, e.target);
-          }),
-    ]));
+      plainButton("View full profile", () => openAccountProfile(r.actor_id)),
+      r.is_following ? el("span", { class: "badge", text: "Following" }) : null,
+    ].filter(Boolean)));
 
     const backfillRow = el("div", { class: "row" }, [
       primaryButton("Backfill latest " + ctx.backfill_default_count + " posts", (e) => doAction("/widget/api/backfill", {}, e.target)),
@@ -1718,7 +2132,7 @@ _WIDGET_HTML = r"""<!doctype html>
       if (!data.following.length) { list.appendChild(el("div", { class: "muted", text: "Not following anyone yet." })); return; }
       data.following.forEach((f) => {
         list.appendChild(el("div", { class: "list-item" }, [
-          el("span", { text: f.display_name || f.actor_id }),
+          el("span", { class: "clickable", text: f.display_name || f.actor_id, onclick: () => openAccountProfile(f.actor_id) }),
           plainButton("Unfollow", (e) => doAction("/widget/api/unfollow", { handle: f.handle }, e.target)),
         ]));
       });
@@ -1727,6 +2141,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
   async function loadContext() {
     ctx = await api("/widget/api/context?room_id=" + encodeURIComponent(roomId));
+    await loadIdentityState();
     render();
   }
 
