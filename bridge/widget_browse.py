@@ -16,10 +16,20 @@ best-effort philosophy ``bridge.commands._discover_mastodon_api_reply_notes``
 already established for using a remote instance's REST API purely as a
 discovery layer.
 
-Misskey and its forks (Calckey/Firefish/Sharkey/Iceshrimp) are
-deliberately NOT supported here -- they expose a conceptually similar but
-totally different, POST-based JSON-RPC-ish API, not this one. Lemmy and
-PeerTube likewise have their own separate APIs this module doesn't speak.
+Misskey's own native API is a conceptually similar but totally different,
+POST-based JSON-RPC-ish one, not this one -- most of its forks (Calckey/
+Firefish/Iceshrimp) speak ONLY that and are correctly skipped here.
+**Sharkey is the confirmed exception**: it ships a real, genuine Mastodon
+client-API-compatible layer alongside its native one (an official, intended
+feature -- Sharkey's own account lists "Mastodon API" among its features;
+confirmed live 2026-10-24 against a real instance, federation.network,
+software.name ``"sharkey"``: ``/api/v1/timelines/public``, ``/api/v2/
+search``, ``/api/v1/accounts/lookup``, and ``/api/v1/statuses/{id}/
+context`` all return real Mastodon-shaped JSON, unauthenticated). NOT
+confirmed for any other Misskey-family fork -- don't widen
+``_COMPATIBLE_SOFTWARE`` to the rest of the family without the same live
+verification. Lemmy and PeerTube likewise have their own separate APIs
+this module doesn't speak.
 
 A found/browsed post is matched against our own ``federated_events`` table
 by its ``uri`` (the same field this bridge's own ``;import`` dedups
@@ -62,10 +72,12 @@ router = APIRouter()
 # real instance of each: mastodon (fosstodon.org), pleroma (poa.st reports
 # "pleroma" even though it may run the Akkoma fork -- same API either way),
 # gotosocial and the listed Mastodon forks follow the same client API by
-# design. NOT Misskey-family -- different API entirely, see module
-# docstring.
+# design. "sharkey" is the one Misskey-family exception -- see module
+# docstring for why, and don't add any OTHER Misskey fork here without the
+# same live confirmation (their native API is a different, POST-based
+# protocol this module doesn't speak at all).
 _COMPATIBLE_SOFTWARE = {
-    "mastodon", "pleroma", "akkoma", "hometown", "glitch-soc", "gotosocial", "sharkey-bridge",
+    "mastodon", "pleroma", "akkoma", "hometown", "glitch-soc", "gotosocial", "sharkey",
 }
 
 # Matches the Mastodon API's own default page size for timelines/search.
