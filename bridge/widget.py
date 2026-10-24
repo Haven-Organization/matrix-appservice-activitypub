@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url
 from bridge.commands import (
     _ALLOW_RULE_TYPES,
@@ -307,7 +308,14 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
         {
             "username": actor.username,
             "display_name": actor.display_name,
-            "summary": actor.summary,
+            # actor.summary is stored as plain text (the Profile Room's
+            # topic, verbatim) -- the real AP actor document only ever
+            # gets an HTML version of it via plain_text_to_note_html at
+            # serve time (see bridge.note_mirroring's own actor-building
+            # code), never pre-rendered into the stored field itself.
+            # Reuse that exact conversion here so the widget's bio
+            # rendering matches what a remote viewer actually sees.
+            "summary": plain_text_to_note_html(actor.summary) if actor.summary else actor.summary,
             "handle": f"@{actor.username}@{config.bridge.domain}",
             "actor_id": actor_url(config.bridge.public_base_url, actor.username),
             "icon_url": actor.icon_url,
@@ -912,13 +920,27 @@ _WIDGET_HTML = r"""<!doctype html>
   .post-header .name { font-weight: 600; color: var(--text); }
   .post-header .handle, .post-header .time { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .post-header .time { margin-left: auto; flex-shrink: 0; }
+  .view-icon-btn { border: none; background: none; color: var(--muted); font-size: 13px; padding: 0 0 0 4px; cursor: pointer; flex-shrink: 0; line-height: 1; }
+  .view-icon-btn:hover { color: var(--text); }
   .boosted-by { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .boosted-by img.emoji, .post-header .name img.emoji { width: 1em; height: 1em; }
+  .reply-to-line { font-size: 12px; color: var(--muted); margin-bottom: 4px; cursor: pointer; }
+  .reply-to-line:hover { color: var(--accent); }
   .post-content { font-size: 15px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
   .post-content p { margin: 0 0 8px; }
   .post-content p:last-child { margin-bottom: 0; }
   .post-content a { color: var(--accent); }
+  img.emoji { width: 1.2em; height: 1.2em; vertical-align: -0.2em; object-fit: contain; }
   .post-media { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 8px 0; border-radius: var(--radius-inner); overflow: hidden; }
   .post-media img { width: 100%; max-height: 300px; object-fit: cover; display: block; background: var(--hover); }
+  .post-counts { display: flex; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .post-counts .count-item { display: flex; align-items: center; gap: 4px; }
+  .post-reactions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .reaction-chip {
+    display: inline-flex; align-items: center; gap: 3px; background: var(--hover); border-radius: var(--radius-chip);
+    padding: 2px 6px; font-size: 12px; color: var(--muted);
+  }
+  .reaction-chip img.emoji { width: 14px; height: 14px; }
   .post-actions { display: flex; gap: 4px; margin-top: 8px; }
   .post-actions button {
     border: none; background: none; padding: 6px 8px; font-size: 12px; color: var(--muted);
@@ -926,6 +948,9 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .post-actions button:hover { background: var(--hover); color: var(--text); }
   .post-actions button.imported { color: var(--ok-text); }
+  .post-card.open-thread { cursor: pointer; }
+  .post-card.thread-ancestor { opacity: .8; }
+  .post-card.thread-focus { background: var(--hover); border-radius: var(--radius-card); cursor: default; }
   .skel { background: var(--border); opacity: .5; border-radius: 4px; height: 12px; }
   .skel-card { display: flex; gap: 12px; padding: 16px; }
   .skel-card + .skel-card { border-top: 1px solid var(--border); }
@@ -993,7 +1018,8 @@ _WIDGET_HTML = r"""<!doctype html>
     width: 88px; height: 88px; font-size: 32px; border: 4px solid var(--bg);
     margin-top: -66px; position: relative; z-index: 1; flex-shrink: 0;
   }
-  .profile-stat { color: var(--muted); font-size: 13px; padding-bottom: 8px; }
+  .profile-stats { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; padding-bottom: 8px; }
+  .profile-stat { color: var(--muted); font-size: 13px; }
   .profile-name { font-size: 20px; font-weight: 700; margin: 4px 0 0; }
   .profile-handle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin: 2px 0 10px; }
   .copy-btn { border: none; background: none; color: var(--muted); cursor: pointer; padding: 2px; font-size: 12px; }
@@ -1151,6 +1177,18 @@ _WIDGET_HTML = r"""<!doctype html>
     return img;
   }
 
+  // A display name that may carry inline custom-emoji <img> tags (see
+  // bridge/widget_browse.py's _display_name_html) -- renders the HTML
+  // version when present, otherwise falls back to plain text exactly like
+  // el()'s own "text" attribute would.
+  function nameNode(tag, cls, plain, nameHtml, onclick) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (nameHtml) node.innerHTML = nameHtml; else node.textContent = plain;
+    if (onclick) node.addEventListener("click", onclick);
+    return node;
+  }
+
   let ctx = null;
   const NAV_ITEMS = [
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
@@ -1163,6 +1201,10 @@ _WIDGET_HTML = r"""<!doctype html>
   // overrides currentTab's own content in render() without changing which
   // sidebar item is "active", so "Back" returns to exactly where you were.
   let profileView = null;
+  // Same idea as profileView, for a post's thread (ancestors + the post +
+  // its immediate replies). Mutually exclusive with profileView -- opening
+  // one clears the other.
+  let threadView = null;
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -1276,9 +1318,9 @@ _WIDGET_HTML = r"""<!doctype html>
       if (t.id === "admin" && !ctx.is_admin) return;
       if (t.id === "publish" && !ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) return;
       bar.appendChild(el("button", {
-        class: "nav-item" + (!profileView && t.id === currentTab ? " active" : ""),
+        class: "nav-item" + (!profileView && !threadView && t.id === currentTab ? " active" : ""),
         title: t.label,
-        onclick: () => { currentTab = t.id; profileView = null; render(); },
+        onclick: () => { currentTab = t.id; profileView = null; threadView = null; render(); },
       }, [
         el("span", { class: "icon", text: t.icon }),
         el("span", { class: "label", text: t.label }),
@@ -1309,6 +1351,7 @@ _WIDGET_HTML = r"""<!doctype html>
     if (!ctx) return;
 
     if (profileView) { renderProfilePage(app, profileView); return; }
+    if (threadView) { renderThreadPage(app, threadView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
     else if (currentTab === "publish") renderPublishTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
@@ -1349,19 +1392,34 @@ _WIDGET_HTML = r"""<!doctype html>
   function renderPostCard(post, onChange) {
     const children = [];
     if (post.boosted_by) {
-      const boostedText = (post.boosted_by.display_name || post.boosted_by.handle) + " boosted";
-      children.push(el("div", {
-        class: "boosted-by" + (post.boosted_by.actor_id ? " clickable" : ""),
-        text: "\u{1F501} " + boostedText,
-        onclick: post.boosted_by.actor_id ? () => openAccountProfile(post.boosted_by.actor_id) : function () {},
-      }));
+      const b = post.boosted_by;
+      const line = document.createElement("div");
+      line.className = "boosted-by" + (b.actor_id ? " clickable" : "");
+      line.appendChild(document.createTextNode("\u{1F501} "));
+      line.appendChild(nameNode("span", "", b.display_name || b.handle, b.display_name_html, null));
+      line.appendChild(document.createTextNode(" boosted"));
+      if (b.actor_id) line.addEventListener("click", (e) => { e.stopPropagation(); openAccountProfile(b.actor_id); });
+      children.push(line);
+    }
+    if (post.in_reply_to) {
+      const hint = post.reply_hint_display_name || post.reply_hint_handle;
+      const replyLine = el("div", {
+        class: "reply-to-line",
+        text: "↩ Reply to " + (hint ? hint + "'s post" : "a post"),
+        onclick: (e) => { e.stopPropagation(); openThreadView(post.uri); },
+      });
+      children.push(replyLine);
     }
     const hasAuthorProfile = !!post.author.actor_id;
-    const openAuthor = hasAuthorProfile ? () => openAccountProfile(post.author.actor_id) : function () {};
+    const openAuthor = (e) => { if (e) e.stopPropagation(); if (hasAuthorProfile) openAccountProfile(post.author.actor_id); };
     const header = el("div", { class: "post-header" }, [
-      el("span", { class: "name" + (hasAuthorProfile ? " clickable" : ""), text: post.author.display_name, onclick: openAuthor }),
+      nameNode("span", "name" + (hasAuthorProfile ? " clickable" : ""), post.author.display_name, post.author.display_name_html, openAuthor),
       el("span", { class: "handle" + (hasAuthorProfile ? " clickable" : ""), text: post.author.handle, onclick: openAuthor }),
       el("span", { class: "time", text: timeAgo(post.created_at) }),
+      el("button", {
+        class: "view-icon-btn", text: "↗", title: "Open on " + (post.instance || "their instance"),
+        onclick: (e) => { e.stopPropagation(); window.open(post.url, "_blank", "noopener"); },
+      }),
     ]);
     const content = el("div", { class: "post-content" });
     content.innerHTML = post.content_html || "";
@@ -1371,25 +1429,49 @@ _WIDGET_HTML = r"""<!doctype html>
         el("img", { src: m.url, alt: m.description || "", loading: "lazy" })
       )));
     }
-    const actions = el("div", { class: "post-actions" }, [
-      el("button", { text: "↗ View", onclick: () => window.open(post.url, "_blank", "noopener") }),
-    ]);
+    const counts = post.counts || { replies: 0, reblogs: 0, favourites: 0 };
+    if (counts.replies || counts.reblogs || counts.favourites) {
+      children.push(el("div", { class: "post-counts" }, [
+        el("span", { class: "count-item", text: "\u{1F4AC} " + counts.replies }),
+        el("span", { class: "count-item", text: "\u{1F501} " + counts.reblogs }),
+        el("span", { class: "count-item", text: "⭐ " + counts.favourites }),
+      ]));
+    }
+    if (post.reactions && post.reactions.length) {
+      children.push(el("div", { class: "post-reactions" }, post.reactions.map((r) => {
+        const chip = el("span", { class: "reaction-chip" });
+        chip.appendChild(r.url ? el("img", { class: "emoji", src: r.url, alt: r.name }) : document.createTextNode(r.name));
+        chip.appendChild(document.createTextNode(" " + r.count));
+        return chip;
+      })));
+    }
+    const actions = el("div", { class: "post-actions" });
     if (post.already_imported) {
       actions.appendChild(el("button", {
         class: "imported", text: "✓ Imported",
-        onclick: () => window.open("https://matrix.to/#/" + post.matrix_room_id, "_blank", "noopener"),
+        onclick: (e) => { e.stopPropagation(); window.open("https://matrix.to/#/" + post.matrix_room_id, "_blank", "noopener"); },
       }));
     } else {
       actions.appendChild(el("button", {
         text: "⬇ Import",
-        onclick: (e) => importPost(post, e.target, onChange),
+        onclick: (e) => { e.stopPropagation(); importPost(post, e.target, onChange); },
       }));
     }
     children.push(actions);
-    return el("div", { class: "post-card" }, [
+    const card = el("div", { class: "post-card" }, [
       avatarEl(post.author.avatar_url, post.author.display_name, hasAuthorProfile ? "clickable" : "", "", openAuthor),
       el("div", { class: "post-body" }, children),
     ]);
+    // The whole card opens this post's thread -- except a real link inside
+    // the content (a mention, a URL) or anything with its own handler
+    // (avatar/name, the view/import buttons, a reaction chip's image),
+    // which should do its own thing instead.
+    card.addEventListener("click", (e) => {
+      if (e.target.closest("a, button, .clickable")) return;
+      openThreadView(post.uri);
+    });
+    card.classList.add("open-thread");
+    return card;
   }
 
   let homeState = null;
@@ -1405,7 +1487,12 @@ _WIDGET_HTML = r"""<!doctype html>
     function scopeBtn(label, value) {
       return el("button", {
         class: state.scope === value ? "active" : "", text: label,
-        onclick: () => { state.scope = value; render(); },
+        onclick: () => {
+          if (state.scope === value) return;
+          state.scope = value;
+          state.posts = []; state.cursor = ""; state.done = false; state.unsupported = false; state.needsLogin = false;
+          render();
+        },
       });
     }
 
@@ -1647,11 +1734,20 @@ _WIDGET_HTML = r"""<!doctype html>
   function openAccountProfile(actorId) {
     if (!actorId) return;
     profileView = { mode: "remote", actorId: actorId };
+    threadView = null;
     render();
   }
 
   function openMyProfile() {
     profileView = { mode: "own" };
+    threadView = null;
+    render();
+  }
+
+  function openThreadView(uri) {
+    if (!uri) return;
+    threadView = { uri: uri };
+    profileView = null;
     render();
   }
 
@@ -1676,12 +1772,14 @@ _WIDGET_HTML = r"""<!doctype html>
             refresh();
           } catch (err) { toast(err.message, false); }
         }));
-        const followersStat = el("div", { class: "profile-stat", text: "Followers: " + s.followers_count });
-        appendProfileIdentity(page, s.icon_url, s.display_name || s.handle, s.handle, followersStat);
+        const followingStat = el("div", { class: "profile-stat clickable", text: "Following: " + s.following_count + "  ›" });
+        followingStat.addEventListener("click", openFollowingList);
+        const statsBox = el("div", { class: "profile-stats" }, [
+          el("div", { class: "profile-stat", text: "Followers: " + s.followers_count }),
+          followingStat,
+        ]);
+        appendProfileIdentity(page, s.icon_url, s.display_name || s.handle, s.handle, statsBox);
         if (s.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = s.summary; page.appendChild(bio); }
-        const followingRow = el("div", { class: "kv clickable" }, [el("span", { text: "Following" }), el("span", { text: s.following_count + "  ›" })]);
-        followingRow.addEventListener("click", openFollowingList);
-        page.appendChild(followingRow);
 
         function visAction(btn, which, hidden, value) {
           btn.disabled = true;
@@ -1754,6 +1852,41 @@ _WIDGET_HTML = r"""<!doctype html>
     });
   }
 
+  // -- thread view (ancestors up to the root, the post, its replies) -------
+
+  function renderThreadPage(app, view) {
+    app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { threadView = null; render(); } }));
+    const page = el("div", { class: "profile-page thread-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+
+    api("/widget/api/browse/thread?uri=" + encodeURIComponent(view.uri)).then((data) => {
+      page.innerHTML = "";
+      if (!data.post) {
+        page.appendChild(el("div", { class: "muted", text: "Couldn't load that post." }));
+        return;
+      }
+      const feed = el("div", { class: "card" });
+      (data.ancestors || []).forEach((p) => {
+        const card = renderPostCard(p, function () {});
+        card.classList.add("thread-ancestor");
+        feed.appendChild(card);
+      });
+      const focusCard = renderPostCard(data.post, function () {});
+      focusCard.classList.add("thread-focus");
+      feed.appendChild(focusCard);
+      page.appendChild(feed);
+      if (data.replies && data.replies.length) {
+        page.appendChild(el("h2", { text: "Replies" }));
+        const repliesCard = el("div", { class: "card" });
+        data.replies.forEach((p) => repliesCard.appendChild(renderPostCard(p, function () {})));
+        page.appendChild(repliesCard);
+      }
+    }).catch((e) => {
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: e.message || "Couldn't load that thread." }));
+    });
+  }
+
   function openFollowingList() {
     const body = el("div", { class: "card profile-modal" }, [el("div", { class: "muted", text: "Loading…" })]);
     openModal(body);
@@ -1784,16 +1917,38 @@ _WIDGET_HTML = r"""<!doctype html>
     api("/widget/api/browse/login/start", { method: "POST", body: { domain: domain } })
       .then((data) => {
         window.open(data.authorize_url, "fediverse-bridge-login", "width=500,height=700");
+        let settled = false;
+        let pollTimer = null;
+        function finish(ok) {
+          if (settled) return;
+          settled = true;
+          window.removeEventListener("message", onMessage);
+          if (pollTimer) clearInterval(pollTimer);
+          if (btn) btn.disabled = false;
+          if (ok) { toast("Signed in.", true); if (onDone) onDone(); }
+        }
         function onMessage(ev) {
           if (!ev.data || ev.data.type !== "fediverse-bridge-login") return;
-          window.removeEventListener("message", onMessage);
-          if (ev.data.ok) { toast("Signed in.", true); if (onDone) onDone(); }
-          else toast("Sign-in failed or was cancelled.", false);
+          if (ev.data.ok) finish(true);
+          else { toast("Sign-in failed or was cancelled.", false); finish(false); }
         }
         window.addEventListener("message", onMessage);
+        // The OAuth tab posts a message back on success, but that relies
+        // on window.opener/postMessage surviving a sandboxed widget
+        // iframe, which isn't always reliable -- observed live: the tab
+        // closed itself but the timeline never refreshed until Browse was
+        // clicked again. Poll for the login actually landing as a
+        // fallback instead of only ever waiting to be told.
+        let attempts = 0;
+        pollTimer = setInterval(() => {
+          attempts++;
+          if (attempts > 60) { finish(false); return; }
+          api("/widget/api/browse/login/list").then((d) => {
+            if ((d.logins || []).some((l) => l.domain === domain)) finish(true);
+          }).catch(() => {});
+        }, 2000);
       })
-      .catch((e) => toast(e.message, false))
-      .finally(() => { if (btn) btn.disabled = false; });
+      .catch((e) => { toast(e.message, false); if (btn) btn.disabled = false; });
   }
 
   function openPasswordLoginForm(domain, onDone) {
