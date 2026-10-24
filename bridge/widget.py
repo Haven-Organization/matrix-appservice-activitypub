@@ -907,7 +907,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
 
   /* -- post cards (timeline) ----------------------------------------------- */
-  .post-card { display: flex; gap: 12px; padding: 16px; }
+  .post-card { display: flex; gap: 12px; padding: 16px; position: relative; }
   .post-card + .post-card { border-top: 1px solid var(--border); }
   .avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; background: var(--hover); object-fit: cover; }
   .avatar.sm { width: 24px; height: 24px; }
@@ -917,14 +917,22 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .post-body { flex: 1; min-width: 0; }
   .post-header { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+  .post-header-left { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
+  .post-header-right { margin-left: auto; flex-shrink: 0; display: flex; align-items: center; gap: 2px; }
   .post-header .name { font-weight: 600; color: var(--text); }
   .post-header .handle, .post-header .time { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .post-header .time { margin-left: auto; flex-shrink: 0; }
   .view-icon-btn { border: none; background: none; color: var(--muted); font-size: 13px; padding: 0 0 0 4px; cursor: pointer; flex-shrink: 0; line-height: 1; }
   .view-icon-btn:hover { color: var(--text); }
+  .post-timestamp-full { font-size: 12px; color: var(--muted); margin: 6px 0; }
   .boosted-by { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .boosted-by img.emoji, .post-header .name img.emoji { width: 1em; height: 1em; }
   .reply-to-line { font-size: 12px; color: var(--muted); margin-bottom: 4px; cursor: pointer; }
+  /* A connecting line from this card's avatar down into the next card's --
+     the ancestor chain leading up to the thread root, and a direct reply
+     that the focused post's own author continued replying to. */
+  .post-card.chain-link::after {
+    content: ""; position: absolute; left: 35px; top: 56px; bottom: -1px; width: 2px; background: var(--border);
+  }
   .reply-to-line:hover { color: var(--accent); }
   .post-content { font-size: 15px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
   .post-content p { margin: 0 0 8px; }
@@ -1370,6 +1378,15 @@ _WIDGET_HTML = r"""<!doctype html>
     return new Date(iso).toLocaleDateString();
   }
 
+  function fullDateTime(iso) {
+    if (!iso) return "";
+    try {
+      return new Date(iso).toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" });
+    } catch (e) {
+      return new Date(iso).toString();
+    }
+  }
+
   function renderSkeletonCard() {
     return el("div", { class: "skel-card" }, [
       el("div", { class: "avatar skel" }),
@@ -1389,7 +1406,8 @@ _WIDGET_HTML = r"""<!doctype html>
       .finally(() => { if (btn) btn.disabled = false; });
   }
 
-  function renderPostCard(post, onChange) {
+  function renderPostCard(post, onChange, opts) {
+    const focused = !!(opts && opts.focused);
     const children = [];
     if (post.boosted_by) {
       const b = post.boosted_by;
@@ -1412,15 +1430,19 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     const hasAuthorProfile = !!post.author.actor_id;
     const openAuthor = (e) => { if (e) e.stopPropagation(); if (hasAuthorProfile) openAccountProfile(post.author.actor_id); };
-    const header = el("div", { class: "post-header" }, [
+    const headerLeft = el("div", { class: "post-header-left" }, [
       nameNode("span", "name" + (hasAuthorProfile ? " clickable" : ""), post.author.display_name, post.author.display_name_html, openAuthor),
       el("span", { class: "handle" + (hasAuthorProfile ? " clickable" : ""), text: post.author.handle, onclick: openAuthor }),
-      el("span", { class: "time", text: timeAgo(post.created_at) }),
-      el("button", {
-        class: "view-icon-btn", text: "↗", title: "Open on " + (post.instance || "their instance"),
-        onclick: (e) => { e.stopPropagation(); window.open(post.url, "_blank", "noopener"); },
-      }),
     ]);
+    const headerRightChildren = [];
+    if (!focused) {
+      headerRightChildren.push(el("span", { class: "time", text: timeAgo(post.created_at), title: fullDateTime(post.created_at) }));
+    }
+    headerRightChildren.push(el("button", {
+      class: "view-icon-btn", text: "↗", title: "Open on " + (post.instance || "their instance"),
+      onclick: (e) => { e.stopPropagation(); window.open(post.url, "_blank", "noopener"); },
+    }));
+    const header = el("div", { class: "post-header" }, [headerLeft, el("div", { class: "post-header-right" }, headerRightChildren)]);
     const content = el("div", { class: "post-content" });
     content.innerHTML = post.content_html || "";
     children.push(header, content);
@@ -1428,6 +1450,9 @@ _WIDGET_HTML = r"""<!doctype html>
       children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) =>
         el("img", { src: m.url, alt: m.description || "", loading: "lazy" })
       )));
+    }
+    if (focused) {
+      children.push(el("div", { class: "post-timestamp-full", text: fullDateTime(post.created_at) }));
     }
     const counts = post.counts || { replies: 0, reblogs: 0, favourites: 0 };
     if (counts.replies || counts.reblogs || counts.favourites) {
@@ -1865,21 +1890,38 @@ _WIDGET_HTML = r"""<!doctype html>
         page.appendChild(el("div", { class: "muted", text: "Couldn't load that post." }));
         return;
       }
-      const feed = el("div", { class: "card" });
-      (data.ancestors || []).forEach((p) => {
-        const card = renderPostCard(p, function () {});
-        card.classList.add("thread-ancestor");
-        feed.appendChild(card);
+      // Ancestors + the focused post form one connected chain, lines
+      // running avatar-to-avatar up to the thread root (or as far back
+      // as this bridge could resolve).
+      const rootChain = el("div", { class: "card" });
+      const chain = (data.ancestors || []).concat([data.post]);
+      chain.forEach((p, i) => {
+        const isFocus = i === chain.length - 1;
+        const card = renderPostCard(p, function () {}, { focused: isFocus });
+        card.classList.add(isFocus ? "thread-focus" : "thread-ancestor");
+        if (!isFocus) card.classList.add("chain-link");
+        rootChain.appendChild(card);
       });
-      const focusCard = renderPostCard(data.post, function () {});
-      focusCard.classList.add("thread-focus");
-      feed.appendChild(focusCard);
-      page.appendChild(feed);
+      page.appendChild(rootChain);
+
       if (data.replies && data.replies.length) {
         page.appendChild(el("h2", { text: "Replies" }));
-        const repliesCard = el("div", { class: "card" });
-        data.replies.forEach((p) => repliesCard.appendChild(renderPostCard(p, function () {})));
-        page.appendChild(repliesCard);
+        // Each direct reply is its own card (or pair of cards, line-
+        // connected) -- NOT one shared list -- so a reply the focused
+        // post's author continued replying to reads as its own
+        // conversation branch, not a flat series.
+        data.replies.forEach((reply) => {
+          const branch = el("div", { class: "card" });
+          const replyCard = renderPostCard(reply, function () {});
+          if (reply.op_reply) {
+            replyCard.classList.add("chain-link");
+            branch.appendChild(replyCard);
+            branch.appendChild(renderPostCard(reply.op_reply, function () {}));
+          } else {
+            branch.appendChild(replyCard);
+          }
+          page.appendChild(branch);
+        });
       }
     }).catch((e) => {
       page.innerHTML = "";
