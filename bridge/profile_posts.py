@@ -313,6 +313,59 @@ async def _maybe_handle_msc4501_quote_post(
     return True
 
 
+async def _maybe_handle_sibling_bridge_reply(
+    request: Request, *, relates_to: dict, body: str, actor_record, room_id: str, matrix_event_id: str,
+) -> bool:
+    """Publishes a real AP Note for a Profile-Room reply whose
+    ``SOCIAL_RELATES_TO_FIELD`` ``sender`` is a SIBLING BRIDGE's own ghost
+    (Bluesky via ``matrix-appservice-atproto``, Nostr via
+    ``matrix-appservice-nostr`` -- see ``bridge.commands.
+    is_foreign_bridge_user``, ``bridge.other_bridge_users``), per
+    FEATURES.md's documented sibling-bridge feature. Distinct from a reply
+    to one of THIS bridge's own (native AP) ghosts, which stays suppressed
+    by the caller -- that case already has a real reply thread elsewhere
+    (the ghost's own Remote User Room conversation, see
+    ``bridge.reply_bridge``), so a second copy here would be purely
+    redundant. A sibling-bridge ghost's content isn't ActivityPub at all,
+    so there's no thread for it to join anywhere else -- this Profile Room
+    post is the ONLY path it has to reach the fediverse, confirmed live
+    2026-10-24 (a reply to a Bluesky-mirrored ghost's post, with no
+    equivalent native-AP thread to redirect to).
+
+    Delegates to ``bridge.reaction_bridge.send_cross_bridge_quote`` (the
+    SAME mechanism a 🔁-react/``;repost``/genuine-same-room-reply to a
+    sibling bridge's ghost already uses, see ``bridge.reply_bridge``'s own
+    call site) rather than reimplementing Note-building/delivery here --
+    one proven attribution/external_url/dedup implementation, not three
+    independently-drifting ones. ``skip_echo=True`` because, unlike those
+    other two callers, the triggering ``matrix_event_id`` here is already
+    sitting in ``actor_record.room_id`` as the user's own real message
+    (Haven posted it directly into the Profile Room) -- a second,
+    synthetic echo card on top of it would just be a duplicate.
+    ``target_room_id``/``target_event_id`` come straight from
+    ``relates_to`` itself (MSC4501's own "room_id"/"event_id" fields,
+    mandatory per the MSC) -- ``send_cross_bridge_quote`` re-fetches that
+    event's CURRENT content live rather than trusting the possibly-stale
+    snapshot under ``relates_to["content"]``.
+
+    Returns ``False`` (falls through to the caller's existing suppression)
+    only if the referenced event itself can no longer be fetched at all
+    (see ``send_cross_bridge_quote``'s own return-False case) -- nothing
+    coherent to publish in that case either."""
+    target_room_id = relates_to.get("room_id")
+    target_event_id = relates_to.get("event_id")
+    if not target_room_id or not target_event_id:
+        return False
+
+    from bridge.reaction_bridge import send_cross_bridge_quote
+
+    return await send_cross_bridge_quote(
+        request, actor_record=actor_record, target_room_id=target_room_id, target_event_id=target_event_id,
+        caption=body, reactor_matrix_user_id=actor_record.matrix_user_id, matrix_event_id=matrix_event_id,
+        is_reply=True, skip_echo=True,
+    )
+
+
 async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     """Returns True if this event belonged to a linked Profile Room (handled,
     successfully distributed or not) -- callers shouldn't process it further."""
@@ -402,13 +455,33 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     # in_reply_to ever set -- federating as a context-free standalone post
     # with no sign it was ever a reply to anything (confirmed live
     # 2026-10-24, a reply to a ghost's post appearing as an unrelated top-
-    # level post on a remote instance). The Profile Room was never a
-    # supported place to compose a real threaded reply from -- that's what
-    # a Remote User Room's own conversation is for, see bridge.reply_bridge
-    # -- and the user explicitly doesn't want these sent out at all, so
-    # this suppresses them rather than building a second, partial reply-
-    # threading pipeline here.
+    # level post on a remote instance).
+    #
+    # Two cases, discriminated by whether the referenced ghost belongs to
+    # a SIBLING bridge (see is_foreign_bridge_user/bridge.
+    # other_bridge_users): a reply to one of THIS bridge's own native AP
+    # ghosts is suppressed -- that ghost already has a real reply thread
+    # elsewhere (its own Remote User Room conversation, see
+    # bridge.reply_bridge), so a Profile Room copy is purely redundant
+    # (confirmed 2026-10-24: a reply to a native AP ghost going out as a
+    # second, context-free standalone post was exactly this redundancy,
+    # not a missing feature). A reply to a SIBLING bridge's ghost (Bluesky/
+    # Nostr content mirrored in) is NOT redundant -- that content isn't
+    # ActivityPub at all, so this Profile Room post is the only path it
+    # ever has to reach the fediverse (see FEATURES.md's documented
+    # sibling-bridge behavior, and _maybe_handle_sibling_bridge_reply).
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPLY:
+        reply_sender = relates_to.get("sender") or ""
+        if is_foreign_bridge_user(reply_sender, config):
+            reply_body = (content.get("body") or "").strip()
+            if await _maybe_handle_sibling_bridge_reply(
+                request, relates_to=relates_to, body=reply_body,
+                actor_record=actor_record, room_id=room_id, matrix_event_id=matrix_event_id,
+            ):
+                return True
+            # No external_url to link back to -- nothing coherent to
+            # publish, so this falls through to the same suppression as a
+            # native-ghost reply rather than a context-free post.
         return True
 
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:

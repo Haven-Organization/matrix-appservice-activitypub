@@ -117,6 +117,33 @@ SOCIAL_PROFILE_ROOM_FIELD = "org.matrix.msc4501.social.profile_room"
 EXTERNAL_HANDLE_FIELD = "org.matrix.msc4503.external_handle"
 
 
+# MSC4144 (unstable prefix, not yet accepted) per-message sender-profile
+# override -- some bridges, including this one (see
+# bridge.reaction_bridge._build_per_message_profile), stamp this on a
+# message sent under a profile other than the room's own default. Used as
+# a fallback attribution source below when EXTERNAL_HANDLE_FIELD isn't
+# present on a referenced message's content.
+PER_MESSAGE_PROFILE_FIELD = "com.beeper.per_message_profile"
+
+
+def resolve_cross_bridge_handle(content: dict, *, fallback: str | None = None) -> str | None:
+    """Best-available human-readable attribution for a message authored by
+    a SIBLING bridge's own ghost (Bluesky/Nostr content mirrored in) --
+    MSC4503 ``external_handle`` (the real fediverse-style handle both
+    sibling bridges stamp on everything they mirror in, confirmed deployed
+    by both, see EXTERNAL_HANDLE_FIELD's own docstring) first, then
+    MSC4144's per-message profile displayname, then ``fallback``.
+
+    Shared by ``bridge.reaction_bridge.send_cross_bridge_quote`` and
+    ``bridge.profile_posts._maybe_handle_sibling_bridge_reply``/
+    ``bridge.activitypub.routes._reconstruct_note_body`` so all three read
+    attribution the same way rather than drifting into three slightly
+    different heuristics."""
+    handle_meta = content.get(EXTERNAL_HANDLE_FIELD) or {}
+    per_message_profile = content.get(PER_MESSAGE_PROFILE_FIELD) or {}
+    return handle_meta.get("handle") or per_message_profile.get("displayname") or fallback
+
+
 def _external_handle_value(config, *, handle: str, profile_url: str | None = None) -> dict:
     """Builds an MSC4503 ``m.external_handle`` object. ``protocol.avatar_url``
     is the bridge bot's own configured avatar (``appservice.bot_avatar_mxc``,
@@ -778,6 +805,32 @@ def build_repost_note_content(caption: str, quote_uri: str, mention_links: dict[
     return plain_text_to_note_html(caption, mention_links) + (
         f'<p>RT: <a href="{html.escape(quote_uri)}">{html.escape(quote_uri)}</a></p>'
     )
+
+
+def build_sibling_reply_note_content(
+    body: str, external_url: str, display_name: str | None, mention_links: dict[str, str] | None = None
+) -> str:
+    """The AP ``content`` HTML for a Profile-Room reply to a sibling
+    bridge's ghost (Bluesky/Nostr content mirrored in by
+    ``matrix-appservice-atproto``/``matrix-appservice-nostr`` -- see
+    ``bridge.profile_posts._maybe_handle_sibling_bridge_reply``): a
+    "↩️ Reply to <display name>'s post" line linking to
+    ``external_url`` (the sibling bridge's own stamped permalink for the
+    ghost's mirrored content), then the replier's own text.
+
+    There's no real AP object to set ``inReplyTo``/``quoteUri`` to here --
+    the replied-to post isn't ActivityPub content at all -- so, like
+    ``build_repost_note_content``'s own "RT: <link>" fallback, this is
+    plain embedded content any fediverse client can render, not a
+    protocol-level relation. Shared between the live send and
+    ``bridge.activitypub.routes``'s own reconstruction (see
+    ``_reconstruct_note_body``) so a re-fetched/outbox copy never drifts
+    from what was actually delivered."""
+    who = display_name or external_url
+    header = (
+        f'<p>↩️ Reply to <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post</p>'
+    )
+    return header + plain_text_to_note_html(body, mention_links)
 
 
 def split_repost_caption(echo_body: str) -> str:

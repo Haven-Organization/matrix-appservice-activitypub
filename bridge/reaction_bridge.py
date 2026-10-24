@@ -55,15 +55,17 @@ from bridge.commands import is_foreign_bridge_user, is_third_party_still_allowed
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
 from bridge.note_mirroring import (
-    EXTERNAL_HANDLE_FIELD,
+    PER_MESSAGE_PROFILE_FIELD,
     SOCIAL_BODY_FIELD,
     SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
     build_repost_note_content,
+    build_sibling_reply_note_content,
     deliver_to_actor_or_followers,
     resolve_actor_matrix_identity,
+    resolve_cross_bridge_handle,
     social_relates_to,
 )
 from bridge.repository import ActorRecord, FederatedEvent, ReactionRecord
@@ -225,9 +227,6 @@ async def note_msc4501_native_repost(
         )
     except SynapseError:
         logger.warning("Failed to redact redundant repost card %s", card_event_id, exc_info=True)
-
-
-_PER_MESSAGE_PROFILE_FIELD = "com.beeper.per_message_profile"
 
 
 async def _build_per_message_profile(request: Request, actor_record: ActorRecord) -> dict | None:
@@ -516,7 +515,7 @@ async def send_repost(
                 notice_content[SOCIAL_FORMATTED_BODY_FIELD] = html.escape(preview_text)
         per_message_profile = await _build_per_message_profile(request, actor_record)
         if per_message_profile is not None:
-            notice_content[_PER_MESSAGE_PROFILE_FIELD] = per_message_profile
+            notice_content[PER_MESSAGE_PROFILE_FIELD] = per_message_profile
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
         try:
             notice_event_id = await request.app.state.synapse.send_message_event(
@@ -579,6 +578,8 @@ async def send_cross_bridge_quote(
     caption: str,
     reactor_matrix_user_id: str,
     matrix_event_id: str | None,
+    is_reply: bool = False,
+    skip_echo: bool = False,
 ) -> bool:
     """Represents reposting (🔁-react, or ``;repost``) or replying to a
     message authored by a DIFFERENT bridge's own ghost (see
@@ -597,14 +598,15 @@ async def send_cross_bridge_quote(
     Bluesky and Nostr bridges already stamp on everything they mirror in,
     same convention this bridge's own ``source_post_url`` uses) as a real
     working link, plus whatever MSC4503 ``external_handle`` attribution
-    the target's own content carries (the same field this bridge uses for
-    its own ghosts, confirmed deployed by both sibling bridges too) --
-    falling back to a bare matrix.to permalink and a generic "a post"
-    attribution if neither is present. Does NOT resolve Matrix mention
-    pills in ``caption`` into AP ``Mention`` tags (unlike
-    ``bridge.commands._handle_repost``'s captioned path) -- a deliberate
-    simplification for this first pass, since the caption itself still
-    renders correctly either way, just without AP-side tag-mentions.
+    the target's own content carries (see ``resolve_cross_bridge_handle``,
+    the same field this bridge uses for its own ghosts, confirmed deployed
+    by both sibling bridges too) -- falling back to a bare matrix.to
+    permalink and a generic "a post" attribution if neither is present.
+    Does NOT resolve Matrix mention pills in ``caption`` into AP
+    ``Mention`` tags (unlike ``bridge.commands._handle_repost``'s
+    captioned path) -- a deliberate simplification for this first pass,
+    since the caption itself still renders correctly either way, just
+    without AP-side tag-mentions.
 
     ``caption`` is the reposter's/replier's own added text -- "" for a
     bare repost, the reply's own body for a reply. Either way this is
@@ -613,11 +615,24 @@ async def send_cross_bridge_quote(
     ``Delete`` -- there is no ``Announce``/``Undo`` bookkeeping to
     maintain here, since nothing is actually being boosted.
 
-    Also posts the usual "🔁 reposted X's post" echo card into
-    ``actor_record``'s own Profile Room, same convention as
-    ``send_repost``/``bridge.commands._handle_repost``'s identical cards
-    (including their own ``external_url``, for the same reason those
-    carry it). Callers are responsible for their own "Reposted."/thread
+    ``is_reply`` (False for a repost/``;repost``, True for an actual
+    reply) switches the Note's own content from "RT: <link>"
+    (``build_repost_note_content``) to "↩️ Reply to <handle>'s
+    post: <link>" (``build_sibling_reply_note_content``) -- same
+    distinction the echo card's own wording below makes.
+
+    Posts the usual "🔁 reposted X's post"/"↩️ replied to X's
+    post" echo card into ``actor_record``'s own Profile Room, same
+    convention as ``send_repost``/``bridge.commands._handle_repost``'s
+    identical cards (including their own ``external_url``, for the same
+    reason those carry it) -- UNLESS ``skip_echo`` is set, for a caller
+    whose own triggering ``matrix_event_id`` already lives in
+    ``actor_record.room_id`` and so is ALREADY the visible Matrix-side
+    record (see ``bridge.profile_posts._maybe_handle_sibling_bridge_reply``,
+    the one caller that passes it -- same reasoning
+    ``_maybe_handle_msc4501_quote_post``'s own docstring gives for not
+    posting a second synthetic echo on top of a client's own message).
+    Callers are responsible for their own "Reposted."/thread
     acknowledgement notice wherever the triggering command actually ran
     from, if anywhere -- this function only ever touches
     ``actor_record.room_id``.
@@ -649,9 +664,7 @@ async def send_cross_bridge_quote(
     external_url = preview_full_content.get("external_url")
     link_for_note = external_url or post_link
 
-    handle_meta = preview_full_content.get(EXTERNAL_HANDLE_FIELD) or {}
-    per_message_profile = preview_full_content.get(_PER_MESSAGE_PROFILE_FIELD) or {}
-    original_handle = handle_meta.get("handle") or per_message_profile.get("displayname") or "a post"
+    original_handle = resolve_cross_bridge_handle(preview_full_content, fallback="a post")
 
     own_actor_id = actor_url(base, actor_record.username)
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
@@ -664,18 +677,26 @@ async def send_cross_bridge_quote(
     # duplicate quote-post. target_ap_object_id/activity_id are synthetic
     # here (there's no real Announce to key this on) -- this ReactionRecord
     # exists purely for the atomic claim, not for Undo-matching; un-quoting
-    # is handled by ordinary post-redaction on the echo FederatedEvent
-    # recorded further down instead.
+    # is handled by ordinary post-redaction on the echo FederatedEvent (or,
+    # with skip_echo, the caller's own triggering event) recorded further
+    # down instead. Claimed against actor_record.room_id when skip_echo is
+    # set -- the triggering matrix_event_id lives THERE, not in
+    # target_room_id, for that caller (see this function's own docstring).
+    claim_room_id = actor_record.room_id if skip_echo else target_room_id
     if matrix_event_id and not await repository.claim_reaction(
         ReactionRecord(
-            activity_id=note_id, room_id=target_room_id, event_id=matrix_event_id,
+            activity_id=note_id, room_id=claim_room_id, event_id=matrix_event_id,
             target_ap_object_id=note_id, reactor_matrix_user_id=reactor_matrix_user_id,
         )
     ):
         return True
 
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    note_html = build_repost_note_content(caption, link_for_note)
+    if is_reply:
+        reply_handle = None if original_handle == "a post" else original_handle
+        note_html = build_sibling_reply_note_content(caption, link_for_note, reply_handle)
+    else:
+        note_html = build_repost_note_content(caption, link_for_note)
     note = Note(
         id=note_id, attributed_to=own_actor_id, content=note_html, published=published,
         to=[AS_PUBLIC], cc=[followers_url(base, actor_record.username)],
@@ -689,8 +710,24 @@ async def send_cross_bridge_quote(
         key_id=main_key_id(base, actor_record.username), private_key_pem=actor_record.private_key_pem,
     )
 
+    if skip_echo:
+        # The caller's own triggering matrix_event_id already lives in
+        # actor_record.room_id and IS the visible Matrix-side record (see
+        # this function's own docstring) -- record it directly instead of
+        # posting a second, synthetic bot-authored copy on top of it.
+        if matrix_event_id:
+            await repository.record_federated_event(
+                FederatedEvent(
+                    event_id=matrix_event_id, room_id=actor_record.room_id, ap_object_id=note_id,
+                    author_actor_id=own_actor_id,
+                )
+            )
+        return True
+
+    verb = "replied to" if is_reply else "reposted"
+    emoji = "↩️" if is_reply else "\U0001F501"
     quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
-    plain_body = f"\U0001F501 reposted {original_handle}'s post:"
+    plain_body = f"{emoji} {verb} {original_handle}'s post:"
     if preview_text:
         plain_body += f"\n> {preview_text}"
     plain_body += f"\n{post_link}"
@@ -700,7 +737,7 @@ async def send_cross_bridge_quote(
     caption_html = f"<p>{html.escape(caption)}</p>" if caption else ""
     formatted_caption = (
         caption_html
-        + f"<p>\U0001F501 reposted {html.escape(original_handle)}'s {post_pill_html}</p>{quote_block_html}"
+        + f"<p>{emoji} {verb} {html.escape(original_handle)}'s {post_pill_html}</p>{quote_block_html}"
     )
     echo_content = build_preview_media_content(
         plain_body=plain_body, formatted_caption=formatted_caption,

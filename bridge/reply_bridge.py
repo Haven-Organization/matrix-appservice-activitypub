@@ -537,7 +537,7 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
                     await send_cross_bridge_quote(
                         request, actor_record=reply_actor_record, target_room_id=room_id,
                         target_event_id=target_event_id, caption=caption, reactor_matrix_user_id=sender,
-                        matrix_event_id=event.get("event_id"),
+                        matrix_event_id=event.get("event_id"), is_reply=True,
                     )
                 return True
             return False  # replying to a purely-local Matrix message; nothing to federate

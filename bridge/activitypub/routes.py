@@ -60,7 +60,14 @@ from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.signatures import SignatureError, verify_incoming_request
 from bridge.custom_emoji import apply_resolved_emoji
 from bridge.identity_settings import get_effective_setting
-from bridge.note_mirroring import build_repost_note_content, split_repost_caption
+from bridge.note_mirroring import (
+    SOCIAL_REL_TYPE_REPLY,
+    SOCIAL_RELATES_TO_FIELD,
+    build_repost_note_content,
+    build_sibling_reply_note_content,
+    resolve_cross_bridge_handle,
+    split_repost_caption,
+)
 from bridge.activitypub.urls import (
     actor_url,
     featured_url,
@@ -75,7 +82,7 @@ from bridge.activitypub.urls import (
     username_from_actor_url,
 )
 from bridge.activitypub.webfinger import build_local_webfinger_document, parse_acct
-from bridge.commands import _effective_third_party_mode
+from bridge.commands import _effective_third_party_mode, is_foreign_bridge_user
 from bridge.inbox_dispatch import handle_activity
 from bridge.media import media_caption, resolve_reconstructed_attachment
 from bridge.mentions import reconstruct_note_mentions
@@ -672,7 +679,9 @@ def _matrix_ts_to_iso(origin_server_ts: int | None) -> str:
     return datetime.fromtimestamp(origin_server_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _reconstruct_note_body(federated, event_content: dict, attachment: dict | None) -> tuple[str, str, str | None]:
+def _reconstruct_note_body(
+    federated, event_content: dict, attachment: dict | None, *, config, raw_event_content: dict | None = None,
+) -> tuple[str, str, str | None]:
     """``(body, content_html, quote_uri)`` for reconstructing a Note from
     the Matrix event that mirrors it (shared by ``get_outbox`` and
     ``get_note``).
@@ -687,11 +696,34 @@ def _reconstruct_note_body(federated, event_content: dict, attachment: dict | No
     ``split_repost_caption``. An ordinary post's ``body`` with an
     attachment is a genuine caption only under the caption convention
     (separate differing ``filename`` -- see ``bridge.media.media_caption``),
-    else it's just the filename and is blanked."""
+    else it's just the filename and is blanked.
+
+    A sibling-bridge Profile Room reply (see ``bridge.profile_posts.
+    _maybe_handle_sibling_bridge_reply``) gets the same "reconstruct from
+    the Matrix event, don't trust a separately-cached copy" treatment --
+    its ``SOCIAL_RELATES_TO_FIELD`` lives directly on the event's own
+    content, same as the live send path reads it from, so this just
+    re-derives the identical header+link rather than falling through to
+    the ordinary body-only reconstruction below (which would silently
+    drop the "reply to X" framing on a re-fetch/outbox view). Uses
+    ``raw_event_content`` (the ORIGINAL, pre-edit content), same
+    raw-vs-effective split ``derive_in_reply_to`` already needs -- an
+    edit's ``m.new_content`` never carries this field either."""
     if federated.reposted_object_id:
         body = (event_content.get("body") or "").strip()
         caption = split_repost_caption(body)
         return body, build_repost_note_content(caption, federated.reposted_object_id), federated.reposted_object_id
+    relates_to = (raw_event_content or event_content).get(SOCIAL_RELATES_TO_FIELD)
+    if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPLY:
+        reply_sender = relates_to.get("sender") or ""
+        if is_foreign_bridge_user(reply_sender, config):
+            relates_to_content = relates_to.get("content") or {}
+            external_url = relates_to_content.get("external_url")
+            if isinstance(external_url, str) and external_url:
+                body = (event_content.get("body") or "").strip()
+                handle = resolve_cross_bridge_handle(relates_to_content, fallback=relates_to.get("displayname"))
+                content_html = build_sibling_reply_note_content(body, external_url, handle)
+                return body, content_html, None
     body = media_caption(event_content) if attachment is not None else (event_content.get("body") or "").strip()
     return body, (plain_text_to_note_html(body) if body else ""), None
 
@@ -1047,9 +1079,12 @@ async def _build_post_view(
         except SynapseError:
             return None
 
+    raw_event_content = matrix_event.get("content") or {}
     event_content = _effective_event_content(matrix_event)
     attachment = await resolve_reconstructed_attachment(request, event_content)
-    body, content_html, _quote_uri = _reconstruct_note_body(federated, event_content, attachment)
+    body, content_html, _quote_uri = _reconstruct_note_body(
+        federated, event_content, attachment, config=config, raw_event_content=raw_event_content
+    )
     # Guest posts re-tack the room owner's mention here too -- see
     # _guest_post_owner_mention; without this, the HTML views show the
     # stripped content even after get_note's JSON was fixed.
@@ -1337,7 +1372,10 @@ async def _reconstruct_note_from_matrix_event(
     raw_event_content = matrix_event.get("content") or {}
     event_content = _effective_event_content(matrix_event)
     attachment = await resolve_reconstructed_attachment(request, event_content)
-    body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
+    body, content_html, quote_uri = _reconstruct_note_body(
+        federated, event_content, attachment,
+        config=request.app.state.config, raw_event_content=raw_event_content,
+    )
     if not body and attachment is None:
         return None
     in_reply_to = await derive_in_reply_to(repository, raw_event_content)
@@ -1659,7 +1697,9 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
     raw_event_content = matrix_event.get("content") or {}
     event_content = _effective_event_content(matrix_event)
     attachment = await resolve_reconstructed_attachment(request, event_content)
-    _body, content_html, quote_uri = _reconstruct_note_body(federated, event_content, attachment)
+    _body, content_html, quote_uri = _reconstruct_note_body(
+        federated, event_content, attachment, config=config, raw_event_content=raw_event_content
+    )
 
     # A redaction empties a Matrix event's `content` (Synapse still serves
     # the event itself -- `get_event` above only 404s if it's gone
