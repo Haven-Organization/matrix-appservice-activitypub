@@ -53,6 +53,7 @@ from bridge.commands import (
     _handle_import,
     _handle_link_profile,
     _handle_mute,
+    _handle_rejoin,
     _handle_replace_room,
     _handle_set,
     _handle_unblock,
@@ -308,6 +309,25 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.post("/widget/api/rejoin")
+async def widget_rejoin(request: Request) -> JSONResponse:
+    """";rejoin profile" + ";rejoin space" back to back -- the self-service
+    recovery shortcut, global like the Identity tab it lives in rather
+    than needing a specific room's own context. Never targets anyone but
+    the caller (no `[@other]` support here) -- that admin-only escape
+    hatch stays chat-only, same scoping decision as the original widget
+    plan's gap audit made for it."""
+    matrix_user_id = _session_user(request)
+    body = await request.json()
+    target_room_id = body.get("room_id", "")
+    try:
+        await _handle_rejoin(request, sender=matrix_user_id, room_id=target_room_id, argument="profile")
+        await _handle_rejoin(request, sender=matrix_user_id, room_id=target_room_id, argument="space")
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": True})
 
 
 @router.get("/widget/api/admin/grants")
@@ -1208,6 +1228,13 @@ _WIDGET_HTML = r"""<!doctype html>
           el("div", { class: "sub", text: "Only works inside a room you want to become that identity's own Profile Room -- switch to the \"This Room\" tab there and use \"Create profile\"." }),
         ]));
       }
+      app.appendChild(el("div", { class: "card" }, [
+        el("h2", { text: "Account recovery" }),
+        el("div", { class: "sub", text: "Locked out of your Profile Room or Space (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
+        el("div", { class: "row" }, [
+          plainButton("Rejoin my rooms", (e) => doAction("/widget/api/rejoin", {}, e.target)),
+        ]),
+      ]));
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
   }
 
