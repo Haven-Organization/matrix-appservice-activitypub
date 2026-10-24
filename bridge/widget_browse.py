@@ -726,12 +726,51 @@ async def _find_op_reply(
     return None
 
 
+async def _resolve_pretty_url_via_search(request: Request, *, raw_uri: str, matrix_user_id: str) -> str | None:
+    """A 'pretty' frontend URL isn't always a real, content-negotiable AS2
+    object -- confirmed live: poa.st's own display route for a REMOTE
+    account's post (``/@user@otherinstance/posts/<id>``) returns plain
+    HTML even with ``Accept: application/activity+json``, since it's a
+    client-side SPA route proxying the real post from wherever it's
+    actually hosted, not a genuine ActivityPub permalink. That instance's
+    own Mastodon-API search with ``resolve=true`` can still often resolve
+    it to the real remote object -- but unauthenticated resolve commonly
+    returns nothing (confirmed live against poa.st), so this attaches
+    this bridge user's own stored login for that domain, if any, the
+    same way ``browse_timeline``/``browse_search`` already do."""
+    parsed = urlparse(raw_uri)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    http_client = request.app.state.http_client
+    headers = await _auth_headers(request, matrix_user_id=matrix_user_id, domain=parsed.netloc)
+    try:
+        resp = await http_client.get(
+            f"{origin}/api/v1/search", params={"q": raw_uri, "resolve": "true", "type": "statuses"}, headers=headers,
+        )
+        resp.raise_for_status()
+        statuses = resp.json().get("statuses") or []
+    except (httpx.HTTPError, ValueError):
+        return None
+    for status in statuses:
+        if isinstance(status, dict) and isinstance(status.get("uri"), str):
+            return status["uri"]
+    return None
+
+
 @router.get("/widget/api/browse/thread")
 async def browse_thread(request: Request, uri: str) -> JSONResponse:
-    _session_user(request)
+    matrix_user_id = _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
     if focus_doc is None:
-        raise HTTPException(502, "Couldn't load that post.")
+        resolved_uri = await _resolve_pretty_url_via_search(request, raw_uri=uri, matrix_user_id=matrix_user_id)
+        if resolved_uri is not None:
+            focus_doc = await _fetch_as2_note(request, resolved_uri)
+    if focus_doc is None:
+        raise HTTPException(
+            502,
+            "Couldn't load that post -- the link might not be a real ActivityPub permalink "
+            "(e.g. a page that only works in that instance's own web app), or it needs you to be "
+            "signed in to that instance first.",
+        )
 
     ancestors: list[dict[str, Any]] = []
     seen = {uri}
