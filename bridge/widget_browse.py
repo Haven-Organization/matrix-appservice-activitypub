@@ -726,6 +726,37 @@ async def _find_op_reply(
     return None
 
 
+async def _resolve_via_mastodon_status_lookup(request: Request, *, raw_uri: str) -> str | None:
+    """Another way a 'pretty' URL isn't the real AS2 object: an
+    instance's own cached/mirrored view of a post that actually lives
+    elsewhere -- confirmed live, poa.st's own
+    ``/@user@otherinstance/posts/<id>`` display route for a remote
+    minds.com post. Unlike the search fallback below, this needs no
+    auth and no instance-specific URL parsing: a Mastodon/Pleroma/
+    Akkoma permalink's own trailing path segment IS that instance's
+    local Mastodon-API status id (the same trick already used for
+    ``_fetch_context_descendant_pool``'s reply discovery), and
+    ``GET /api/v1/statuses/<id>`` -- unauthenticated, confirmed live --
+    returns that status's real ``uri``, which for a mirrored/cached post
+    is the genuine remote object's own id (confirmed live: exactly the
+    working ``.../entities/urn:activity:...`` form a user had already
+    found by hand for a poa.st-mirrored minds.com post)."""
+    http_client = request.app.state.http_client
+    parsed = urlparse(raw_uri)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    candidate_id = raw_uri.rstrip("/").rsplit("/", 1)[-1]
+    if not candidate_id:
+        return None
+    try:
+        resp = await http_client.get(f"{origin}/api/v1/statuses/{candidate_id}")
+        if resp.status_code != 200:
+            return None
+        status_uri = resp.json().get("uri")
+    except (httpx.HTTPError, ValueError):
+        return None
+    return status_uri if isinstance(status_uri, str) else None
+
+
 async def _resolve_pretty_url_via_search(request: Request, *, raw_uri: str, matrix_user_id: str) -> str | None:
     """A 'pretty' frontend URL isn't always a real, content-negotiable AS2
     object -- confirmed live: poa.st's own display route for a REMOTE
@@ -760,6 +791,10 @@ async def _resolve_pretty_url_via_search(request: Request, *, raw_uri: str, matr
 async def browse_thread(request: Request, uri: str) -> JSONResponse:
     matrix_user_id = _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
+    if focus_doc is None:
+        resolved_uri = await _resolve_via_mastodon_status_lookup(request, raw_uri=uri)
+        if resolved_uri is not None:
+            focus_doc = await _fetch_as2_note(request, resolved_uri)
     if focus_doc is None:
         resolved_uri = await _resolve_pretty_url_via_search(request, raw_uri=uri, matrix_user_id=matrix_user_id)
         if resolved_uri is not None:
