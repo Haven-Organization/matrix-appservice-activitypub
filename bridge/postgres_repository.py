@@ -976,6 +976,12 @@ class PostgresActorRepository:
         row = await self._pool.fetchrow("SELECT * FROM lemmy_communities WHERE room_id = $1", room_id)
         return self._row_to_lemmy_community(row) if row else None
 
+    async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM lemmy_communities WHERE owner_username = $1 ORDER BY username", owner_username
+        )
+        return [self._row_to_lemmy_community(row) for row in rows]
+
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         await self._pool.execute(
             """

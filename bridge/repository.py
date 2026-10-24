@@ -590,6 +590,11 @@ class ActorRepository(Protocol):
 
     async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None: ...
 
+    async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
+        """Every community ``owner_username`` owns -- the Lemmy-side
+        equivalent of ``list_peertube_channels_by_owner``, same reasoning."""
+        ...
+
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         """Create or replace a hosted Lemmy community (freshly created, or
         updated display fields / moderator list)."""
@@ -1583,6 +1588,9 @@ class InMemoryActorRepository:
     async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
         username = self._lemmy_communities_by_room_id.get(room_id) if room_id else None
         return self._lemmy_communities.get(username) if username else None
+
+    async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
+        return [c for c in self._lemmy_communities.values() if c.owner_username == owner_username]
 
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         existing = self._lemmy_communities.get(record.username)

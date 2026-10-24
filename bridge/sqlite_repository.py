@@ -1228,6 +1228,15 @@ class SqliteActorRepository:
     async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
         return await self._run(self._get_lemmy_community, username)
 
+    def _list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM lemmy_communities WHERE owner_username = ? ORDER BY username", (owner_username,)
+        ).fetchall()
+        return [self._row_to_lemmy_community(row) for row in rows]
+
+    async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
+        return await self._run(self._list_lemmy_communities_by_owner, owner_username)
+
     def _get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
         if not room_id:
             return None
