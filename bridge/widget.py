@@ -36,14 +36,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from bridge.activitypub.urls import actor_url
 from bridge.commands import (
+    _ALLOW_RULE_TYPES,
     _bot_mxid,
     _COMMAND_PREFIX,
+    _handle_allow,
     _handle_backfill,
     _handle_banner,
     _handle_block,
     _handle_chat,
     _handle_create_profile,
     _handle_delete_profile,
+    _handle_disallow,
     _handle_dm,
     _handle_follow,
     _handle_id,
@@ -305,6 +308,53 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.get("/widget/api/admin/grants")
+async def widget_admin_grants(request: Request) -> JSONResponse:
+    """Every current third-party access grant -- the widget's own
+    equivalent of ``;allowed``, read directly from the repository (same
+    ``widget_following``-style pattern) rather than parsing a chat notice.
+    Admin-gated here too, not just client-side by hiding the tab -- same
+    defense in depth every other admin-only widget read/action already
+    has via the handler it calls, since nothing stops a crafted request
+    straight at this endpoint."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view third-party access grants.")
+    repository = request.app.state.repository
+    config = request.app.state.config
+    grants = await repository.list_third_party_allows()
+    return JSONResponse(
+        {
+            "mode": config.bridge.third_party_access_mode,
+            "grants": [
+                {"rule_type": g.rule_type, "value": g.value, "granted_by": g.granted_by, "granted_at": g.granted_at}
+                for g in grants
+            ],
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/admin/allow")
+async def widget_admin_allow(request: Request) -> JSONResponse:
+    body = await request.json()
+    rule_type = body.get("rule_type", "")
+    value = body.get("value", "")
+    if rule_type not in _ALLOW_RULE_TYPES or not isinstance(value, str) or not value.strip():
+        raise HTTPException(400, f"rule_type must be one of {_ALLOW_RULE_TYPES} and value is required")
+    return await _dispatch(request, body.get("room_id", ""), _handle_allow, argument=f"{rule_type} {value.strip()}")
+
+
+@router.post("/widget/api/admin/disallow")
+async def widget_admin_disallow(request: Request) -> JSONResponse:
+    body = await request.json()
+    rule_type = body.get("rule_type", "")
+    value = body.get("value", "")
+    if rule_type not in _ALLOW_RULE_TYPES or not isinstance(value, str) or not value.strip():
+        raise HTTPException(400, f"rule_type must be one of {_ALLOW_RULE_TYPES} and value is required")
+    return await _dispatch(request, body.get("room_id", ""), _handle_disallow, argument=f"{rule_type} {value.strip()}")
 
 
 # -- actions -------------------------------------------------------------------
@@ -917,7 +967,7 @@ _WIDGET_HTML = r"""<!doctype html>
     else if (currentTab === "room") renderRoomTab(app);
     else if (currentTab === "identity") renderIdentityTab(app);
     else if (currentTab === "publish") placeholder(app, "Channel/community publishing is coming soon.");
-    else if (currentTab === "admin") placeholder(app, "The admin panel is coming soon.");
+    else if (currentTab === "admin") renderAdminTab(app);
   }
 
   // -- Home: fediverse timeline -------------------------------------------
@@ -1159,6 +1209,49 @@ _WIDGET_HTML = r"""<!doctype html>
         ]));
       }
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  // -- Admin ------------------------------------------------------------------
+
+  function renderAdminTab(app) {
+    const RULE_TYPES = ["mxid", "room", "homeserver"];
+    const typeSelect = el("select", { style: "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;" },
+      RULE_TYPES.map((t) => el("option", { value: t, text: t })));
+    const valueInput = el("input", { type: "text", placeholder: "@user:example.org, !room:example.org, or example.org" });
+
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+
+    function loadGrants() {
+      api("/widget/api/admin/grants").then((data) => {
+        list.innerHTML = "";
+        if (!data.grants.length) {
+          list.appendChild(el("div", { class: "muted", text: "No grants yet — mode: " + data.mode + "." }));
+          return;
+        }
+        data.grants.forEach((g) => {
+          list.appendChild(el("div", { class: "list-item" }, [
+            el("span", { text: g.rule_type + ": " + g.value }),
+            plainButton("Revoke", (e) =>
+              doAction("/widget/api/admin/disallow", { rule_type: g.rule_type, value: g.value }, e.target).then(loadGrants)),
+          ]));
+        });
+      }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    }
+
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Third-party access" }),
+      el("div", { class: "sub", text: "Let a user, room, or whole homeserver other than your own use this bridge." }),
+      el("div", { class: "row" }, [
+        typeSelect, valueInput,
+        primaryButton("Grant", (e) => {
+          if (!valueInput.value.trim()) return;
+          doAction("/widget/api/admin/allow", { rule_type: typeSelect.value, value: valueInput.value.trim() }, e.target)
+            .then(() => { valueInput.value = ""; loadGrants(); });
+        }),
+      ]),
+      list,
+    ]));
+    loadGrants();
   }
 
   // -- This Room (room-kind actions, unchanged from before) -----------------
