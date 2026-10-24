@@ -1118,35 +1118,39 @@ _WIDGET_HTML = r"""<!doctype html>
     }
   });
 
-  function sendFromWidget(action, data) {
+  // timeoutMs is optional -- without it this can hang forever if the host
+  // never replies at all (confirmed live: stuck on "Connecting…" with no
+  // way back into the widget, after navigating away via MSC2931 navigate
+  // and back to the room -- whatever the host's own reason, OUR side
+  // should never have an unbounded wait with no recovery). Resolves
+  // `null` on timeout rather than rejecting, so a caller that doesn't
+  // pass one keeps today's exact behavior.
+  function sendFromWidget(action, data, timeoutMs) {
     return new Promise((resolve) => {
       const requestId = "req-" + (reqCounter++) + "-" + Date.now();
-      pending[requestId] = resolve;
+      let settled = false;
+      pending[requestId] = (response) => {
+        if (settled) return;
+        settled = true;
+        resolve(response);
+      };
       window.parent.postMessage({ api: "fromWidget", widgetId, requestId, action, data: data || {} }, "*");
+      if (timeoutMs) {
+        setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          delete pending[requestId];
+          resolve(null);
+        }, timeoutMs);
+      }
     });
   }
 
   // MSC2931 navigate -- resolves {} on success, {error:{...}} if the host
   // rejected it (capability not approved, or it just doesn't support the
-  // action). sendFromWidget's own Promise never rejects and never times
-  // out on its own, so a host that silently ignores an action it doesn't
-  // recognize would otherwise hang this forever -- the timeout here is
-  // what lets the caller fall back to opening a new window instead.
+  // action), null on timeout.
   function navigateViaWidgetApi(uri) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        resolve({ error: { message: "timed out" } });
-      }, 2000);
-      sendFromWidget(NAVIGATE_CAPABILITY, { uri }).then((response) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(response);
-      });
-    });
+    return sendFromWidget(NAVIGATE_CAPABILITY, { uri }, 2000);
   }
 
   // One delegated listener for every matrix.to link in the widget (post
@@ -1168,9 +1172,16 @@ _WIDGET_HTML = r"""<!doctype html>
   let openIdResolve = null;
 
   async function getOpenIdToken() {
-    const first = await sendFromWidget("get_openid", {});
-    if (first && first.state === "allowed") return first;
-    if (first && first.state === "blocked") throw new Error("This client denied the identity request.");
+    // This first request previously had NO timeout at all -- confirmed
+    // live: after navigating away via MSC2931 navigate and back to the
+    // room, the client sometimes never answers it again, leaving the
+    // widget stuck on "Connecting…" forever with nothing to even show an
+    // error, let alone retry. 15s is generous for what should be a
+    // near-instant reply.
+    const first = await sendFromWidget("get_openid", {}, 15000);
+    if (first === null) throw new Error("Timed out waiting for the client to respond. Try Cancel below, or closing and reopening this widget.");
+    if (first.state === "allowed") return first;
+    if (first.state === "blocked") throw new Error("This client denied the identity request.");
     // state === "request" -- the client is asking the user now; the
     // actual credentials arrive later as an unsolicited toWidget message.
     return new Promise((resolve, reject) => {
@@ -2452,21 +2463,57 @@ _WIDGET_HTML = r"""<!doctype html>
     render();
   }
 
+  // Bumped on every start() call and on Cancel -- a stale attempt (the
+  // get_openid call that already timed out, or one still in flight when
+  // the user cancels) checks this before touching the DOM, so a late
+  // response from an abandoned attempt can never clobber a newer one.
+  let startGeneration = 0;
+
+  function showConnectErrorState(message) {
+    const app = document.getElementById("app");
+    app.innerHTML = "";
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Couldn't connect" }),
+      el("div", { class: "sub", text: message }),
+      el("div", { class: "row" }, [primaryButton("Retry", () => start())]),
+    ]));
+  }
+
+  function showConnectingState() {
+    const app = document.getElementById("app");
+    app.innerHTML = "";
+    const cancelBtn = plainButton("Cancel", () => {
+      startGeneration++;
+      showConnectErrorState("Cancelled.");
+    });
+    cancelBtn.style.display = "none";
+    app.appendChild(el("div", { class: "spinner" }, [
+      el("div", { text: "Connecting…" }),
+      el("div", { style: "margin-top:12px" }, [cancelBtn]),
+    ]));
+    // Not shown immediately -- a normal connection is near-instant, and
+    // a button that flashes for a fraction of a second on every load is
+    // just noise. Still well before anyone would notice something's
+    // actually wrong.
+    setTimeout(() => { cancelBtn.style.display = ""; }, 3000);
+  }
+
   async function start() {
+    const myGeneration = ++startGeneration;
+    showConnectingState();
     try {
       const creds = await getOpenIdToken();
+      if (myGeneration !== startGeneration) return; // cancelled, or superseded by a newer attempt
       const session = await api("/widget/api/session", {
         method: "POST",
         body: { access_token: creds.access_token, matrix_server_name: creds.matrix_server_name },
       });
+      if (myGeneration !== startGeneration) return;
       sessionId = session.session_id;
       await loadContext();
     } catch (e) {
-      document.getElementById("app").innerHTML = "";
-      document.getElementById("app").appendChild(el("div", { class: "card" }, [
-        el("h2", { text: "Couldn't connect" }),
-        el("div", { class: "sub", text: e.message }),
-      ]));
+      if (myGeneration !== startGeneration) return;
+      showConnectErrorState(e.message);
     }
   }
 
