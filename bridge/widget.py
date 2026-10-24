@@ -959,6 +959,11 @@ _WIDGET_HTML = r"""<!doctype html>
   .post-card.open-thread { cursor: pointer; }
   .post-card.thread-ancestor { opacity: .8; }
   .post-card.thread-focus { background: var(--hover); border-radius: var(--radius-card); cursor: default; }
+  /* No outer .card border/background here -- each post-card in the chain
+     already carries its own look (the focused one's own grey highlight,
+     a border-top between siblings), so wrapping that in another bordered
+     box just double-boxes the selected post. */
+  .thread-chain { margin-bottom: 12px; }
   .skel { background: var(--border); opacity: .5; border-radius: 4px; height: 12px; }
   .skel-card { display: flex; gap: 12px; padding: 16px; }
   .skel-card + .skel-card { border-top: 1px solid var(--border); }
@@ -1033,6 +1038,16 @@ _WIDGET_HTML = r"""<!doctype html>
   .copy-btn { border: none; background: none; color: var(--muted); cursor: pointer; padding: 2px; font-size: 12px; }
   .copy-btn:hover { color: var(--text); }
   .profile-bio { font-size: 14px; line-height: 1.5; margin-bottom: 10px; }
+
+  /* -- scroll-to-top (Element/Haven style: a round "^" button, top right) */
+  .scroll-top-btn {
+    position: fixed; top: 16px; right: 16px; width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; font-weight: 700;
+    cursor: pointer; display: none; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15); z-index: 40;
+  }
+  .scroll-top-btn.visible { display: flex; }
+  .scroll-top-btn:hover { background: var(--hover); }
 </style>
 </head>
 <body>
@@ -1041,6 +1056,7 @@ _WIDGET_HTML = r"""<!doctype html>
     <div id="content"><div id="app"><div class="spinner">Connecting&hellip;</div></div></div>
   </div>
   <div id="toast" class="toast"></div>
+  <button id="scroll-top-btn" class="scroll-top-btn" title="Scroll to top">^</button>
 
 <script>
 (function () {
@@ -1376,6 +1392,16 @@ _WIDGET_HTML = r"""<!doctype html>
     app.innerHTML = "";
     if (!ctx) return;
 
+    // The Home scroll listener (set up inside renderHomeTimeline) only
+    // belongs attached while Home's own timeline is actually showing --
+    // otherwise it would keep recording THIS page's scroll position into
+    // homeState.scrollY, corrupting what "Back" should restore.
+    const goingToHome = !profileView && !threadView && currentTab === "home";
+    if (!goingToHome && window.__homeScrollHandler) {
+      window.removeEventListener("scroll", window.__homeScrollHandler);
+      window.__homeScrollHandler = null;
+    }
+
     if (profileView) { renderProfilePage(app, profileView); return; }
     if (threadView) { renderThreadPage(app, threadView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
@@ -1473,13 +1499,11 @@ _WIDGET_HTML = r"""<!doctype html>
       children.push(el("div", { class: "post-timestamp-full", text: fullDateTime(post.created_at) }));
     }
     const counts = post.counts || { replies: 0, reblogs: 0, favourites: 0 };
-    if (counts.replies || counts.reblogs || counts.favourites) {
-      children.push(el("div", { class: "post-counts" }, [
-        el("span", { class: "count-item", text: "\u{1F4AC} " + counts.replies }),
-        el("span", { class: "count-item", text: "\u{1F501} " + counts.reblogs }),
-        el("span", { class: "count-item", text: "⭐ " + counts.favourites }),
-      ]));
-    }
+    children.push(el("div", { class: "post-counts" }, [
+      el("span", { class: "count-item", text: "\u{1F4AC} " + counts.replies, title: "Replies" }),
+      el("span", { class: "count-item", text: "\u{1F501} " + counts.reblogs, title: "Boosts" }),
+      el("span", { class: "count-item", text: "⭐ " + counts.favourites, title: "Favourites" }),
+    ]));
     if (post.reactions && post.reactions.length) {
       children.push(el("div", { class: "post-reactions" }, post.reactions.map((r) => {
         const chip = el("span", { class: "reaction-chip" });
@@ -1520,7 +1544,7 @@ _WIDGET_HTML = r"""<!doctype html>
   let homeState = null;
 
   function renderHomeTimeline(app) {
-    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false, needsLogin: false, needsLoginDomains: [] };
+    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false, needsLogin: false, needsLoginDomains: [], scrollY: 0 };
     const state = homeState;
 
     const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, a name, or paste a post link to import" });
@@ -1533,7 +1557,7 @@ _WIDGET_HTML = r"""<!doctype html>
         onclick: () => {
           if (state.scope === value) return;
           state.scope = value;
-          state.posts = []; state.cursor = ""; state.done = false; state.unsupported = false; state.needsLogin = false;
+          state.posts = []; state.cursor = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
           render();
         },
       });
@@ -1544,16 +1568,11 @@ _WIDGET_HTML = r"""<!doctype html>
       if (!q) return;
       searchResults.innerHTML = "";
       if (/^https?:\/\//i.test(q)) {
-        goBtn.disabled = true;
-        try {
-          await api("/widget/api/import", { method: "POST", body: { url: q, room_id: roomId } });
-          toast("Imported.", true);
-          searchInput.value = "";
-        } catch (err) {
-          toast(err.message, false);
-        } finally {
-          goBtn.disabled = false;
-        }
+        // Open it in the widget (the same thread view a post click uses)
+        // instead of importing it sight unseen -- lets the user look at
+        // what they're about to pull in and decide for themselves.
+        searchInput.value = "";
+        openThreadView(q);
         return;
       }
       try {
@@ -1576,7 +1595,7 @@ _WIDGET_HTML = r"""<!doctype html>
       const d = domainInput.value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
       state.mode = d ? "instance" : "home";
       state.domain = d;
-      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false;
+      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
       render();
     }
     searchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchOrImport(); });
@@ -1602,7 +1621,7 @@ _WIDGET_HTML = r"""<!doctype html>
         el("span", { text: "Browsing " + state.domain + " (" + state.scope + ") — " }),
         el("a", {
           href: "#", text: "back to your default feed",
-          onclick: (e) => { e.preventDefault(); state.mode = "home"; state.domain = ""; state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; render(); },
+          onclick: (e) => { e.preventDefault(); state.mode = "home"; state.domain = ""; state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.scrollY = 0; render(); },
         }),
       ]));
     }
@@ -1682,7 +1701,22 @@ _WIDGET_HTML = r"""<!doctype html>
     }
 
     renderFeedList();
-    if (!state.posts.length) loadMore();
+
+    function restoreScroll() {
+      if (!state.scrollY) return;
+      // Double rAF: the freshly-rendered posts need a layout pass before
+      // the page is even tall enough to scroll to a saved position.
+      requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, state.scrollY)));
+    }
+    if (!state.posts.length) {
+      loadMore().then(restoreScroll);
+    } else {
+      restoreScroll();
+    }
+
+    if (window.__homeScrollHandler) window.removeEventListener("scroll", window.__homeScrollHandler);
+    window.__homeScrollHandler = () => { state.scrollY = window.scrollY; };
+    window.addEventListener("scroll", window.__homeScrollHandler);
 
     if (window.__timelineObserver) window.__timelineObserver.disconnect();
     window.__timelineObserver = new IntersectionObserver((entries) => { if (entries[0].isIntersecting) loadMore(); });
@@ -1911,7 +1945,7 @@ _WIDGET_HTML = r"""<!doctype html>
       // Ancestors + the focused post form one connected chain, lines
       // running avatar-to-avatar up to the thread root (or as far back
       // as this bridge could resolve).
-      const rootChain = el("div", { class: "card" });
+      const rootChain = el("div", { class: "thread-chain" });
       const chain = (data.ancestors || []).concat([data.post]);
       chain.forEach((p, i) => {
         const isFocus = i === chain.length - 1;
@@ -2363,6 +2397,18 @@ _WIDGET_HTML = r"""<!doctype html>
       ]));
     }
   }
+
+  // Shows once scrolled down a little, on any view -- Element/Haven-style
+  // round "^" button, independent of whichever tab/profile/thread is
+  // currently showing.
+  (function initScrollTopButton() {
+    const btn = document.getElementById("scroll-top-btn");
+    if (!btn) return;
+    btn.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+    window.addEventListener("scroll", () => {
+      btn.classList.toggle("visible", window.scrollY > 300);
+    });
+  })();
 
   start();
 })();
