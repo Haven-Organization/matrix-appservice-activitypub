@@ -348,8 +348,18 @@ async def widget_leave_unfollowed_preview(request: Request) -> JSONResponse:
         unfollowed = await _list_unfollowed_ghost_rooms(
             request, sender=matrix_user_id, usernames=[i.username for i in identities]
         )
-    except _RoomListingUnreliable:
-        return JSONResponse({"rooms": [], "unreliable": True}, headers={"Cache-Control": "no-store"})
+    except _RoomListingUnreliable as exc:
+        # str(exc) is _RoomListingUnreliable's own str(SynapseError) --
+        # "Synapse error <status> <errcode>: <error>" -- safe to show
+        # directly (no secrets, just the homeserver's own error shape) and
+        # genuinely useful: distinguishes "the bridge's Synapse admin token
+        # is stale/invalid" from a transient network blip, which "try again
+        # shortly" alone can't (confirmed live 2026-10-24: a stale
+        # synapse.admin_token produced exactly this generic message with no
+        # way to tell what was actually wrong).
+        return JSONResponse(
+            {"rooms": [], "unreliable": True, "reason": str(exc)}, headers={"Cache-Control": "no-store"}
+        )
     return JSONResponse(
         {"rooms": [{"handle": handle} for _room_id, _actor_id, handle in unfollowed], "unreliable": False},
         headers={"Cache-Control": "no-store"},
@@ -444,6 +454,14 @@ async def _dispatch(request: Request, room_id: str, handler, /, **kwargs) -> JSO
     except SynapseError as exc:
         logger.warning("Widget action failed in %s: %s", room_id, exc, exc_info=True)
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    except _RoomListingUnreliable as exc:
+        # Same underlying failure widget_leave_unfollowed_preview surfaces
+        # with a reason string -- this is the EXECUTE side (e.g. the admin
+        # API went stale again in the gap between a successful Preview and
+        # clicking Confirm), which would otherwise propagate as a raw,
+        # unexplained 500 instead of a clean error naming the real cause.
+        logger.warning("Widget action's room listing was unreliable: %s", exc, exc_info=True)
+        raise HTTPException(502, f"Couldn't reliably list your rooms: {exc}") from exc
     return JSONResponse({"ok": True})
 
 
@@ -880,6 +898,8 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .muted { color: var(--muted); }
   .spinner { text-align: center; color: var(--muted); padding: 40px 0; }
+  .confirm-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  .confirm-row .muted { font-size: 13px; }
   a { color: var(--accent); }
   .toggle-on { background: var(--ok-bg); color: var(--ok-text); border-color: var(--ok-bg); }
 
@@ -1239,7 +1259,12 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   async function doAction(path, body, busyBtn) {
-    if (busyBtn) busyBtn.disabled = true;
+    let originalText = null;
+    if (busyBtn) {
+      busyBtn.disabled = true;
+      originalText = busyBtn.textContent;
+      busyBtn.textContent = "Working…";
+    }
     try {
       await api(path, { method: "POST", body: Object.assign({ room_id: roomId }, body || {}) });
       toast("Done.", true);
@@ -1247,7 +1272,13 @@ _WIDGET_HTML = r"""<!doctype html>
     } catch (e) {
       toast(e.message, false);
     } finally {
-      if (busyBtn) busyBtn.disabled = false;
+      // busyBtn may already be a detached node by now if the action's own
+      // loadContext() re-render replaced it -- touching a detached node is
+      // harmless (a silent no-op), so no extra guard needed here.
+      if (busyBtn) {
+        busyBtn.disabled = false;
+        if (originalText !== null) busyBtn.textContent = originalText;
+      }
     }
   }
 
@@ -1971,11 +2002,12 @@ _WIDGET_HTML = r"""<!doctype html>
     // remote account
     const actorId = view.actorId;
     function profileAction(path, p, btn) {
-      if (btn) btn.disabled = true;
+      let originalText = null;
+      if (btn) { btn.disabled = true; originalText = btn.textContent; btn.textContent = "Working…"; }
       api(path, { method: "POST", body: { room_id: roomId, handle: p.handle } })
         .then(() => { toast("Done.", true); return refresh(); })
         .catch((e) => toast(e.message, false))
-        .finally(() => { if (btn) btn.disabled = false; });
+        .finally(() => { if (btn) { btn.disabled = false; if (originalText !== null) btn.textContent = originalText; } });
     }
     function renderRemote(p) {
       page.innerHTML = "";
@@ -1994,9 +2026,10 @@ _WIDGET_HTML = r"""<!doctype html>
           profileAction(p.is_muted ? "/widget/api/unmute" : "/widget/api/mute", p, e.target)),
         p.is_blocked
           ? plainButton("Unblock", (e) => profileAction("/widget/api/unblock", p, e.target))
-          : dangerButton("Block", (e) => {
-              if (confirm("Block this account? This cuts any follow and kicks you from their rooms.")) profileAction("/widget/api/block", p, e.target);
-            }),
+          : dangerButton("Block", withConfirm(
+              "Block this account? This cuts any follow and kicks you from their rooms.",
+              (btn) => profileAction("/widget/api/block", p, btn)
+            )),
       ]));
       page.appendChild(el("div", { class: "sub" }, [el("a", { href: p.url, target: "_blank", text: "View on their instance →" })]));
       if (p.has_posts) {
@@ -2227,7 +2260,10 @@ _WIDGET_HTML = r"""<!doctype html>
             if (old) old.remove();
             const result = el("div", { id: "leave-unfollowed-result" });
             if (data.unreliable) {
-              result.appendChild(el("div", { class: "muted", text: "Couldn't reliably check right now -- try again shortly." }));
+              const reasonText = data.reason
+                ? "Couldn't reliably check right now: " + data.reason + " (ask the bridge operator to look into this -- it's not something you can fix yourself)."
+                : "Couldn't reliably check right now -- try again shortly.";
+              result.appendChild(el("div", { class: "muted", text: reasonText }));
             } else if (!data.rooms.length) {
               result.appendChild(el("div", { class: "muted", text: "Nothing to leave." }));
             } else {
@@ -2239,11 +2275,35 @@ _WIDGET_HTML = r"""<!doctype html>
                 result.appendChild(el("div", { class: "muted", text: "...and " + (data.rooms.length - shown.length) + " more" }));
               }
               result.appendChild(el("div", { class: "row" }, [
-                dangerButton("Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"), (e2) => {
-                  if (confirm("Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.")) {
-                    doAction("/widget/api/leave_unfollowed/execute", {}, e2.target);
-                  }
-                }),
+                dangerButton(
+                  "Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"),
+                  withConfirm(
+                    "Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.",
+                    async (btn) => {
+                      const original = btn.textContent;
+                      btn.disabled = true;
+                      btn.textContent = "Working…";
+                      try {
+                        await api("/widget/api/leave_unfollowed/execute", {
+                          method: "POST", body: { room_id: roomId },
+                        });
+                        toast("Done.", true);
+                        // Replace the now-stale room list + button directly --
+                        // this panel is built outside the normal render()
+                        // cycle, so loadContext() alone wouldn't touch it and
+                        // it would otherwise keep showing the pre-leave list,
+                        // looking exactly like the click had done nothing
+                        // (confirmed live 2026-10-24).
+                        result.innerHTML = "";
+                        result.appendChild(el("div", { class: "muted", text: "Left " + data.rooms.length + " room(s)." }));
+                      } catch (err) {
+                        toast(err.message, false);
+                        btn.disabled = false;
+                        btn.textContent = original;
+                      }
+                    }
+                  )
+                ),
               ]));
             }
             leaveCard.appendChild(result);
@@ -2386,6 +2446,39 @@ _WIDGET_HTML = r"""<!doctype html>
     return el("button", { class: on ? "toggle-on" : "", onclick: handler, text: label });
   }
 
+  // Replaces window.confirm() for a destructive action's click handler --
+  // confirmed live 2026-10-24 that a native confirm() dialog produces NO
+  // visible prompt and NO subsequent request at all when the widget runs
+  // inside Haven Desktop's iframe (sandboxed without allow-modals, the
+  // standard reason an embedded widget can't use blocking browser dialogs
+  // -- every OTHER confirm()-gated button in this file had the exact same
+  // silent-no-op bug, not just the one reported). Clicking the trigger
+  // button disables it and inserts an inline "message [Yes] [Cancel]" row
+  // right after it instead of blocking on a native dialog; "Yes" runs
+  // `run(btn)` (expected to handle its own busy-state via doAction/
+  // profileAction, which already disable+relabel btn while in flight).
+  function withConfirm(message, run) {
+    return (e) => {
+      const btn = e.target;
+      if (btn.dataset.confirmPending === "1") return;
+      btn.dataset.confirmPending = "1";
+      btn.disabled = true;
+      const row = el("div", { class: "confirm-row" }, [
+        el("span", { class: "muted", text: message }),
+        dangerButton("Yes", () => {
+          row.remove();
+          Promise.resolve(run(btn)).finally(() => { delete btn.dataset.confirmPending; });
+        }),
+        plainButton("Cancel", () => {
+          row.remove();
+          btn.disabled = false;
+          delete btn.dataset.confirmPending;
+        }),
+      ]);
+      btn.insertAdjacentElement("afterend", row);
+    };
+  }
+
   // Whatever's specific to the room the widget happens to be embedded in
   // right now -- there's no more standalone "This Room" tab, so this is
   // folded into Settings instead (see renderSettingsTab). Room-bound
@@ -2400,15 +2493,18 @@ _WIDGET_HTML = r"""<!doctype html>
       const card = el("div", { class: "card" }, [el("h2", { text: "This room: your profile" })]);
       if (r.is_owner) {
         card.appendChild(el("div", { class: "row" }, [
-          plainButton("Replace this room", (e) => {
-            if (confirm("Create a fresh replacement room and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
-          }),
-          dangerButton("Unlink profile", (e) => {
-            if (confirm("Detach this room from your identity? You can relink later.")) doAction("/widget/api/unlink_profile", {}, e.target);
-          }),
-          dangerButton("Delete profile", (e) => {
-            if (confirm("Permanently delete your fediverse identity and notify followers? This cannot be undone.")) doAction("/widget/api/delete_profile", {}, e.target);
-          }),
+          plainButton("Replace this room", withConfirm(
+            "Create a fresh replacement room and retire this one?",
+            (btn) => doAction("/widget/api/replace_room", {}, btn)
+          )),
+          dangerButton("Unlink profile", withConfirm(
+            "Detach this room from your identity? You can relink later.",
+            (btn) => doAction("/widget/api/unlink_profile", {}, btn)
+          )),
+          dangerButton("Delete profile", withConfirm(
+            "Permanently delete your fediverse identity and notify followers? This cannot be undone.",
+            (btn) => doAction("/widget/api/delete_profile", {}, btn)
+          )),
         ]));
       } else {
         card.appendChild(el("div", { class: "row" }, [
@@ -2432,9 +2528,10 @@ _WIDGET_HTML = r"""<!doctype html>
         backfillRow.appendChild(countInput);
         backfillRow.appendChild(plainButton("Backfill custom amount", (e) =>
           doAction("/widget/api/backfill", { count: parseInt(countInput.value || "0", 10) }, e.target)));
-        backfillRow.appendChild(plainButton("Replace this room", (e) => {
-          if (confirm("Create a fresh replacement room for this account and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
-        }));
+        backfillRow.appendChild(plainButton("Replace this room", withConfirm(
+          "Create a fresh replacement room for this account and retire this one?",
+          (btn) => doAction("/widget/api/replace_room", {}, btn)
+        )));
       }
       card.appendChild(backfillRow);
       app.appendChild(card);
@@ -2443,9 +2540,10 @@ _WIDGET_HTML = r"""<!doctype html>
         el("h2", { text: "This room: " + (kind === "dm" ? "Direct message" : "Chat") }),
         el("div", { class: "row" }, [
           plainButton("Mute", (e) => doAction("/widget/api/mute", {}, e.target)),
-          dangerButton("Block", (e) => {
-            if (confirm("Block this account?")) doAction("/widget/api/block", {}, e.target);
-          }),
+          dangerButton("Block", withConfirm(
+            "Block this account?",
+            (btn) => doAction("/widget/api/block", {}, btn)
+          )),
         ]),
       ]));
     } else if (kind === "notifications") {
