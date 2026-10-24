@@ -301,14 +301,21 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
     if actor is None or actor.matrix_user_id != matrix_user_id:
         raise HTTPException(404, "No such identity on this account")
     settings = await get_effective_settings(repository, actor.username, "profile")
+    followers = await repository.list_followers(actor.username)
+    following = await repository.list_following(actor.username)
     return JSONResponse(
         {
             "username": actor.username,
             "display_name": actor.display_name,
+            "summary": actor.summary,
             "handle": f"@{actor.username}@{config.bridge.domain}",
+            "actor_id": actor_url(config.bridge.public_base_url, actor.username),
             "icon_url": actor.icon_url,
+            "banner_url": actor.banner_url,
             "public_url": actor_url(config.bridge.public_base_url, actor.username),
             "room_id": actor.room_id,
+            "followers_count": len(followers),
+            "following_count": len(following),
             "hide_followers": settings.get("hide_followers", False),
             "hide_following": settings.get("hide_following", False),
             "discoverable": settings.get("discoverable", True),
@@ -954,15 +961,44 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   #shell.collapsed .identity-dropdown { left: 4px; right: auto; width: 200px; }
 
-  /* -- modals (account profile, my profile, following list, password login) */
+  /* -- modals (following list, password login) ----------------------------- */
   .modal-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center;
     justify-content: center; z-index: 50; padding: 16px;
   }
   .modal-backdrop .card { max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; margin-bottom: 0; }
-  .profile-banner { width: 100%; max-height: 140px; object-fit: cover; border-radius: var(--radius-inner); margin-bottom: 8px; }
   .modal-close { border: none; background: none; color: var(--muted); font-size: 16px; padding: 4px 8px; cursor: pointer; }
   .clickable { cursor: pointer; }
+
+  /* -- full-page profile (own identity or a browsed/followed account) ------ */
+  .back-link {
+    border: none; background: none; color: var(--text); font-weight: 600; font-size: 13px;
+    cursor: pointer; padding: 4px 0 12px; display: block;
+  }
+  .back-link:hover { color: var(--accent); }
+  .profile-page { max-width: 640px; }
+  .profile-banner-wrap {
+    position: relative; width: 100%; height: 180px; border-radius: var(--radius-card);
+    overflow: hidden; background: var(--hover); margin-bottom: 44px;
+  }
+  .profile-banner-empty { background: linear-gradient(135deg, var(--hover), var(--border)); }
+  .profile-banner-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .banner-edit-btn {
+    position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border-radius: 50%;
+    border: none; background: rgba(0,0,0,.55); color: #fff; cursor: pointer; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .profile-header-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .profile-avatar-xl {
+    width: 88px; height: 88px; font-size: 32px; border: 4px solid var(--bg);
+    margin-top: -66px; position: relative; z-index: 1; flex-shrink: 0;
+  }
+  .profile-stat { color: var(--muted); font-size: 13px; padding-bottom: 8px; }
+  .profile-name { font-size: 20px; font-weight: 700; margin: 4px 0 0; }
+  .profile-handle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin: 2px 0 10px; }
+  .copy-btn { border: none; background: none; color: var(--muted); cursor: pointer; padding: 2px; font-size: 12px; }
+  .copy-btn:hover { color: var(--text); }
+  .profile-bio { font-size: 14px; line-height: 1.5; margin-bottom: 10px; }
 </style>
 </head>
 <body>
@@ -1118,12 +1154,15 @@ _WIDGET_HTML = r"""<!doctype html>
   let ctx = null;
   const NAV_ITEMS = [
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
-    { id: "room", label: "This Room", icon: "\u{1F9E9}" },
     { id: "publish", label: "Publish", icon: "\u{1F4E1}" },
     { id: "settings", label: "Settings", icon: "\u{2699}️" },
     { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
   let currentTab = "home";
+  // Non-null while a full-page profile (own or remote) is drilled into --
+  // overrides currentTab's own content in render() without changing which
+  // sidebar item is "active", so "Back" returns to exactly where you were.
+  let profileView = null;
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -1237,9 +1276,9 @@ _WIDGET_HTML = r"""<!doctype html>
       if (t.id === "admin" && !ctx.is_admin) return;
       if (t.id === "publish" && !ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) return;
       bar.appendChild(el("button", {
-        class: "nav-item" + (t.id === currentTab ? " active" : ""),
+        class: "nav-item" + (!profileView && t.id === currentTab ? " active" : ""),
         title: t.label,
-        onclick: () => { currentTab = t.id; render(); },
+        onclick: () => { currentTab = t.id; profileView = null; render(); },
       }, [
         el("span", { class: "icon", text: t.icon }),
         el("span", { class: "label", text: t.label }),
@@ -1269,8 +1308,8 @@ _WIDGET_HTML = r"""<!doctype html>
     app.innerHTML = "";
     if (!ctx) return;
 
+    if (profileView) { renderProfilePage(app, profileView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
-    else if (currentTab === "room") renderRoomTab(app);
     else if (currentTab === "publish") renderPublishTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
     else if (currentTab === "admin") renderAdminTab(app);
@@ -1356,10 +1395,10 @@ _WIDGET_HTML = r"""<!doctype html>
   let homeState = null;
 
   function renderHomeTimeline(app) {
-    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false };
+    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false, needsLogin: false, needsLoginDomains: [] };
     const state = homeState;
 
-    const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, or a name" });
+    const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, a name, or paste a post link to import" });
     const searchResults = el("div", { class: "list" });
     const domainInput = el("input", { type: "text", value: state.domain, placeholder: "instance.example (blank = your default feed)" });
 
@@ -1370,42 +1409,62 @@ _WIDGET_HTML = r"""<!doctype html>
       });
     }
 
+    async function runSearchOrImport() {
+      const q = searchInput.value.trim();
+      if (!q) return;
+      searchResults.innerHTML = "";
+      if (/^https?:\/\//i.test(q)) {
+        goBtn.disabled = true;
+        try {
+          await api("/widget/api/import", { method: "POST", body: { url: q, room_id: roomId } });
+          toast("Imported.", true);
+          searchInput.value = "";
+        } catch (err) {
+          toast(err.message, false);
+        } finally {
+          goBtn.disabled = false;
+        }
+        return;
+      }
+      try {
+        const data = await api("/widget/api/browse/search?q=" + encodeURIComponent(q) + "&domain=" + encodeURIComponent(state.domain || ctx.domain));
+        if (!data.accounts.length) { searchResults.appendChild(el("div", { class: "muted", text: "No accounts found." })); return; }
+        data.accounts.forEach((a) => {
+          searchResults.appendChild(el("div", {
+            class: "account-card clickable", onclick: () => openAccountProfile(a.actor_id),
+          }, [
+            avatarEl(a.avatar_url, a.display_name, "sm"),
+            el("div", { class: "meta" }, [
+              el("div", { class: "name", text: a.display_name }),
+              el("div", { class: "handle", text: a.handle }),
+            ]),
+          ]));
+        });
+      } catch (err) { toast(err.message, false); }
+    }
+    function runBrowse() {
+      const d = domainInput.value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
+      state.mode = d ? "instance" : "home";
+      state.domain = d;
+      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false;
+      render();
+    }
+    searchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchOrImport(); });
+    domainInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runBrowse(); });
+
+    // One box, two jobs: a handle/name looks accounts up (as before); a
+    // pasted https:// link is instead handed straight to the existing
+    // import action -- "pull in anything from a link or handle" without
+    // needing a separate "Import a post" card.
+    const goBtn = primaryButton("Go", runSearchOrImport);
     const controlsChildren = [
       el("h2", { text: "Browse the fediverse" }),
-      el("div", { class: "row" }, [
-        searchInput,
-        primaryButton("Search", async () => {
-          const q = searchInput.value.trim();
-          if (!q) return;
-          searchResults.innerHTML = "";
-          try {
-            const data = await api("/widget/api/browse/search?q=" + encodeURIComponent(q) + "&domain=" + encodeURIComponent(state.domain || ctx.domain));
-            if (!data.accounts.length) { searchResults.appendChild(el("div", { class: "muted", text: "No accounts found." })); return; }
-            data.accounts.forEach((a) => {
-              searchResults.appendChild(el("div", {
-                class: "account-card clickable", onclick: () => openAccountProfile(a.actor_id),
-              }, [
-                avatarEl(a.avatar_url, a.display_name, "sm"),
-                el("div", { class: "meta" }, [
-                  el("div", { class: "name", text: a.display_name }),
-                  el("div", { class: "handle", text: a.handle }),
-                ]),
-              ]));
-            });
-          } catch (e) { toast(e.message, false); }
-        }),
-      ]),
+      el("div", { class: "row" }, [searchInput, goBtn]),
       searchResults,
       el("div", { class: "row" }, [
         domainInput,
         el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
-        primaryButton("Browse", () => {
-          const d = domainInput.value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
-          state.mode = d ? "instance" : "home";
-          state.domain = d;
-          state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false;
-          render();
-        }),
+        primaryButton("Browse", runBrowse),
       ]),
     ];
     if (state.mode === "instance") {
@@ -1427,6 +1486,28 @@ _WIDGET_HTML = r"""<!doctype html>
     function renderFeedList() {
       feed.innerHTML = "";
       if (!state.posts.length && !state.loading) {
+        if (state.needsLogin && state.mode === "instance") {
+          const retry = () => { state.done = false; state.needsLogin = false; loadMore(); };
+          feed.appendChild(el("div", { class: "placeholder" }, [
+            el("div", { text: state.domain + " needs you to be signed in to view this.", style: "margin-bottom:10px" }),
+            primaryButton("Sign in with OAuth", (e) => startOAuthLogin(state.domain, e.target, retry)),
+            el("div", { style: "margin-top:8px" }, [
+              plainButton("Use username/password instead", () => openPasswordLoginForm(state.domain, retry)),
+            ]),
+          ]));
+          return;
+        }
+        if (state.mode === "home" && state.needsLoginDomains.length) {
+          const retry = () => { state.done = false; state.needsLoginDomains = []; loadMore(); };
+          feed.appendChild(el("div", { class: "placeholder" }, [
+            el("div", { text: "Some of your feed sources need you to be signed in:", style: "margin-bottom:10px" }),
+            ...state.needsLoginDomains.map((d) => el("div", { class: "row", style: "justify-content:center" }, [
+              el("span", { text: d, style: "align-self:center" }),
+              primaryButton("Sign in", (e) => startOAuthLogin(d, e.target, retry)),
+            ])),
+          ]));
+          return;
+        }
         feed.appendChild(el("div", {
           class: "placeholder",
           text: state.unsupported
@@ -1450,6 +1531,7 @@ _WIDGET_HTML = r"""<!doctype html>
           state.homeCursorMap = data.next_max_id_map || "";
           state.done = !data.next_max_id_map;
           state.unsupported = !data.supported;
+          state.needsLoginDomains = data.needs_login_domains || [];
         } else {
           data = await api(
             "/widget/api/browse/timeline?domain=" + encodeURIComponent(state.domain) + "&scope=" + state.scope +
@@ -1458,6 +1540,7 @@ _WIDGET_HTML = r"""<!doctype html>
           state.cursor = data.next_max_id || "";
           state.done = !data.next_max_id;
           state.unsupported = !data.supported;
+          state.needsLogin = !!data.needs_login;
         }
         state.posts = state.posts.concat(data.posts);
       } catch (e) {
@@ -1476,30 +1559,159 @@ _WIDGET_HTML = r"""<!doctype html>
     window.__timelineObserver.observe(sentinel);
   }
 
-  // -- account profile modal (any browsed/followed account) -----------------
+  // -- full-page profile (own identity, or any browsed/followed account) ----
+  //
+  // Takes over the content area like an ordinary social-app profile page
+  // (not a popup) -- opened from a Browse search result, a post author/
+  // booster, a Following-list entry, or the sidebar identity card.
+  // currentTab itself never changes while this is showing (see render()),
+  // so "Back" always returns to wherever you came from.
 
-  function modalCard(extraClass) {
-    return el("div", { class: "card profile-modal" + (extraClass ? " " + extraClass : "") }, [
-      el("div", { class: "muted", text: "Loading…" }),
-    ]);
+  function profileBanner(bannerUrl, onUpload) {
+    const wrap = el("div", { class: "profile-banner-wrap" + (bannerUrl ? "" : " profile-banner-empty") });
+    if (bannerUrl) wrap.appendChild(el("img", { class: "profile-banner-img", src: bannerUrl, alt: "" }));
+    if (onUpload) {
+      const fileInput = el("input", { type: "file", accept: "image/*", style: "display:none" });
+      fileInput.addEventListener("change", () => { if (fileInput.files[0]) onUpload(fileInput.files[0]); });
+      wrap.appendChild(el("button", { class: "banner-edit-btn", text: "✎", title: "Change banner", onclick: () => fileInput.click() }));
+      wrap.appendChild(fileInput);
+    }
+    return wrap;
   }
 
-  function modalHeader(body, avatarUrl, name, handle) {
-    body.appendChild(el("div", { class: "row", style: "align-items:flex-start" }, [
-      avatarEl(avatarUrl, name, "", "width:56px;height:56px;font-size:20px"),
-      el("div", {}, [
-        el("div", { style: "font-weight:600;font-size:15px", text: name }),
-        el("div", { class: "muted", text: handle }),
+  function appendProfileIdentity(page, avatarUrl, name, handle, actionsNode) {
+    page.appendChild(el("div", { class: "profile-header-row" }, [
+      avatarEl(avatarUrl, name, "profile-avatar-xl"),
+      actionsNode || el("div", {}),
+    ]));
+    page.appendChild(el("div", { class: "profile-name", text: name }));
+    page.appendChild(el("div", { class: "profile-handle" }, [
+      el("span", { text: handle }),
+      el("button", {
+        class: "copy-btn", text: "⧉", title: "Copy handle",
+        onclick: () => { try { navigator.clipboard.writeText(handle); toast("Copied.", true); } catch (e) {} },
+      }),
+    ]));
+  }
+
+  function renderProfilePostFeed(page, actorId, author) {
+    page.appendChild(el("h2", { text: "Posts" }));
+    const feed = el("div", {});
+    const sentinel = el("div");
+    page.appendChild(feed);
+    page.appendChild(sentinel);
+    let cursor = "", loading = false, done = false;
+    function loadMorePosts() {
+      if (loading || done) return;
+      loading = true;
+      api("/widget/api/browse/profile/timeline?actor_id=" + encodeURIComponent(actorId) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""))
+        .then((data) => {
+          data.posts.forEach((post) => { post.author = author; feed.appendChild(renderPostCard(post, function () {})); });
+          cursor = data.next_cursor || "";
+          done = !cursor;
+        })
+        .catch(() => { done = true; })
+        .finally(() => { loading = false; });
+    }
+    loadMorePosts();
+    const observer = new IntersectionObserver((entries) => { if (entries[0].isIntersecting) loadMorePosts(); });
+    observer.observe(sentinel);
+  }
+
+  function renderImportFollowsCard(page, targetRoomId) {
+    const fileInput = el("input", { type: "file", accept: ".csv,.txt" });
+    page.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Import a follows list" }),
+      el("div", { class: "sub", text: "A Pleroma/Akkoma export (one @user@instance.org per line) or a Mastodon follows CSV." }),
+      el("div", { class: "row" }, [fileInput]),
+      el("div", { class: "row" }, [
+        primaryButton("Import follows", async (e) => {
+          const file = fileInput.files[0];
+          if (!file) { toast("Choose a file first.", false); return; }
+          e.target.disabled = true;
+          try {
+            const result = await api("/widget/api/import_follows?room_id=" + encodeURIComponent(targetRoomId), {
+              method: "POST", headers: { "Content-Type": "text/plain" }, raw: file,
+            });
+            toast("Importing " + result.count + " follows -- a summary will be posted to your Profile Room when it's done.", true);
+          } catch (err) {
+            toast(err.message, false);
+          } finally {
+            e.target.disabled = false;
+          }
+        }),
       ]),
-      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
   }
 
   function openAccountProfile(actorId) {
     if (!actorId) return;
-    const body = modalCard();
-    openModal(body);
+    profileView = { mode: "remote", actorId: actorId };
+    render();
+  }
 
+  function openMyProfile() {
+    profileView = { mode: "own" };
+    render();
+  }
+
+  function renderProfilePage(app, view) {
+    app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { profileView = null; render(); } }));
+    const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+
+    if (view.mode === "own") {
+      function refresh() {
+        return loadIdentityState().then(() => renderOwn(identityState.active));
+      }
+      function renderOwn(s) {
+        page.innerHTML = "";
+        if (!s) { page.appendChild(el("div", { class: "muted", text: "No identity yet." })); return; }
+        page.appendChild(profileBanner(s.banner_url, async (file) => {
+          try {
+            await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(s.room_id), {
+              method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
+            });
+            toast("Banner updated.", true);
+            refresh();
+          } catch (err) { toast(err.message, false); }
+        }));
+        const followersStat = el("div", { class: "profile-stat", text: "Followers: " + s.followers_count });
+        appendProfileIdentity(page, s.icon_url, s.display_name || s.handle, s.handle, followersStat);
+        if (s.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = s.summary; page.appendChild(bio); }
+        const followingRow = el("div", { class: "kv clickable" }, [el("span", { text: "Following" }), el("span", { text: s.following_count + "  ›" })]);
+        followingRow.addEventListener("click", openFollowingList);
+        page.appendChild(followingRow);
+
+        function visAction(btn, which, hidden, value) {
+          btn.disabled = true;
+          const payload = { username: s.username, which: which };
+          if (hidden !== undefined) payload.hidden = hidden;
+          if (value !== undefined) payload.value = value;
+          api("/widget/api/visibility", { method: "POST", body: payload })
+            .then(() => { toast("Done.", true); refresh(); })
+            .catch((e) => toast(e.message, false))
+            .finally(() => { btn.disabled = false; });
+        }
+        page.appendChild(el("div", { class: "row" }, [
+          toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
+          toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
+          toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
+        ]));
+        if (s.public_url) page.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
+
+        renderImportFollowsCard(page, s.room_id);
+        renderProfilePostFeed(page, s.actor_id, { actor_id: s.actor_id, display_name: s.display_name || s.handle, handle: s.handle, avatar_url: s.icon_url, url: s.public_url });
+      }
+      refresh().catch(() => {
+        page.innerHTML = "";
+        page.appendChild(el("div", { class: "muted", text: "Couldn't load your profile." }));
+      });
+      return;
+    }
+
+    // remote account
+    const actorId = view.actorId;
     function profileAction(path, p, btn) {
       if (btn) btn.disabled = true;
       api(path, { method: "POST", body: { room_id: roomId, handle: p.handle } })
@@ -1507,23 +1719,19 @@ _WIDGET_HTML = r"""<!doctype html>
         .catch((e) => toast(e.message, false))
         .finally(() => { if (btn) btn.disabled = false; });
     }
-
-    function renderBody(p) {
-      body.innerHTML = "";
-      if (p.banner_url) body.appendChild(el("img", { class: "profile-banner", src: p.banner_url, alt: "" }));
-      modalHeader(body, p.avatar_url, p.display_name, p.handle);
-      const bio = el("div", { class: "post-content" });
-      bio.innerHTML = p.bio_html || "";
-      body.appendChild(bio);
-      body.appendChild(el("div", { class: "sub" }, [el("a", { href: p.url, target: "_blank", text: "View on their instance →" })]));
-      body.appendChild(el("div", { class: "row" }, [
+    function renderRemote(p) {
+      page.innerHTML = "";
+      page.appendChild(profileBanner(p.banner_url, null));
+      const actions = el("div", { class: "row" }, [
         p.is_following
           ? dangerButton("Unfollow", (e) => profileAction("/widget/api/unfollow", p, e.target))
           : primaryButton("Follow", (e) => profileAction("/widget/api/follow", p, e.target)),
         plainButton("DM", (e) => profileAction("/widget/api/dm", p, e.target)),
         plainButton("Chat", (e) => profileAction("/widget/api/chat", p, e.target)),
-      ]));
-      body.appendChild(el("div", { class: "row" }, [
+      ]);
+      appendProfileIdentity(page, p.avatar_url, p.display_name, p.handle, actions);
+      if (p.bio_html) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = p.bio_html; page.appendChild(bio); }
+      page.appendChild(el("div", { class: "row" }, [
         toggleButton(p.is_muted ? "Muted" : "Mute", p.is_muted, (e) =>
           profileAction(p.is_muted ? "/widget/api/unmute" : "/widget/api/mute", p, e.target)),
         p.is_blocked
@@ -1532,109 +1740,22 @@ _WIDGET_HTML = r"""<!doctype html>
               if (confirm("Block this account? This cuts any follow and kicks you from their rooms.")) profileAction("/widget/api/block", p, e.target);
             }),
       ]));
+      page.appendChild(el("div", { class: "sub" }, [el("a", { href: p.url, target: "_blank", text: "View on their instance →" })]));
       if (p.has_posts) {
-        body.appendChild(el("h2", { text: "Posts" }));
-        const feed = el("div", {});
-        const sentinel = el("div");
-        body.appendChild(feed);
-        body.appendChild(sentinel);
-        let cursor = "", loading = false, done = false;
-        const author = { actor_id: p.actor_id, display_name: p.display_name, handle: p.handle, avatar_url: p.avatar_url, url: p.url };
-        function loadMorePosts() {
-          if (loading || done) return;
-          loading = true;
-          api("/widget/api/browse/profile/timeline?actor_id=" + encodeURIComponent(p.actor_id) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""))
-            .then((data) => {
-              data.posts.forEach((post) => { post.author = author; feed.appendChild(renderPostCard(post, function () {})); });
-              cursor = data.next_cursor || "";
-              done = !cursor;
-            })
-            .catch(() => { done = true; })
-            .finally(() => { loading = false; });
-        }
-        loadMorePosts();
-        const observer = new IntersectionObserver((entries) => { if (entries[0].isIntersecting) loadMorePosts(); });
-        observer.observe(sentinel);
+        renderProfilePostFeed(page, p.actor_id, { actor_id: p.actor_id, display_name: p.display_name, handle: p.handle, avatar_url: p.avatar_url, url: p.url });
       }
     }
-
     function refresh() {
-      return api("/widget/api/browse/profile?actor_id=" + encodeURIComponent(actorId)).then((p) => { renderBody(p); return p; });
+      return api("/widget/api/browse/profile?actor_id=" + encodeURIComponent(actorId)).then((p) => { renderRemote(p); return p; });
     }
-
     refresh().catch(() => {
-      body.innerHTML = "";
-      body.appendChild(el("div", { class: "muted", text: "Couldn't load that profile." }));
-    });
-  }
-
-  // -- my profile modal (active identity, opened from the sidebar card) -----
-
-  function openMyProfile() {
-    const body = modalCard();
-    openModal(body);
-    refreshMyProfile(body);
-  }
-
-  function refreshMyProfile(body) {
-    loadIdentityState().then(() => {
-      const s = identityState.active;
-      body.innerHTML = "";
-      if (!s) {
-        body.appendChild(el("div", { class: "muted", text: "No identity yet." }));
-        return;
-      }
-      modalHeader(body, s.icon_url, s.display_name || s.handle, s.handle);
-      if (s.public_url) body.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
-      const followingRow = el("div", { class: "kv clickable" }, [
-        el("span", { text: "Following" }),
-        el("span", { text: "…" }),
-      ]);
-      followingRow.addEventListener("click", openFollowingList);
-      body.appendChild(followingRow);
-      api("/widget/api/following").then((d) => { followingRow.lastChild.textContent = d.following.length + "  ›"; }).catch(() => {});
-
-      function visAction(btn, which, hidden, value) {
-        btn.disabled = true;
-        const payload = { username: s.username, which: which };
-        if (hidden !== undefined) payload.hidden = hidden;
-        if (value !== undefined) payload.value = value;
-        api("/widget/api/visibility", { method: "POST", body: payload })
-          .then(() => { toast("Done.", true); refreshMyProfile(body); })
-          .catch((e) => toast(e.message, false))
-          .finally(() => { btn.disabled = false; });
-      }
-      body.appendChild(el("div", { class: "row" }, [
-        toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
-        toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
-        toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
-      ]));
-
-      const fileInput = el("input", { type: "file", accept: "image/*" });
-      body.appendChild(el("h2", { text: "Profile banner" }));
-      body.appendChild(el("div", { class: "row" }, [
-        fileInput,
-        primaryButton("Upload banner", async (e) => {
-          const file = fileInput.files[0];
-          if (!file) { toast("Choose an image first.", false); return; }
-          e.target.disabled = true;
-          try {
-            await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(s.room_id), {
-              method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
-            });
-            toast("Banner updated.", true);
-          } catch (err) {
-            toast(err.message, false);
-          } finally {
-            e.target.disabled = false;
-          }
-        }),
-      ]));
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: "Couldn't load that profile." }));
     });
   }
 
   function openFollowingList() {
-    const body = modalCard();
+    const body = el("div", { class: "card profile-modal" }, [el("div", { class: "muted", text: "Loading…" })]);
     openModal(body);
     function load() {
       api("/widget/api/following").then((data) => {
@@ -1751,6 +1872,7 @@ _WIDGET_HTML = r"""<!doctype html>
       return;
     }
 
+    renderThisRoomSection(app);
     renderInstanceLoginsCard(app);
 
     app.appendChild(el("div", { class: "card" }, [
@@ -1919,81 +2041,6 @@ _WIDGET_HTML = r"""<!doctype html>
     loadGrants();
   }
 
-  // -- This Room (room-kind actions, unchanged from before) -----------------
-
-  function renderRoomTab(app) {
-    app.appendChild(el("div", { class: "card" }, [
-      el("h1", {}, [
-        el("span", { text: "\u{1F30D} Fediverse Bridge" }),
-        el("span", { class: "badge", text: kindLabel(ctx.room.kind) }),
-      ]),
-      el("div", { class: "sub", text: ctx.matrix_user_id + (ctx.is_admin ? "  ·  admin" : "") }),
-    ]));
-
-    if (!ctx.has_profile) {
-      app.appendChild(el("div", { class: "card" }, [
-        el("h2", { text: "Get started" }),
-        el("div", { class: "sub", text: "You don't have a fediverse profile yet." }),
-        el("div", { class: "row" }, [
-          primaryButton("Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
-        ]),
-      ]));
-    }
-
-    const kind = ctx.room.kind;
-    if (kind === "profile") renderProfile(app);
-    else if (kind === "remote_actor") renderRemoteActor(app);
-    else if (kind === "dm" || kind === "chat") renderDmChat(app);
-    else if (kind === "notifications") {
-      app.appendChild(el("div", { class: "card" }, [
-        el("h2", { text: "Notifications" }),
-        el("div", { class: "sub", text: "Your Fediverse Notifications DM with the bridge bot -- nothing to configure here." }),
-      ]));
-    } else {
-      app.appendChild(el("div", { class: "card" }, [
-        el("div", { class: "sub", text: "This room isn't one the bridge manages, or I can't tell yet." }),
-      ]));
-    }
-
-    renderFollowing(app);
-    renderImportPost(app);
-    if (ctx.has_profile) {
-      // Follow/block/mute now live on the account profile modal (opened
-      // via search, a post author, or "View full profile" below) --
-      // follows-import stays here since it's a file upload, not a
-      // single-handle action. The banner (which needs to run inside your
-      // own Profile Room specifically, per _handle_banner) lives on "My
-      // Profile" in the sidebar instead.
-      renderImportFollows(app);
-    }
-
-    app.appendChild(el("div", { class: "card" }, [
-      el("div", { class: "sub", text: "Every button here does the same thing as its " + ctx.command_prefix + "command -- both always work." }),
-    ]));
-  }
-
-  function renderImportPost(app) {
-    const input = el("input", { type: "text", placeholder: "https://instance.example/@user/12345" });
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Import a post" }),
-      el("div", { class: "sub", text: "Fetch and mirror a single fediverse post by its URL, regardless of whether you follow its author." }),
-      el("div", { class: "row" }, [
-        input,
-        primaryButton("Import", (e) => {
-          if (!input.value) return;
-          doAction("/widget/api/import", { url: input.value }, e.target).then(() => { input.value = ""; });
-        }),
-      ]),
-    ]));
-  }
-
-  function kindLabel(kind) {
-    return {
-      profile: "Your profile", remote_actor: "Fediverse account", dm: "Direct message",
-      chat: "Chat", notifications: "Notifications", unmanaged: "Unmanaged",
-    }[kind] || kind;
-  }
-
   function primaryButton(label, handler) {
     return el("button", { class: "primary", onclick: handler, text: label });
   }
@@ -2007,161 +2054,75 @@ _WIDGET_HTML = r"""<!doctype html>
     return el("button", { class: on ? "toggle-on" : "", onclick: handler, text: label });
   }
 
-  function renderProfile(app) {
+  // Whatever's specific to the room the widget happens to be embedded in
+  // right now -- there's no more standalone "This Room" tab, so this is
+  // folded into Settings instead (see renderSettingsTab). Room-bound
+  // because each action's own meaning depends on which Matrix room it
+  // runs in (replace/unlink/delete THIS profile room, backfill THIS
+  // account, mute/block THIS DM partner) -- unlike everything else in
+  // Settings, which is account-wide regardless of room.
+  function renderThisRoomSection(app) {
+    const kind = ctx.room.kind;
     const r = ctx.room;
-    const card = el("div", { class: "card" }, [
-      el("h2", { text: "Your profile" }),
-      el("div", { class: "kv" }, [el("span", { text: "Handle" }), el("span", { text: "@" + r.username + "@" + ctx.domain })]),
-      el("div", { class: "kv" }, [el("span", { text: "Display name" }), el("span", { text: r.display_name || "—" })]),
-    ]);
-    if (r.public_url) {
-      card.appendChild(el("div", { class: "sub" }, [
-        el("a", { href: r.public_url, target: "_blank", text: "View public profile →" }),
-      ]));
-    }
-    if (r.is_owner) {
-      card.appendChild(el("div", { class: "row" }, [
-        toggleButton(r.hide_followers ? "Followers: hidden" : "Followers: visible", r.hide_followers, (e) =>
-          doAction("/widget/api/visibility", { which: "followers", hidden: !r.hide_followers }, e.target)),
-        toggleButton(r.hide_following ? "Following: hidden" : "Following: visible", r.hide_following, (e) =>
-          doAction("/widget/api/visibility", { which: "following", hidden: !r.hide_following }, e.target)),
-      ]));
-      card.appendChild(el("div", { class: "row" }, [
-        plainButton("Replace this room", (e) => {
-          if (confirm("Create a fresh replacement room and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
-        }),
-        dangerButton("Unlink profile", (e) => {
-          if (confirm("Detach this room from your identity? You can relink later.")) doAction("/widget/api/unlink_profile", {}, e.target);
-        }),
-        dangerButton("Delete profile", (e) => {
-          if (confirm("Permanently delete your fediverse identity and notify followers? This cannot be undone.")) doAction("/widget/api/delete_profile", {}, e.target);
-        }),
-      ]));
-    } else {
-      card.appendChild(el("div", { class: "row" }, [
-        plainButton("Link this room to my profile", (e) => doAction("/widget/api/link_profile", {}, e.target)),
-      ]));
-    }
-    app.appendChild(card);
-
-    if (r.is_owner) {
-      renderBanner(app);
-    }
-  }
-
-  function renderBanner(app) {
-    const fileInput = el("input", { type: "file", accept: "image/*" });
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Profile banner" }),
-      el("div", { class: "row" }, [fileInput]),
-      el("div", { class: "row" }, [
-        primaryButton("Upload banner", async (e) => {
-          const file = fileInput.files[0];
-          if (!file) { toast("Choose an image first.", false); return; }
-          e.target.disabled = true;
-          try {
-            await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(roomId), {
-              method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
-            });
-            toast("Banner updated.", true);
-            await loadContext();
-          } catch (err) {
-            toast(err.message, false);
-          } finally {
-            e.target.disabled = false;
-          }
-        }),
-      ]),
-    ]));
-  }
-
-  function renderImportFollows(app) {
-    const fileInput = el("input", { type: "file", accept: ".csv,.txt" });
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Import a follows list" }),
-      el("div", { class: "sub", text: "A Pleroma/Akkoma export (one @user@instance.org per line) or a Mastodon follows CSV." }),
-      el("div", { class: "row" }, [fileInput]),
-      el("div", { class: "row" }, [
-        primaryButton("Import follows", async (e) => {
-          const file = fileInput.files[0];
-          if (!file) { toast("Choose a file first.", false); return; }
-          e.target.disabled = true;
-          try {
-            const result = await api("/widget/api/import_follows?room_id=" + encodeURIComponent(roomId), {
-              method: "POST", headers: { "Content-Type": "text/plain" }, raw: file,
-            });
-            toast("Importing " + result.count + " follows -- a summary will be posted here when it's done.", true);
-          } catch (err) {
-            toast(err.message, false);
-          } finally {
-            e.target.disabled = false;
-          }
-        }),
-      ]),
-    ]));
-  }
-
-  function renderRemoteActor(app) {
-    const r = ctx.room;
-    const card = el("div", { class: "card" }, [
-      el("h2", { text: r.display_name || "Fediverse account" }),
-      el("div", { class: "sub", text: r.actor_id }),
-    ]);
-    if (!ctx.has_profile) { app.appendChild(card); return; }
-    // Follow/DM/Chat/Mute/Block now live on the account profile modal --
-    // this just links there, so this account's full state (and its own
-    // posts) are one click away instead of duplicating the action set.
-    card.appendChild(el("div", { class: "row" }, [
-      plainButton("View full profile", () => openAccountProfile(r.actor_id)),
-      r.is_following ? el("span", { class: "badge", text: "Following" }) : null,
-    ].filter(Boolean)));
-
-    const backfillRow = el("div", { class: "row" }, [
-      primaryButton("Backfill latest " + ctx.backfill_default_count + " posts", (e) => doAction("/widget/api/backfill", {}, e.target)),
-    ]);
-    if (ctx.is_admin) {
-      const countInput = el("input", { type: "number", min: "1", placeholder: "custom count" });
-      backfillRow.appendChild(countInput);
-      backfillRow.appendChild(plainButton("Backfill custom amount", (e) =>
-        doAction("/widget/api/backfill", { count: parseInt(countInput.value || "0", 10) }, e.target)));
-      backfillRow.appendChild(plainButton("Replace this room", (e) => {
-        if (confirm("Create a fresh replacement room for this account and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
-      }));
-    }
-    card.appendChild(backfillRow);
-    app.appendChild(card);
-  }
-
-  function renderDmChat(app) {
-    const r = ctx.room;
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: ctx.room.kind === "dm" ? "Direct message" : "Chat" }),
-      el("div", { class: "sub", text: r.actor_id }),
-      el("div", { class: "row" }, [
-        plainButton("Mute", (e) => doAction("/widget/api/mute", {}, e.target)),
-        dangerButton("Block", (e) => {
-          if (confirm("Block this account?")) doAction("/widget/api/block", {}, e.target);
-        }),
-      ]),
-    ]));
-  }
-
-  function renderFollowing(app) {
-    if (!ctx.has_profile) return;
-    const card = el("div", { class: "card" }, [el("h2", { text: "Following" })]);
-    const list = el("div", { class: "list", id: "following-list" }, [el("div", { class: "muted", text: "Loading…" })]);
-    card.appendChild(list);
-    app.appendChild(card);
-    api("/widget/api/following").then((data) => {
-      list.innerHTML = "";
-      if (!data.following.length) { list.appendChild(el("div", { class: "muted", text: "Not following anyone yet." })); return; }
-      data.following.forEach((f) => {
-        list.appendChild(el("div", { class: "list-item" }, [
-          el("span", { class: "clickable", text: f.display_name || f.actor_id, onclick: () => openAccountProfile(f.actor_id) }),
-          plainButton("Unfollow", (e) => doAction("/widget/api/unfollow", { handle: f.handle }, e.target)),
+    if (kind === "profile") {
+      const card = el("div", { class: "card" }, [el("h2", { text: "This room: your profile" })]);
+      if (r.is_owner) {
+        card.appendChild(el("div", { class: "row" }, [
+          plainButton("Replace this room", (e) => {
+            if (confirm("Create a fresh replacement room and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
+          }),
+          dangerButton("Unlink profile", (e) => {
+            if (confirm("Detach this room from your identity? You can relink later.")) doAction("/widget/api/unlink_profile", {}, e.target);
+          }),
+          dangerButton("Delete profile", (e) => {
+            if (confirm("Permanently delete your fediverse identity and notify followers? This cannot be undone.")) doAction("/widget/api/delete_profile", {}, e.target);
+          }),
         ]));
-      });
-    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+      } else {
+        card.appendChild(el("div", { class: "row" }, [
+          plainButton("Link this room to my profile", (e) => doAction("/widget/api/link_profile", {}, e.target)),
+        ]));
+      }
+      app.appendChild(card);
+    } else if (kind === "remote_actor") {
+      const card = el("div", { class: "card" }, [
+        el("h2", { text: "This room: " + (r.display_name || "Fediverse account") }),
+        el("div", { class: "row" }, [
+          plainButton("View full profile", () => openAccountProfile(r.actor_id)),
+          r.is_following ? el("span", { class: "badge", text: "Following" }) : null,
+        ].filter(Boolean)),
+      ]);
+      const backfillRow = el("div", { class: "row" }, [
+        primaryButton("Backfill latest " + ctx.backfill_default_count + " posts", (e) => doAction("/widget/api/backfill", {}, e.target)),
+      ]);
+      if (ctx.is_admin) {
+        const countInput = el("input", { type: "number", min: "1", placeholder: "custom count" });
+        backfillRow.appendChild(countInput);
+        backfillRow.appendChild(plainButton("Backfill custom amount", (e) =>
+          doAction("/widget/api/backfill", { count: parseInt(countInput.value || "0", 10) }, e.target)));
+        backfillRow.appendChild(plainButton("Replace this room", (e) => {
+          if (confirm("Create a fresh replacement room for this account and retire this one?")) doAction("/widget/api/replace_room", {}, e.target);
+        }));
+      }
+      card.appendChild(backfillRow);
+      app.appendChild(card);
+    } else if (kind === "dm" || kind === "chat") {
+      app.appendChild(el("div", { class: "card" }, [
+        el("h2", { text: "This room: " + (kind === "dm" ? "Direct message" : "Chat") }),
+        el("div", { class: "row" }, [
+          plainButton("Mute", (e) => doAction("/widget/api/mute", {}, e.target)),
+          dangerButton("Block", (e) => {
+            if (confirm("Block this account?")) doAction("/widget/api/block", {}, e.target);
+          }),
+        ]),
+      ]));
+    } else if (kind === "notifications") {
+      app.appendChild(el("div", { class: "card" }, [
+        el("h2", { text: "This room: Notifications" }),
+        el("div", { class: "sub", text: "Your Fediverse Notifications DM with the bridge bot -- nothing to configure here." }),
+      ]));
+    }
+    // kind === "unmanaged": nothing room-specific to show.
   }
 
   async function loadContext() {
