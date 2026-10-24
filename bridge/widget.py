@@ -502,68 +502,65 @@ _WIDGET_HTML = r"""<!doctype html>
 <link rel="icon" href="/widget/icon">
 <style>
   :root {
-    --bg: #f5f6f8;
-    --card: #ffffff;
-    --border: #e2e4e9;
-    --text: #1c1e21;
-    --muted: #6b7280;
-    --accent: #6d28d9;
-    --accent-text: #ffffff;
-    --danger: #dc2626;
-    --danger-bg: #fef2f2;
-    --ok-bg: #f0fdf4;
-    --ok-text: #15803d;
+    --bg: #ffffff; --card: #ffffff; --border: #e1e6ec;
+    --text: #1b1d22; --muted: #656d77; --muted2: #818a95;
+    --accent: #007a61; --accent-text: #ffffff; --hover: #f0f2f5;
+    --danger: #dc2626; --danger-bg: #fef2f2; --ok-bg: #f0fdf4; --ok-text: #15803d;
+    --radius-card: 12px; --radius-inner: 8px; --radius-chip: 6px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #17181c; --card: #1f2025; --border: #2e3038; --text: #e7e8ea;
-      --muted: #9aa0ab; --accent: #a78bfa; --accent-text: #17181c;
-      --danger: #f87171; --danger-bg: #2a1618; --ok-bg: #12241a; --ok-text: #4ade80;
+      --bg: #101317; --card: #101317; --border: #26282d; --text: #ebeef2;
+      --muted: #808994; --muted2: #656c76; --accent: #129a78; --accent-text: #101317;
+      --hover: #1d1f24; --danger: #f87171; --danger-bg: #2a1618; --ok-bg: #12241a; --ok-text: #4ade80;
     }
   }
   :root[data-theme="dark"] {
-    --bg: #17181c; --card: #1f2025; --border: #2e3038; --text: #e7e8ea;
-    --muted: #9aa0ab; --accent: #a78bfa; --accent-text: #17181c;
-    --danger: #f87171; --danger-bg: #2a1618; --ok-bg: #12241a; --ok-text: #4ade80;
+    --bg: #101317; --card: #101317; --border: #26282d; --text: #ebeef2;
+    --muted: #808994; --muted2: #656c76; --accent: #129a78; --accent-text: #101317;
+    --hover: #1d1f24; --danger: #f87171; --danger-bg: #2a1618; --ok-bg: #12241a; --ok-text: #4ade80;
   }
   :root[data-theme="light"] {
-    --bg: #f5f6f8; --card: #ffffff; --border: #e2e4e9; --text: #1c1e21;
-    --muted: #6b7280; --accent: #6d28d9; --accent-text: #ffffff;
-    --danger: #dc2626; --danger-bg: #fef2f2; --ok-bg: #f0fdf4; --ok-text: #15803d;
+    --bg: #ffffff; --card: #ffffff; --border: #e1e6ec; --text: #1b1d22;
+    --muted: #656d77; --muted2: #818a95; --accent: #007a61; --accent-text: #ffffff;
+    --hover: #f0f2f5; --danger: #dc2626; --danger-bg: #fef2f2; --ok-bg: #f0fdf4; --ok-text: #15803d;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     min-height: 100vh;
   }
+  #content { padding: 16px; }
   .card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-card);
     padding: 16px; margin-bottom: 12px;
   }
   h1 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
-  .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; word-break: break-all; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; word-break: break-all; }
   .badge {
     display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
     background: var(--accent); color: var(--accent-text); font-weight: 600;
   }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
   .row:last-child { margin-bottom: 0; }
   button {
-    font: inherit; font-weight: 600; border: 1px solid var(--border); background: var(--card);
-    color: var(--text); border-radius: 8px; padding: 8px 14px; cursor: pointer;
+    font: inherit; font-size: 13px; font-weight: 600; border: 1px solid var(--border); background: var(--card);
+    color: var(--text); border-radius: var(--radius-inner); padding: 8px 14px; cursor: pointer;
   }
   button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   button.danger { color: var(--danger); border-color: var(--danger); }
   button:disabled { opacity: .5; cursor: default; }
+  button:not(:disabled):hover { background: var(--hover); }
+  button.primary:not(:disabled):hover { filter: brightness(1.08); }
   button:not(:disabled):active { transform: translateY(1px); }
   input[type=text], input[type=number] {
-    font: inherit; border: 1px solid var(--border); background: var(--bg); color: var(--text);
-    border-radius: 8px; padding: 8px 10px; flex: 1; min-width: 120px;
+    font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    border-radius: var(--radius-inner); padding: 8px 10px; flex: 1; min-width: 120px;
   }
   .toast {
-    position: fixed; left: 16px; right: 16px; bottom: 16px; padding: 10px 14px; border-radius: 10px;
+    position: fixed; left: 16px; right: 16px; bottom: 16px; padding: 10px 14px; border-radius: var(--radius-inner);
     font-size: 13px; font-weight: 600; display: none; z-index: 10;
   }
   .toast.ok { background: var(--ok-bg); color: var(--ok-text); display: block; }
@@ -573,16 +570,30 @@ _WIDGET_HTML = r"""<!doctype html>
   .list { display: flex; flex-direction: column; gap: 6px; }
   .list-item {
     display: flex; justify-content: space-between; align-items: center; padding: 8px 10px;
-    border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+    border: 1px solid var(--border); border-radius: var(--radius-inner); font-size: 13px;
   }
   .muted { color: var(--muted); }
   .spinner { text-align: center; color: var(--muted); padding: 40px 0; }
   a { color: var(--accent); }
   .toggle-on { background: var(--ok-bg); color: var(--ok-text); border-color: var(--ok-bg); }
+
+  /* -- tab bar ------------------------------------------------------------ */
+  #tabbar {
+    display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border);
+    background: var(--card); position: sticky; top: 0; z-index: 5; overflow-x: auto;
+  }
+  .tab {
+    font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: none; border: none;
+    border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .tab:hover { background: var(--hover); color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
 </style>
 </head>
 <body>
-  <div id="app"><div class="spinner">Connecting&hellip;</div></div>
+  <div id="tabbar"></div>
+  <div id="content"><div id="app"><div class="spinner">Connecting&hellip;</div></div></div>
   <div id="toast" class="toast"></div>
 
 <script>
@@ -712,12 +723,47 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   let ctx = null;
+  const TABS = [
+    { id: "home", label: "Home" },
+    { id: "browse", label: "Browse" },
+    { id: "identity", label: "Identity" },
+    { id: "publish", label: "Publish" },
+    { id: "admin", label: "Admin" },
+  ];
+  let currentTab = "home";
+
+  function renderTabBar() {
+    const bar = document.getElementById("tabbar");
+    bar.innerHTML = "";
+    if (!ctx) return;
+    TABS.forEach((t) => {
+      if (t.id === "admin" && !ctx.is_admin) return;
+      bar.appendChild(el("button", {
+        class: "tab" + (t.id === currentTab ? " active" : ""),
+        text: t.label,
+        onclick: () => { currentTab = t.id; render(); },
+      }));
+    });
+  }
+
+  function placeholder(app, text) {
+    app.appendChild(el("div", { class: "placeholder", text: text }));
+  }
 
   function render() {
+    renderTabBar();
     const app = document.getElementById("app");
     app.innerHTML = "";
     if (!ctx) return;
 
+    if (currentTab === "home") renderHome(app);
+    else if (currentTab === "browse") placeholder(app, "Browse is coming soon.");
+    else if (currentTab === "identity") placeholder(app, "Identity management is coming soon.");
+    else if (currentTab === "publish") placeholder(app, "Channel/community publishing is coming soon.");
+    else if (currentTab === "admin") placeholder(app, "The admin panel is coming soon.");
+  }
+
+  function renderHome(app) {
     app.appendChild(el("div", { class: "card" }, [
       el("h1", {}, [
         el("span", { text: "\u{1F30D} Fediverse Bridge" }),
