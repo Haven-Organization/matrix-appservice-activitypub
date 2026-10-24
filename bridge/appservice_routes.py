@@ -276,6 +276,139 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
     return True
 
 
+async def _dispatch_single_event(request: Request, event: dict) -> None:
+    """Runs the full handler chain for one event, returning as soon as
+    something claims it.
+
+    Split out from ``_handle_transaction`` (2026-10-24) so that marking an
+    event processed, in that function's own per-event loop, always runs
+    after this returns or raises. When this chain lived inline in that
+    loop's own ``try`` block, every ``continue`` below doubled as "skip the
+    mark-as-processed step too" -- ``continue`` jumps to the top of the
+    *loop*, not just out of the ``try``. That meant the per-event
+    idempotency table was only ever populated for events that fell through
+    this entire chain unclaimed, or that raised -- NOT for the vast
+    majority of real events, which get claimed by one of the ``maybe_*``
+    handlers below well before reaching the end. Confirmed live: Synapse
+    retried the same transaction (one redaction, itself slow to deliver for
+    an unrelated reason -- see ``bridge.delete_bridge``'s own fix from the
+    same incident) repeatedly for hours; nothing here remembered any
+    already-completed attempt, so the real work -- a Delete fanned out to
+    every follower -- would have re-run in full on every single retry once
+    that other bug stopped making delivery fail outright.
+    """
+    handled_as_invite = await maybe_accept_invite(request, event)
+    if handled_as_invite:
+        return
+    handled_as_knock = await maybe_handle_knock(request, event)
+    if handled_as_knock:
+        return
+    handled_as_leave = await maybe_handle_leave(request, event)
+    if handled_as_leave:
+        return
+    handled_as_community_ban = await maybe_handle_community_ban(request, event)
+    if handled_as_community_ban:
+        return
+    handled_as_owned_community_ban = await maybe_handle_owned_community_ban(request, event)
+    if handled_as_owned_community_ban:
+        return
+    handled_as_join = await maybe_handle_join(request, event)
+    if handled_as_join:
+        return
+    handled_as_topic_change = await maybe_handle_topic_change(request, event)
+    if handled_as_topic_change:
+        return
+    handled_as_name_change = await maybe_handle_room_name_change(request, event)
+    if handled_as_name_change:
+        return
+    handled_as_avatar_change = await maybe_handle_room_avatar_change(request, event)
+    if handled_as_avatar_change:
+        return
+    handled_as_banner_change = await maybe_handle_room_banner_change(request, event)
+    if handled_as_banner_change:
+        return
+    handled_as_pinned_events_change = await maybe_handle_pinned_events_change(request, event)
+    if handled_as_pinned_events_change:
+        return
+    handled_as_channel_topic_change = await maybe_handle_channel_topic_change(request, event)
+    if handled_as_channel_topic_change:
+        return
+    handled_as_channel_name_change = await maybe_handle_channel_name_change(request, event)
+    if handled_as_channel_name_change:
+        return
+    handled_as_channel_avatar_change = await maybe_handle_channel_avatar_change(request, event)
+    if handled_as_channel_avatar_change:
+        return
+    handled_as_owned_community_name_change = await maybe_handle_owned_community_name_change(request, event)
+    if handled_as_owned_community_name_change:
+        return
+    handled_as_owned_community_topic_change = await maybe_handle_owned_community_topic_change(request, event)
+    if handled_as_owned_community_topic_change:
+        return
+    handled_as_owned_community_avatar_change = await maybe_handle_owned_community_avatar_change(request, event)
+    if handled_as_owned_community_avatar_change:
+        return
+    handled_as_owned_community_banner_change = await maybe_handle_owned_community_banner_change(request, event)
+    if handled_as_owned_community_banner_change:
+        return
+    handled_as_owned_community_power_level_change = await maybe_handle_owned_community_power_level_change(
+        request, event
+    )
+    if handled_as_owned_community_power_level_change:
+        return
+    handled_as_reaction = await maybe_federate_reaction(request, event)
+    if handled_as_reaction:
+        return
+    handled_as_reaction_removal = await maybe_federate_reaction_removal(request, event)
+    if handled_as_reaction_removal:
+        return
+    handled_as_poll_vote = await maybe_federate_poll_vote(request, event)
+    if handled_as_poll_vote:
+        return
+    handled_as_poll_close = await maybe_federate_poll_close(request, event)
+    if handled_as_poll_close:
+        return
+    handled_as_delete = await maybe_federate_delete(request, event)
+    if handled_as_delete:
+        return
+    handled_as_delete_confirmation = await maybe_handle_delete_confirmation(request, event)
+    if handled_as_delete_confirmation:
+        return
+    handled_as_link_profile_confirmation = await maybe_handle_link_profile_confirmation(request, event)
+    if handled_as_link_profile_confirmation:
+        return
+    handled_as_link_community_confirmation = await maybe_handle_link_community_confirmation(request, event)
+    if handled_as_link_community_confirmation:
+        return
+    handled_as_unlink_profile_confirmation = await maybe_handle_unlink_profile_confirmation(request, event)
+    if handled_as_unlink_profile_confirmation:
+        return
+    handled_as_replace_room_confirmation = await maybe_handle_replace_room_confirmation(request, event)
+    if handled_as_replace_room_confirmation:
+        return
+    handled_as_replace_ghost_room_confirmation = await maybe_handle_replace_ghost_room_confirmation(request, event)
+    if handled_as_replace_ghost_room_confirmation:
+        return
+    handled_as_leave_unfollowed_confirmation = await maybe_handle_leave_unfollowed_confirmation(request, event)
+    if handled_as_leave_unfollowed_confirmation:
+        return
+    handled_as_allow_homeserver_confirmation = await maybe_handle_allow_homeserver_confirmation(request, event)
+    if handled_as_allow_homeserver_confirmation:
+        return
+    handled_as_encrypted_attachment_confirmation = await maybe_handle_encrypted_attachment_confirmation(
+        request, event
+    )
+    if handled_as_encrypted_attachment_confirmation:
+        return
+    handled_as_command = await maybe_handle_command(request, event)
+    if not handled_as_command:
+        # Edits MUST be intercepted before the chat/reply/post paths: an
+        # m.replace event's own body is the "* ..." fallback text, and any
+        # of those paths would federate it as a fresh malformed post --
+        # see bridge.edit_bridge.
+        await _dispatch_outbound_send(request, event)
+
+
 async def _handle_transaction(
     request: Request, txn_id: str, authorization: str | None, access_token: str | None
 ) -> Response:
@@ -304,126 +437,7 @@ async def _handle_transaction(
             logger.debug("Ignoring already-processed event %s", event_id)
             continue
         try:
-            handled_as_invite = await maybe_accept_invite(request, event)
-            if handled_as_invite:
-                continue
-            handled_as_knock = await maybe_handle_knock(request, event)
-            if handled_as_knock:
-                continue
-            handled_as_leave = await maybe_handle_leave(request, event)
-            if handled_as_leave:
-                continue
-            handled_as_community_ban = await maybe_handle_community_ban(request, event)
-            if handled_as_community_ban:
-                continue
-            handled_as_owned_community_ban = await maybe_handle_owned_community_ban(request, event)
-            if handled_as_owned_community_ban:
-                continue
-            handled_as_join = await maybe_handle_join(request, event)
-            if handled_as_join:
-                continue
-            handled_as_topic_change = await maybe_handle_topic_change(request, event)
-            if handled_as_topic_change:
-                continue
-            handled_as_name_change = await maybe_handle_room_name_change(request, event)
-            if handled_as_name_change:
-                continue
-            handled_as_avatar_change = await maybe_handle_room_avatar_change(request, event)
-            if handled_as_avatar_change:
-                continue
-            handled_as_banner_change = await maybe_handle_room_banner_change(request, event)
-            if handled_as_banner_change:
-                continue
-            handled_as_pinned_events_change = await maybe_handle_pinned_events_change(request, event)
-            if handled_as_pinned_events_change:
-                continue
-            handled_as_channel_topic_change = await maybe_handle_channel_topic_change(request, event)
-            if handled_as_channel_topic_change:
-                continue
-            handled_as_channel_name_change = await maybe_handle_channel_name_change(request, event)
-            if handled_as_channel_name_change:
-                continue
-            handled_as_channel_avatar_change = await maybe_handle_channel_avatar_change(request, event)
-            if handled_as_channel_avatar_change:
-                continue
-            handled_as_owned_community_name_change = await maybe_handle_owned_community_name_change(request, event)
-            if handled_as_owned_community_name_change:
-                continue
-            handled_as_owned_community_topic_change = await maybe_handle_owned_community_topic_change(request, event)
-            if handled_as_owned_community_topic_change:
-                continue
-            handled_as_owned_community_avatar_change = await maybe_handle_owned_community_avatar_change(
-                request, event
-            )
-            if handled_as_owned_community_avatar_change:
-                continue
-            handled_as_owned_community_banner_change = await maybe_handle_owned_community_banner_change(
-                request, event
-            )
-            if handled_as_owned_community_banner_change:
-                continue
-            handled_as_owned_community_power_level_change = await maybe_handle_owned_community_power_level_change(
-                request, event
-            )
-            if handled_as_owned_community_power_level_change:
-                continue
-            handled_as_reaction = await maybe_federate_reaction(request, event)
-            if handled_as_reaction:
-                continue
-            handled_as_reaction_removal = await maybe_federate_reaction_removal(request, event)
-            if handled_as_reaction_removal:
-                continue
-            handled_as_poll_vote = await maybe_federate_poll_vote(request, event)
-            if handled_as_poll_vote:
-                continue
-            handled_as_poll_close = await maybe_federate_poll_close(request, event)
-            if handled_as_poll_close:
-                continue
-            handled_as_delete = await maybe_federate_delete(request, event)
-            if handled_as_delete:
-                continue
-            handled_as_delete_confirmation = await maybe_handle_delete_confirmation(request, event)
-            if handled_as_delete_confirmation:
-                continue
-            handled_as_link_profile_confirmation = await maybe_handle_link_profile_confirmation(request, event)
-            if handled_as_link_profile_confirmation:
-                continue
-            handled_as_link_community_confirmation = await maybe_handle_link_community_confirmation(request, event)
-            if handled_as_link_community_confirmation:
-                continue
-            handled_as_unlink_profile_confirmation = await maybe_handle_unlink_profile_confirmation(request, event)
-            if handled_as_unlink_profile_confirmation:
-                continue
-            handled_as_replace_room_confirmation = await maybe_handle_replace_room_confirmation(request, event)
-            if handled_as_replace_room_confirmation:
-                continue
-            handled_as_replace_ghost_room_confirmation = await maybe_handle_replace_ghost_room_confirmation(
-                request, event
-            )
-            if handled_as_replace_ghost_room_confirmation:
-                continue
-            handled_as_leave_unfollowed_confirmation = await maybe_handle_leave_unfollowed_confirmation(
-                request, event
-            )
-            if handled_as_leave_unfollowed_confirmation:
-                continue
-            handled_as_allow_homeserver_confirmation = await maybe_handle_allow_homeserver_confirmation(
-                request, event
-            )
-            if handled_as_allow_homeserver_confirmation:
-                continue
-            handled_as_encrypted_attachment_confirmation = await maybe_handle_encrypted_attachment_confirmation(
-                request, event
-            )
-            if handled_as_encrypted_attachment_confirmation:
-                continue
-            handled_as_command = await maybe_handle_command(request, event)
-            if not handled_as_command:
-                # Edits MUST be intercepted before the chat/reply/post
-                # paths: an m.replace event's own body is the "* ..."
-                # fallback text, and any of those paths would federate it
-                # as a fresh malformed post -- see bridge.edit_bridge.
-                await _dispatch_outbound_send(request, event)
+            await _dispatch_single_event(request, event)
         except Exception:
             logger.exception(
                 "Error handling event %s (%s) in %s",
@@ -432,7 +446,7 @@ async def _handle_transaction(
                 event.get("room_id"),
             )
         if event_id:
-            # Marked regardless of whether the try block above raised --
+            # Marked regardless of whether _dispatch_single_event raised --
             # same "attempted it, move on" semantics mark_transaction_processed
             # already had for the whole transaction (an exception here is
             # already logged and swallowed, never surfaced as a non-200
