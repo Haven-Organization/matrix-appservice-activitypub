@@ -1131,8 +1131,26 @@ _WIDGET_HTML = r"""<!doctype html>
     const res = await fetch(path, { method: opts.method || "GET", headers, body });
     let data = {};
     try { data = await res.json(); } catch (e) {}
-    if (!res.ok) throw new Error(data.detail || ("Request failed (" + res.status + ")"));
+    if (!res.ok) throw new Error(errorMessage(data, res.status));
     return data;
+  }
+
+  // A FastAPI error body's "detail" is usually a plain string, but a 422
+  // validation failure makes it a LIST of {loc, msg, type} objects instead
+  // -- new Error(thatArray) previously coerced straight to
+  // "[object Object],[object Object]" via Array's own toString, shown to
+  // the user verbatim (observed live opening a thread). Handle every
+  // shape it can actually take.
+  function errorMessage(data, status) {
+    const detail = data && data.detail;
+    if (typeof detail === "string" && detail) return detail;
+    if (Array.isArray(detail) && detail.length) {
+      return detail.map((d) => (d && typeof d === "object" && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
+    }
+    if (detail && typeof detail === "object") {
+      try { return JSON.stringify(detail); } catch (e) {}
+    }
+    return "Request failed (" + status + ")";
   }
 
   function toast(message, ok) {
