@@ -46,6 +46,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from bridge import instance_auth
+from bridge.commands import _discover_mastodon_api_reply_notes
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.remote_actor import RemoteActorFetchError, fetch_actor
 from bridge.activitypub.webfinger import WebfingerError, resolve_remote_actor_id
@@ -642,7 +643,73 @@ async def _fetch_reply_uris(request: Request, note_doc: dict[str, Any]) -> list[
     return [i for i in items if isinstance(i, str)][:_THREAD_MAX_REPLIES]
 
 
-async def _find_op_reply(request: Request, reply_doc: dict[str, Any], focus_author_id: Any) -> dict[str, Any] | None:
+async def _fetch_direct_children(
+    request: Request, parent_doc: dict[str, Any], *, descendant_pool: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """Every direct reply to ``parent_doc``. Tries the Note's own AS2
+    ``replies`` collection first; Pleroma/Akkoma notably don't populate
+    this at all (confirmed live against a real blob.cat/Akkoma post --
+    ``replies`` is simply absent, not just empty), so when that comes up
+    with nothing, falls back to filtering ``descendant_pool`` (the whole
+    subtree, already fetched once via the Mastodon-API ``/context``
+    endpoint -- see ``_discover_mastodon_api_reply_notes``, the same
+    known-unreliable-AS2-replies-collection fallback already used for
+    ``;backfill``) down to whichever of those have THIS post as their own
+    ``inReplyTo``."""
+    parent_uri = parent_doc.get("id")
+    reply_uris = await _fetch_reply_uris(request, parent_doc)
+    if reply_uris:
+        docs = await asyncio.gather(*(_fetch_as2_note(request, u) for u in reply_uris))
+        return [d for d in docs if d is not None]
+    if descendant_pool and isinstance(parent_uri, str):
+        return [d for d in descendant_pool if d.get("inReplyTo") == parent_uri]
+    return []
+
+
+async def _fetch_context_descendant_pool(request: Request, *, origin_uri: str, fallback_object_id: str) -> list[dict[str, Any]]:
+    """The whole descendant subtree via the Mastodon-API ``/context``
+    endpoint, for when a post's own AS2 ``replies`` collection is empty
+    or absent. Tries the ORIGINAL uri's own last path segment as a
+    Mastodon-API status id directly first -- a Mastodon/Pleroma/Akkoma
+    permalink (``/@user/<id>``, ``/notice/<id>``) literally IS that id in
+    its own URL, which works even when an instance's unauthenticated
+    ``/api/v1/search`` is disabled (confirmed live: blob.cat's Akkoma
+    returns ``{"error":"Not implemented"}`` for search, but
+    ``/api/v1/statuses/<id>/context`` with that same id works fine,
+    unauthenticated, and finds real descendants search alone would have
+    missed entirely). Falls back to ``_discover_mastodon_api_reply_notes``'s
+    own search-based resolution (needed when the uri's last segment isn't
+    a usable id -- an outbox-item URL, for instance) if that direct guess
+    doesn't pan out."""
+    http_client = request.app.state.http_client
+    parsed = urlparse(origin_uri)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    candidate_id = origin_uri.rstrip("/").rsplit("/", 1)[-1]
+    if candidate_id:
+        try:
+            resp = await http_client.get(f"{origin}/api/v1/statuses/{candidate_id}/context")
+            if resp.status_code == 200:
+                descendants = resp.json().get("descendants") or []
+                notes = []
+                for status in descendants:
+                    status_uri = status.get("uri") if isinstance(status, dict) else None
+                    if not isinstance(status_uri, str):
+                        continue
+                    note = await _fetch_as2_note(request, status_uri)
+                    if note is not None and note.get("type") == "Note":
+                        notes.append(note)
+                if notes:
+                    return notes
+        except (httpx.HTTPError, ValueError):
+            pass
+    return await _discover_mastodon_api_reply_notes(
+        request, root_ap_object_id=fallback_object_id, limit=_THREAD_MAX_REPLIES * 4, already_seen=set()
+    )
+
+
+async def _find_op_reply(
+    request: Request, reply_doc: dict[str, Any], focus_author_id: Any, *, descendant_pool: list[dict[str, Any]] | None
+) -> dict[str, Any] | None:
     """The one reply-of-reply (if any) that's authored by the FOCUSED
     post's own author continuing the conversation with this particular
     direct reply -- the 'OP replying back' pattern Haven Desktop/Poa.st
@@ -652,12 +719,9 @@ async def _find_op_reply(request: Request, reply_doc: dict[str, Any], focus_auth
     tree)."""
     if not isinstance(focus_author_id, str):
         return None
-    candidate_uris = (await _fetch_reply_uris(request, reply_doc))[:_THREAD_MAX_NESTED_CANDIDATES]
-    if not candidate_uris:
-        return None
-    candidate_docs = await asyncio.gather(*(_fetch_as2_note(request, u) for u in candidate_uris))
-    for doc in candidate_docs:
-        if doc is not None and doc.get("attributedTo") == focus_author_id:
+    candidates = (await _fetch_direct_children(request, reply_doc, descendant_pool=descendant_pool))[:_THREAD_MAX_NESTED_CANDIDATES]
+    for doc in candidates:
+        if doc.get("attributedTo") == focus_author_id:
             return doc
     return None
 
@@ -684,9 +748,27 @@ async def browse_thread(request: Request, uri: str) -> JSONResponse:
         current = parent_doc
     ancestors.reverse()  # root first, immediate parent last
 
-    reply_uris = await _fetch_reply_uris(request, focus_doc)
-    reply_docs = [d for d in await asyncio.gather(*(_fetch_as2_note(request, u) for u in reply_uris)) if d is not None]
-    op_reply_docs = await asyncio.gather(*(_find_op_reply(request, d, focus_doc.get("attributedTo")) for d in reply_docs))
+    focus_id = focus_doc.get("id") if isinstance(focus_doc.get("id"), str) else uri
+    reply_docs = await _fetch_direct_children(request, focus_doc, descendant_pool=None)
+    descendant_pool: list[dict[str, Any]] | None = None
+    if not reply_docs:
+        # The native AS2 replies collection came up empty (missing
+        # entirely, on Pleroma/Akkoma, or genuinely zero replies) -- fetch
+        # the whole subtree once via the Mastodon-API fallback and reuse
+        # it both for this post's own direct replies and for each of
+        # those replies' own op_reply lookup below, rather than one
+        # extra fetch per candidate. Filtered against the post's own
+        # CANONICAL id (post-redirect, e.g. a Pleroma/Akkoma /objects/
+        # uuid) -- the original `uri` the caller passed (e.g. a /notice/
+        # permalink) is a different string and would never match a
+        # descendant's own inReplyTo.
+        descendant_pool = await _fetch_context_descendant_pool(request, origin_uri=uri, fallback_object_id=focus_id)
+        reply_docs = [d for d in descendant_pool if d.get("inReplyTo") == focus_id][:_THREAD_MAX_REPLIES]
+
+    focus_author_id = focus_doc.get("attributedTo")
+    op_reply_docs = await asyncio.gather(
+        *(_find_op_reply(request, d, focus_author_id, descendant_pool=descendant_pool) for d in reply_docs)
+    )
 
     normalized_ancestors = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in ancestors)) if p is not None]
     normalized_focus = await _normalize_as2_note_full(request, focus_doc)
