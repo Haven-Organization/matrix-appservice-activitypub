@@ -306,6 +306,7 @@ async def widget_identity_settings(request: Request, username: str) -> JSONRespo
             "username": actor.username,
             "display_name": actor.display_name,
             "handle": f"@{actor.username}@{config.bridge.domain}",
+            "icon_url": actor.icon_url,
             "public_url": actor_url(config.bridge.public_base_url, actor.username),
             "room_id": actor.room_id,
             "hide_followers": settings.get("hide_followers", False),

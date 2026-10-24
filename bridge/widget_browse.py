@@ -103,6 +103,7 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
         "sensitive": bool(base.get("sensitive")),
         "spoiler_text": base.get("spoiler_text") if isinstance(base.get("spoiler_text"), str) else "",
         "author": {
+            "actor_id": account.get("uri"),
             "display_name": account.get("display_name") or account.get("username") or "(unknown)",
             "handle": account.get("acct") or account.get("username") or "",
             "avatar_url": account.get("avatar") or account.get("avatar_static"),
@@ -115,7 +116,11 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
             "favourites": base.get("favourites_count") or 0,
         },
         "boosted_by": (
-            {"display_name": booster.get("display_name") or booster.get("username") or "", "handle": booster.get("acct") or ""}
+            {
+                "actor_id": booster.get("uri"),
+                "display_name": booster.get("display_name") or booster.get("username") or "",
+                "handle": booster.get("acct") or "",
+            }
             if booster is not None else None
         ),
         "instance": instance_domain,
