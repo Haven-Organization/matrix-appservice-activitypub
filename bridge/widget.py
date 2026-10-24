@@ -44,6 +44,8 @@ from bridge.commands import (
     _handle_banner,
     _handle_block,
     _handle_chat,
+    _handle_create_channel,
+    _handle_create_community,
     _handle_create_profile,
     _execute_leave_unfollowed,
     _handle_delete_profile,
@@ -525,8 +527,19 @@ async def widget_backfill(request: Request) -> JSONResponse:
 
 @router.post("/widget/api/create_profile")
 async def widget_create_profile(request: Request) -> JSONResponse:
+    """Creates a brand-new identity -- the bare form (no ``custom_id``)
+    for a first-ever profile, or an additional one when
+    ``custom_identities_enabled``. ``room_id`` is only ever used by
+    ``_handle_create_profile`` for its own confirmation notice (silently
+    swallowed if the room doesn't make sense for it), never to decide
+    WHICH identity gets created -- safe to call from any room the widget
+    happens to be embedded in, including from the sidebar identity
+    switcher rather than a specific room's own tab."""
     body = await request.json()
-    return await _dispatch(request, body["room_id"], _handle_create_profile)
+    custom_id = (body.get("custom_id") or "").strip()
+    return await _dispatch(
+        request, body.get("room_id", ""), _handle_create_profile, custom_id=custom_id
+    )
 
 
 @router.post("/widget/api/link_profile")
@@ -545,6 +558,92 @@ async def widget_unlink_profile(request: Request) -> JSONResponse:
 async def widget_delete_profile(request: Request) -> JSONResponse:
     body = await request.json()
     return await _dispatch(request, body["room_id"], _handle_delete_profile)
+
+
+# -- Publish tab: PeerTube channels + Lemmy communities -----------------------
+#
+# Create + list only -- publish/unpublish/edit a video/post and
+# replace-video all require replying to an already-uploaded Matrix media
+# event INSIDE the channel/community's own room (_handle_publish etc. take
+# a Matrix `content` dict, not a free-form argument), which needs a real
+# Matrix media upload the widget has no access token to drive itself. Those
+# stay "manage in the room" -- see the channel/community's own room_id,
+# surfaced below for a plain matrix.to deep link.
+
+
+def _build_create_argument(identifier: str, as_identity: str, display_name: str) -> str:
+    parts = [identifier]
+    if as_identity:
+        parts += ["as", as_identity]
+    if display_name:
+        parts.append(display_name)
+    return " ".join(parts)
+
+
+@router.get("/widget/api/channels")
+async def widget_channels(request: Request) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    if not config.bridge.peertube_channels_enabled:
+        return JSONResponse({"enabled": False, "channels": []}, headers={"Cache-Control": "no-store"})
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    channels = [
+        {
+            "username": channel.username,
+            "display_name": channel.display_name,
+            "owner_username": channel.owner_username,
+            "room_id": channel.room_id,
+        }
+        for identity in identities
+        for channel in await repository.list_peertube_channels_by_owner(identity.username)
+    ]
+    return JSONResponse({"enabled": True, "channels": channels}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/channels/create")
+async def widget_create_channel(request: Request) -> JSONResponse:
+    body = await request.json()
+    channel_id = (body.get("id") or "").strip()
+    if not channel_id:
+        raise HTTPException(400, "id is required")
+    argument = _build_create_argument(
+        channel_id, (body.get("as_identity") or "").strip(), (body.get("display_name") or "").strip()
+    )
+    return await _dispatch(request, body.get("room_id", ""), _handle_create_channel, argument=argument)
+
+
+@router.get("/widget/api/communities")
+async def widget_communities(request: Request) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    if not config.bridge.lemmy_community_hosting_enabled:
+        return JSONResponse({"enabled": False, "communities": []}, headers={"Cache-Control": "no-store"})
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    communities = [
+        {
+            "username": community.username,
+            "display_name": community.display_name,
+            "owner_username": community.owner_username,
+            "room_id": community.room_id,
+        }
+        for identity in identities
+        for community in await repository.list_lemmy_communities_by_owner(identity.username)
+    ]
+    return JSONResponse({"enabled": True, "communities": communities}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/communities/create")
+async def widget_create_community(request: Request) -> JSONResponse:
+    body = await request.json()
+    community_id = (body.get("id") or "").strip()
+    if not community_id:
+        raise HTTPException(400, "id is required")
+    argument = _build_create_argument(
+        community_id, (body.get("as_identity") or "").strip(), (body.get("display_name") or "").strip()
+    )
+    return await _dispatch(request, body.get("room_id", ""), _handle_create_community, argument=argument)
 
 
 @router.post("/widget/api/banner")
