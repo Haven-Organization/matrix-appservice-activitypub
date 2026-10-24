@@ -888,7 +888,6 @@ _WIDGET_HTML = r"""<!doctype html>
   .nav-item .label { overflow: hidden; text-overflow: ellipsis; }
   #shell.collapsed .nav-item .label { display: none; }
   #shell.collapsed .nav-item { justify-content: center; }
-  #sidebar-toggle { margin-top: auto; }
   #content { padding: 16px; flex: 1; min-width: 0; max-width: 640px; }
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
 
@@ -897,6 +896,10 @@ _WIDGET_HTML = r"""<!doctype html>
   .post-card + .post-card { border-top: 1px solid var(--border); }
   .avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; background: var(--hover); object-fit: cover; }
   .avatar.sm { width: 24px; height: 24px; }
+  .avatar-fallback {
+    display: flex; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-text);
+    font-weight: 700; font-size: 1.1em;
+  }
   .post-body { flex: 1; min-width: 0; }
   .post-header { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
   .post-header .name { font-weight: 600; color: var(--text); }
@@ -1095,6 +1098,23 @@ _WIDGET_HTML = r"""<!doctype html>
     return node;
   }
 
+  // An <img> for url, falling back to an initial-letter circle both when
+  // url is empty/missing (the common case -- most accounts never set an
+  // avatar) and when it's present but fails to load (dead link, blocked
+  // host, ...), rather than a silently broken image either way.
+  function avatarEl(url, label, extraClass, style, onclick) {
+    const cls = "avatar" + (extraClass ? " " + extraClass : "");
+    const initial = ((label || "").trim().charAt(0) || "?").toUpperCase();
+    const attrs = { class: cls + " avatar-fallback", text: initial, style: style || "" };
+    if (onclick) attrs.onclick = onclick;
+    if (!url) return el("div", attrs);
+    const imgAttrs = { class: cls, src: url, alt: "", style: style || "" };
+    if (onclick) imgAttrs.onclick = onclick;
+    const img = el("img", imgAttrs);
+    img.addEventListener("error", () => { img.replaceWith(el("div", attrs)); }, { once: true });
+    return img;
+  }
+
   let ctx = null;
   const NAV_ITEMS = [
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
@@ -1154,7 +1174,7 @@ _WIDGET_HTML = r"""<!doctype html>
       class: "identity-card", title: active ? active.handle : "",
       onclick: () => { identityDropdownOpen = false; openMyProfile(); },
     }, [
-      el("img", { class: "avatar", src: (active && active.icon_url) || "", alt: "" }),
+      avatarEl(active && active.icon_url, active && (active.display_name || active.handle)),
       el("div", { class: "identity-meta" }, [
         el("div", { class: "name", text: active ? (active.display_name || active.handle) : "…" }),
         el("div", { class: "handle muted", text: active ? active.handle : "" }),
@@ -1320,10 +1340,7 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     children.push(actions);
     return el("div", { class: "post-card" }, [
-      el("img", {
-        class: "avatar" + (hasAuthorProfile ? " clickable" : ""), src: post.author.avatar_url || "", alt: "",
-        onclick: openAuthor,
-      }),
+      avatarEl(post.author.avatar_url, post.author.display_name, hasAuthorProfile ? "clickable" : "", "", openAuthor),
       el("div", { class: "post-body" }, children),
     ]);
   }
@@ -1360,7 +1377,7 @@ _WIDGET_HTML = r"""<!doctype html>
               searchResults.appendChild(el("div", {
                 class: "account-card clickable", onclick: () => openAccountProfile(a.actor_id),
               }, [
-                el("img", { class: "avatar sm", src: a.avatar_url || "", alt: "" }),
+                avatarEl(a.avatar_url, a.display_name, "sm"),
                 el("div", { class: "meta" }, [
                   el("div", { class: "name", text: a.display_name }),
                   el("div", { class: "handle", text: a.handle }),
@@ -1461,7 +1478,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
   function modalHeader(body, avatarUrl, name, handle) {
     body.appendChild(el("div", { class: "row", style: "align-items:flex-start" }, [
-      el("img", { class: "avatar", style: "width:56px;height:56px", src: avatarUrl || "", alt: "" }),
+      avatarEl(avatarUrl, name, "", "width:56px;height:56px;font-size:20px"),
       el("div", {}, [
         el("div", { style: "font-weight:600;font-size:15px", text: name }),
         el("div", { class: "muted", text: handle }),
