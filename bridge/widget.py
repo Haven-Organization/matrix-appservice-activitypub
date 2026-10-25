@@ -70,7 +70,9 @@ from bridge.commands import (
     _parse_follows_export,
     _run_follows_import,
     _RUNNING_FOLLOWS_IMPORTS,
+    widget_edit_video,
     widget_publish_video,
+    widget_unpublish_video,
 )
 from bridge.identity_settings import get_effective_settings
 from bridge.peertube import (
@@ -779,6 +781,10 @@ async def widget_channel_videos(request: Request, username: str) -> JSONResponse
             "tags": meta.get("tags") or [],
             "sensitive": bool(meta.get("sensitive")),
             "description": meta.get("description") or "",
+            "category": meta.get("category") or "",
+            "license": meta.get("license") or "",
+            "language": meta.get("language") or "",
+            "comments_enabled": bool(meta.get("commentsEnabled", True)),
             "matrix_room_id": federated.room_id if federated else None,
             "matrix_event_id": federated.event_id if federated else None,
         })
@@ -869,6 +875,46 @@ async def widget_channel_publish(request: Request, username: str) -> JSONRespons
             duration_ms=body.get("duration_ms") if isinstance(body.get("duration_ms"), (int, float)) else None,
             width=body.get("width") if isinstance(body.get("width"), (int, float)) else None,
             height=body.get("height") if isinstance(body.get("height"), (int, float)) else None,
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/channels/{username}/videos/{video_id}/edit")
+async def widget_channel_edit_video(request: Request, username: str, video_id: str) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    try:
+        ok, message = await widget_edit_video(
+            request,
+            matrix_user_id=matrix_user_id,
+            channel_username=username,
+            local_video_id=video_id,
+            name=name,
+            category=(body.get("category") or "").strip(),
+            licence=(body.get("license") or "").strip(),
+            language=(body.get("language") or "").strip(),
+            tags=(body.get("tags") or "").strip(),
+            sensitive=bool(body.get("sensitive")),
+            comments_enabled=body.get("comments_enabled", True) is not False,
+            description=(body.get("description") or "").strip(),
+            thumbnail_mxc=(body.get("thumbnail_mxc") or "").strip(),
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/channels/{username}/videos/{video_id}/unpublish")
+async def widget_channel_unpublish_video(request: Request, username: str, video_id: str) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    try:
+        ok, message = await widget_unpublish_video(
+            request, matrix_user_id=matrix_user_id, channel_username=username, local_video_id=video_id,
         )
     except SynapseError as exc:
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
@@ -1169,6 +1215,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .video-tile-title { font-size: 13px; font-weight: 600; padding: 8px 10px 0; }
   .video-tile-meta { font-size: 12px; color: var(--muted); padding: 4px 10px 10px; }
   .video-tile-link { display: block; font-size: 12px; padding: 0 10px 10px; }
+  .video-tile-actions { padding: 0 10px 10px; margin-bottom: 0; }
   .muted { color: var(--muted); }
   .spinner { text-align: center; color: var(--muted); padding: 40px 0; }
   .confirm-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
@@ -3068,7 +3115,7 @@ _WIDGET_HTML = r"""<!doctype html>
     render();
   }
 
-  function renderVideoTile(v) {
+  function renderVideoTile(v, channelUsername, isOwner, onChanged) {
     const tile = el("div", { class: "video-tile" });
     const thumbWrap = el("div", { class: "video-tile-thumb" });
     if (v.thumbnail_url) thumbWrap.appendChild(el("img", { src: v.thumbnail_url, alt: "" }));
@@ -3080,11 +3127,19 @@ _WIDGET_HTML = r"""<!doctype html>
     if (v.published) metaBits.push(timeAgo(v.published));
     if (v.tags && v.tags.length) metaBits.push(v.tags.slice(0, 3).join(", "));
     tile.appendChild(el("div", { class: "video-tile-meta", text: metaBits.join(" · ") }));
+    const links = el("div", { class: "video-tile-links" });
     if (v.matrix_room_id) {
-      tile.appendChild(el("a", {
+      links.appendChild(el("a", {
         class: "video-tile-link", text: "View in room",
         href: matrixToUrl(v.matrix_room_id, v.matrix_event_id), target: "_blank", rel: "noopener",
       }));
+    }
+    tile.appendChild(links);
+    if (isOwner) {
+      tile.appendChild(el("div", { class: "row video-tile-actions" }, [
+        plainButton("Edit", () => openEditVideoModal(channelUsername, v, onChanged)),
+        dangerButton("Delete", () => openDeleteVideoModal(channelUsername, v, onChanged)),
+      ]));
     }
     return tile;
   }
@@ -3115,7 +3170,7 @@ _WIDGET_HTML = r"""<!doctype html>
         api("/widget/api/channels/" + encodeURIComponent(view.username) + "/videos").then((data) => {
           grid.innerHTML = "";
           if (!data.videos.length) { grid.appendChild(el("div", { class: "muted", text: "No videos published yet." })); return; }
-          data.videos.forEach((v) => grid.appendChild(renderVideoTile(v)));
+          data.videos.forEach((v) => grid.appendChild(renderVideoTile(v, view.username, c.is_owner, loadVideos)));
         }).catch(() => { grid.innerHTML = ""; grid.appendChild(el("div", { class: "muted", text: "Couldn't load videos." })); });
       }
       loadVideos();
@@ -3438,6 +3493,141 @@ _WIDGET_HTML = r"""<!doctype html>
         .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
     });
     body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    openModal(body);
+  }
+
+  // -- Edit / delete a published video -----------------------------------
+
+  function openEditVideoModal(channelUsername, video, onDone) {
+    const modalBody = el("div", { class: "card profile-modal publish-video-modal" });
+    modalBody.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Edit video" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    modalBody.appendChild(el("div", { class: "sub", text: "The video file itself can't be changed here -- everything else can." }));
+
+    // Thumbnail: shows the current one (if any); picking a new file
+    // replaces it, otherwise it's left exactly as it was (see
+    // widget_edit_video's own docstring for why "didn't touch it" must
+    // never be read as "clear it").
+    let thumbnailFile = null;
+    const thumbnailInput = el("input", { type: "file", accept: "image/*" });
+    const thumbnailPreview = el("div", { class: "file-preview", style: video.thumbnail_url ? "" : "display:none" });
+    function clearThumbnail() {
+      thumbnailFile = null;
+      thumbnailInput.value = "";
+      thumbnailPreview.style.display = "none";
+      thumbnailPreview.innerHTML = "";
+      thumbnailInput.style.display = "";
+    }
+    function showThumbnailPreview(srcUrl, label) {
+      thumbnailPreview.innerHTML = "";
+      thumbnailPreview.style.display = "";
+      thumbnailPreview.appendChild(el("img", { class: "file-preview-thumb-img", src: srcUrl, alt: "" }));
+      thumbnailPreview.appendChild(el("div", { class: "file-preview-meta" }, [el("div", { class: "file-preview-name", text: label })]));
+      thumbnailPreview.appendChild(el("button", {
+        class: "file-preview-remove", text: "✕", title: "Remove",
+        onclick: (e) => { e.preventDefault(); clearThumbnail(); },
+      }));
+      thumbnailInput.style.display = "none";
+    }
+    if (video.thumbnail_url) showThumbnailPreview(video.thumbnail_url, "Current thumbnail");
+    thumbnailInput.addEventListener("change", () => {
+      const file = thumbnailInput.files[0];
+      if (!file) return;
+      thumbnailFile = file;
+      showThumbnailPreview(URL.createObjectURL(file), file.name);
+    });
+    modalBody.appendChild(el("div", { class: "sub", text: "Thumbnail" }));
+    modalBody.appendChild(el("div", { class: "row" }, [thumbnailInput]));
+    modalBody.appendChild(thumbnailPreview);
+
+    const nameInput = el("input", { type: "text", placeholder: "Title", value: video.name || "" });
+    const descInput = el("textarea", { class: "form-textarea", placeholder: "Description (optional)", rows: "3", text: video.description || "" });
+    const tagsInput = el("input", { type: "text", placeholder: "Tags, comma-separated (optional)", value: (video.tags || []).join(", ") });
+    const categorySelect = el("select", {}, [el("option", { value: "", text: "(no category)" })]);
+    const licenseSelect = el("select", {}, [el("option", { value: "", text: "(no license)" })]);
+    const languageInput = el("input", { type: "text", placeholder: "Language code, e.g. en (optional)", value: video.language || "" });
+    const sensitiveCheck = el("input", Object.assign({ type: "checkbox" }, video.sensitive ? { checked: "checked" } : {}));
+    const commentsCheck = el("input", Object.assign({ type: "checkbox" }, video.comments_enabled !== false ? { checked: "checked" } : {}));
+
+    api("/widget/api/video_options").then((opts) => {
+      opts.categories.forEach((c) => categorySelect.appendChild(el("option", { value: c, text: c })));
+      opts.licences.forEach((l) => licenseSelect.appendChild(el("option", { value: l, text: l })));
+      categorySelect.value = video.category || "";
+      licenseSelect.value = video.license || "";
+    }).catch(() => {});
+
+    modalBody.appendChild(el("div", { class: "row" }, [nameInput]));
+    modalBody.appendChild(el("div", { class: "row" }, [descInput]));
+    modalBody.appendChild(el("div", { class: "row" }, [tagsInput]));
+    modalBody.appendChild(el("div", { class: "row" }, [categorySelect, licenseSelect, languageInput]));
+    modalBody.appendChild(el("div", { class: "row" }, [
+      el("label", { class: "checkbox-label" }, [sensitiveCheck, el("span", { text: " Sensitive content" })]),
+      el("label", { class: "checkbox-label" }, [commentsCheck, el("span", { text: " Comments enabled" })]),
+    ]));
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    modalBody.appendChild(errorBox);
+
+    const submitBtn = primaryButton("Save Changes", () => {
+      errorBox.style.display = "none";
+      if (!nameInput.value.trim()) { errorBox.textContent = "A title is required."; errorBox.style.display = ""; return; }
+      submitBtn.disabled = true;
+      const originalText = submitBtn.textContent;
+
+      function doEdit(thumbnailMxc) {
+        submitBtn.textContent = "Saving…";
+        return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/videos/" + encodeURIComponent(video.id) + "/edit", {
+          method: "POST",
+          body: {
+            thumbnail_mxc: thumbnailMxc || "",
+            name: nameInput.value.trim(),
+            description: descInput.value.trim(),
+            tags: tagsInput.value.trim(),
+            category: categorySelect.value,
+            license: licenseSelect.value,
+            language: languageInput.value.trim(),
+            sensitive: sensitiveCheck.checked,
+            comments_enabled: commentsCheck.checked,
+          },
+        }).then((data) => {
+          if (data && data.ok === false) { errorBox.textContent = data.message || "Could not save those changes."; errorBox.style.display = ""; return; }
+          toast(data.message || "Submitted.", true);
+          closeModal();
+          if (onDone) onDone();
+        });
+      }
+
+      const editPromise = thumbnailFile
+        ? api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_thumbnail", {
+            method: "POST", headers: { "Content-Type": thumbnailFile.type || "image/jpeg" }, raw: thumbnailFile,
+          }).then((data) => doEdit(data.mxc))
+        : doEdit("");
+      editPromise
+        .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+        .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+    });
+    modalBody.appendChild(el("div", { class: "row" }, [submitBtn]));
+    openModal(modalBody);
+  }
+
+  function openDeleteVideoModal(channelUsername, video, onDone) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Delete \"" + video.name + "\"?" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "This retracts the video from federation. The underlying Matrix video message is left untouched, so you can publish it again afterward." }));
+    body.appendChild(el("div", { class: "row" }, [
+      dangerButton("Delete", (e) => {
+        e.target.disabled = true;
+        api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/videos/" + encodeURIComponent(video.id) + "/unpublish", { method: "POST", body: {} })
+          .then((data) => { toast((data && data.message) || "Submitted.", true); })
+          .catch((err) => { toast(err.message || "Could not delete that video.", false); })
+          .finally(() => { closeModal(); if (onDone) onDone(); });
+      }),
+      plainButton("Cancel", closeModal),
+    ]));
     openModal(body);
   }
 

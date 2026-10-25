@@ -6660,6 +6660,108 @@ async def widget_publish_video(
     return True, "Submitted -- check the channel room for the result."
 
 
+async def widget_edit_video(
+    request: Request, *, matrix_user_id: str, channel_username: str, local_video_id: str,
+    name: str, category: str, licence: str, language: str, tags: str,
+    sensitive: bool, comments_enabled: bool, description: str, thumbnail_mxc: str,
+) -> tuple[bool, str]:
+    """Edits an already-published video's metadata from the widget's own
+    channel page. Unlike ``widget_publish_video``, this needs no bot-sent
+    stand-in message at all: the video's own ``FederatedEvent`` record
+    already points at a real Matrix event to target, whether that
+    message was originally sent by the bot (a widget-originated publish)
+    or by the owner's own Matrix client directly (a chat-command
+    publish) -- edits work identically either way. Hands off to the
+    exact same ``_handle_edit`` the ``;edit`` command uses (same
+    key:value body syntax), mirroring ``widget_publish_video``'s own
+    handoff to ``_handle_publish``.
+
+    The video FILE itself is intentionally not editable here, same as
+    ``;edit`` itself (see its own docstring) -- use "replace video" for
+    that, unchanged, chat-only.
+
+    Every field below is always sent explicitly (never omitted) except
+    ``thumbnail_mxc``, so this always behaves as a full overwrite of the
+    form's current state -- including clearing a category/tags/etc. the
+    widget form shows as blank -- EXCEPT the thumbnail, which is left
+    alone (``_handle_edit`` keeps whatever's already set) unless a new
+    one was actually picked, since the widget always pre-fills the
+    existing one and "didn't touch it" shouldn't read as "clear it".
+
+    Returns ``(ok, message)`` for the same reason ``widget_publish_video``
+    does -- a `True` here only means "an edit was submitted", not that it
+    definitely took; the real outcome is still only a room notice."""
+    repository = request.app.state.repository
+    channel = await repository.get_peertube_channel(channel_username)
+    if channel is None:
+        return False, "No such channel."
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != matrix_user_id:
+        return False, "Only the channel's owner can edit its videos."
+
+    name = name.strip()
+    if not name:
+        return False, "A name is required."
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    ap_object_id = f"{base}/actor/{channel.username}/videos/{local_video_id}"
+    federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if federated is None:
+        return False, "No such video."
+
+    body_lines = [
+        ";edit", f"name: {name}", f"category: {category}", f"license: {licence}", f"language: {language}",
+        f"tags: {tags}", f"sensitive: {'true' if sensitive else 'false'}",
+        f"commentsenabled: {'true' if comments_enabled else 'false'}",
+    ]
+    if thumbnail_mxc:
+        body_lines.append(f"thumbnail: {thumbnail_mxc}")
+    body = "\n".join(body_lines)
+    if description:
+        body += "\n\n" + description
+    synthetic_content = {
+        "body": body,
+        "m.relates_to": {"m.in_reply_to": {"event_id": federated.event_id}},
+    }
+    await _handle_edit(request, sender=matrix_user_id, room_id=federated.room_id, content=synthetic_content)
+    return True, "Submitted -- check the channel room for the result."
+
+
+async def widget_unpublish_video(
+    request: Request, *, matrix_user_id: str, channel_username: str, local_video_id: str,
+) -> tuple[bool, str]:
+    """Retracts an already-published video from the widget's own channel
+    page (a real AP ``Delete``), resolved from the video's own
+    ``FederatedEvent`` record instead of a reply-to Matrix event, since
+    the widget has no message to reply to. Hands off to the exact same
+    ``_handle_unpublish`` the ``;unpublish`` command uses, which does
+    NOT touch the underlying Matrix video message (see its own
+    docstring) -- so the same video can be re-published afterward,
+    through this widget or the chat command, either way.
+
+    Returns ``(ok, message)`` for the same reason ``widget_edit_video``
+    does."""
+    repository = request.app.state.repository
+    channel = await repository.get_peertube_channel(channel_username)
+    if channel is None:
+        return False, "No such channel."
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != matrix_user_id:
+        return False, "Only the channel's owner can unpublish from it."
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    ap_object_id = f"{base}/actor/{channel.username}/videos/{local_video_id}"
+    federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+    if federated is None:
+        return False, "No such video."
+
+    synthetic_content = {"m.relates_to": {"m.in_reply_to": {"event_id": federated.event_id}}}
+    await _handle_unpublish(request, sender=matrix_user_id, room_id=federated.room_id, content=synthetic_content)
+    return True, "Submitted -- check the channel room for the result."
+
+
 async def _handle_publish(
     request: Request, *, sender: str, room_id: str, content: dict, command_event_id: str | None = None,
 ) -> None:
