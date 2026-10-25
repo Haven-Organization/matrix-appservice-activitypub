@@ -321,14 +321,20 @@ async def browse_timeline(request: Request, domain: str, scope: str = "local", m
 
 
 @router.get("/widget/api/browse/home")
-async def browse_home(request: Request, max_id_map: str = "") -> JSONResponse:
-    """The widget's default landing feed: every configured
+async def browse_home(request: Request, max_id_map: str = "", extra_domains: str = "") -> JSONResponse:
+    """The widget's "Whole Known Network" feed: every configured
     ``bridge.default_timeline_domains`` instance's OWN federated ("whole
-    known network") timeline, merged by recency. Falls back to just this
-    bridge's own domain if none are configured -- which, since this
-    bridge's own domain never runs Mastodon-API-compatible software,
-    correctly comes back empty rather than guessing at some other public
-    instance to advertise by default.
+    known network") timeline, PLUS every instance in ``extra_domains``
+    (comma-separated), merged by recency. ``extra_domains`` is how this
+    picks up the instances a given USER has added via the widget's own
+    "+ Add instance" flow -- those live only in that browser's
+    localStorage (see ``renderHomeTimeline``'s own comment), never
+    persisted server-side, so the frontend sends the list along on every
+    call rather than this bridge trying to remember it itself. Falls back
+    to just this bridge's own domain if neither source has anything --
+    which, since this bridge's own domain never runs Mastodon-API-
+    compatible software, correctly comes back empty rather than guessing
+    at some other public instance to advertise by default.
 
     ``max_id_map`` is a JSON object of ``{domain: max_id}`` from the
     previous page, one cursor per source instance -- each source instance
@@ -340,7 +346,16 @@ async def browse_home(request: Request, max_id_map: str = "") -> JSONResponse:
     """
     matrix_user_id = _session_user(request)
     config = request.app.state.config
-    domains = config.bridge.default_timeline_domains or [config.bridge.domain]
+    configured_domains = list(config.bridge.default_timeline_domains or [])
+    user_domains = [d.strip() for d in extra_domains.split(",") if d.strip()]
+    seen: set[str] = set()
+    domains: list[str] = []
+    for d in configured_domains + user_domains:
+        if d not in seen:
+            seen.add(d)
+            domains.append(d)
+    if not domains:
+        domains = [config.bridge.domain]
     try:
         cursor_map: dict[str, Any] = json.loads(max_id_map) if max_id_map else {}
     except ValueError:

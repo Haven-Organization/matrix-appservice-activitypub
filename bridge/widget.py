@@ -1832,13 +1832,33 @@ _WIDGET_HTML = r"""<!doctype html>
     return (raw || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
   }
 
+  // Remembers which dropdown option was last picked -- "" for Whole Known
+  // Network, a domain otherwise -- so it's restored on the next visit
+  // instead of always resetting. Distinct from BROWSE_INSTANCES_STORAGE_KEY
+  // (the instance LIST): this is just the one currently-selected value.
+  // localStorage.getItem returns null (not "") for a key that was never
+  // set at all, which is exactly how loadBrowseChoice tells "nothing
+  // chosen yet, use the given default" apart from "explicitly chose Whole
+  // Known Network" (stored as the empty string, not absent).
+  const BROWSE_CHOICE_STORAGE_KEY = "fediverse-bridge-browse-domain";
+
+  function loadBrowseChoice(defaultDomain) {
+    try {
+      const raw = localStorage.getItem(BROWSE_CHOICE_STORAGE_KEY);
+      return raw === null ? defaultDomain : raw;
+    } catch (e) { return defaultDomain; }
+  }
+  function saveBrowseChoice(domain) {
+    try { localStorage.setItem(BROWSE_CHOICE_STORAGE_KEY, domain); } catch (e) {}
+  }
+
   // Merges the homeserver + admin shortlist (bridge.default_timeline_domains,
   // see widget_context's own comment) + the user's own remembered instances
   // into one deduplicated option list, in that priority order, plus a
   // trailing "+ Add instance" action-option.
   function browseInstanceOptions(selectedDomain) {
     const seen = new Set();
-    const options = [{ value: "", label: "My default feed" }];
+    const options = [{ value: "", label: "Whole Known Network" }];
     function addDomain(d, suffix) {
       if (!d || seen.has(d)) return;
       seen.add(d);
@@ -1880,7 +1900,19 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   function renderHomeTimeline(app) {
-    if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false, needsLogin: false, needsLoginDomains: [], scrollY: 0 };
+    if (!homeState) {
+      // First visit ever (nothing in BROWSE_CHOICE_STORAGE_KEY yet)
+      // defaults to the user's own homeserver, not Whole Known Network --
+      // see loadBrowseChoice's own comment for how it tells that apart
+      // from an explicit, remembered choice of Whole Known Network
+      // (stored as "").
+      const initialDomain = loadBrowseChoice(ctx.domain);
+      homeState = {
+        mode: initialDomain ? "instance" : "home", domain: initialDomain,
+        scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false,
+        unsupported: false, needsLogin: false, needsLoginDomains: [], scrollY: 0,
+      };
+    }
     const state = homeState;
 
     const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, a name, or paste a post link to import" });
@@ -1889,6 +1921,7 @@ _WIDGET_HTML = r"""<!doctype html>
       state.mode = d ? "instance" : "home";
       state.domain = d;
       state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
+      saveBrowseChoice(d);
       render();
     }
     const domainSelect = el("select", {
@@ -1967,8 +2000,8 @@ _WIDGET_HTML = r"""<!doctype html>
       controlsChildren.push(el("div", { class: "sub" }, [
         el("span", { text: "Browsing " + state.domain + " (" + state.scope + ") — " }),
         el("a", {
-          href: "#", text: "back to your default feed",
-          onclick: (e) => { e.preventDefault(); state.mode = "home"; state.domain = ""; state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.scrollY = 0; render(); },
+          href: "#", text: "back to Whole Known Network",
+          onclick: (e) => { e.preventDefault(); switchToDomain(""); },
         }),
       ]));
     }
@@ -2023,7 +2056,14 @@ _WIDGET_HTML = r"""<!doctype html>
       try {
         let data;
         if (state.mode === "home") {
-          data = await api("/widget/api/browse/home?max_id_map=" + encodeURIComponent(state.homeCursorMap || ""));
+          // extra_domains: the user's own added instances, merged into
+          // Whole Known Network alongside bridge.default_timeline_domains
+          // -- see browse_home's own docstring for why this bridge needs
+          // telling every time rather than remembering it server-side.
+          data = await api(
+            "/widget/api/browse/home?max_id_map=" + encodeURIComponent(state.homeCursorMap || "") +
+            "&extra_domains=" + encodeURIComponent(loadUserBrowseInstances().join(","))
+          );
           state.homeCursorMap = data.next_max_id_map || "";
           state.done = !data.next_max_id_map;
           state.unsupported = !data.supported;
