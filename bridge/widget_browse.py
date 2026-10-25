@@ -168,6 +168,25 @@ def _mastodon_emoji_map(emojis: Any) -> dict[str, str]:
     return result
 
 
+def _misskey_emoji_map(obj: dict[str, Any] | None) -> dict[str, str]:
+    """Misskey's own ``emojis`` field -- present directly on BOTH a note
+    (for a ``:shortcode:`` run in its own text/cw) and a user object (for
+    one in that user's display name) -- is already a ``{shortcode: url}``
+    dict, unlike Mastodon's list-of-objects shape (``_mastodon_emoji_map``
+    needs to reshape that; this doesn't). Confirmed live against
+    misskey.io 2026-10-25, on both a note's own ``emojis`` and a chained-
+    custom-emoji display name's ``user.emojis`` -- contradicts
+    ``_misskey_text_to_html``'s own previous assumption that resolving
+    either needed a separate fetch no timeline response actually
+    provides; it was already right there."""
+    if not isinstance(obj, dict):
+        return {}
+    emojis = obj.get("emojis")
+    if not isinstance(emojis, dict):
+        return {}
+    return {k: v for k, v in emojis.items() if isinstance(k, str) and isinstance(v, str)}
+
+
 def _as2_emoji_map(doc: dict[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for t in doc.get("tag") or []:
@@ -336,23 +355,24 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
 _BARE_URL_RE = re.compile(r"https?://\S+")
 
 
-def _misskey_text_to_html(text: str) -> str:
+def _misskey_text_to_html(text: str, emoji_map: dict[str, str] | None = None) -> str:
     """Misskey's own ``text`` field is MFM (Misskey Flavored Markdown), not
     HTML -- nothing here parses it (no MFM parser exists in this codebase,
     and building one is out of scope for a widget preview card). Escaped,
     then only line breaks and bare URLs are turned into real markup, same
-    as how a plain-text Mastodon post with no HTML would already render. A
-    ``:shortcode:`` custom emoji in the text stays literal text: the
-    timeline endpoints that feed this don't return an emoji map to resolve
-    it against (unlike Mastodon's own per-status ``emojis`` field), and a
-    separate instance-wide emoji list fetch isn't worth it here."""
+    as how a plain-text Mastodon post with no HTML would already render.
+    A ``:shortcode:`` custom emoji in the text IS still substituted
+    against ``emoji_map`` (see ``_misskey_emoji_map`` -- its own note
+    carries this directly, no separate fetch needed, despite what an
+    earlier version of this docstring assumed)."""
     if not text:
         return ""
     escaped = html.escape(text)
     linked = _BARE_URL_RE.sub(
         lambda m: f'<a href="{m.group(0)}" rel="nofollow noopener" target="_blank">{m.group(0)}</a>', escaped
     )
-    return linked.replace("\n", "<br>")
+    with_breaks = linked.replace("\n", "<br>")
+    return _substitute_emoji_html(with_breaks, emoji_map or {})
 
 
 def _misskey_actor_id(user: dict[str, Any], *, instance_domain: str) -> str | None:
@@ -444,13 +464,15 @@ def _normalize_misskey_note(note: dict[str, Any], *, instance_domain: str) -> di
         "uri": uri,
         "url": uri,
         "created_at": base.get("createdAt"),
-        "content_html": _misskey_text_to_html(base.get("text") if isinstance(base.get("text"), str) else ""),
+        "content_html": _misskey_text_to_html(
+            base.get("text") if isinstance(base.get("text"), str) else "", _misskey_emoji_map(base)
+        ),
         "sensitive": bool(cw),
         "spoiler_text": cw or "",
         "author": {
             "actor_id": _misskey_actor_id(account, instance_domain=instance_domain),
             "display_name": author_name,
-            "display_name_html": _display_name_html(author_name, {}),
+            "display_name_html": _display_name_html(author_name, _misskey_emoji_map(account)),
             "handle": _misskey_handle(account, instance_domain=instance_domain),
             "avatar_url": account.get("avatarUrl") if isinstance(account.get("avatarUrl"), str) else None,
             "url": _misskey_profile_url(account, instance_domain=instance_domain),
@@ -469,7 +491,7 @@ def _normalize_misskey_note(note: dict[str, Any], *, instance_domain: str) -> di
             {
                 "actor_id": _misskey_actor_id(booster, instance_domain=instance_domain),
                 "display_name": booster_name,
-                "display_name_html": _display_name_html(booster_name, {}),
+                "display_name_html": _display_name_html(booster_name, _misskey_emoji_map(booster)),
                 "handle": _misskey_handle(booster, instance_domain=instance_domain),
             }
             if booster is not None else None
@@ -792,7 +814,7 @@ async def browse_search(request: Request, q: str, domain: str = "") -> JSONRespo
                 "actor_id": _misskey_actor_id(u, instance_domain=domain),
                 "handle": _misskey_handle(u, instance_domain=domain),
                 "display_name": display_name,
-                "display_name_html": _display_name_html(display_name, {}),
+                "display_name_html": _display_name_html(display_name, _misskey_emoji_map(u)),
                 "avatar_url": u.get("avatarUrl") if isinstance(u.get("avatarUrl"), str) else None,
             })
         return JSONResponse({"accounts": accounts}, headers={"Cache-Control": "no-store"})
