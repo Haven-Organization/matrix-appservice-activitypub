@@ -1308,10 +1308,6 @@ _WIDGET_HTML = r"""<!doctype html>
     color: #e5484d; font-size: 13px; margin-top: 8px; padding: 8px 10px;
     border: 1px solid #e5484d; border-radius: var(--radius-inner); background: rgba(229,72,77,.08);
   }
-  .form-warning {
-    color: #e5a000; font-size: 13px; margin-top: 8px; padding: 8px 10px;
-    border: 1px solid #e5a000; border-radius: var(--radius-inner); background: rgba(229,160,0,.08);
-  }
   .form-textarea {
     font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
     border-radius: var(--radius-inner); padding: 8px 10px; width: 100%; resize: vertical;
@@ -3243,7 +3239,6 @@ _WIDGET_HTML = r"""<!doctype html>
     let selectedFileMeta = null;
     const mxcInput = el("input", { type: "text", placeholder: "mxc://... (paste an existing one)" });
     const fileInput = el("input", { type: "file", accept: "video/*" });
-    const webmWarning = el("div", { class: "form-warning", style: "display:none" });
     const filePreview = el("div", { class: "file-preview", style: "display:none" });
 
     function clearFile() {
@@ -3252,7 +3247,6 @@ _WIDGET_HTML = r"""<!doctype html>
       fileInput.value = "";
       filePreview.style.display = "none";
       filePreview.innerHTML = "";
-      webmWarning.style.display = "none";
       fileInput.style.display = "";
       mxcInput.disabled = false;
     }
@@ -3277,16 +3271,6 @@ _WIDGET_HTML = r"""<!doctype html>
       mxcInput.value = "";
       mxcInput.disabled = true;
       showFilePreview(file);
-      // PeerTube's remote-video (federated) handling doesn't play .webm
-      // correctly, unlike a direct upload through PeerTube's own web UI --
-      // worth a heads-up before someone publishes one and it looks broken
-      // on the other end, not a hard block (this bridge's own
-      // VIDEO_MIMETYPE_ALLOWLIST still accepts it).
-      const isWebm = file.type === "video/webm" || /\.webm$/i.test(file.name);
-      webmWarning.style.display = isWebm ? "" : "none";
-      webmWarning.textContent = isWebm
-        ? "⚠️ .webm files don't play correctly once federated to PeerTube -- mp4 is the safest choice."
-        : "";
       const objectUrl = URL.createObjectURL(file);
       probeVideoMetadata(objectUrl)
         .then((meta) => { if (selectedFile === file) selectedFileMeta = meta; })
@@ -3301,7 +3285,6 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "row" }, [mxcInput]));
     body.appendChild(el("div", { class: "row" }, [fileInput]));
     body.appendChild(filePreview);
-    body.appendChild(webmWarning);
 
     // Thumbnail: pick an image by hand, or leave it and one gets grabbed
     // automatically from a frame of the video at publish time (only
