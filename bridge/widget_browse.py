@@ -83,6 +83,24 @@ _COMPATIBLE_SOFTWARE = {
 # Matches the Mastodon API's own default page size for timelines/search.
 _PAGE_SIZE = 20
 
+# Caps how long browse_home's merge waits for any ONE source instance
+# before giving up on it for this page, deliberately much shorter than
+# federation.request_timeout (15s, tuned for this bridge's own outbound AP
+# delivery, where patience is the right tradeoff). A single slow/
+# unreachable instance in the merge can otherwise stall EVERY other
+# instance's results too -- browse_home awaits every source before
+# returning anything at all (one REST response, not a stream), and
+# _is_compatible's nodeinfo check plus _fetch_timeline's own request are
+# two-to-three sequential round trips PER instance, each already allowed
+# up to federation.request_timeout on its own -- so one bad instance could
+# otherwise hold up the whole merged feed for closer to 45s than 15s
+# (reported live 2026-10-24: Whole Known Network stuck on loading
+# skeletons well past that). Deliberately NOT applied to browse_timeline
+# (a single explicitly-chosen instance) -- there, the user picked that one
+# instance on purpose and federation.request_timeout's own patience is the
+# right call.
+_HOME_FEED_SOURCE_TIMEOUT = 8.0
+
 _EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_+-]+):")
 
 
@@ -361,26 +379,41 @@ async def browse_home(request: Request, max_id_map: str = "", extra_domains: str
     except ValueError:
         cursor_map = {}
 
-    async def _one(domain: str) -> tuple[str, list[dict[str, Any]], str | None, bool, bool]:
-        if not await _is_compatible(request, domain):
-            return domain, [], None, False, False
-        posts, next_max_id, needs_login = await _fetch_timeline(
-            request, domain=domain, local=False, max_id=cursor_map.get(domain), matrix_user_id=matrix_user_id
-        )
-        return domain, posts, next_max_id, True, needs_login
+    async def _one(domain: str) -> tuple[str, list[dict[str, Any]], str | None, bool, bool, bool]:
+        try:
+            async with asyncio.timeout(_HOME_FEED_SOURCE_TIMEOUT):
+                if not await _is_compatible(request, domain):
+                    return domain, [], None, False, False, False
+                posts, next_max_id, needs_login = await _fetch_timeline(
+                    request, domain=domain, local=False, max_id=cursor_map.get(domain), matrix_user_id=matrix_user_id
+                )
+                return domain, posts, next_max_id, True, needs_login, False
+        except TimeoutError:
+            # A slow/unresponsive source must never hold up every OTHER
+            # source's results too -- see _HOME_FEED_SOURCE_TIMEOUT's own
+            # comment. Reported as its own distinct state (not lumped into
+            # needs_login_domains or treated as plain "unsupported") so the
+            # frontend can tell a user "X is slow right now" apart from
+            # "X needs you to sign in" or "X doesn't run compatible
+            # software" -- three different things, three different next
+            # steps for the user.
+            return domain, [], None, True, False, True
 
     results = await asyncio.gather(*(_one(d) for d in domains))
     merged: list[dict[str, Any]] = []
     next_cursor_map: dict[str, str] = {}
     any_supported = False
     needs_login_domains: list[str] = []
-    for domain, posts, next_max_id, supported, needs_login in results:
+    timed_out_domains: list[str] = []
+    for domain, posts, next_max_id, supported, needs_login, timed_out in results:
         any_supported = any_supported or supported
         merged.extend(posts)
         if next_max_id:
             next_cursor_map[domain] = next_max_id
         if needs_login:
             needs_login_domains.append(domain)
+        if timed_out:
+            timed_out_domains.append(domain)
     merged.sort(key=lambda p: p.get("created_at") or "", reverse=True)
     await _mark_imported(request, merged)
     return JSONResponse(
@@ -388,6 +421,7 @@ async def browse_home(request: Request, max_id_map: str = "", extra_domains: str
             "supported": any_supported,
             "domains": domains,
             "needs_login_domains": needs_login_domains,
+            "timed_out_domains": timed_out_domains,
             "posts": merged,
             "next_max_id_map": json.dumps(next_cursor_map) if next_cursor_map else "",
         },

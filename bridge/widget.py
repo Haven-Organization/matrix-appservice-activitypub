@@ -958,6 +958,11 @@ _WIDGET_HTML = r"""<!doctype html>
   #shell.collapsed .nav-item { justify-content: center; }
   #content { padding: 16px; flex: 1; min-width: 0; max-width: 640px; }
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
+  /* A source-level notice (needs sign-in / timed out) sits ABOVE a
+     possibly-non-empty post list now, not alone on the page -- the full
+     48px placeholder padding reads as too much dead space stacked on top
+     of real posts, and it needs a visible break from what follows. */
+  .browse-source-notice { padding: 16px; border-bottom: 1px solid var(--border); }
 
   /* -- post cards (timeline) ----------------------------------------------- */
   .post-card { display: flex; gap: 12px; padding: 16px; position: relative; }
@@ -1910,7 +1915,7 @@ _WIDGET_HTML = r"""<!doctype html>
       homeState = {
         mode: initialDomain ? "instance" : "home", domain: initialDomain,
         scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false,
-        unsupported: false, needsLogin: false, needsLoginDomains: [], scrollY: 0,
+        unsupported: false, needsLogin: false, needsLoginDomains: [], timedOutDomains: [], scrollY: 0,
       };
     }
     const state = homeState;
@@ -1920,7 +1925,8 @@ _WIDGET_HTML = r"""<!doctype html>
     function switchToDomain(d) {
       state.mode = d ? "instance" : "home";
       state.domain = d;
-      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
+      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false;
+      state.needsLogin = false; state.needsLoginDomains = []; state.timedOutDomains = []; state.scrollY = 0;
       saveBrowseChoice(d);
       render();
     }
@@ -1946,7 +1952,8 @@ _WIDGET_HTML = r"""<!doctype html>
         onclick: () => {
           if (state.scope === value) return;
           state.scope = value;
-          state.posts = []; state.cursor = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
+          state.posts = []; state.cursor = ""; state.done = false; state.unsupported = false;
+          state.needsLogin = false; state.needsLoginDomains = []; state.timedOutDomains = []; state.scrollY = 0;
           render();
         },
       });
@@ -2014,29 +2021,53 @@ _WIDGET_HTML = r"""<!doctype html>
 
     function renderFeedList() {
       feed.innerHTML = "";
+      // A single explicitly-browsed instance (state.mode === "instance")
+      // needing sign-in really does mean "nothing can show here at all" --
+      // there's only the one source. Whole Known Network ("home") is
+      // different: several sources are merged, so one needing sign-in (or
+      // timing out -- see _HOME_FEED_SOURCE_TIMEOUT's own comment) must
+      // never hide the posts the OTHER sources already returned. Its
+      // banner(s) render unconditionally, above whatever post list there
+      // is (even an empty one, while still loading), instead of only
+      // appearing in the old "nothing to show at all" branch below.
+      if (state.needsLogin && state.mode === "instance") {
+        const retry = () => { state.done = false; state.needsLogin = false; loadMore(); };
+        feed.appendChild(el("div", { class: "placeholder" }, [
+          el("div", { text: state.domain + " needs you to be signed in to view this.", style: "margin-bottom:10px" }),
+          primaryButton("Sign in with OAuth", (e) => startOAuthLogin(state.domain, e.target, retry)),
+          el("div", { style: "margin-top:8px" }, [
+            plainButton("Use username/password instead", () => openPasswordLoginForm(state.domain, retry)),
+          ]),
+        ]));
+        return;
+      }
+      let sourceNoticeShown = false;
+      if (state.mode === "home" && state.needsLoginDomains.length) {
+        sourceNoticeShown = true;
+        const retry = () => { state.done = false; state.needsLoginDomains = []; loadMore(); };
+        feed.appendChild(el("div", { class: "placeholder browse-source-notice" }, [
+          el("div", { text: "Some of your feed sources need you to be signed in:", style: "margin-bottom:10px" }),
+          ...state.needsLoginDomains.map((d) => el("div", { class: "row", style: "justify-content:center" }, [
+            el("span", { text: d, style: "align-self:center" }),
+            primaryButton("Sign in", (e) => startOAuthLogin(d, e.target, retry)),
+          ])),
+        ]));
+      }
+      if (state.mode === "home" && state.timedOutDomains.length) {
+        sourceNoticeShown = true;
+        const retry = () => { state.done = false; state.timedOutDomains = []; loadMore(); };
+        feed.appendChild(el("div", { class: "placeholder browse-source-notice" }, [
+          el("div", {
+            text: (state.timedOutDomains.length === 1
+              ? state.timedOutDomains[0] + " didn't respond in time."
+              : "These sources didn't respond in time: " + state.timedOutDomains.join(", ")),
+            style: "margin-bottom:10px",
+          }),
+          plainButton("Retry", retry),
+        ]));
+      }
       if (!state.posts.length && !state.loading) {
-        if (state.needsLogin && state.mode === "instance") {
-          const retry = () => { state.done = false; state.needsLogin = false; loadMore(); };
-          feed.appendChild(el("div", { class: "placeholder" }, [
-            el("div", { text: state.domain + " needs you to be signed in to view this.", style: "margin-bottom:10px" }),
-            primaryButton("Sign in with OAuth", (e) => startOAuthLogin(state.domain, e.target, retry)),
-            el("div", { style: "margin-top:8px" }, [
-              plainButton("Use username/password instead", () => openPasswordLoginForm(state.domain, retry)),
-            ]),
-          ]));
-          return;
-        }
-        if (state.mode === "home" && state.needsLoginDomains.length) {
-          const retry = () => { state.done = false; state.needsLoginDomains = []; loadMore(); };
-          feed.appendChild(el("div", { class: "placeholder" }, [
-            el("div", { text: "Some of your feed sources need you to be signed in:", style: "margin-bottom:10px" }),
-            ...state.needsLoginDomains.map((d) => el("div", { class: "row", style: "justify-content:center" }, [
-              el("span", { text: d, style: "align-self:center" }),
-              primaryButton("Sign in", (e) => startOAuthLogin(d, e.target, retry)),
-            ])),
-          ]));
-          return;
-        }
+        if (sourceNoticeShown) return; // already explained why there's nothing (yet)
         feed.appendChild(el("div", {
           class: "placeholder",
           text: state.unsupported
@@ -2068,6 +2099,7 @@ _WIDGET_HTML = r"""<!doctype html>
           state.done = !data.next_max_id_map;
           state.unsupported = !data.supported;
           state.needsLoginDomains = data.needs_login_domains || [];
+          state.timedOutDomains = data.timed_out_domains || [];
         } else {
           data = await api(
             "/widget/api/browse/timeline?domain=" + encodeURIComponent(state.domain) + "&scope=" + state.scope +
