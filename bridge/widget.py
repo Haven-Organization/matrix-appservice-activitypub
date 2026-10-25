@@ -1041,6 +1041,12 @@ _WIDGET_HTML = r"""<!doctype html>
     box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px; z-index: 20;
   }
   #shell.collapsed .identity-dropdown { left: 4px; right: auto; width: 200px; }
+  .identity-create-row { display: flex; gap: 4px; align-items: center; padding: 4px; }
+  .identity-create-input {
+    flex: 1; min-width: 0; font-size: 12px; padding: 4px 6px;
+    border: 1px solid var(--border); border-radius: var(--radius-inner);
+    background: var(--bg); color: var(--text);
+  }
 
   /* -- modals (following list, password login) ----------------------------- */
   .modal-backdrop {
@@ -1400,6 +1406,14 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   let identityDropdownOpen = false;
+  // Haven's widget iframe is sandboxed without allow-modals (same root
+  // cause as the confirm() fix elsewhere in this file -- see withConfirm):
+  // window.prompt() silently no-ops there, no dialog, no error, nothing.
+  // "+ New identity" used to call it directly, so inside Haven it looked
+  // like the button did nothing except (see below) fall through to the
+  // card's own "open my profile" click handler. identityCreatePending
+  // swaps the "+ New identity" row for an inline id-input form instead.
+  let identityCreatePending = false;
 
   function renderIdentityCard(bar) {
     if (!ctx) return;
@@ -1434,25 +1448,64 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     const card = el("button", {
       class: "identity-card", title: active ? active.handle : "",
-      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
+      onclick: () => { identityDropdownOpen = false; identityCreatePending = false; openMyProfile(); },
     }, cardChildren);
     if (hasDropdownContent && identityDropdownOpen) {
       const pop = el("div", { class: "identity-dropdown" });
+      // Every item below needs its own e.stopPropagation() -- the popover
+      // is appended INSIDE the identity-card <button> (so it lines up
+      // visually, anchored to it), which means an unstopped click bubbles
+      // straight up to that button's own onclick and fires openMyProfile()
+      // right after, same click. That's what made "+ New identity" look
+      // like it "just opens my profile" -- both handlers were firing.
       otherIdentities.forEach((i) => {
         pop.appendChild(el("button", {
           class: "nav-item", text: i.display_name || i.handle,
-          onclick: () => {
+          onclick: (e) => {
+            e.stopPropagation();
             identityDropdownOpen = false;
             api("/widget/api/identities/switch", { method: "POST", body: { room_id: roomId, username: i.username } })
-              .then(() => loadContext()).catch((e) => toast(e.message, false));
+              .then(() => loadContext()).catch((e2) => toast(e2.message, false));
           },
         }));
       });
       if (ctx.custom_identities_enabled) {
-        pop.appendChild(el("button", {
-          class: "nav-item", text: "+ New identity",
-          onclick: () => { identityDropdownOpen = false; createNewIdentity(); },
-        }));
+        if (identityCreatePending) {
+          const input = el("input", {
+            type: "text", class: "identity-create-input",
+            placeholder: "id (letters, numbers, underscores)",
+            onclick: (e) => e.stopPropagation(),
+            onkeydown: (e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") { e.preventDefault(); submitBtn.click(); }
+            },
+          });
+          const submitBtn = el("button", {
+            class: "nav-item", text: "Create",
+            onclick: (e) => {
+              e.stopPropagation();
+              const customId = input.value.trim();
+              if (!customId) return;
+              identityDropdownOpen = false;
+              identityCreatePending = false;
+              createNewIdentity(customId);
+            },
+          });
+          pop.appendChild(el("div", { class: "identity-create-row" }, [
+            input,
+            submitBtn,
+            el("button", {
+              class: "nav-item", text: "Cancel",
+              onclick: (e) => { e.stopPropagation(); identityCreatePending = false; renderSidebar(); },
+            }),
+          ]));
+          setTimeout(() => input.focus(), 0);
+        } else {
+          pop.appendChild(el("button", {
+            class: "nav-item", text: "+ New identity",
+            onclick: (e) => { e.stopPropagation(); identityCreatePending = true; renderSidebar(); },
+          }));
+        }
       }
       card.appendChild(pop);
     }
@@ -1463,8 +1516,11 @@ _WIDGET_HTML = r"""<!doctype html>
     const needsId = ctx.has_profile; // the very first identity uses the bare form (your Matrix localpart)
     let customId = "";
     if (needsId) {
-      customId = (promptOverride !== undefined ? promptOverride : prompt("Choose an id for your new identity (letters, numbers, underscores):")) || "";
-      if (!customId.trim()) return;
+      // promptOverride always comes from the inline identity-create-row
+      // input above now -- see its own comment for why this can no longer
+      // fall back to window.prompt().
+      customId = (promptOverride || "").trim();
+      if (!customId) return;
     }
     api("/widget/api/create_profile", { method: "POST", body: { room_id: roomId, custom_id: customId.trim() } })
       .then(() => { toast("Identity created.", true); return loadContext(); })
