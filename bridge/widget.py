@@ -1833,6 +1833,10 @@ _WIDGET_HTML = r"""<!doctype html>
     list.push(domain);
     try { localStorage.setItem(BROWSE_INSTANCES_STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
   }
+  function removeUserBrowseInstance(domain) {
+    const list = loadUserBrowseInstances().filter((d) => d !== domain);
+    try { localStorage.setItem(BROWSE_INSTANCES_STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+  }
   function normalizeDomain(raw) {
     return (raw || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
   }
@@ -1902,6 +1906,42 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "row" }, [primaryButton("Add", submit)]));
     openModal(body);
     setTimeout(() => domainInput.focus(), 0);
+  }
+
+  // Only ever offered for an instance the USER added (never the homeserver
+  // or one of the admin's bridge.default_timeline_domains -- see the
+  // Remove button's own render condition) -- removing one of those isn't
+  // this bridge's call to make. Checks sign-in status first since removing
+  // an instance you're signed into would otherwise silently orphan that
+  // login (still stored, never offered again through this dropdown) --
+  // better to fold it into one explicit action the user actually sees.
+  function removeBrowseInstance(domain, onRemoved) {
+    api("/widget/api/browse/login/list")
+      .then((data) => {
+        const loggedIn = (data.logins || []).some((l) => l.domain === domain);
+        if (loggedIn) openRemoveInstanceWarningModal(domain, onRemoved);
+        else { removeUserBrowseInstance(domain); onRemoved(); }
+      })
+      .catch(() => { removeUserBrowseInstance(domain); onRemoved(); });
+  }
+  function openRemoveInstanceWarningModal(domain, onRemoved) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Remove " + domain + "?" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "You're signed into " + domain + " -- removing it from this list will also sign you out there." }));
+    body.appendChild(el("div", { class: "row" }, [
+      dangerButton("Remove and sign out", (e) => {
+        e.target.disabled = true;
+        removeUserBrowseInstance(domain);
+        api("/widget/api/browse/login/logout", { method: "POST", body: { domain: domain } })
+          .catch(() => {}) // best-effort -- the instance is leaving the list either way
+          .finally(() => { closeModal(); onRemoved(); });
+      }),
+      plainButton("Cancel", closeModal),
+    ]));
+    openModal(body);
   }
 
   function renderHomeTimeline(app) {
@@ -1994,14 +2034,22 @@ _WIDGET_HTML = r"""<!doctype html>
     // import action -- "pull in anything from a link or handle" without
     // needing a separate "Import a post" card.
     const goBtn = primaryButton("Go", runSearchOrImport);
+    const browseRow = [
+      domainSelect,
+      el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
+    ];
+    // Only ever offered for an instance the user added themselves -- never
+    // the homeserver (not this bridge's to remove) or one of the admin's
+    // own bridge.default_timeline_domains (an admin decision, not a
+    // per-user one) -- see removeBrowseInstance's own docstring.
+    if (state.mode === "instance" && state.domain && loadUserBrowseInstances().includes(state.domain)) {
+      browseRow.push(dangerButton("Remove", () => removeBrowseInstance(state.domain, () => switchToDomain(""))));
+    }
     const controlsChildren = [
       el("h2", { text: "Browse the fediverse" }),
       el("div", { class: "row" }, [searchInput, goBtn]),
       searchResults,
-      el("div", { class: "row" }, [
-        domainSelect,
-        el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
-      ]),
+      el("div", { class: "row" }, browseRow),
     ];
     if (state.mode === "instance") {
       controlsChildren.push(el("div", { class: "sub" }, [
@@ -2049,7 +2097,7 @@ _WIDGET_HTML = r"""<!doctype html>
           el("div", { text: "Some of your feed sources need you to be signed in:", style: "margin-bottom:10px" }),
           ...state.needsLoginDomains.map((d) => el("div", { class: "row", style: "justify-content:center" }, [
             el("span", { text: d, style: "align-self:center" }),
-            primaryButton("Sign in", (e) => startOAuthLogin(d, e.target, retry)),
+            primaryButton("Sign in", () => openSignInModal(d, retry)),
           ])),
         ]));
       }
@@ -2464,6 +2512,27 @@ _WIDGET_HTML = r"""<!doctype html>
         }, 2000);
       })
       .catch((e) => { toast(e.message, false); if (btn) btn.disabled = false; });
+  }
+
+  // The one-click "Sign in" a Whole Known Network source notice offers
+  // (see renderFeedList's own needsLoginDomains branch) has no room to
+  // show both OAuth and username/password inline the way the single-
+  // instance "needs sign-in" placeholder does -- this is that same choice
+  // in a popup instead, reusing startOAuthLogin/openPasswordLoginForm
+  // verbatim rather than a second, parallel sign-in implementation.
+  function openSignInModal(domain, onDone) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Sign in to " + domain }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "row" }, [
+      primaryButton("Sign in with OAuth", (e) => startOAuthLogin(domain, e.target, () => { closeModal(); if (onDone) onDone(); })),
+    ]));
+    body.appendChild(el("div", { class: "row" }, [
+      plainButton("Use username/password instead", () => { closeModal(); openPasswordLoginForm(domain, onDone); }),
+    ]));
+    openModal(body);
   }
 
   function openPasswordLoginForm(domain, onDone) {
