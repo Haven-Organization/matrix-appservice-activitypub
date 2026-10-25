@@ -396,7 +396,7 @@ _RECOVERY_ROOM_KINDS = ("profile", "notifications", "space")
 
 
 async def _resolve_recovery_room_id(request: Request, *, matrix_user_id: str, kind: str) -> str | None:
-    """The room id for one of the three Account-recovery row kinds, always
+    """The room id for one of the three Room-recovery row kinds, always
     re-resolved server-side (never trusted from the client) -- shared by
     widget_recovery_rooms (status) and widget_rejoin_room (the actual
     invite) so they can never disagree about which room a row means.
@@ -422,7 +422,7 @@ async def widget_recovery_rooms(request: Request) -> JSONResponse:
     """Status (room id + open/rejoin/not_created) for the three bridge-
     managed rooms tied to this account -- the ACTIVE identity's Profile
     Room, the account-wide Notifications (bot DM) room, and the account-
-    wide Fediverse Space -- backing the Settings tab's Account recovery
+    wide Fediverse Space -- backing the Settings tab's Room recovery
     section. "Currently in it" is checked live via a joined_members call
     (the bot is always a member of all three once created, so this never
     needs the Synapse Admin API the way a bridge-wide room sweep would)
@@ -458,7 +458,7 @@ async def widget_recovery_rooms(request: Request) -> JSONResponse:
 @router.post("/widget/api/rejoin_room")
 async def widget_rejoin_room(request: Request) -> JSONResponse:
     """Re-invite the session's own Matrix user into exactly one of the
-    three Account-recovery rows' rooms -- the per-row "Rejoin" button.
+    three Room-recovery rows' rooms -- the per-row "Rejoin" button.
     Never targets anyone but the caller (no `[@other]` support here) --
     that admin-only escape hatch stays chat-only, same scoping decision
     as the rest of this widget's recovery tools."""
@@ -3196,7 +3196,7 @@ _WIDGET_HTML = r"""<!doctype html>
     loadLogins();
   }
 
-  // -- Account recovery --------------------------------------------------
+  // -- Room recovery -------------------------------------------------------
   //
   // Per-room-type status (Open/Rejoin/Not Created) for the three bridge-
   // managed rooms tied to this account, replacing the old single blanket
@@ -3209,11 +3209,11 @@ _WIDGET_HTML = r"""<!doctype html>
     { kind: "space", label: "Space" },
   ];
 
-  function renderAccountRecoveryCard(app) {
+  function renderRoomRecoveryCard(app) {
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
     app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Account recovery" }),
-      el("div", { class: "sub", text: "Locked out of one of these (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
+      el("h2", { text: "Room recovery" }),
+      el("div", { class: "sub", text: "Locked out of one of these? Re-invite yourself." }),
       list,
     ]));
 
@@ -3274,7 +3274,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
     renderThisRoomSection(app);
     renderInstanceLoginsCard(app);
-    renderAccountRecoveryCard(app);
+    renderRoomRecoveryCard(app);
 
     const leaveCard = el("div", { class: "card" }, [
       el("h2", { text: "Leave unfollowed rooms" }),
