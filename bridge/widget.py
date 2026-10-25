@@ -55,6 +55,7 @@ from bridge.commands import (
     _handle_follow,
     _handle_id,
     _handle_import,
+    _handle_joinguild,
     _handle_link_profile,
     _handle_mute,
     _handle_rejoin,
@@ -71,10 +72,14 @@ from bridge.commands import (
     _run_follows_import,
     _RUNNING_FOLLOWS_IMPORTS,
     widget_edit_video,
+    widget_leave_guild,
+    widget_list_guilds,
     widget_publish_video,
+    widget_set_guild_invite_code,
     widget_unpublish_video,
 )
 from bridge.identity_settings import get_effective_settings
+from bridge.spaces import get_guild_invite_code
 from bridge.peertube import (
     COMMON_LANGUAGES,
     VIDEO_CATEGORIES,
@@ -404,6 +409,75 @@ async def widget_rejoin(request: Request) -> JSONResponse:
     except SynapseError as exc:
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
     return JSONResponse({"ok": True})
+
+
+@router.get("/widget/api/guilds")
+async def widget_guilds(request: Request) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    guilds = await widget_list_guilds(request, matrix_user_id=matrix_user_id)
+    is_admin = await _is_matrix_admin(request, matrix_user_id)
+    return JSONResponse({"guilds": guilds, "is_admin": is_admin}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/guilds/join")
+async def widget_guilds_join(request: Request) -> JSONResponse:
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    domain = (body.get("domain") or "").strip()
+    if not code or not domain:
+        raise HTTPException(400, "Both a code and a domain are required")
+    return await _dispatch(
+        request, body.get("room_id", ""), _handle_joinguild, argument=f"{code}@{domain}",
+    )
+
+
+@router.post("/widget/api/guilds/leave")
+async def widget_guilds_leave(request: Request) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    body = await request.json()
+    guild_actor_id = (body.get("guild_actor_id") or "").strip()
+    if not guild_actor_id:
+        raise HTTPException(400, "guild_actor_id is required")
+    try:
+        ok, message = await widget_leave_guild(request, matrix_user_id=matrix_user_id, guild_actor_id=guild_actor_id)
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/widget/api/guilds/invite_code")
+async def widget_guild_invite_code(request: Request, guild_actor_id: str) -> JSONResponse:
+    """Admin-only, same gate as setting one -- the code itself isn't
+    secret to EVERY member (Shoot's own invite codes are deliberately
+    shareable, that's the point), but surfacing "here's the stored code"
+    as a widget read is still scoped to admins only, matching
+    ``;refresh guild invite``'s own write-side gate, rather than
+    inventing a separate, looser read policy for the exact same data."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view a guild's stored invite code.")
+    repository = request.app.state.repository
+    space_room_id = await repository.get_guild_space(guild_actor_id)
+    if space_room_id is None:
+        return JSONResponse({"code": None, "domain": None}, headers={"Cache-Control": "no-store"})
+    stored = await get_guild_invite_code(request, space_room_id)
+    code, domain = stored if stored is not None else (None, None)
+    return JSONResponse({"code": code, "domain": domain}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/guilds/invite_code")
+async def widget_guild_set_invite_code(request: Request) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    body = await request.json()
+    guild_actor_id = (body.get("guild_actor_id") or "").strip()
+    code = (body.get("code") or "").strip()
+    domain = (body.get("domain") or "").strip()
+    if not guild_actor_id or not code or not domain:
+        raise HTTPException(400, "guild_actor_id, code, and domain are all required")
+    ok, message = await widget_set_guild_invite_code(
+        request, matrix_user_id=matrix_user_id, guild_actor_id=guild_actor_id, code=code, domain=domain,
+    )
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/widget/api/admin/grants")
@@ -1754,6 +1828,7 @@ _WIDGET_HTML = r"""<!doctype html>
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
     { id: "channels", label: "Channels", icon: "\u{1F4FA}" },
     { id: "communities", label: "Communities", icon: "\u{1F465}" },
+    { id: "guilds", label: "Guilds", icon: "\u{1F3F0}" },
     { id: "settings", label: "Settings", icon: "\u{2699}️" },
     { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
@@ -2004,6 +2079,7 @@ _WIDGET_HTML = r"""<!doctype html>
     if (currentTab === "home") renderHomeTimeline(app);
     else if (currentTab === "channels") renderChannelsTab(app);
     else if (currentTab === "communities") renderCommunitiesTab(app);
+    else if (currentTab === "guilds") renderGuildsTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
     else if (currentTab === "admin") renderAdminTab(app);
   }
@@ -3232,6 +3308,132 @@ _WIDGET_HTML = r"""<!doctype html>
         list.appendChild(row);
       });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  // -- Guilds (Shoot guild bridging): join via invite code, list joined
+  //    guilds, leave, and (admin-only) manage each guild's own stored
+  //    invite code -- the widget equivalent of ;joinguild/;leaveguild/
+  //    ;refresh guild invite. ----------------------------------------
+
+  function openJoinGuildModal(onJoined) {
+    const body = el("div", { class: "card profile-modal" });
+    const codeInput = el("input", { type: "text", placeholder: "Invite code" });
+    const domainInput = el("input", { type: "text", placeholder: "guild.example.com" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Join a guild" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "Paste the invite code someone shared with you, and the guild's own domain." }));
+    body.appendChild(el("div", { class: "row" }, [codeInput]));
+    body.appendChild(el("div", { class: "row" }, [domainInput]));
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    body.appendChild(errorBox);
+    const submitBtn = primaryButton("Join", () => {
+      errorBox.style.display = "none";
+      const code = codeInput.value.trim();
+      const domain = domainInput.value.trim();
+      if (!code || !domain) { errorBox.textContent = "Both a code and a domain are required."; errorBox.style.display = ""; return; }
+      submitBtn.disabled = true;
+      api("/widget/api/guilds/join", { method: "POST", body: { code: code, domain: domain, room_id: roomId } })
+        .then(() => { toast("Join request sent -- you'll be notified once it's confirmed.", true); closeModal(); if (onJoined) onJoined(); })
+        .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+        .finally(() => { submitBtn.disabled = false; });
+    });
+    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    openModal(body);
+    setTimeout(() => codeInput.focus(), 0);
+  }
+
+  function openLeaveGuildModal(guild, onLeft) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Leave " + guild.name + "?" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "This drops it on this bridge's own side. Its Space and Channel rooms are untouched -- leave them yourself in Matrix if you don't want them anymore." }));
+    body.appendChild(el("div", { class: "row" }, [
+      dangerButton("Leave", (e) => {
+        e.target.disabled = true;
+        api("/widget/api/guilds/leave", { method: "POST", body: { guild_actor_id: guild.guild_actor_id } })
+          .then((data) => { toast((data && data.message) || "Left.", true); })
+          .catch((err) => { toast(err.message || "Could not leave that guild.", false); })
+          .finally(() => { closeModal(); if (onLeft) onLeft(); });
+      }),
+      plainButton("Cancel", closeModal),
+    ]));
+    openModal(body);
+  }
+
+  function openGuildInviteCodeModal(guild) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Invite code -- " + guild.name }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "Setting this lets anyone who joins this guild's Matrix Space (or one of its Channel rooms) join the guild over ActivityPub automatically -- no “Join Guild” needed from them. Also resyncs any current member who hasn't joined yet." }));
+    const codeInput = el("input", { type: "text", placeholder: "Invite code" });
+    const domainInput = el("input", { type: "text", placeholder: "guild.example.com", value: guild.guild_actor_id ? (new URL(guild.guild_actor_id)).hostname : "" });
+    const loadingNote = el("div", { class: "sub", text: "Loading current code…" });
+    body.appendChild(loadingNote);
+    body.appendChild(el("div", { class: "row" }, [codeInput]));
+    body.appendChild(el("div", { class: "row" }, [domainInput]));
+    api("/widget/api/guilds/invite_code?guild_actor_id=" + encodeURIComponent(guild.guild_actor_id))
+      .then((data) => {
+        loadingNote.remove();
+        if (data.code) { codeInput.value = data.code; domainInput.value = data.domain || domainInput.value; }
+      })
+      .catch(() => { loadingNote.textContent = "Couldn't load the current code."; });
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    body.appendChild(errorBox);
+    const submitBtn = primaryButton("Save", () => {
+      errorBox.style.display = "none";
+      const code = codeInput.value.trim();
+      const domain = domainInput.value.trim();
+      if (!code || !domain) { errorBox.textContent = "Both a code and a domain are required."; errorBox.style.display = ""; return; }
+      submitBtn.disabled = true;
+      api("/widget/api/guilds/invite_code", {
+        method: "POST", body: { guild_actor_id: guild.guild_actor_id, code: code, domain: domain },
+      }).then((data) => {
+        if (data && data.ok === false) { errorBox.textContent = data.message || "Could not set that invite code."; errorBox.style.display = ""; return; }
+        toast(data.message || "Saved.", true);
+        closeModal();
+      }).catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+        .finally(() => { submitBtn.disabled = false; });
+    });
+    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    openModal(body);
+  }
+
+  function renderGuildsTab(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
+        el("h2", { text: "Guilds", style: "margin:0;" }),
+        primaryButton("Join Guild", () => openJoinGuildModal(loadGuilds)),
+      ]),
+      list,
+    ]));
+    function loadGuilds() {
+      list.innerHTML = "";
+      list.appendChild(el("div", { class: "muted", text: "Loading…" }));
+      api("/widget/api/guilds").then((data) => {
+        list.innerHTML = "";
+        if (!data.guilds.length) { list.appendChild(el("div", { class: "muted", text: "Not a member of any guilds yet." })); return; }
+        data.guilds.forEach((g) => {
+          const actions = [plainButton("Leave", () => openLeaveGuildModal(g, loadGuilds))];
+          if (data.is_admin) actions.unshift(plainButton("Invite Code", () => openGuildInviteCodeModal(g)));
+          if (g.space_room_id) actions.unshift(linkButton("Manage in room", matrixToUrl(g.space_room_id, null)));
+          list.appendChild(el("div", { class: "list-item" }, [
+            avatarEl(g.icon_url, g.name, "sm"),
+            el("div", { class: "meta", style: "flex:1;min-width:0;" }, [
+              el("div", { class: "name", text: g.name }),
+            ]),
+            el("div", { class: "row", style: "margin:0;flex-wrap:nowrap;" }, actions),
+          ]));
+        });
+      }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    }
+    loadGuilds();
   }
 
   // -- Channel page: avatar/name/summary, owner controls, video tiles ---
