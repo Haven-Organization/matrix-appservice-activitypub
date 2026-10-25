@@ -1477,6 +1477,7 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .modal-backdrop .card { max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; margin-bottom: 0; }
   .modal-close { border: none; background: none; color: var(--muted); font-size: 16px; padding: 4px 8px; cursor: pointer; }
+  .modal-actions { justify-content: flex-end; }
   .clickable { cursor: pointer; }
 
   /* -- full-page profile (own identity or a browsed/followed account) ------ */
@@ -1617,7 +1618,7 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   // One delegated listener for every matrix.to link in the widget (post
-  // cards' "Imported" badge, "Manage in room" on Publish, ...) instead of
+  // cards' "Imported" badge, "Open" on Publish, ...) instead of
   // wiring each one individually -- asks the host to jump straight to it
   // (room, or room+event when there is one) via MSC2931 navigate, falling
   // back to opening it in a new browser tab/window exactly as before if
@@ -2386,7 +2387,7 @@ _WIDGET_HTML = r"""<!doctype html>
       onAdded(domain);
     }
     domainInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-    body.appendChild(el("div", { class: "row" }, [primaryButton("Add", submit)]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [primaryButton("Add", submit)]));
     openModal(body);
     setTimeout(() => domainInput.focus(), 0);
   }
@@ -2414,7 +2415,8 @@ _WIDGET_HTML = r"""<!doctype html>
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
     body.appendChild(el("div", { class: "sub", text: "You're signed into " + domain + " -- removing it from this list will also sign you out there." }));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
+      plainButton("Cancel", closeModal),
       dangerButton("Remove and sign out", (e) => {
         e.target.disabled = true;
         removeUserBrowseInstance(domain);
@@ -2422,7 +2424,6 @@ _WIDGET_HTML = r"""<!doctype html>
           .catch(() => {}) // best-effort -- the instance is leaving the list either way
           .finally(() => { closeModal(); onRemoved(); });
       }),
-      plainButton("Cancel", closeModal),
     ]));
     openModal(body);
   }
@@ -2748,7 +2749,7 @@ _WIDGET_HTML = r"""<!doctype html>
       ]),
       el("div", { class: "sub", text: "A Pleroma/Akkoma export (one @user@instance.org per line) or a Mastodon follows CSV." }),
       el("div", { class: "row" }, [fileInput]),
-      el("div", { class: "row" }, [
+      el("div", { class: "row modal-actions" }, [
         primaryButton("Import follows", async (e) => {
           const file = fileInput.files[0];
           if (!file) { toast("Choose a file first.", false); return; }
@@ -3060,10 +3061,10 @@ _WIDGET_HTML = r"""<!doctype html>
       el("h2", { text: "Sign in to " + domain }),
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
       primaryButton("Sign in with OAuth", (e) => startOAuthLogin(domain, e.target, () => { closeModal(); if (onDone) onDone(); })),
     ]));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
       plainButton("Use username/password instead", () => { closeModal(); openPasswordLoginForm(domain, onDone); }),
     ]));
     openModal(body);
@@ -3081,7 +3082,7 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "sub", text: "Prefer OAuth above when the instance supports it -- your password goes directly to that instance over HTTPS and is never stored here, only the resulting access token is." }));
     body.appendChild(el("div", { class: "row" }, [domainInput]));
     body.appendChild(el("div", { class: "row" }, [userInput, passInput]));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
       primaryButton("Sign in", (e) => {
         if (!domainInput.value.trim() || !userInput.value || !passInput.value) return;
         e.target.disabled = true;
@@ -3245,7 +3246,7 @@ _WIDGET_HTML = r"""<!doctype html>
     ]));
     body.appendChild(el("div", { class: "sub", text: sub }));
     body.appendChild(el("div", { class: "row" }, row));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
       primaryButton("Create", (e) => {
         if (!idInput.value.trim()) return;
         doAction(createPath, {
@@ -3266,7 +3267,7 @@ _WIDGET_HTML = r"""<!doctype html>
         el("div", { class: "name", text: e.display_name || e.username }),
         el("div", { class: "handle", text: "@" + e.handle }),
       ]),
-      linkButton("Manage in room", matrixToUrl(e.room_id, null)),
+      linkButton("Open", matrixToUrl(e.room_id, null)),
     ]);
   }
 
@@ -3288,7 +3289,7 @@ _WIDGET_HTML = r"""<!doctype html>
       if (!data.channels.length) { list.appendChild(el("div", { class: "muted", text: "No channels yet." })); return; }
       data.channels.forEach((c) => {
         const row = entityListItem(c, (ev) => {
-          if (ev.target.closest("a")) return; // "Manage in room" handles its own click
+          if (ev.target.closest("a")) return; // "Open" handles its own click
           openChannelPage(c.username);
         });
         list.appendChild(row);
@@ -3351,7 +3352,7 @@ _WIDGET_HTML = r"""<!doctype html>
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
         .finally(() => { submitBtn.disabled = false; });
     });
-    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(body);
     setTimeout(() => codeInput.focus(), 0);
   }
@@ -3363,7 +3364,8 @@ _WIDGET_HTML = r"""<!doctype html>
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
     body.appendChild(el("div", { class: "sub", text: "This drops it on this bridge's own side. Its Space and Channel rooms are untouched -- leave them yourself in Matrix if you don't want them anymore." }));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
+      plainButton("Cancel", closeModal),
       dangerButton("Leave", (e) => {
         e.target.disabled = true;
         api("/widget/api/guilds/leave", { method: "POST", body: { guild_actor_id: guild.guild_actor_id } })
@@ -3371,7 +3373,6 @@ _WIDGET_HTML = r"""<!doctype html>
           .catch((err) => { toast(err.message || "Could not leave that guild.", false); })
           .finally(() => { closeModal(); if (onLeft) onLeft(); });
       }),
-      plainButton("Cancel", closeModal),
     ]));
     openModal(body);
   }
@@ -3412,7 +3413,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }).catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
         .finally(() => { submitBtn.disabled = false; });
     });
-    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(body);
   }
 
@@ -3434,7 +3435,7 @@ _WIDGET_HTML = r"""<!doctype html>
         data.guilds.forEach((g) => {
           const actions = [plainButton("Leave", () => openLeaveGuildModal(g, loadGuilds))];
           if (data.is_admin) actions.unshift(plainButton("Invite Code", () => openGuildInviteCodeModal(g)));
-          if (g.space_room_id) actions.unshift(linkButton("Manage in room", matrixToUrl(g.space_room_id, null)));
+          if (g.space_room_id) actions.unshift(linkButton("Open", matrixToUrl(g.space_room_id, null)));
           list.appendChild(el("div", { class: "list-item" }, [
             avatarEl(g.icon_url, g.name, "sm"),
             el("div", { class: "meta", style: "flex:1;min-width:0;" }, [
@@ -3493,7 +3494,7 @@ _WIDGET_HTML = r"""<!doctype html>
       page.innerHTML = "";
       page.appendChild(profileBanner(c.banner_url, null));
       const actions = el("div", { class: "row" }, [
-        linkButton("Manage in room", matrixToUrl(c.room_id, null)),
+        linkButton("Open", matrixToUrl(c.room_id, null)),
         el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
       ]);
       appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
@@ -3537,7 +3538,7 @@ _WIDGET_HTML = r"""<!doctype html>
       page.innerHTML = "";
       page.appendChild(profileBanner(c.banner_url, null));
       const actions = el("div", { class: "row" }, [
-        linkButton("Manage in room", matrixToUrl(c.room_id, null)),
+        linkButton("Open", matrixToUrl(c.room_id, null)),
         el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
       ]);
       appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
@@ -3833,7 +3834,7 @@ _WIDGET_HTML = r"""<!doctype html>
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
         .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
     });
-    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(body);
   }
 
@@ -3948,7 +3949,7 @@ _WIDGET_HTML = r"""<!doctype html>
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
         .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
     });
-    modalBody.appendChild(el("div", { class: "row" }, [submitBtn]));
+    modalBody.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(modalBody);
   }
 
@@ -3959,7 +3960,8 @@ _WIDGET_HTML = r"""<!doctype html>
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
     body.appendChild(el("div", { class: "sub", text: "This retracts the video from federation. The underlying Matrix video message is left untouched, so you can publish it again afterward." }));
-    body.appendChild(el("div", { class: "row" }, [
+    body.appendChild(el("div", { class: "row modal-actions" }, [
+      plainButton("Cancel", closeModal),
       dangerButton("Delete", (e) => {
         e.target.disabled = true;
         api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/videos/" + encodeURIComponent(video.id) + "/unpublish", { method: "POST", body: {} })
@@ -3967,7 +3969,6 @@ _WIDGET_HTML = r"""<!doctype html>
           .catch((err) => { toast(err.message || "Could not delete that video.", false); })
           .finally(() => { closeModal(); if (onDone) onDone(); });
       }),
-      plainButton("Cancel", closeModal),
     ]));
     openModal(body);
   }
