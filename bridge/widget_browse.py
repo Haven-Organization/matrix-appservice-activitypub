@@ -314,6 +314,17 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
     return {
         "uri": uri,
         "url": base.get("url") or uri,
+        # This status's own Mastodon-API id (its home instance's local,
+        # numeric/flake id -- NOT the canonical AS2 "uri" above, which for
+        # Pleroma-family software is a DIFFERENT string, e.g. a
+        # /objects/<uuid> the Mastodon-API itself doesn't recognize as an
+        # id; confirmed live 2026-10-25). Carried through so opening this
+        # post's thread can go straight to {origin}/api/v1/statuses/
+        # {local_id}/context for guaranteed-accurate reply/like/repost
+        # counts across the WHOLE thread, instead of guessing an id from
+        # a URL's trailing path segment (browse_thread's own fallback,
+        # which only works when that segment happens to BE a real id).
+        "local_id": base.get("id") if isinstance(base.get("id"), str) else None,
         "created_at": base.get("created_at"),
         "content_html": content_html,
         "sensitive": bool(base.get("sensitive")),
@@ -899,20 +910,44 @@ def _normalize_ap_item(item: dict[str, Any], *, author: dict[str, Any] | None = 
     content_html = obj.get("content") if isinstance(obj.get("content"), str) else ""
     content_html = _substitute_emoji_html(content_html, emoji_map)
     in_reply_to_uri = obj.get("inReplyTo") if isinstance(obj.get("inReplyTo"), str) else None
+    # A real Mastodon-API status's own counts, when some caller already
+    # fetched one for this exact post and stashed it here (see
+    # _fetch_context_descendant_pool/_discover_mastodon_api_reply_notes/
+    # browse_thread's own context-resolution) -- preferred over this
+    # object's own AS2 "replies"/"shares"/"likes" collection counts,
+    # confirmed unreliable on Pleroma (its own collections can report 0
+    # while real replies/boosts/likes exist). Each field falls back to
+    # the AS2 count individually, in case the stashed status happened to
+    # omit one.
+    mastodon_counts = obj.get("_mastodon_counts") if isinstance(obj.get("_mastodon_counts"), dict) else {}
+    as2_counts = {
+        "replies": _as2_collection_count(obj.get("replies")),
+        "reblogs": _as2_collection_count(obj.get("shares")),
+        "favourites": _as2_collection_count(obj.get("likes")),
+    }
+    counts = {
+        key: mastodon_counts.get(key) if isinstance(mastodon_counts.get(key), int) else as2_counts[key]
+        for key in as2_counts
+    }
+    # Stashed by browse_thread's own counts resolution (see
+    # _resolve_thread_counts) when it managed to find this exact post's
+    # real Mastodon-API id -- threaded back out to the frontend so
+    # clicking INTO this post as the next thread view's own focus can
+    # pass it straight through, instead of this bridge having to re-guess
+    # it (or fail to) all over again. The one piece that fixes accurate
+    # counts for an ancestor reached by pure inReplyTo walking.
+    local_id = obj.get("_local_id") if isinstance(obj.get("_local_id"), str) else None
     return {
         "uri": uri,
         "url": obj.get("url") or uri,
+        "local_id": local_id,
         "created_at": obj.get("published"),
         "content_html": content_html,
         "sensitive": bool(obj.get("sensitive")) or bool(summary),
         "spoiler_text": summary,
         "author": author,
         "media": media,
-        "counts": {
-            "replies": _as2_collection_count(obj.get("replies")),
-            "reblogs": _as2_collection_count(obj.get("shares")),
-            "favourites": _as2_collection_count(obj.get("likes")),
-        },
+        "counts": counts,
         # AS2 has no standard custom-reaction concept of its own (Pleroma's
         # emoji_reactions are exposed only via its Mastodon-compatible
         # status API, not on the bare Note -- see _normalize_status for
@@ -1111,6 +1146,22 @@ async def _fetch_context_descendant_pool(request: Request, *, origin_uri: str, f
                         continue
                     note = await _fetch_as2_note(request, status_uri)
                     if note is not None and note.get("type") == "Note":
+                        # Stashes this status's own real Mastodon-API
+                        # counts (replies_count/reblogs_count/
+                        # favourites_count) onto the fetched AS2 doc --
+                        # already fetched as part of discovering this
+                        # reply at all, so this is free. _normalize_ap_item
+                        # prefers these over the doc's own AS2 "replies"/
+                        # "shares"/"likes" collection counts, which are
+                        # exactly the field confirmed unreliable on
+                        # Pleroma (see known_child_uri's own comment
+                        # above) for both this reply's OWN reply count
+                        # and its like/repost counts alike.
+                        note["_mastodon_counts"] = {
+                            "replies": status.get("replies_count"),
+                            "reblogs": status.get("reblogs_count"),
+                            "favourites": status.get("favourites_count"),
+                        }
                         notes.append(note)
                 if notes:
                     return notes
@@ -1201,8 +1252,98 @@ async def _resolve_pretty_url_via_search(request: Request, *, raw_uri: str, matr
     return None
 
 
+async def _fetch_mastodon_status(request: Request, *, origin: str, status_id: str) -> dict[str, Any] | None:
+    """``GET {origin}/api/v1/statuses/{status_id}``, unauthenticated --
+    the full Mastodon-API status object (real ``replies_count``/
+    ``reblogs_count``/``favourites_count`` included), when ``status_id``
+    is genuinely that instance's own local id for a post (not a guess
+    that happened to land on a UUID or some other unrelated string)."""
+    http_client = request.app.state.http_client
+    try:
+        resp = await http_client.get(f"{origin}/api/v1/statuses/{status_id}")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+async def _resolve_thread_counts(
+    request: Request, *, uri: str, local_id: str
+) -> dict[str, dict[str, Any]]:
+    """Real Mastodon-API counts for as much of this thread as can be
+    reached from ONE known-good local status id, keyed by each post's own
+    canonical AS2 uri -- ``_normalize_ap_item`` prefers these over a
+    document's own AS2 ``replies``/``shares``/``likes`` collection counts,
+    confirmed unreliable on Pleroma (see ``known_child_uri``'s own
+    comment in ``browse_thread``). ``{origin}/api/v1/statuses/{id}/
+    context`` conveniently returns BOTH ancestors and descendants as full
+    status objects in one call, so when this succeeds it covers the
+    WHOLE thread, not just whichever post was clicked into.
+
+    ``local_id`` is this instance's own id for ``uri``'s post, when the
+    caller already knows it (passed straight through from a Mastodon-
+    API-sourced post's own "local_id" -- see ``_normalize_status``'s own
+    comment on why that's the only fully reliable source); when it
+    doesn't, this tries ``uri``'s own trailing path segment as a guess,
+    which only works when ``uri`` happens to already be a pretty/flake-id
+    permalink rather than a bare canonical AS2 id (confirmed live
+    2026-10-25: this is exactly where it CAN'T work -- navigating into an
+    ancestor passes that ancestor's own canonical AS2 id, e.g. a Pleroma
+    ``/objects/<uuid>``, which was never resolved against the Mastodon
+    API in the first place and has no derivable mapping back to one).
+    Returns ``{}`` rather than raising when neither pans out -- counts
+    simply stay best-effort (AS2-collection-derived) for that post. On
+    success, keyed by each post's own canonical AS2 uri, to
+    ``{"counts": {...}, "local_id": "..."}``."""
+    parsed = urlparse(uri)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    status = await _fetch_mastodon_status(request, origin=origin, status_id=local_id) if local_id else None
+    resolved_id = local_id if status is not None else None
+    if status is None:
+        guess = uri.rstrip("/").rsplit("/", 1)[-1]
+        if guess:
+            status = await _fetch_mastodon_status(request, origin=origin, status_id=guess)
+            resolved_id = guess if status is not None else None
+    if status is None or resolved_id is None:
+        return {}
+
+    def _entry(s: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "counts": {"replies": s.get("replies_count"), "reblogs": s.get("reblogs_count"), "favourites": s.get("favourites_count")},
+            "local_id": s.get("id") if isinstance(s.get("id"), str) else None,
+        }
+
+    by_uri: dict[str, dict[str, Any]] = {}
+    if isinstance(status.get("uri"), str):
+        by_uri[status["uri"]] = _entry(status)
+
+    http_client = request.app.state.http_client
+    try:
+        resp = await http_client.get(f"{origin}/api/v1/statuses/{resolved_id}/context")
+        if resp.status_code == 200:
+            context = resp.json()
+            # Covers the WHOLE thread in one extra call when this
+            # succeeds: every ancestor AND descendant's real counts, AND
+            # (just as valuable) their own real local_id, so clicking
+            # into one of THEM as the new focus no longer needs to guess
+            # either -- the one case _resolve_thread_counts's own
+            # docstring flags as otherwise unresolvable (an ancestor
+            # reached via pure inReplyTo walking, whose canonical AS2 id
+            # alone has no derivable Mastodon-API id) is fixed by this
+            # exact context response, whenever the ORIGINAL click that
+            # got us here had a usable local_id/pretty URL to start from.
+            for s in (context.get("ancestors") or []) + (context.get("descendants") or []):
+                if isinstance(s, dict) and isinstance(s.get("uri"), str):
+                    by_uri[s["uri"]] = _entry(s)
+    except (httpx.HTTPError, ValueError):
+        pass
+    return by_uri
+
+
 @router.get("/widget/api/browse/thread")
-async def browse_thread(request: Request, uri: str, known_child_uri: str = "") -> JSONResponse:
+async def browse_thread(request: Request, uri: str, known_child_uri: str = "", local_id: str = "") -> JSONResponse:
     matrix_user_id = _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
     if focus_doc is None:
@@ -1220,6 +1361,11 @@ async def browse_thread(request: Request, uri: str, known_child_uri: str = "") -
             "(e.g. a page that only works in that instance's own web app), or it needs you to be "
             "signed in to that instance first.",
         )
+
+    # Started now, awaited right before it's needed below -- overlaps
+    # with the (sequential) ancestor walk and reply discovery instead of
+    # adding its own serial round trip on top of them.
+    counts_task = asyncio.ensure_future(_resolve_thread_counts(request, uri=uri, local_id=local_id))
 
     ancestors: list[dict[str, Any]] = []
     seen = {uri}
@@ -1278,6 +1424,24 @@ async def browse_thread(request: Request, uri: str, known_child_uri: str = "") -
         *(_find_op_reply(request, d, focus_author_id, descendant_pool=descendant_pool) for d in reply_docs)
     )
 
+    # Applied to every doc about to be normalized, by its own canonical
+    # AS2 id -- a doc that already carries a stashed "_mastodon_counts"
+    # (from _fetch_context_descendant_pool's own Mastodon-API discovery
+    # path) keeps that; this only fills in whichever ones don't have one
+    # yet (ancestors, and replies discovered via the native AS2 "replies"
+    # collection instead), without overwriting the fresher, specific-to-
+    # that-reply counts the discovery path already attached.
+    thread_info_by_uri = await counts_task
+    for doc in (*ancestors, focus_doc, *reply_docs, *(d for d in op_reply_docs if d is not None)):
+        doc_id = doc.get("id")
+        if not isinstance(doc_id, str) or doc_id not in thread_info_by_uri:
+            continue
+        entry = thread_info_by_uri[doc_id]
+        if "_mastodon_counts" not in doc:
+            doc["_mastodon_counts"] = entry.get("counts")
+        if "_local_id" not in doc:
+            doc["_local_id"] = entry.get("local_id")
+
     normalized_ancestors = [p for p in await asyncio.gather(*(_normalize_as2_note_full(request, d) for d in ancestors)) if p is not None]
     normalized_focus = await _normalize_as2_note_full(request, focus_doc)
     normalized_replies = []
@@ -1296,6 +1460,17 @@ async def browse_thread(request: Request, uri: str, known_child_uri: str = "") -
 
     if normalized_focus is None:
         raise HTTPException(502, "That post is missing something required to show it.")
+
+    # The focused post's own self-reported reply count can under-report
+    # the real number -- confirmed live 2026-10-25 against a Pleroma post
+    # whose AS2 "replies" collection claimed totalItems: 0 while this very
+    # response is about to render 2 real replies below it (same root
+    # cause as known_child_uri's own fix above: Pleroma's "replies"
+    # collection isn't reliably kept current). Never let the displayed
+    # count read as LESS than what's actually shown underneath it.
+    real_reply_count = len(normalized_replies)
+    if real_reply_count > normalized_focus.get("counts", {}).get("replies", 0):
+        normalized_focus["counts"]["replies"] = real_reply_count
 
     return JSONResponse(
         {"ancestors": normalized_ancestors, "post": normalized_focus, "replies": normalized_replies},

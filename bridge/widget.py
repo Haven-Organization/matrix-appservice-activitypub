@@ -2099,7 +2099,7 @@ _WIDGET_HTML = r"""<!doctype html>
       const replyLine = el("div", {
         class: "reply-to-line",
         text: "↩ Reply to " + (hint ? hint + "'s post" : "a post"),
-        onclick: (e) => { e.stopPropagation(); openThreadView(post.uri); },
+        onclick: (e) => { e.stopPropagation(); openThreadView(post.uri, null, post.local_id); },
       });
       children.push(replyLine);
     }
@@ -2202,7 +2202,7 @@ _WIDGET_HTML = r"""<!doctype html>
     // which should do its own thing instead.
     card.addEventListener("click", (e) => {
       if (e.target.closest("a, button, .clickable")) return;
-      openThreadView(post.uri, opts && opts.knownChildUri);
+      openThreadView(post.uri, opts && opts.knownChildUri, post.local_id);
     });
     card.classList.add("open-thread");
     return card;
@@ -2692,7 +2692,7 @@ _WIDGET_HTML = r"""<!doctype html>
     render();
   }
 
-  function openThreadView(uri, knownChildUri) {
+  function openThreadView(uri, knownChildUri, localId) {
     if (!uri) return;
     // knownChildUri: when navigating UP to an ancestor from a thread
     // already open, we just walked its own inReplyTo chain to get here,
@@ -2705,7 +2705,15 @@ _WIDGET_HTML = r"""<!doctype html>
     // even though a reply definitely exists, when the canonical AS2 id
     // clicked into isn't the same id its Mastodon API actually indexes
     // by -- see _fetch_context_descendant_pool's own comment).
-    threadView = { uri: uri, knownChildUri: knownChildUri || null };
+    //
+    // localId: this post's own Mastodon-API status id, when the post we
+    // clicked from already knew it (a timeline card's own "local_id", or
+    // one the PREVIOUS thread view's own counts resolution found for it
+    // -- see _resolve_thread_counts). Lets the backend fetch guaranteed-
+    // accurate reply/like/repost counts for this whole thread instead of
+    // guessing an id from the URL, which only works for a pretty/flake-
+    // id permalink, not a bare canonical AS2 id.
+    threadView = { uri: uri, knownChildUri: knownChildUri || null, localId: localId || null };
     profileView = null;
     render();
   }
@@ -2820,7 +2828,9 @@ _WIDGET_HTML = r"""<!doctype html>
     const page = el("div", { class: "profile-page thread-page" }, [el("div", { class: "muted", text: "Loading…" })]);
     app.appendChild(page);
 
-    const qs = "uri=" + encodeURIComponent(view.uri) + (view.knownChildUri ? "&known_child_uri=" + encodeURIComponent(view.knownChildUri) : "");
+    const qs = "uri=" + encodeURIComponent(view.uri) +
+      (view.knownChildUri ? "&known_child_uri=" + encodeURIComponent(view.knownChildUri) : "") +
+      (view.localId ? "&local_id=" + encodeURIComponent(view.localId) : "");
     api("/widget/api/browse/thread?" + qs).then((data) => {
       page.innerHTML = "";
       if (!data.post) {
@@ -2839,6 +2849,14 @@ _WIDGET_HTML = r"""<!doctype html>
         // gets threaded through on click instead of trusting reply-
         // discovery alone once p becomes the new focus.
         const knownChildUri = !isFocus && chain[i + 1] ? chain[i + 1].uri : null;
+        // Defensive floor, on top of the backend's own more accurate
+        // counts resolution (_resolve_thread_counts): if THAT couldn't
+        // resolve real counts for this ancestor either, the chain itself
+        // still proves at least one reply exists (the next link down),
+        // so the displayed count should never read lower than that.
+        if (knownChildUri && p.counts && (p.counts.replies || 0) < 1) {
+          p.counts = Object.assign({}, p.counts, { replies: 1 });
+        }
         const card = renderLiveCard(p, { focused: isFocus, knownChildUri: knownChildUri });
         card.classList.add(isFocus ? "thread-focus" : "thread-ancestor");
         if (!isFocus) card.classList.add("chain-link");

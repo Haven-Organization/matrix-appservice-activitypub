@@ -4091,11 +4091,17 @@ async def _discover_mastodon_api_reply_notes(
     except (httpx.HTTPError, ValueError):
         return []
 
+    counts_by_uri: dict[str, dict] = {}
     discovered_uris: list[str] = []
     for status in descendants:
         uri = status.get("uri") if isinstance(status, dict) else None
         if isinstance(uri, str) and uri not in already_seen and uri not in discovered_uris:
             discovered_uris.append(uri)
+            counts_by_uri[uri] = {
+                "replies": status.get("replies_count"),
+                "reblogs": status.get("reblogs_count"),
+                "favourites": status.get("favourites_count"),
+            }
 
     notes: list[dict] = []
     for uri in discovered_uris:
@@ -4106,6 +4112,15 @@ async def _discover_mastodon_api_reply_notes(
         except RemoteActorFetchError:
             continue
         if note.get("type") == "Note":
+            # bridge.widget_browse's own display-only use of this
+            # function's result reads this (real Mastodon-API counts,
+            # already fetched for discovery -- not thrown away for free)
+            # in preference to the doc's own AS2 "replies"/"shares"/
+            # "likes" collection counts, confirmed unreliable on Pleroma.
+            # Every OTHER caller (;import, ;backfill, the Lemmy bridge)
+            # only ever reads the AS2 fields this function has always
+            # returned, so this extra key is inert for them.
+            note["_mastodon_counts"] = counts_by_uri.get(uri)
             notes.append(note)
     notes.reverse()  # /context's descendants arrive oldest-first
     return notes
