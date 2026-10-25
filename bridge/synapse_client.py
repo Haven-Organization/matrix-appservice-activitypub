@@ -528,7 +528,29 @@ class SynapseClient:
         than the time the bridge happened to process it. This does NOT
         change the event's actual position in the room's DAG (per spec, it
         is still appended at the tip as if sent "now") -- only its
-        displayed timestamp."""
+        displayed timestamp.
+
+        Always carries an ``m.mentions`` key on an ``m.room.message``
+        (defaulting to ``{}`` when the caller didn't resolve any real
+        mentions). Per Matrix's intentional-mentions spec (v1.7+), a
+        server/client only falls back to the legacy
+        ``.m.rule.contains_display_name``/``contains_user_name``/``@room``
+        push rules when ``m.mentions`` is absent entirely -- an empty
+        ``{}`` still counts as "this event has an opinion about mentions,
+        and it's none," which turns those legacy rules off. Without this,
+        a user's display name matching some incidental substring of a
+        mirrored post (an event id, a URL fragment, ...) triggers a false
+        highlight/push for them. A caller that resolved real mentions
+        already set this key itself; ``setdefault`` only fills it in for
+        everything else, in this one shared send path rather than at each
+        of this bridge's many call sites. ``m.new_content`` (an edit's
+        replacement content) gets the same treatment, since clients and
+        push rules can evaluate it the same way."""
+        if event_type == "m.room.message":
+            content.setdefault("m.mentions", {})
+            new_content = content.get("m.new_content")
+            if isinstance(new_content, dict):
+                new_content.setdefault("m.mentions", content["m.mentions"])
         txn_id = txn_id or uuid.uuid4().hex
         params: dict[str, Any] | None = {"ts": ts} if ts is not None else None
         result = await self._request(
