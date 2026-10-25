@@ -303,6 +303,7 @@ from bridge.note_mirroring import attach_media_to_content as _attach_media_to_co
 from bridge.note_mirroring import resolve_old_remote_actor_room as _resolve_old_remote_actor_room
 from bridge.note_mirroring import (
     EXTERNAL_HANDLE_FIELD,
+    PER_MESSAGE_PROFILE_FIELD,
     SOCIAL_BODY_FIELD,
     SOCIAL_FORMATTED_BODY_FIELD,
     SOCIAL_REL_TYPE_REPOST,
@@ -6536,6 +6537,102 @@ def _is_redelivered_publish_command(command_event_id: str | None) -> bool:
     seen_at = _recent_publish_command_events.get(command_event_id)
     _recent_publish_command_events[command_event_id] = now
     return seen_at is not None and now - seen_at < _PUBLISH_REDELIVERY_DEDUP_WINDOW_SECONDS
+
+
+async def widget_publish_video(
+    request: Request, *, matrix_user_id: str, channel_username: str,
+    mxc: str, filename: str, mimetype: str, size: int | None,
+    name: str, category: str, licence: str, language: str, tags: str,
+    sensitive: bool, comments_enabled: bool, description: str, thumbnail_mxc: str,
+) -> tuple[bool, str]:
+    """Publishes a video to a channel from the widget's own Publish form.
+
+    This needs to exist separately from ``_handle_publish`` at all because
+    that command requires a REAL Matrix video message already sent by the
+    channel's owner inside the channel room, for it to reply to -- and the
+    widget (via the AppService's own access token) can never send a
+    message as an arbitrary real human user (a hard platform constraint,
+    confirmed repeatedly elsewhere in this bridge -- see
+    ``bridge.reaction_bridge``'s own notes on it). This bridges the gap by
+    having the BOT send that message instead, decorated with MSC4144's
+    ``com.beeper.per_message_profile`` (``_build_per_message_profile``) so
+    it reads as the owner's own post -- the same mechanism already used
+    for ``send_repost``'s echo cards and other bot-sent-but-attributed
+    messages elsewhere in this bridge, not a new impersonation path. Once
+    that real Matrix event exists, it's functionally indistinguishable
+    from one the owner sent by hand, so this hands off to the EXACT SAME
+    ``_handle_publish`` the chat command uses (via a synthesized reply
+    whose body is the same ``key: value`` text ``;publish`` itself parses)
+    rather than reimplementing any of its validation/AP-building/delivery
+    logic.
+
+    Returns ``(ok, message)`` the same shape ``_handle_create_profile``
+    does, for the SAME reason (the widget has nowhere to show a room
+    notice from) -- but ``_handle_publish`` itself was NOT given that same
+    treatment (too large a function to be worth it for this one caller),
+    so a `True` here only means "a video message was sent and handed to
+    `_handle_publish`", not "publishing definitely succeeded" -- the real
+    outcome is still only visible as a room notice in the channel room."""
+    repository = request.app.state.repository
+    channel = await repository.get_peertube_channel(channel_username)
+    if channel is None:
+        return False, "No such channel."
+    owner = await repository.get_local_actor(channel.owner_username)
+    if owner is None or owner.matrix_user_id != matrix_user_id:
+        return False, "Only the channel's owner can publish to it."
+    name = name.strip()
+    if not name:
+        return False, "A name is required."
+
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+
+    info: dict[str, Any] = {"mimetype": mimetype or "video/mp4"}
+    if size:
+        info["size"] = size
+    if thumbnail_mxc:
+        info["thumbnail_url"] = thumbnail_mxc
+    video_content: dict[str, Any] = {
+        "msgtype": "m.video", "body": filename or "video", "url": mxc, "info": info,
+    }
+
+    # Local import -- reaction_bridge imports FROM this module, so a
+    # top-level import here would be circular.
+    from bridge.reaction_bridge import _build_per_message_profile
+
+    per_message_profile = await _build_per_message_profile(request, owner)
+    if per_message_profile is not None:
+        video_content[PER_MESSAGE_PROFILE_FIELD] = per_message_profile
+
+    try:
+        video_event_id = await synapse.send_message_event(channel.room_id, video_content, as_user_id=bot_mxid)
+    except SynapseError as exc:
+        logger.warning("Could not send widget-published video into %s: %s", channel.room_id, exc)
+        return False, "Could not send that video into the channel room."
+
+    body_lines = [";publish", f"name: {name}"]
+    if category:
+        body_lines.append(f"category: {category}")
+    if licence:
+        body_lines.append(f"license: {licence}")
+    if language:
+        body_lines.append(f"language: {language}")
+    if tags:
+        body_lines.append(f"tags: {tags}")
+    if sensitive:
+        body_lines.append("sensitive: true")
+    if not comments_enabled:
+        body_lines.append("commentsenabled: false")
+    body = "\n".join(body_lines)
+    if description:
+        body += "\n\n" + description
+    synthetic_content = {
+        "body": body,
+        "m.relates_to": {"m.in_reply_to": {"event_id": video_event_id}},
+    }
+    await _handle_publish(request, sender=matrix_user_id, room_id=channel.room_id, content=synthetic_content)
+    return True, "Submitted -- check the channel room for the result."
 
 
 async def _handle_publish(

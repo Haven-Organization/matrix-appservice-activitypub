@@ -35,7 +35,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from bridge.activitypub.sanitize import plain_text_to_note_html
-from bridge.activitypub.urls import actor_url
+from bridge.activitypub.urls import actor_url, media_url
 from bridge.commands import (
     _ALLOW_RULE_TYPES,
     _bot_mxid,
@@ -70,8 +70,16 @@ from bridge.commands import (
     _parse_follows_export,
     _run_follows_import,
     _RUNNING_FOLLOWS_IMPORTS,
+    widget_publish_video,
 )
 from bridge.identity_settings import get_effective_settings
+from bridge.peertube import (
+    COMMON_LANGUAGES,
+    VIDEO_CATEGORIES,
+    VIDEO_LICENCES,
+    VIDEO_METADATA_STATE_TYPE,
+    get_video_index,
+)
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -647,6 +655,27 @@ def _build_create_argument(identifier: str, as_identity: str, display_name: str)
     return " ".join(parts)
 
 
+@router.get("/widget/api/video_options")
+async def widget_video_options(request: Request) -> JSONResponse:
+    """Static reference data for the Publish-video form's dropdowns --
+    the exact same name strings ``;publish``/``;edit``'s own ``resolve_category``/
+    ``resolve_licence`` accept as the raw ``category``/``license`` field
+    value, so a widget-published video validates identically to a chat-
+    command-published one. No language list -- see ``COMMON_LANGUAGES``'s
+    own docstring for why that one stays a free-text ISO code input with
+    just a placeholder hint instead of a dropdown that can't name every
+    valid value anyway."""
+    _session_user(request)
+    return JSONResponse(
+        {
+            "categories": list(VIDEO_CATEGORIES.values()),
+            "licences": list(VIDEO_LICENCES.values()),
+            "common_languages": [{"code": k, "name": v} for k, v in COMMON_LANGUAGES.items()],
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/widget/api/channels")
 async def widget_channels(request: Request) -> JSONResponse:
     matrix_user_id = _session_user(request)
@@ -654,6 +683,7 @@ async def widget_channels(request: Request) -> JSONResponse:
     if not config.bridge.peertube_channels_enabled:
         return JSONResponse({"enabled": False, "channels": []}, headers={"Cache-Control": "no-store"})
     repository = request.app.state.repository
+    base = config.bridge.public_base_url
     identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
     channels = [
         {
@@ -661,6 +691,8 @@ async def widget_channels(request: Request) -> JSONResponse:
             "display_name": channel.display_name,
             "owner_username": channel.owner_username,
             "room_id": channel.room_id,
+            "icon_url": media_url(base, channel.icon_url) if channel.icon_url else None,
+            "handle": f"{channel.username}@{config.bridge.domain}",
         }
         for identity in identities
         for channel in await repository.list_peertube_channels_by_owner(identity.username)
@@ -680,6 +712,141 @@ async def widget_create_channel(request: Request) -> JSONResponse:
     return await _dispatch(request, body.get("room_id", ""), _handle_create_channel, argument=argument)
 
 
+@router.get("/widget/api/channels/{username}")
+async def widget_channel_detail(request: Request, username: str) -> JSONResponse:
+    """A single channel's own page -- avatar/name/summary plus whether the
+    calling user is its owner (gates the management controls the page
+    itself renders; this bridge double-checks ownership server-side again
+    on every actual write below regardless, the same way every other
+    owner-gated widget action already does)."""
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    channel = await repository.get_peertube_channel(username)
+    if channel is None:
+        raise HTTPException(404, "No such channel.")
+    base = config.bridge.public_base_url
+    owner = await repository.get_local_actor(channel.owner_username)
+    return JSONResponse(
+        {
+            "username": channel.username,
+            "display_name": channel.display_name,
+            "handle": f"{channel.username}@{config.bridge.domain}",
+            "summary": channel.summary,
+            "icon_url": media_url(base, channel.icon_url) if channel.icon_url else None,
+            "banner_url": media_url(base, channel.banner_url) if channel.banner_url else None,
+            "room_id": channel.room_id,
+            "owner_username": channel.owner_username,
+            "is_owner": owner is not None and owner.matrix_user_id == matrix_user_id,
+            "public_url": actor_url(base, channel.username),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/widget/api/channels/{username}/videos")
+async def widget_channel_videos(request: Request, username: str) -> JSONResponse:
+    """Video tiles for a channel's own page -- reads the SAME
+    ``VIDEO_INDEX_STATE_TYPE``/``VIDEO_METADATA_STATE_TYPE`` room state
+    ``;publish``/``;edit`` themselves already maintain (``bridge.peertube.
+    get_video_index``), no separate tracking of its own. ``ap_object_id``
+    is reconstructed deterministically from each video's own id shape
+    (``_handle_publish``'s own ``video_id`` format), not stored again here,
+    so a lookup against ``federated_events`` can resolve the matrix room/
+    event a tile's "View in room"/management actions need."""
+    _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+    channel = await repository.get_peertube_channel(username)
+    if channel is None:
+        raise HTTPException(404, "No such channel.")
+    base = config.bridge.public_base_url
+    video_ids = await get_video_index(synapse, room_id=channel.room_id)
+    videos = []
+    for local_video_id in video_ids:
+        try:
+            meta = await synapse.get_room_state(channel.room_id, VIDEO_METADATA_STATE_TYPE, local_video_id)
+        except SynapseError:
+            continue
+        ap_object_id = f"{base}/actor/{channel.username}/videos/{local_video_id}"
+        federated = await repository.get_federated_event_by_ap_object(ap_object_id)
+        thumbnail_mxc = meta.get("thumbnail_mxc")
+        videos.append({
+            "id": local_video_id,
+            "name": meta.get("name") or "(untitled)",
+            "thumbnail_url": media_url(base, thumbnail_mxc) if thumbnail_mxc else None,
+            "published": meta.get("published"),
+            "tags": meta.get("tags") or [],
+            "sensitive": bool(meta.get("sensitive")),
+            "description": meta.get("description") or "",
+            "matrix_room_id": federated.room_id if federated else None,
+            "matrix_event_id": federated.event_id if federated else None,
+        })
+    videos.sort(key=lambda v: v.get("published") or "", reverse=True)
+    return JSONResponse({"videos": videos}, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/widget/api/channels/{username}/upload_video")
+async def widget_upload_video(request: Request, username: str) -> JSONResponse:
+    """Raw video bytes straight from the widget's own ``<input
+    type=file>`` -- same shape as ``widget_upload_banner``, uploaded as
+    the bot (the AS token can never upload "as" an arbitrary real human
+    user), returning the resulting ``mxc://`` for the caller to then pass
+    to ``/widget/api/channels/{username}/publish``. Ownership isn't
+    checked here (uploading media commits nothing on its own); ``publish``
+    below re-checks it before doing anything real."""
+    _session_user(request)
+    config = request.app.state.config
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "No video data received")
+    content_type = request.headers.get("content-type") or "video/mp4"
+    try:
+        mxc = await request.app.state.synapse.upload_media(
+            data, content_type, f"{username}-video", as_user_id=_bot_mxid(config),
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "Could not upload that video to the homeserver.") from exc
+    return JSONResponse(
+        {"mxc": mxc, "mimetype": content_type, "size": len(data)}, headers={"Cache-Control": "no-store"}
+    )
+
+
+@router.post("/widget/api/channels/{username}/publish")
+async def widget_channel_publish(request: Request, username: str) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    body = await request.json()
+    mxc = (body.get("mxc") or "").strip()
+    if not mxc.startswith("mxc://"):
+        raise HTTPException(400, "mxc must be a mxc:// URI -- upload a video or paste one first")
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    try:
+        ok, message = await widget_publish_video(
+            request,
+            matrix_user_id=matrix_user_id,
+            channel_username=username,
+            mxc=mxc,
+            filename=(body.get("filename") or "").strip(),
+            mimetype=(body.get("mimetype") or "").strip(),
+            size=body.get("size") if isinstance(body.get("size"), int) else None,
+            name=name,
+            category=(body.get("category") or "").strip(),
+            licence=(body.get("license") or "").strip(),
+            language=(body.get("language") or "").strip(),
+            tags=(body.get("tags") or "").strip(),
+            sensitive=bool(body.get("sensitive")),
+            comments_enabled=body.get("comments_enabled", True) is not False,
+            description=(body.get("description") or "").strip(),
+            thumbnail_mxc=(body.get("thumbnail_mxc") or "").strip(),
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": ok, "message": message}, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/widget/api/communities")
 async def widget_communities(request: Request) -> JSONResponse:
     matrix_user_id = _session_user(request)
@@ -687,6 +854,7 @@ async def widget_communities(request: Request) -> JSONResponse:
     if not config.bridge.lemmy_community_hosting_enabled:
         return JSONResponse({"enabled": False, "communities": []}, headers={"Cache-Control": "no-store"})
     repository = request.app.state.repository
+    base = config.bridge.public_base_url
     identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
     communities = [
         {
@@ -694,6 +862,8 @@ async def widget_communities(request: Request) -> JSONResponse:
             "display_name": community.display_name,
             "owner_username": community.owner_username,
             "room_id": community.room_id,
+            "icon_url": media_url(base, community.icon_url) if community.icon_url else None,
+            "handle": f"{community.username}@{config.bridge.domain}",
         }
         for identity in identities
         for community in await repository.list_lemmy_communities_by_owner(identity.username)
@@ -711,6 +881,34 @@ async def widget_create_community(request: Request) -> JSONResponse:
         community_id, (body.get("as_identity") or "").strip(), (body.get("display_name") or "").strip()
     )
     return await _dispatch(request, body.get("room_id", ""), _handle_create_community, argument=argument)
+
+
+@router.get("/widget/api/communities/{username}")
+async def widget_community_detail(request: Request, username: str) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    community = await repository.get_lemmy_community(username)
+    if community is None:
+        raise HTTPException(404, "No such community.")
+    base = config.bridge.public_base_url
+    owner = await repository.get_local_actor(community.owner_username)
+    return JSONResponse(
+        {
+            "username": community.username,
+            "display_name": community.display_name,
+            "handle": f"{community.username}@{config.bridge.domain}",
+            "summary": community.summary,
+            "icon_url": media_url(base, community.icon_url) if community.icon_url else None,
+            "banner_url": media_url(base, community.banner_url) if community.banner_url else None,
+            "room_id": community.room_id,
+            "owner_username": community.owner_username,
+            "is_owner": owner is not None and owner.matrix_user_id == matrix_user_id,
+            "moderator_count": len(community.moderator_actor_ids),
+            "public_url": actor_url(base, community.username),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post("/widget/api/banner")
@@ -927,8 +1125,23 @@ _WIDGET_HTML = r"""<!doctype html>
   .list { display: flex; flex-direction: column; gap: 6px; }
   .list-item {
     display: flex; justify-content: space-between; align-items: center; padding: 8px 10px;
-    border: 1px solid var(--border); border-radius: var(--radius-inner); font-size: 13px;
+    border: 1px solid var(--border); border-radius: var(--radius-inner); font-size: 13px; gap: 10px;
   }
+  .list-item.clickable { cursor: pointer; }
+  .list-item.clickable:hover { background: var(--hover); }
+  .checkbox-label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+  .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+  .video-tile { border: 1px solid var(--border); border-radius: var(--radius-card); overflow: hidden; }
+  .video-tile-thumb { position: relative; aspect-ratio: 16/9; background: var(--hover); }
+  .video-tile-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .video-tile-thumb-empty { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 28px; }
+  .video-tile-badge {
+    position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,.65); color: #fff;
+    font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: var(--radius-chip);
+  }
+  .video-tile-title { font-size: 13px; font-weight: 600; padding: 8px 10px 0; }
+  .video-tile-meta { font-size: 12px; color: var(--muted); padding: 4px 10px 10px; }
+  .video-tile-link { display: block; font-size: 12px; padding: 0 10px 10px; }
   .muted { color: var(--muted); }
   .spinner { text-align: center; color: var(--muted); padding: 40px 0; }
   .confirm-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
@@ -1382,7 +1595,8 @@ _WIDGET_HTML = r"""<!doctype html>
   let ctx = null;
   const NAV_ITEMS = [
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
-    { id: "publish", label: "Publish", icon: "\u{1F4E1}" },
+    { id: "channels", label: "Channels", icon: "\u{1F4FA}" },
+    { id: "communities", label: "Communities", icon: "\u{1F465}" },
     { id: "settings", label: "Settings", icon: "\u{2699}️" },
     { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
@@ -1400,6 +1614,11 @@ _WIDGET_HTML = r"""<!doctype html>
   // there's room for a real error message (reserved name, already taken,
   // belongs to a real Matrix user, ...) instead of a toast easy to miss.
   let createIdentityView = false;
+  // Same idea again, for a single channel's/community's own full page --
+  // mutually exclusive with everything else above (opening one clears the
+  // others, same convention as profileView/threadView).
+  let channelView = null;
+  let communityView = null;
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -1568,13 +1787,19 @@ _WIDGET_HTML = r"""<!doctype html>
     const bar = document.getElementById("sidebar");
     bar.innerHTML = "";
     if (!ctx) return;
+    const anyOverlayShowing = !!(profileView || threadView || createIdentityView || channelView || communityView);
     NAV_ITEMS.forEach((t) => {
       if (t.id === "admin" && !ctx.is_admin) return;
-      if (t.id === "publish" && !ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) return;
+      if (t.id === "channels" && !ctx.peertube_channels_enabled) return;
+      if (t.id === "communities" && !ctx.lemmy_community_hosting_enabled) return;
       bar.appendChild(el("button", {
-        class: "nav-item" + (!profileView && !threadView && t.id === currentTab ? " active" : ""),
+        class: "nav-item" + (!anyOverlayShowing && t.id === currentTab ? " active" : ""),
         title: t.label,
-        onclick: () => { currentTab = t.id; profileView = null; threadView = null; render(); },
+        onclick: () => {
+          currentTab = t.id;
+          profileView = null; threadView = null; createIdentityView = false; channelView = null; communityView = null;
+          render();
+        },
       }, [
         el("span", { class: "icon", text: t.icon }),
         el("span", { class: "label", text: t.label }),
@@ -1608,7 +1833,7 @@ _WIDGET_HTML = r"""<!doctype html>
     // belongs attached while Home's own timeline is actually showing --
     // otherwise it would keep recording THIS page's scroll position into
     // homeState.scrollY, corrupting what "Back" should restore.
-    const goingToHome = !profileView && !threadView && !createIdentityView && currentTab === "home";
+    const goingToHome = !profileView && !threadView && !createIdentityView && !channelView && !communityView && currentTab === "home";
     if (!goingToHome && window.__homeScrollHandler) {
       window.removeEventListener("scroll", window.__homeScrollHandler);
       window.__homeScrollHandler = null;
@@ -1617,8 +1842,11 @@ _WIDGET_HTML = r"""<!doctype html>
     if (createIdentityView) { renderCreateIdentityPage(app); return; }
     if (profileView) { renderProfilePage(app, profileView); return; }
     if (threadView) { renderThreadPage(app, threadView); return; }
+    if (channelView) { renderChannelPage(app, channelView); return; }
+    if (communityView) { renderCommunityPage(app, communityView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
-    else if (currentTab === "publish") renderPublishTab(app);
+    else if (currentTab === "channels") renderChannelsTab(app);
+    else if (currentTab === "communities") renderCommunitiesTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
     else if (currentTab === "admin") renderAdminTab(app);
   }
@@ -2694,7 +2922,9 @@ _WIDGET_HTML = r"""<!doctype html>
 
   // -- Publish (PeerTube channels + Lemmy communities) ------------------------
 
-  function renderCreateForm(app, title, sub, onCreate) {
+  // -- Channels / Communities: shared list+create pattern ---------------
+
+  function openCreateEntityModal(title, sub, createPath, onCreated) {
     const idInput = el("input", { type: "text", placeholder: "id (e.g. my-show)" });
     const nameInput = el("input", { type: "text", placeholder: "Display name (optional)" });
     const identitySelect = identityState.identities.length > 1
@@ -2702,66 +2932,275 @@ _WIDGET_HTML = r"""<!doctype html>
       : null;
     const row = [idInput, nameInput];
     if (identitySelect) row.push(identitySelect);
-    app.appendChild(el("div", { class: "card" }, [
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
       el("h2", { text: title }),
-      el("div", { class: "sub", text: sub }),
-      el("div", { class: "row" }, row),
-      el("div", { class: "row" }, [
-        primaryButton("Create", (e) => {
-          if (!idInput.value.trim()) return;
-          onCreate({
-            id: idInput.value.trim(),
-            display_name: nameInput.value.trim(),
-            as_identity: identitySelect ? identitySelect.value : "",
-          }, e.target);
-        }),
-      ]),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
+    body.appendChild(el("div", { class: "sub", text: sub }));
+    body.appendChild(el("div", { class: "row" }, row));
+    body.appendChild(el("div", { class: "row" }, [
+      primaryButton("Create", (e) => {
+        if (!idInput.value.trim()) return;
+        doAction(createPath, {
+          id: idInput.value.trim(),
+          display_name: nameInput.value.trim(),
+          as_identity: identitySelect ? identitySelect.value : "",
+        }, e.target).then(() => { closeModal(); if (onCreated) onCreated(); });
+      }),
+    ]));
+    openModal(body);
+    setTimeout(() => idInput.focus(), 0);
   }
 
-  function renderChannelsSection(app) {
+  function entityListItem(e, onOpen) {
+    return el("div", { class: "list-item clickable", onclick: onOpen }, [
+      avatarEl(e.icon_url, e.display_name || e.username, "sm"),
+      el("div", { class: "meta", style: "flex:1;min-width:0;" }, [
+        el("div", { class: "name", text: e.display_name || e.username }),
+        el("div", { class: "handle", text: "@" + e.handle }),
+      ]),
+      linkButton("Manage in room", matrixToUrl(e.room_id, null)),
+    ]);
+  }
+
+  function renderChannelsTab(app) {
+    if (!ctx.peertube_channels_enabled) { placeholder(app, "PeerTube channels aren't enabled on this bridge."); return; }
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
-    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "PeerTube channels" }), list]));
+    app.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
+        el("h2", { text: "PeerTube Channels", style: "margin:0;" }),
+        primaryButton("Create Channel", () => openCreateEntityModal(
+          "Create a channel", "Hosts a PeerTube-compatible video channel as a Matrix room.",
+          "/widget/api/channels/create", () => render(),
+        )),
+      ]),
+      list,
+    ]));
     api("/widget/api/channels").then((data) => {
       list.innerHTML = "";
       if (!data.channels.length) { list.appendChild(el("div", { class: "muted", text: "No channels yet." })); return; }
       data.channels.forEach((c) => {
-        list.appendChild(el("div", { class: "list-item" }, [
-          el("span", { text: c.display_name || c.username }),
-          linkButton("Manage in room", matrixToUrl(c.room_id, null)),
-        ]));
+        const row = entityListItem(c, (ev) => {
+          if (ev.target.closest("a")) return; // "Manage in room" handles its own click
+          openChannelPage(c.username);
+        });
+        list.appendChild(row);
       });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
-    renderCreateForm(app, "Create a channel", "Hosts a PeerTube-compatible video channel as a Matrix room.", (vals, btn) => {
-      doAction("/widget/api/channels/create", vals, btn);
-    });
   }
 
-  function renderCommunitiesSection(app) {
+  function renderCommunitiesTab(app) {
+    if (!ctx.lemmy_community_hosting_enabled) { placeholder(app, "Lemmy communities aren't enabled on this bridge."); return; }
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
-    app.appendChild(el("div", { class: "card" }, [el("h2", { text: "Lemmy communities" }), list]));
+    app.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
+        el("h2", { text: "Lemmy Communities", style: "margin:0;" }),
+        primaryButton("Create Community", () => openCreateEntityModal(
+          "Create a community", "Hosts a Lemmy-compatible community as a Matrix room.",
+          "/widget/api/communities/create", () => render(),
+        )),
+      ]),
+      list,
+    ]));
     api("/widget/api/communities").then((data) => {
       list.innerHTML = "";
       if (!data.communities.length) { list.appendChild(el("div", { class: "muted", text: "No communities yet." })); return; }
       data.communities.forEach((c) => {
-        list.appendChild(el("div", { class: "list-item" }, [
-          el("span", { text: c.display_name || c.username }),
-          linkButton("Manage in room", matrixToUrl(c.room_id, null)),
-        ]));
+        const row = entityListItem(c, (ev) => {
+          if (ev.target.closest("a")) return;
+          openCommunityPage(c.username);
+        });
+        list.appendChild(row);
       });
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
-    renderCreateForm(app, "Create a community", "Hosts a Lemmy-compatible community as a Matrix room.", (vals, btn) => {
-      doAction("/widget/api/communities/create", vals, btn);
+  }
+
+  // -- Channel page: avatar/name/summary, owner controls, video tiles ---
+
+  function openChannelPage(username) {
+    channelView = { username: username };
+    profileView = null; threadView = null; createIdentityView = false; communityView = null;
+    render();
+  }
+
+  function renderVideoTile(v) {
+    const tile = el("div", { class: "video-tile" });
+    const thumbWrap = el("div", { class: "video-tile-thumb" });
+    if (v.thumbnail_url) thumbWrap.appendChild(el("img", { src: v.thumbnail_url, alt: "" }));
+    else thumbWrap.appendChild(el("div", { class: "video-tile-thumb-empty", text: "\u{1F3A5}" }));
+    if (v.sensitive) thumbWrap.appendChild(el("span", { class: "video-tile-badge", text: "Sensitive" }));
+    tile.appendChild(thumbWrap);
+    tile.appendChild(el("div", { class: "video-tile-title", text: v.name }));
+    const metaBits = [];
+    if (v.published) metaBits.push(timeAgo(v.published));
+    if (v.tags && v.tags.length) metaBits.push(v.tags.slice(0, 3).join(", "));
+    tile.appendChild(el("div", { class: "video-tile-meta", text: metaBits.join(" · ") }));
+    if (v.matrix_room_id) {
+      tile.appendChild(el("a", {
+        class: "video-tile-link", text: "View in room",
+        href: matrixToUrl(v.matrix_room_id, v.matrix_event_id), target: "_blank", rel: "noopener",
+      }));
+    }
+    return tile;
+  }
+
+  function renderChannelPage(app, view) {
+    app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { channelView = null; currentTab = "channels"; render(); } }));
+    const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+    api("/widget/api/channels/" + encodeURIComponent(view.username)).then((c) => {
+      page.innerHTML = "";
+      page.appendChild(profileBanner(c.banner_url, null));
+      const actions = el("div", { class: "row" }, [
+        linkButton("Manage in room", matrixToUrl(c.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
+      ]);
+      appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
+      if (c.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = c.summary; page.appendChild(bio); }
+      if (c.is_owner) {
+        page.appendChild(el("div", { class: "row" }, [
+          primaryButton("Publish Video", () => openPublishVideoModal(c.username, () => { loadVideos(); })),
+        ]));
+      }
+      page.appendChild(el("h2", { text: "Videos" }));
+      const grid = el("div", { class: "video-grid" }, [el("div", { class: "muted", text: "Loading…" })]);
+      page.appendChild(grid);
+      function loadVideos() {
+        grid.innerHTML = "";
+        api("/widget/api/channels/" + encodeURIComponent(view.username) + "/videos").then((data) => {
+          grid.innerHTML = "";
+          if (!data.videos.length) { grid.appendChild(el("div", { class: "muted", text: "No videos published yet." })); return; }
+          data.videos.forEach((v) => grid.appendChild(renderVideoTile(v)));
+        }).catch(() => { grid.innerHTML = ""; grid.appendChild(el("div", { class: "muted", text: "Couldn't load videos." })); });
+      }
+      loadVideos();
+    }).catch((e) => {
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: e.message || "Couldn't load that channel." }));
     });
   }
 
-  function renderPublishTab(app) {
-    if (!ctx.peertube_channels_enabled && !ctx.lemmy_community_hosting_enabled) {
-      placeholder(app, "Publishing isn't enabled on this bridge.");
-      return;
-    }
-    if (ctx.peertube_channels_enabled) renderChannelsSection(app);
-    if (ctx.lemmy_community_hosting_enabled) renderCommunitiesSection(app);
+  // -- Community page: avatar/name/summary, owner controls --------------
+
+  function openCommunityPage(username) {
+    communityView = { username: username };
+    profileView = null; threadView = null; createIdentityView = false; channelView = null;
+    render();
+  }
+
+  function renderCommunityPage(app, view) {
+    app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { communityView = null; currentTab = "communities"; render(); } }));
+    const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+    api("/widget/api/communities/" + encodeURIComponent(view.username)).then((c) => {
+      page.innerHTML = "";
+      page.appendChild(profileBanner(c.banner_url, null));
+      const actions = el("div", { class: "row" }, [
+        linkButton("Manage in room", matrixToUrl(c.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
+      ]);
+      appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
+      if (c.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = c.summary; page.appendChild(bio); }
+      page.appendChild(el("div", { class: "sub", text: c.moderator_count + " moderator" + (c.moderator_count === 1 ? "" : "s") }));
+      if (c.is_owner) {
+        page.appendChild(el("div", { class: "sub", text: "You created this community. Manage posts, moderators, and settings from its room." }));
+      }
+    }).catch((e) => {
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: e.message || "Couldn't load that community." }));
+    });
+  }
+
+  // -- Publish video modal ------------------------------------------------
+
+  function openPublishVideoModal(channelUsername, onDone) {
+    const body = el("div", { class: "card profile-modal publish-video-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Publish a video" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+
+    let uploadedMxc = "", uploadedMimetype = "", uploadedSize = null, uploadedFilename = "";
+    const mxcInput = el("input", { type: "text", placeholder: "mxc://... (paste an existing one)" });
+    const fileInput = el("input", { type: "file", accept: "video/*" });
+    const uploadStatus = el("div", { class: "sub", text: "" });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      uploadStatus.textContent = "Uploading…";
+      api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
+        method: "POST", headers: { "Content-Type": file.type || "video/mp4" }, raw: file,
+      }).then((data) => {
+        uploadedMxc = data.mxc; uploadedMimetype = data.mimetype; uploadedSize = data.size; uploadedFilename = file.name;
+        mxcInput.value = data.mxc;
+        uploadStatus.textContent = "Uploaded: " + file.name;
+      }).catch((e) => { uploadStatus.textContent = ""; toast(e.message, false); });
+    });
+    body.appendChild(el("div", { class: "sub", text: "Paste an mxc:// you already have, or upload a video file." }));
+    body.appendChild(el("div", { class: "row" }, [mxcInput]));
+    body.appendChild(el("div", { class: "row" }, [fileInput]));
+    body.appendChild(uploadStatus);
+
+    const nameInput = el("input", { type: "text", placeholder: "Title" });
+    const descInput = el("textarea", { placeholder: "Description (optional)", rows: "3" });
+    const tagsInput = el("input", { type: "text", placeholder: "Tags, comma-separated (optional)" });
+    const categorySelect = el("select", {}, [el("option", { value: "", text: "(no category)" })]);
+    const licenseSelect = el("select", {}, [el("option", { value: "", text: "(no license)" })]);
+    const languageInput = el("input", { type: "text", placeholder: "Language code, e.g. en (optional)" });
+    const sensitiveCheck = el("input", { type: "checkbox" });
+    const commentsCheck = el("input", { type: "checkbox", checked: "checked" });
+
+    api("/widget/api/video_options").then((opts) => {
+      opts.categories.forEach((c) => categorySelect.appendChild(el("option", { value: c, text: c })));
+      opts.licences.forEach((l) => licenseSelect.appendChild(el("option", { value: l, text: l })));
+    }).catch(() => {});
+
+    body.appendChild(el("div", { class: "row" }, [nameInput]));
+    body.appendChild(el("div", { class: "row" }, [descInput]));
+    body.appendChild(el("div", { class: "row" }, [tagsInput]));
+    body.appendChild(el("div", { class: "row" }, [categorySelect, licenseSelect, languageInput]));
+    body.appendChild(el("div", { class: "row" }, [
+      el("label", { class: "checkbox-label" }, [sensitiveCheck, el("span", { text: " Sensitive content" })]),
+      el("label", { class: "checkbox-label" }, [commentsCheck, el("span", { text: " Comments enabled" })]),
+    ]));
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    body.appendChild(errorBox);
+
+    const submitBtn = primaryButton("Publish", () => {
+      errorBox.style.display = "none";
+      const mxc = (mxcInput.value || "").trim();
+      if (!mxc.startsWith("mxc://")) { errorBox.textContent = "Paste an mxc:// or upload a video file first."; errorBox.style.display = ""; return; }
+      if (!nameInput.value.trim()) { errorBox.textContent = "A title is required."; errorBox.style.display = ""; return; }
+      submitBtn.disabled = true;
+      const originalText = submitBtn.textContent;
+      submitBtn.textContent = "Working…";
+      api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
+        method: "POST",
+        body: {
+          mxc: mxc,
+          filename: mxc === uploadedMxc ? uploadedFilename : "",
+          mimetype: mxc === uploadedMxc ? uploadedMimetype : "",
+          size: mxc === uploadedMxc ? uploadedSize : null,
+          name: nameInput.value.trim(),
+          description: descInput.value.trim(),
+          tags: tagsInput.value.trim(),
+          category: categorySelect.value,
+          license: licenseSelect.value,
+          language: languageInput.value.trim(),
+          sensitive: sensitiveCheck.checked,
+          comments_enabled: commentsCheck.checked,
+        },
+      }).then((data) => {
+        if (data && data.ok === false) { errorBox.textContent = data.message || "Could not publish that video."; errorBox.style.display = ""; return; }
+        toast(data.message || "Submitted.", true);
+        closeModal();
+        if (onDone) onDone();
+      }).catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+        .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+    });
+    body.appendChild(el("div", { class: "row" }, [submitBtn]));
+    openModal(body);
   }
 
   // -- Admin ------------------------------------------------------------------
