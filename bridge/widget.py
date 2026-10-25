@@ -2128,14 +2128,6 @@ _WIDGET_HTML = r"""<!doctype html>
         // widget_import's own docstring for why these come back here).
         post.matrix_room_id = data.room_id;
         post.matrix_event_id = data.event_id;
-        // Transient, never persisted or re-fetched from the server --
-        // "✓ Imported" is feedback for the click that JUST happened, not
-        // a status label. A post that was already imported before this
-        // page even loaded (already_imported came back true on the
-        // initial fetch) goes straight to "View on Matrix" instead; see
-        // renderPostCard's own branch for how the two render differently
-        // from the exact same already_imported=true state.
-        post._justImported = true;
         if (onDone) onDone();
       })
       .catch((e) => { toast(e.message, false); })
@@ -2253,18 +2245,9 @@ _WIDGET_HTML = r"""<!doctype html>
       // matrix.to click listener (MSC2931 navigate) only intercepts
       // actual anchor clicks; the post-card's own click-to-thread
       // handler already ignores anything matching closest("a"), so this
-      // needs no onclick of its own at all. "✓ Imported" only for the
-      // one render right after a live import click (post._justImported,
-      // set by importPost) -- consumed (cleared) the instant it's read
-      // here, so every OTHER render of an already-imported post -- on
-      // load, or this same card redrawn again later for any other
-      // reason -- reads "View on Matrix" instead. Past that first
-      // moment, "Imported" reads as a status label nobody asked to
-      // toggle, not feedback for an action that just happened.
-      const justImported = post._justImported;
-      post._justImported = false;
+      // needs no onclick of its own at all.
       actions.appendChild(el("a", {
-        class: "imported", text: justImported ? "✓ Imported" : "View on Matrix",
+        class: "imported", text: "View on Matrix",
         href: matrixToUrl(post.matrix_room_id, post.matrix_event_id),
         target: "_blank", rel: "noopener",
       }));
