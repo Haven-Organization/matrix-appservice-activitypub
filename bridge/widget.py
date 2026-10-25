@@ -683,7 +683,6 @@ async def widget_channels(request: Request) -> JSONResponse:
     if not config.bridge.peertube_channels_enabled:
         return JSONResponse({"enabled": False, "channels": []}, headers={"Cache-Control": "no-store"})
     repository = request.app.state.repository
-    base = config.bridge.public_base_url
     identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
     channels = [
         {
@@ -691,7 +690,7 @@ async def widget_channels(request: Request) -> JSONResponse:
             "display_name": channel.display_name,
             "owner_username": channel.owner_username,
             "room_id": channel.room_id,
-            "icon_url": media_url(base, channel.icon_url) if channel.icon_url else None,
+            "icon_url": channel.icon_url,
             "handle": f"{channel.username}@{config.bridge.domain}",
         }
         for identity in identities
@@ -733,8 +732,8 @@ async def widget_channel_detail(request: Request, username: str) -> JSONResponse
             "display_name": channel.display_name,
             "handle": f"{channel.username}@{config.bridge.domain}",
             "summary": channel.summary,
-            "icon_url": media_url(base, channel.icon_url) if channel.icon_url else None,
-            "banner_url": media_url(base, channel.banner_url) if channel.banner_url else None,
+            "icon_url": channel.icon_url,
+            "banner_url": channel.banner_url,
             "room_id": channel.room_id,
             "owner_username": channel.owner_username,
             "is_owner": owner is not None and owner.matrix_user_id == matrix_user_id,
@@ -854,7 +853,6 @@ async def widget_communities(request: Request) -> JSONResponse:
     if not config.bridge.lemmy_community_hosting_enabled:
         return JSONResponse({"enabled": False, "communities": []}, headers={"Cache-Control": "no-store"})
     repository = request.app.state.repository
-    base = config.bridge.public_base_url
     identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
     communities = [
         {
@@ -862,7 +860,7 @@ async def widget_communities(request: Request) -> JSONResponse:
             "display_name": community.display_name,
             "owner_username": community.owner_username,
             "room_id": community.room_id,
-            "icon_url": media_url(base, community.icon_url) if community.icon_url else None,
+            "icon_url": community.icon_url,
             "handle": f"{community.username}@{config.bridge.domain}",
         }
         for identity in identities
@@ -899,8 +897,8 @@ async def widget_community_detail(request: Request, username: str) -> JSONRespon
             "display_name": community.display_name,
             "handle": f"{community.username}@{config.bridge.domain}",
             "summary": community.summary,
-            "icon_url": media_url(base, community.icon_url) if community.icon_url else None,
-            "banner_url": media_url(base, community.banner_url) if community.banner_url else None,
+            "icon_url": community.icon_url,
+            "banner_url": community.banner_url,
             "room_id": community.room_id,
             "owner_username": community.owner_username,
             "is_owner": owner is not None and owner.matrix_user_id == matrix_user_id,
