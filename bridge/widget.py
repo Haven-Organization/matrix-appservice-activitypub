@@ -1156,7 +1156,7 @@ _WIDGET_HTML = r"""<!doctype html>
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 16px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     min-height: 100vh;
   }
   #content { padding: 16px; }
@@ -1243,7 +1243,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .nav-item .label { overflow: hidden; text-overflow: ellipsis; }
   #shell.collapsed .nav-item .label { display: none; }
   #shell.collapsed .nav-item { justify-content: center; }
-  #content { padding: 16px; flex: 1; min-width: 0; max-width: 640px; }
+  #content { padding: 16px; flex: 1; min-width: 0; max-width: 820px; }
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
   /* A source-level notice (needs sign-in / timed out) sits ABOVE a
      possibly-non-empty post list now, not alone on the page -- the full
@@ -1261,7 +1261,7 @@ _WIDGET_HTML = r"""<!doctype html>
     font-weight: 700; font-size: 1.1em;
   }
   .post-body { flex: 1; min-width: 0; }
-  .post-header { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+  .post-header { display: flex; align-items: baseline; gap: 6px; font-size: 14px; }
   .post-header-left { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
   .post-header-right { margin-left: auto; flex-shrink: 0; display: flex; align-items: center; gap: 2px; }
   .post-header .name { font-weight: 600; color: var(--text); }
@@ -1281,15 +1281,22 @@ _WIDGET_HTML = r"""<!doctype html>
     content: ""; position: absolute; left: 35px; top: 56px; bottom: -1px; width: 2px; background: var(--border);
   }
   .reply-to-line:hover { color: var(--accent); }
-  .post-content { font-size: 15px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
+  .post-content { font-size: 16px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
   .post-content p { margin: 0 0 8px; }
   .post-content p:last-child { margin-bottom: 0; }
   .post-content a { color: var(--accent); }
   img.emoji { width: 1.2em; height: 1.2em; vertical-align: -0.2em; object-fit: contain; }
   .post-media { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 8px 0; border-radius: var(--radius-inner); overflow: hidden; }
-  .post-media img, .post-media video { width: 100%; max-height: 300px; object-fit: cover; display: block; background: var(--hover); }
+  .post-media img, .post-media video { width: 100%; max-height: 360px; object-fit: cover; display: block; background: var(--hover); }
   .post-media-audio { width: 100%; grid-column: 1 / -1; }
-  .post-counts { display: flex; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  /* A lone attachment: full width instead of boxed into half a 2-column
+     grid, and uncropped (contain, not cover) with a taller cap so it
+     actually reads as a real embed instead of a tiny cropped square --
+     this is the single biggest gap vs. a page like nicecrew.digital's
+     own timeline, which gives a solo image/video the whole row. */
+  .post-media.single { grid-template-columns: 1fr; }
+  .post-media.single img, .post-media.single video { max-height: 560px; object-fit: contain; }
+  .post-counts { display: flex; gap: 14px; margin-top: 8px; font-size: 13px; color: var(--muted); }
   .post-counts .count-item { display: flex; align-items: center; gap: 4px; }
   .post-reactions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
   .reaction-chip {
@@ -1390,7 +1397,7 @@ _WIDGET_HTML = r"""<!doctype html>
     cursor: pointer; padding: 4px 0 12px; display: block;
   }
   .back-link:hover { color: var(--accent); }
-  .profile-page { max-width: 640px; }
+  .profile-page { max-width: 820px; }
   .profile-banner-wrap {
     position: relative; width: 100%; height: 180px; border-radius: var(--radius-card);
     overflow: hidden; background: var(--hover); margin-bottom: 44px;
@@ -2071,7 +2078,14 @@ _WIDGET_HTML = r"""<!doctype html>
     content.innerHTML = post.content_html || "";
     children.push(header, content);
     if (post.media && post.media.length) {
-      children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) => {
+      const mediaItems = post.media.slice(0, 4);
+      // A single attachment gets its own full-width, uncropped layout
+      // (see the .post-media.single CSS) instead of sitting cramped in
+      // one half of a 2-column grid meant for multiple items -- that
+      // grid shape made even a single large image render as a small
+      // postage stamp with half the row left empty.
+      const mediaClass = "post-media" + (mediaItems.length === 1 ? " single" : "");
+      children.push(el("div", { class: mediaClass }, mediaItems.map((m) => {
         if (m.type === "video") return el("video", { src: m.url, controls: "", preload: "metadata" });
         if (m.type === "audio") return el("audio", { class: "post-media-audio", src: m.url, controls: "" });
         // full_url is the real, full-resolution file -- "url" here may be
