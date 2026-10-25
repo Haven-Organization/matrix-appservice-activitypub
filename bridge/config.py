@@ -362,8 +362,9 @@ class BridgeSection:
     # feeds the widget's own default Home view -- e.g. ["mastodon.social"],
     # or several merged together by recency. Only instances running
     # Mastodon-API-compatible software (Mastodon, Pleroma/Akkoma, GoToSocial,
-    # Misskey-family) can supply one; this bridge's own AS2-only outbox has
-    # no site-wide timeline concept to browse at all. Defaults to just this
+    # Sharkey) or Misskey-family software (Misskey, Calckey, Firefish,
+    # Iceshrimp) can supply one; this bridge's own AS2-only outbox has no
+    # site-wide timeline concept to browse at all. Defaults to just this
     # bridge's own domain if left unset.
     default_timeline_domains: list[str] = field(default_factory=list)
     # The character(s) that start a bot command in chat (";follow ...",

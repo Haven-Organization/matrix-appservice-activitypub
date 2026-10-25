@@ -1,20 +1,32 @@
-"""OAuth (plus a password-grant fallback) login to a remote Mastodon-API-
-compatible instance, for the widget's Browse feature to view timelines,
-search results, and profiles that instance requires authentication for.
+"""Login to a remote instance for the widget's Browse feature to view
+timelines, search results, and profiles that instance requires
+authentication for -- two unrelated flows for the two unrelated families
+of software Browse supports (see ``bridge.widget_browse``'s own
+``_COMPATIBLE_SOFTWARE``/``_MISSKEY_FAMILY_SOFTWARE``):
 
-Steers towards OAuth: dynamically registers a bridge-owned OAuth app on
-the target domain (cached in memory -- see ``_APP_CACHE``'s own note) and
-runs the standard authorization-code redirect flow. Offers the password
-grant as an explicit fallback for instances that still support it (many
-large Mastodon-API-compatible instances have removed it entirely; that
-degrades to a clear ``InstanceAuthError``, not a crash).
+Mastodon-API-compatible instances get OAuth (plus a password-grant
+fallback): dynamically registers a bridge-owned OAuth app on the target
+domain (cached in memory -- see ``_APP_CACHE``'s own note) and runs the
+standard authorization-code redirect flow. The password grant is an
+explicit fallback for instances that still support it (many large
+instances have removed it entirely; that degrades to a clear
+``InstanceAuthError``, not a crash).
 
-Resulting tokens are durable -- ``ActorRepository.save_instance_login``/
-``get_instance_login``/..., keyed by the bridge's own ``matrix_user_id``
-(see ``InstanceLoginRecord``'s docstring for why that's the right key
-instead of a browser cookie: it's already how every widget session
-resolves identity, so a login done once works from any device the user
-later opens the widget from).
+Misskey-family instances get MiAuth instead (``start_miauth``/
+``complete_miauth``) -- a simpler redirect flow with no app-registration
+step at all, and no password-grant equivalent exposed by this module (see
+``login_with_password``'s own guard). Both land in the SAME callback URL
+(``bridge.widget_browse.browse_login_callback``), which tells them apart
+by which query params actually show up (MiAuth's own redirect carries
+``session``, OAuth's carries ``code``/``state``) rather than needing two
+separate registered callback paths.
+
+Resulting tokens are durable either way -- ``ActorRepository.
+save_instance_login``/``get_instance_login``/..., keyed by the bridge's
+own ``matrix_user_id`` (see ``InstanceLoginRecord``'s docstring for why
+that's the right key instead of a browser cookie: it's already how every
+widget session resolves identity, so a login done once works from any
+device the user later opens the widget from).
 """
 
 from __future__ import annotations
@@ -23,6 +35,7 @@ import logging
 import secrets
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 from fastapi import Request
@@ -34,6 +47,7 @@ logger = logging.getLogger(__name__)
 _REDIRECT_PATH = "/widget/api/browse/login/callback"
 _SCOPES = "read"
 _APP_NAME = "Fediverse Bridge Widget"
+_MIAUTH_PERMISSIONS = "read:account"
 
 # Per-domain OAuth app registration -- (client_id, client_secret). In
 # memory only, deliberately not persisted (see the "ask before adding a
@@ -55,6 +69,12 @@ _APP_CACHE: dict[str, tuple[str, str]] = {}
 # session of its own).
 _PENDING: dict[str, tuple[str, str, str, str, float]] = {}
 _PENDING_TTL_SECONDS = 600.0
+
+# Same idea as _PENDING, for a MiAuth session in flight -- (matrix_user_id,
+# domain, expiry). No client_id/secret to carry here: unlike OAuth, MiAuth
+# has no app-registration step at all.
+_MIAUTH_PENDING: dict[str, tuple[str, str, float]] = {}
+_MIAUTH_CALLBACK_PATH = _REDIRECT_PATH  # same URL as OAuth's -- see this module's own docstring
 
 
 class InstanceAuthError(Exception):
@@ -99,6 +119,8 @@ def _prune_pending() -> None:
     now = time.monotonic()
     for state in [s for s, (*_, exp) in _PENDING.items() if exp < now]:
         _PENDING.pop(state, None)
+    for session in [s for s, (*_, exp) in _MIAUTH_PENDING.items() if exp < now]:
+        _MIAUTH_PENDING.pop(session, None)
 
 
 async def start_oauth(request: Request, *, matrix_user_id: str, domain: str) -> str:
@@ -140,6 +162,83 @@ async def complete_oauth(request: Request, *, state: str, code: str) -> tuple[st
     )
     await _save_token(request, matrix_user_id=matrix_user_id, domain=domain, auth_method="oauth", token=token)
     return matrix_user_id, domain
+
+
+async def start_miauth(request: Request, *, matrix_user_id: str, domain: str) -> str:
+    """Begin a MiAuth sign-in (the Misskey-family login flow -- see this
+    module's own docstring). Unlike ``start_oauth``, there's no app pre-
+    registration step at all -- just a random session id the instance
+    remembers for the lifetime of this one login attempt. Returns the URL
+    the widget should open in a new tab/window, same contract as
+    ``start_oauth``."""
+    _prune_pending()
+    session = secrets.token_urlsafe(32)
+    _MIAUTH_PENDING[session] = (matrix_user_id, domain, time.monotonic() + _PENDING_TTL_SECONDS)
+    callback = f"{_public_base_url(request)}{_MIAUTH_CALLBACK_PATH}"
+    return (
+        f"https://{domain}/miauth/{session}"
+        f"?name={quote(_APP_NAME)}&callback={quote(callback)}&permission={_MIAUTH_PERMISSIONS}"
+    )
+
+
+async def complete_miauth(request: Request, *, session: str) -> tuple[str, str]:
+    """Exchange a completed MiAuth session for a token and persist it.
+    Returns ``(matrix_user_id, domain)``, same contract as
+    ``complete_oauth`` (including raising ``InstanceAuthError`` the same
+    way on an unrecognized/expired session)."""
+    _prune_pending()
+    pending = _MIAUTH_PENDING.pop(session, None)
+    if pending is None:
+        raise InstanceAuthError("This sign-in link has expired or was already used. Please try again.")
+    matrix_user_id, domain, _ = pending
+    http_client: httpx.AsyncClient = request.app.state.http_client
+    try:
+        resp = await http_client.post(f"https://{domain}/api/miauth/{session}/check", timeout=15.0)
+    except httpx.HTTPError as exc:
+        raise InstanceAuthError(f"Couldn't reach {domain}.") from exc
+    if resp.status_code >= 400:
+        raise InstanceAuthError(f"{domain} rejected the login (HTTP {resp.status_code}).")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise InstanceAuthError(f"{domain} returned an unexpected response.") from exc
+    if not body.get("ok") or not isinstance(body.get("token"), str):
+        raise InstanceAuthError(f"{domain} didn't confirm the sign-in -- it may have been cancelled.")
+    user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    account_handle = ("@" + user["username"]) if isinstance(user.get("username"), str) else ""
+    now = datetime.now(timezone.utc).isoformat()
+    repo = request.app.state.repository
+    await repo.save_instance_login(
+        InstanceLoginRecord(
+            matrix_user_id=matrix_user_id,
+            instance_domain=domain,
+            auth_method="miauth",
+            access_token=body["token"],
+            refresh_token=None,
+            token_type="misskey_i",
+            scope=_MIAUTH_PERMISSIONS,
+            account_handle=account_handle,
+            expires_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    return matrix_user_id, domain
+
+
+async def get_misskey_token(request: Request, *, matrix_user_id: str, domain: str) -> str | None:
+    """The stored MiAuth token for this bridge user at this instance, or
+    ``None`` if they aren't logged in there. Unlike ``get_bearer_token``,
+    there's no refresh step -- a MiAuth token doesn't expire the way an
+    OAuth access token does; it stays valid until the user revokes it from
+    their own Misskey settings, at which point the next authenticated call
+    simply gets refused and the caller falls back to "please sign in", the
+    same as an unauthenticated request would."""
+    repo = request.app.state.repository
+    login = await repo.get_instance_login(matrix_user_id, domain)
+    if login is None or login.auth_method != "miauth":
+        return None
+    return login.access_token
 
 
 async def login_with_password(

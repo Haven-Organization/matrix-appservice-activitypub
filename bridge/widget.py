@@ -2119,7 +2119,7 @@ _WIDGET_HTML = r"""<!doctype html>
         feed.appendChild(el("div", {
           class: "placeholder",
           text: state.unsupported
-            ? "Browsing isn't available there (it doesn't run Mastodon-compatible software, or public preview is turned off)."
+            ? "Browsing isn't available there (it doesn't run compatible software, or public preview is turned off)."
             : "Nothing to show yet.",
         }));
         return;

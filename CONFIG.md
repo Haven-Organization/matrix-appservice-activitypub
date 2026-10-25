@@ -406,7 +406,7 @@ This is separate from, and in addition to, an always-on check (not configurable)
 
 **Default:** `[]` (falls back to just this bridge's own domain)
 
-Instance domain(s) whose "whole known network" (federated) timeline the widget's Home tab shows by default -- a single popular instance, or several merged together by recency. Only instances running Mastodon-API-compatible software (Mastodon, Pleroma/Akkoma, GoToSocial, and Sharkey -- the one Misskey-family fork that also ships a real Mastodon-API-compatible layer) can supply one; a bare ActivityPub server (including another install of this bridge) or any other Misskey-family instance (Misskey itself, Calckey, Firefish, Iceshrimp) has no site-wide timeline to browse at all, and is silently skipped.
+Instance domain(s) whose "whole known network" (federated) timeline the widget's Home tab shows by default -- a single popular instance, or several merged together by recency. Supports two unrelated families of software: Mastodon-API-compatible (Mastodon, Pleroma/Akkoma, GoToSocial, and Sharkey) and native Misskey-API (Misskey, Calckey, Firefish, Iceshrimp). A bare ActivityPub server (including another install of this bridge), Lemmy, or PeerTube has no site-wide timeline to browse at all, and is silently skipped.
 
 ---
 

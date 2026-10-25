@@ -17,19 +17,26 @@ already established for using a remote instance's REST API purely as a
 discovery layer.
 
 Misskey's own native API is a conceptually similar but totally different,
-POST-based JSON-RPC-ish one, not this one -- most of its forks (Calckey/
-Firefish/Iceshrimp) speak ONLY that and are correctly skipped here.
-**Sharkey is the confirmed exception**: it ships a real, genuine Mastodon
-client-API-compatible layer alongside its native one (an official, intended
-feature -- Sharkey's own account lists "Mastodon API" among its features;
+POST-based JSON one, not this one -- it's handled as a SECOND, parallel
+family throughout this module (``_fetch_misskey_timeline``/
+``_normalize_misskey_note``/``_MISSKEY_FAMILY_SOFTWARE``, dispatched via
+``_browse_family``), not folded into the Mastodon-API path above. See
+``_MISSKEY_FAMILY_SOFTWARE``'s own comment for which software is in it and
+how confidently each one is verified -- "misskey" itself is live-verified,
+Calckey/Firefish/Iceshrimp are included on shared-codebase-lineage
+confidence only, not independently confirmed.
+
+**Sharkey is the standing exception on the OTHER side**: unlike the rest
+of the Misskey family, it ships a real, genuine Mastodon client-API-
+compatible layer alongside its native one (an official, intended feature
+-- Sharkey's own account lists "Mastodon API" among its features;
 confirmed live 2026-10-24 against a real instance, federation.network,
 software.name ``"sharkey"``: ``/api/v1/timelines/public``, ``/api/v2/
 search``, ``/api/v1/accounts/lookup``, and ``/api/v1/statuses/{id}/
-context`` all return real Mastodon-shaped JSON, unauthenticated). NOT
-confirmed for any other Misskey-family fork -- don't widen
-``_COMPATIBLE_SOFTWARE`` to the rest of the family without the same live
-verification. Lemmy and PeerTube likewise have their own separate APIs
-this module doesn't speak.
+context`` all return real Mastodon-shaped JSON, unauthenticated) -- so it
+lives in ``_COMPATIBLE_SOFTWARE`` instead of ``_MISSKEY_FAMILY_SOFTWARE``,
+and goes through the Mastodon-API path, not the Misskey one. Lemmy and
+PeerTube have their own separate APIs this module doesn't speak at all.
 
 A found/browsed post is matched against our own ``federated_events`` table
 by its ``uri`` (the same field this bridge's own ``;import`` dedups
@@ -79,6 +86,25 @@ router = APIRouter()
 _COMPATIBLE_SOFTWARE = {
     "mastodon", "pleroma", "akkoma", "hometown", "glitch-soc", "gotosocial", "sharkey",
 }
+
+# Native Misskey API family -- a totally different, POST-based JSON API
+# from the Mastodon-API-compatible set above (see _fetch_misskey_timeline/
+# _normalize_misskey_note/bridge.instance_auth's MiAuth functions).
+# "misskey" itself is live-verified (confirmed 2026-10-25 against
+# misskey.io): unauthenticated POST /api/notes/{local,global}-timeline and
+# POST /api/users/search-by-username-and-host both work, and a note's own
+# REST `id` composes deterministically into its real AP object id as
+# https://{domain}/notes/{id} -- confirmed by fetching that exact URL with
+# Accept: application/activity+json and checking the returned Note's own
+# "id" field matches, since Misskey's REST API never exposes that URI
+# directly itself. Calckey/Firefish/Iceshrimp are included on the strength
+# of being direct source forks that have historically kept this same core
+# REST surface (MiAuth, the *-timeline endpoints, the note/user JSON
+# shape) -- NOT independently live-verified the same way (no reachable
+# public instance of any of the three at the time this was written, unlike
+# Sharkey's own verification in _COMPATIBLE_SOFTWARE's history). Remove
+# any of the three here if one turns out to have actually diverged.
+_MISSKEY_FAMILY_SOFTWARE = {"misskey", "calckey", "firefish", "iceshrimp"}
 
 # Matches the Mastodon API's own default page size for timelines/search.
 _PAGE_SIZE = 20
@@ -172,6 +198,27 @@ async def _is_compatible(request: Request, domain: str) -> bool:
     return name in _COMPATIBLE_SOFTWARE
 
 
+async def _is_misskey_family(request: Request, domain: str) -> bool:
+    name = await remote_software_name(request, domain)
+    return name in _MISSKEY_FAMILY_SOFTWARE
+
+
+async def _browse_family(request: Request, domain: str) -> str | None:
+    """Which of the two families of software Browse understands ``domain``
+    runs, or ``None`` if it's neither (a bare AP server, Lemmy, PeerTube,
+    vanilla Misskey-API-incompatible software, or simply unreachable) --
+    the one check most callers actually want instead of asking
+    ``_is_compatible``/``_is_misskey_family`` separately. ``remote_software_name``
+    itself is already cached per-domain for an hour, so asking it twice
+    here is cheap."""
+    name = await remote_software_name(request, domain)
+    if name in _COMPATIBLE_SOFTWARE:
+        return "mastodon"
+    if name in _MISSKEY_FAMILY_SOFTWARE:
+        return "misskey"
+    return None
+
+
 def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[str, Any] | None:
     """A Mastodon-API status -> the shape the widget frontend renders.
     ``None`` if it's too malformed to show at all (missing the basics)."""
@@ -257,6 +304,199 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
     }
 
 
+_BARE_URL_RE = re.compile(r"https?://\S+")
+
+
+def _misskey_text_to_html(text: str) -> str:
+    """Misskey's own ``text`` field is MFM (Misskey Flavored Markdown), not
+    HTML -- nothing here parses it (no MFM parser exists in this codebase,
+    and building one is out of scope for a widget preview card). Escaped,
+    then only line breaks and bare URLs are turned into real markup, same
+    as how a plain-text Mastodon post with no HTML would already render. A
+    ``:shortcode:`` custom emoji in the text stays literal text: the
+    timeline endpoints that feed this don't return an emoji map to resolve
+    it against (unlike Mastodon's own per-status ``emojis`` field), and a
+    separate instance-wide emoji list fetch isn't worth it here."""
+    if not text:
+        return ""
+    escaped = html.escape(text)
+    linked = _BARE_URL_RE.sub(
+        lambda m: f'<a href="{m.group(0)}" rel="nofollow noopener" target="_blank">{m.group(0)}</a>', escaped
+    )
+    return linked.replace("\n", "<br>")
+
+
+def _misskey_actor_id(user: dict[str, Any], *, instance_domain: str) -> str | None:
+    """A LOCAL user's (``host`` is ``None``) actor id -- ``None`` for a
+    remote one, whose Misskey-internal id is meaningless off this
+    instance. See ``_normalize_misskey_note``'s own docstring for why."""
+    if user.get("host"):
+        return None
+    uid = user.get("id")
+    return f"https://{instance_domain}/users/{uid}" if isinstance(uid, str) and uid else None
+
+
+def _misskey_profile_url(user: dict[str, Any], *, instance_domain: str) -> str | None:
+    if user.get("host") or not isinstance(user.get("username"), str) or not user.get("username"):
+        return None
+    return f"https://{instance_domain}/@{user['username']}"
+
+
+def _misskey_handle(user: dict[str, Any], *, instance_domain: str) -> str:
+    username = user.get("username") if isinstance(user.get("username"), str) else ""
+    if not username:
+        return ""
+    host = user.get("host") if isinstance(user.get("host"), str) and user.get("host") else instance_domain
+    return f"@{username}@{host}"
+
+
+def _normalize_misskey_note(note: dict[str, Any], *, instance_domain: str) -> dict[str, Any] | None:
+    """Misskey-family equivalent of ``_normalize_status`` -- produces the
+    exact same normalized shape, so ``renderPostCard`` on the frontend
+    needs no changes to render either one. Relies on two facts confirmed
+    live against a real instance (see ``_MISSKEY_FAMILY_SOFTWARE``'s own
+    comment): a note's own REST ``id`` composes deterministically into its
+    real AP object id as ``https://{domain}/notes/{id}``, and a LOCAL
+    author's (``user.host`` is ``None``) actor id is
+    ``https://{domain}/users/{id}`` the same way. A REMOTE author's
+    Misskey-internal user id is meaningless off this instance (nothing in
+    the timeline response exposes their real cross-instance actor URI), so
+    ``actor_id`` is left ``None`` for one -- same degraded-but-safe
+    fallback ``_normalize_status`` already uses when Mastodon's own
+    ``account.uri`` happens to be missing; it just can't be clicked
+    through to a profile from here.
+
+    A pure renote (Misskey's boost, ``renoteId`` set and no added text of
+    its own) is unwrapped the same way ``_normalize_status`` unwraps a
+    Mastodon ``reblog``: ``base`` becomes the renoted note, and the outer
+    note's own author becomes ``boosted_by``. A QUOTE renote (``renoteId``
+    set AND the outer note has its own text) is deliberately NOT given the
+    same quote-preview treatment Mastodon/Pleroma get elsewhere in this
+    bridge -- out of scope here; it's shown as an ordinary standalone post
+    instead, same as this function would render it with ``renote``
+    ignored entirely."""
+    renote = note.get("renote")
+    is_pure_renote = isinstance(renote, dict) and not (note.get("text") or "").strip()
+    base = renote if is_pure_renote else note
+    if not isinstance(base, dict):
+        return None
+    base_id = base.get("id")
+    if not isinstance(base_id, str) or not base_id:
+        return None
+    uri = f"https://{instance_domain}/notes/{base_id}"
+    account = base.get("user") if isinstance(base.get("user"), dict) else {}
+    booster = note.get("user") if (is_pure_renote and isinstance(note.get("user"), dict)) else None
+
+    author_name = account.get("name") or account.get("username") or "(unknown)"
+    booster_name = (booster.get("name") or booster.get("username") or "") if booster is not None else ""
+
+    media = []
+    for f in base.get("files") or []:
+        if not isinstance(f, dict) or not isinstance(f.get("url"), str):
+            continue
+        mime = f.get("type") if isinstance(f.get("type"), str) else ""
+        kind = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else None
+        if kind is None:
+            continue
+        media.append({
+            "type": kind, "url": f["url"],
+            "description": f.get("comment") if isinstance(f.get("comment"), str) else "",
+        })
+
+    reactions = [
+        {"name": name.strip(":"), "count": count, "url": None}
+        for name, count in (base.get("reactions") or {}).items()
+        if isinstance(name, str) and isinstance(count, int) and count > 0
+    ]
+
+    cw = base.get("cw") if isinstance(base.get("cw"), str) else None
+
+    return {
+        "uri": uri,
+        "url": uri,
+        "created_at": base.get("createdAt"),
+        "content_html": _misskey_text_to_html(base.get("text") if isinstance(base.get("text"), str) else ""),
+        "sensitive": bool(cw),
+        "spoiler_text": cw or "",
+        "author": {
+            "actor_id": _misskey_actor_id(account, instance_domain=instance_domain),
+            "display_name": author_name,
+            "display_name_html": _display_name_html(author_name, {}),
+            "handle": _misskey_handle(account, instance_domain=instance_domain),
+            "avatar_url": account.get("avatarUrl") if isinstance(account.get("avatarUrl"), str) else None,
+            "url": _misskey_profile_url(account, instance_domain=instance_domain),
+        },
+        "media": media,
+        "counts": {
+            "replies": base.get("repliesCount") or 0,
+            "reblogs": base.get("renoteCount") or 0,
+            "favourites": base.get("reactionCount") or 0,
+        },
+        "reactions": reactions,
+        "in_reply_to": bool(base.get("replyId")),
+        "reply_hint_display_name": None,
+        "reply_hint_handle": None,
+        "boosted_by": (
+            {
+                "actor_id": _misskey_actor_id(booster, instance_domain=instance_domain),
+                "display_name": booster_name,
+                "display_name_html": _display_name_html(booster_name, {}),
+                "handle": _misskey_handle(booster, instance_domain=instance_domain),
+            }
+            if booster is not None else None
+        ),
+        "instance": instance_domain,
+    }
+
+
+async def _misskey_auth_body(request: Request, *, matrix_user_id: str, domain: str) -> dict[str, Any]:
+    token = await instance_auth.get_misskey_token(request, matrix_user_id=matrix_user_id, domain=domain)
+    return {"i": token} if token else {}
+
+
+async def _fetch_misskey_timeline(
+    request: Request, *, domain: str, local: bool, max_id: str | None, matrix_user_id: str
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Misskey-family equivalent of ``_fetch_timeline`` -- same return
+    shape, same meaning for each element (see that function's own
+    docstring). Misskey's API is POST-based JSON throughout (never query
+    params), and a sign-in token goes in the request BODY as ``i`` (see
+    ``_misskey_auth_body``/``bridge.instance_auth``'s MiAuth functions),
+    not an ``Authorization`` header. ``local`` maps to ``POST /api/notes/
+    local-timeline``, ``federated`` to ``POST /api/notes/global-timeline``
+    -- both confirmed live and unauthenticated against misskey.io (see
+    ``_MISSKEY_FAMILY_SOFTWARE``'s own comment). There's no Misskey
+    equivalent of Mastodon's authenticated-only "home" timeline fetched
+    here, matching ``_fetch_timeline``'s own scope (only local/federated
+    are ever requested by this module)."""
+    http_client = request.app.state.http_client
+    endpoint = "local-timeline" if local else "global-timeline"
+    body: dict[str, Any] = {"limit": _PAGE_SIZE}
+    body.update(await _misskey_auth_body(request, matrix_user_id=matrix_user_id, domain=domain))
+    if max_id:
+        body["untilId"] = max_id
+    try:
+        response = await http_client.post(f"https://{domain}/api/notes/{endpoint}", json=body)
+    except httpx.HTTPError:
+        return [], None, False
+    if response.status_code in (401, 403):
+        return [], None, True
+    if response.status_code != 200:
+        return [], None, False
+    try:
+        raw = response.json()
+    except ValueError:
+        return [], None, False
+    if not isinstance(raw, list):
+        return [], None, False
+    posts = [
+        p for p in (_normalize_misskey_note(n, instance_domain=domain) for n in raw if isinstance(n, dict))
+        if p is not None
+    ]
+    next_max_id = raw[-1].get("id") if raw and isinstance(raw[-1], dict) else None
+    return posts, (str(next_max_id) if len(raw) >= _PAGE_SIZE and next_max_id is not None else None), False
+
+
 async def _auth_headers(request: Request, *, matrix_user_id: str, domain: str) -> dict[str, str]:
     token = await instance_auth.get_bearer_token(request, matrix_user_id=matrix_user_id, domain=domain)
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -308,12 +548,26 @@ async def _mark_imported(request: Request, posts: list[dict[str, Any]]) -> None:
         post["matrix_room_id"] = existing.room_id if existing is not None else None
 
 
+async def _fetch_timeline_any(
+    request: Request, *, domain: str, family: str, local: bool, max_id: str | None, matrix_user_id: str
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Dispatches to whichever of ``_fetch_timeline``/``_fetch_misskey_timeline``
+    matches ``family`` (as returned by ``_browse_family``) -- the one
+    place that choice is made, so ``browse_timeline``/``browse_home`` don't
+    each need their own copy of it."""
+    if family == "misskey":
+        return await _fetch_misskey_timeline(
+            request, domain=domain, local=local, max_id=max_id, matrix_user_id=matrix_user_id
+        )
+    return await _fetch_timeline(request, domain=domain, local=local, max_id=max_id, matrix_user_id=matrix_user_id)
+
+
 @router.get("/widget/api/browse/software")
 async def browse_software(request: Request, domain: str) -> JSONResponse:
     _session_user(request)
     name = await remote_software_name(request, domain)
     return JSONResponse(
-        {"domain": domain, "software": name, "supported": name in _COMPATIBLE_SOFTWARE},
+        {"domain": domain, "software": name, "supported": name in _COMPATIBLE_SOFTWARE or name in _MISSKEY_FAMILY_SOFTWARE},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -323,13 +577,14 @@ async def browse_timeline(request: Request, domain: str, scope: str = "local", m
     matrix_user_id = _session_user(request)
     if scope not in ("local", "federated"):
         raise HTTPException(400, "scope must be 'local' or 'federated'")
-    if not await _is_compatible(request, domain):
+    family = await _browse_family(request, domain)
+    if family is None:
         return JSONResponse(
             {"supported": False, "needs_login": False, "posts": [], "next_max_id": None},
             headers={"Cache-Control": "no-store"},
         )
-    posts, next_max_id, needs_login = await _fetch_timeline(
-        request, domain=domain, local=(scope == "local"), max_id=max_id, matrix_user_id=matrix_user_id
+    posts, next_max_id, needs_login = await _fetch_timeline_any(
+        request, domain=domain, family=family, local=(scope == "local"), max_id=max_id, matrix_user_id=matrix_user_id
     )
     await _mark_imported(request, posts)
     return JSONResponse(
@@ -382,10 +637,12 @@ async def browse_home(request: Request, max_id_map: str = "", extra_domains: str
     async def _one(domain: str) -> tuple[str, list[dict[str, Any]], str | None, bool, bool, bool]:
         try:
             async with asyncio.timeout(_HOME_FEED_SOURCE_TIMEOUT):
-                if not await _is_compatible(request, domain):
+                family = await _browse_family(request, domain)
+                if family is None:
                     return domain, [], None, False, False, False
-                posts, next_max_id, needs_login = await _fetch_timeline(
-                    request, domain=domain, local=False, max_id=cursor_map.get(domain), matrix_user_id=matrix_user_id
+                posts, next_max_id, needs_login = await _fetch_timeline_any(
+                    request, domain=domain, family=family, local=False,
+                    max_id=cursor_map.get(domain), matrix_user_id=matrix_user_id,
                 )
                 return domain, posts, next_max_id, True, needs_login, False
         except TimeoutError:
@@ -469,9 +726,48 @@ async def browse_search(request: Request, q: str, domain: str = "") -> JSONRespo
             headers={"Cache-Control": "no-store"},
         )
 
-    if not domain or not await _is_compatible(request, domain):
+    if not domain:
+        return JSONResponse({"accounts": []}, headers={"Cache-Control": "no-store"})
+    family = await _browse_family(request, domain)
+    if family is None:
         return JSONResponse({"accounts": []}, headers={"Cache-Control": "no-store"})
     http_client = request.app.state.http_client
+
+    if family == "misskey":
+        # POST /api/users/search-by-username-and-host -- confirmed live
+        # and unauthenticated against misskey.io (see
+        # _MISSKEY_FAMILY_SOFTWARE's own comment). No sign-in token is
+        # attached here even if the user has one on file: a fuzzy account
+        # search like this one is the same best-effort discovery tool
+        # regardless of auth, unlike a timeline view an instance can
+        # genuinely gate.
+        try:
+            response = await http_client.post(
+                f"https://{domain}/api/users/search-by-username-and-host",
+                json={"username": q, "limit": 8},
+            )
+        except httpx.HTTPError:
+            return JSONResponse({"accounts": []}, headers={"Cache-Control": "no-store"})
+        if response.status_code != 200:
+            return JSONResponse({"accounts": []}, headers={"Cache-Control": "no-store"})
+        try:
+            raw = response.json()
+        except ValueError:
+            return JSONResponse({"accounts": []}, headers={"Cache-Control": "no-store"})
+        accounts = []
+        for u in raw if isinstance(raw, list) else []:
+            if not isinstance(u, dict):
+                continue
+            display_name = u.get("name") or u.get("username") or ""
+            accounts.append({
+                "actor_id": _misskey_actor_id(u, instance_domain=domain),
+                "handle": _misskey_handle(u, instance_domain=domain),
+                "display_name": display_name,
+                "display_name_html": _display_name_html(display_name, {}),
+                "avatar_url": u.get("avatarUrl") if isinstance(u.get("avatarUrl"), str) else None,
+            })
+        return JSONResponse({"accounts": accounts}, headers={"Cache-Control": "no-store"})
+
     headers = await _auth_headers(request, matrix_user_id=matrix_user_id, domain=domain)
     try:
         response = await http_client.get(
@@ -977,31 +1273,53 @@ async def browse_profile_timeline(request: Request, actor_id: str, cursor: str =
 
 @router.post("/widget/api/browse/login/start")
 async def browse_login_start(request: Request) -> JSONResponse:
-    """Begin an OAuth sign-in to ``body['domain']``. Returns a URL the
-    widget opens in a new tab (its own iframe can't navigate top-level to
-    a cross-origin page); the opened tab posts a message back and closes
-    itself once ``browse_login_callback`` below completes."""
+    """Begin a sign-in to ``body['domain']`` -- OAuth for a Mastodon-API-
+    compatible instance, MiAuth for a Misskey-family one (see
+    ``_browse_family``), whichever ``remote_software_name`` says it is.
+    Returns a URL the widget opens in a new tab (its own iframe can't
+    navigate top-level to a cross-origin page); the opened tab posts a
+    message back and closes itself once ``browse_login_callback`` below
+    completes, for either flow alike."""
     matrix_user_id = _session_user(request)
     body = await request.json()
     domain = (body.get("domain") or "").strip().lower()
     if not domain:
         raise HTTPException(400, "domain is required")
+    family = await _browse_family(request, domain)
+    if family is None:
+        raise HTTPException(400, f"Sign-in isn't available for {domain} -- it isn't a supported kind of instance.")
     try:
-        url = await instance_auth.start_oauth(request, matrix_user_id=matrix_user_id, domain=domain)
+        if family == "misskey":
+            url = await instance_auth.start_miauth(request, matrix_user_id=matrix_user_id, domain=domain)
+        else:
+            url = await instance_auth.start_oauth(request, matrix_user_id=matrix_user_id, domain=domain)
     except InstanceAuthError as exc:
         raise HTTPException(400, str(exc))
     return JSONResponse({"authorize_url": url}, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/widget/api/browse/login/callback")
-async def browse_login_callback(request: Request, code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+async def browse_login_callback(
+    request: Request, code: str = "", state: str = "", session: str = "", error: str = ""
+) -> HTMLResponse:
     """The instance redirects the user's real browser tab here after they
-    approve (or deny) the OAuth prompt -- this is a bare top-level page
+    approve (or deny) the sign-in prompt -- this is a bare top-level page
     load, not a widget-authenticated API call, so it has no session of
-    its own; ``state`` (minted by ``browse_login_start``) is what
-    reconnects it to the bridge user who started the flow."""
+    its own. OAuth's own redirect carries ``code``/``state`` (minted by
+    ``start_oauth``); MiAuth's carries ``session`` (minted by
+    ``start_miauth``) instead -- whichever one actually shows up is what
+    tells the two flows apart here and reconnects it to the bridge user
+    who started it, since both land on this same URL (see
+    ``bridge.instance_auth``'s own module docstring for why one shared
+    callback path is simpler than registering two)."""
     if error:
         message, ok = f"Sign-in was cancelled or denied ({error}).", False
+    elif session:
+        try:
+            _matrix_user_id, domain = await instance_auth.complete_miauth(request, session=session)
+            message, ok = f"Signed in to {domain}. You can close this tab.", True
+        except InstanceAuthError as exc:
+            message, ok = str(exc), False
     elif not code or not state:
         message, ok = "Missing sign-in response from the instance.", False
     else:
@@ -1030,6 +1348,15 @@ async def browse_login_password(request: Request) -> JSONResponse:
     password = body.get("password") or ""
     if not domain or not username or not password:
         raise HTTPException(400, "domain, username, and password are all required")
+    if await _is_misskey_family(request, domain):
+        # Misskey-family has no password-grant equivalent exposed by this
+        # module -- MiAuth (the "Sign in" button's own OAuth-equivalent
+        # path) is the only sign-in method for one. Checked explicitly so
+        # this fails with a clear reason instead of a confusing generic
+        # HTTP error from login_with_password trying (and failing) to
+        # register an OAuth app that doesn't exist on this kind of
+        # instance.
+        raise HTTPException(400, f"{domain} doesn't support username/password sign-in -- use the main Sign in button instead.")
     try:
         await instance_auth.login_with_password(
             request, matrix_user_id=matrix_user_id, domain=domain, username=username, password=password
