@@ -1283,9 +1283,16 @@ _WIDGET_HTML = r"""<!doctype html>
   .reply-to-line { font-size: 12px; color: var(--muted); margin-bottom: 4px; cursor: pointer; }
   /* A connecting line from this card's avatar down into the next card's --
      the ancestor chain leading up to the thread root, and a direct reply
-     that the focused post's own author continued replying to. */
+     that the focused post's own author continued replying to. No
+     border-top divider between a chain-linked pair (previously ran
+     RIGHT THROUGH the connector, and bottom: -1px stopped the line at
+     this card's own edge rather than reaching the next card's avatar
+     another 16px of padding down -- together reading as a broken,
+     disconnected line rather than Haven's own unbroken avatar-to-avatar
+     one, confirmed live 2026-10-25). */
+  .post-card.chain-link + .post-card { border-top: none; }
   .post-card.chain-link::after {
-    content: ""; position: absolute; left: 35px; top: 56px; bottom: -1px; width: 2px; background: var(--border);
+    content: ""; position: absolute; left: 35px; top: 56px; bottom: -17px; width: 2px; background: var(--border);
   }
   .reply-to-line:hover { color: var(--accent); }
   .post-content { font-size: 16px; line-height: 1.5; margin: 4px 0; overflow-wrap: break-word; }
