@@ -1707,6 +1707,10 @@ class PostgresActorRepository:
             return None
         return GuildMembership(username=row["username"], guild_actor_id=row["guild_actor_id"])
 
+    async def list_guild_memberships(self, username: str) -> list[GuildMembership]:
+        rows = await self._pool.fetch("SELECT * FROM guild_memberships WHERE username = $1", username)
+        return [GuildMembership(username=row["username"], guild_actor_id=row["guild_actor_id"]) for row in rows]
+
     async def is_guild_member(self, guild_actor_id: str) -> bool:
         row = await self._pool.fetchrow(
             "SELECT 1 FROM guild_memberships WHERE guild_actor_id = $1 LIMIT 1", guild_actor_id

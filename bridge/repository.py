@@ -816,6 +816,13 @@ class ActorRepository(Protocol):
         if they aren't (or never were) a member."""
         ...
 
+    async def list_guild_memberships(self, username: str) -> list[GuildMembership]:
+        """Every guild ``username`` is currently a member of -- the widget's
+        own Guilds list (``bridge.widget.widget_guilds``), the inverse of
+        ``list_guild_members`` above (which lists members of ONE guild,
+        not guilds of one member)."""
+        ...
+
     async def is_guild_member(self, guild_actor_id: str) -> bool:
         """Whether ANY local actor is currently a member of
         ``guild_actor_id`` -- guards against a redundant ``;joinguild`` for
@@ -1759,6 +1766,9 @@ class InMemoryActorRepository:
 
     async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
         return self._guild_memberships.get((username, guild_actor_id))
+
+    async def list_guild_memberships(self, username: str) -> list[GuildMembership]:
+        return [m for (u, _gid), m in self._guild_memberships.items() if u == username]
 
     async def is_guild_member(self, guild_actor_id: str) -> bool:
         return any(gid == guild_actor_id for _, gid in self._guild_memberships)

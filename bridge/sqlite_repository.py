@@ -2245,6 +2245,15 @@ class SqliteActorRepository:
     async def get_guild_membership(self, username: str, guild_actor_id: str) -> GuildMembership | None:
         return await self._run(self._get_guild_membership, username, guild_actor_id)
 
+    def _list_guild_memberships(self, username: str) -> list[GuildMembership]:
+        rows = self._conn.execute(
+            "SELECT * FROM guild_memberships WHERE username = ?", (username,)
+        ).fetchall()
+        return [GuildMembership(username=row["username"], guild_actor_id=row["guild_actor_id"]) for row in rows]
+
+    async def list_guild_memberships(self, username: str) -> list[GuildMembership]:
+        return await self._run(self._list_guild_memberships, username)
+
     def _is_guild_member(self, guild_actor_id: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM guild_memberships WHERE guild_actor_id = ? LIMIT 1", (guild_actor_id,)

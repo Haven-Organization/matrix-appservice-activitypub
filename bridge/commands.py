@@ -2497,11 +2497,17 @@ async def _reinvite_to_guild_space(request: Request, *, guild_actor_id: str, mat
     )
 
 
-async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> None:
-    """``;leaveguild``, run inside one of that guild's own Channel rooms --
-    sends a real ``Undo(Follow)`` (the spec-correct way to leave, so a
-    server that DOES handle it properly stops treating us as a member) and
-    drops this bridge's own local membership tracking.
+async def _execute_leave_guild(
+    request: Request, *, actor_record: ActorRecord, guild_actor_id: str,
+) -> tuple[bool, str]:
+    """Core of ``;leaveguild``: sends a real ``Undo(Follow)`` (the spec-
+    correct way to leave, so a server that DOES handle it properly stops
+    treating us as a member) and drops this bridge's own local membership
+    tracking. Shared by the room-scoped ``;leaveguild`` command below
+    (which resolves ``guild_actor_id`` from the Channel room it's run in)
+    and the widget's own Guilds list (``widget_leave_guild``), which
+    already has ``guild_actor_id`` directly off the membership list it's
+    rendering and has no Channel room to resolve it from at all.
 
     Only the local side actually takes effect right now: confirmed live
     2026-07-14 by reading Shoot's own ``Undo`` handler
@@ -2511,38 +2517,24 @@ async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> 
     it), so Shoot itself never actually removes the membership, its cached
     (possibly avatar-less -- see ``bridge.channel_bridge``'s own docstring
     on why a stale cache can get permanently stuck) ``User``/``Member``
-    row, or anything else. This command still sends the Undo (it's free,
-    and correct behavior for any OTHER implementation that DOES honor it)
-    and still drops OUR OWN tracking regardless -- ``;joinguild`` on a
-    NEW guild is unaffected by any of this either way, since it's keyed
-    entirely by that guild's own distinct ``guild_actor_id``."""
+    row, or anything else. This still sends the Undo (it's free, and
+    correct behavior for any OTHER implementation that DOES honor it) and
+    still drops OUR OWN tracking regardless -- ``;joinguild`` on a NEW
+    guild is unaffected by any of this either way, since it's keyed
+    entirely by that guild's own distinct ``guild_actor_id``.
+
+    Returns ``(ok, message)`` -- ``message`` is the same notice text
+    either caller shows verbatim."""
     repository = request.app.state.repository
-    channel_room = await repository.get_channel_room_by_room_id(room_id)
-    if channel_room is None:
-        await _notice(
-            request, room_id, f'"{_COMMAND_PREFIX}leaveguild" only works inside one of that guild\'s own Channel rooms.',
-        )
-        return
-
-    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
-    if actor_record is None:
-        await _notice(
-            request, room_id,
-            f'You need a linked profile before leaving a guild -- run "{_COMMAND_PREFIX}link profile" '
-            "in your own room first.",
-        )
-        return
-
     config = request.app.state.config
     base = config.bridge.public_base_url
-    guild_actor_id = channel_room.guild_actor_id
     own_actor_id = actor_url(base, actor_record.username)
 
     try:
         guild_doc = await fetch_actor(request, guild_actor_id)
     except RemoteActorFetchError as exc:
-        await _notice(request, room_id, f"Could not fetch the guild's own actor document: {exc}")
-        return
+        return False, f"Could not fetch the guild's own actor document: {exc}"
+
     guild_inbox = guild_doc.get("inbox")
     if guild_inbox:
         undo_activity = Activity(
@@ -2564,12 +2556,91 @@ async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> 
 
     await repository.remove_guild_membership(actor_record.username, guild_actor_id)
     guild_name = guild_doc.get("name") or guild_doc.get("preferredUsername") or guild_actor_id
-    await _notice(
-        request, room_id,
+    return True, (
         f"Left {guild_name} on this bridge's own side. Its Space and Channel rooms are untouched -- "
         f'leave them yourself in Matrix if you don\'t want them anymore. Note: Shoot itself doesn\'t '
-        f"actually process guild-leave yet, so it will still list you as a member there regardless.",
+        f"actually process guild-leave yet, so it will still list you as a member there regardless."
     )
+
+
+async def _handle_leaveguild(request: Request, *, sender: str, room_id: str) -> None:
+    """``;leaveguild``, run inside one of that guild's own Channel rooms
+    -- see ``_execute_leave_guild`` for the actual mechanics, shared with
+    the widget's own Guilds list."""
+    repository = request.app.state.repository
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    if channel_room is None:
+        await _notice(
+            request, room_id, f'"{_COMMAND_PREFIX}leaveguild" only works inside one of that guild\'s own Channel rooms.',
+        )
+        return
+
+    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
+    if actor_record is None:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile before leaving a guild -- run "{_COMMAND_PREFIX}link profile" '
+            "in your own room first.",
+        )
+        return
+
+    _ok, message = await _execute_leave_guild(request, actor_record=actor_record, guild_actor_id=channel_room.guild_actor_id)
+    await _notice(request, room_id, message)
+
+
+async def widget_list_guilds(request: Request, *, matrix_user_id: str) -> list[dict]:
+    """Every guild any of this Matrix user's OWN local identities has
+    joined -- the widget's Guilds list. Guild membership is tracked per
+    local-actor username (``GuildMembership``), not per Matrix user
+    directly, since ``;joinguild`` runs as whichever identity is active
+    in the room it's run from -- so this checks every identity this
+    account has, not just the currently-active one, the same multi-
+    identity awareness the widget's own Identity tab already has.
+    De-duplicated by guild (the same guild joined under two different
+    identities only ever shows up once, attributed to whichever identity
+    this happens to see first)."""
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    seen: set[str] = set()
+    guilds: list[dict] = []
+    for identity in identities:
+        for membership in await repository.list_guild_memberships(identity.username):
+            if membership.guild_actor_id in seen:
+                continue
+            seen.add(membership.guild_actor_id)
+            try:
+                guild_doc = await fetch_actor(request, membership.guild_actor_id)
+            except RemoteActorFetchError:
+                guild_doc = {}
+            space_room_id = await repository.get_guild_space(membership.guild_actor_id)
+            guilds.append({
+                "guild_actor_id": membership.guild_actor_id,
+                "name": guild_doc.get("name") or guild_doc.get("preferredUsername") or membership.guild_actor_id,
+                "icon_url": extract_icon_url(guild_doc),
+                "space_room_id": space_room_id,
+                "joined_as": identity.username,
+            })
+    guilds.sort(key=lambda g: g["name"].lower())
+    return guilds
+
+
+async def widget_leave_guild(request: Request, *, matrix_user_id: str, guild_actor_id: str) -> tuple[bool, str]:
+    """Leaves a guild from the widget's own Guilds list -- same mechanics
+    as ``;leaveguild`` (``_execute_leave_guild``), just resolved directly
+    from ``guild_actor_id`` (already known from the membership list the
+    widget is rendering) instead of requiring a Channel room of that
+    guild to run the command from, which the Guilds list has no reason to
+    be embedded in."""
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+    actor_record = None
+    for identity in identities:
+        if await repository.get_guild_membership(identity.username, guild_actor_id) is not None:
+            actor_record = identity
+            break
+    if actor_record is None:
+        return False, "You're not a member of that guild."
+    return await _execute_leave_guild(request, actor_record=actor_record, guild_actor_id=guild_actor_id)
 
 
 async def _handle_unfollow(request: Request, *, sender: str, room_id: str, handle: str, content: dict) -> None:
@@ -5481,10 +5552,27 @@ async def _handle_refresh_guild_invite(request: Request, *, sender: str, room_id
     code, domain = argument.split("@", 1)
     code = code.removeprefix("invite:")
 
+    _ok, message = await _execute_set_guild_invite_code(request, guild_actor_id=guild_actor_id, code=code, domain=domain)
+    await _notice(request, room_id, message)
+
+
+async def _execute_set_guild_invite_code(
+    request: Request, *, guild_actor_id: str, code: str, domain: str,
+) -> tuple[bool, str]:
+    """Core of ``;refresh guild invite``: stores ``code``/``domain`` on
+    the guild's Space (``bridge.spaces.set_guild_invite_code``) and
+    resyncs any CURRENT local member who doesn't already have an
+    accepted Follow for this guild (``_resync_guild_members``). Shared by
+    the room-scoped command above and the widget's own Guilds-list
+    invite-code management (``widget_set_guild_invite_code``), which has
+    no guild Space/Channel room to resolve ``guild_actor_id`` from the
+    way the command does -- it already has it directly off the
+    membership list it's rendering. Returns ``(ok, message)``, the same
+    notice text either caller shows verbatim."""
+    repository = request.app.state.repository
     space_room_id = await repository.get_guild_space(guild_actor_id)
     if space_room_id is None:
-        await _notice(request, room_id, "This guild has no Matrix Space on record -- something's gone wrong.")
-        return
+        return False, "This guild has no Matrix Space on record -- something's gone wrong."
 
     await set_guild_invite_code(request, space_room_id=space_room_id, code=code, domain=domain)
 
@@ -5497,7 +5585,24 @@ async def _handle_refresh_guild_invite(request: Request, *, sender: str, room_id
         if failed:
             summary += f" ({failed} couldn't be joined -- they'll need to run {_COMMAND_PREFIX}joinguild themselves)"
         summary += "."
-    await _notice(request, room_id, summary)
+    return True, summary
+
+
+async def widget_set_guild_invite_code(
+    request: Request, *, matrix_user_id: str, guild_actor_id: str, code: str, domain: str,
+) -> tuple[bool, str]:
+    """Sets a guild's stored invite code from the widget's own Guilds
+    list -- same mechanics and admin-gating as ``;refresh guild invite``
+    (``_execute_set_guild_invite_code``), just resolved directly from
+    ``guild_actor_id`` instead of requiring the guild's own Space/Channel
+    room to run the command from."""
+    if not await _is_matrix_admin(request, matrix_user_id):
+        return False, "Only a Matrix server admin can set a guild's invite code."
+    code = code.strip().removeprefix("invite:")
+    domain = domain.strip()
+    if not code or not domain:
+        return False, "Both a code and a domain are required."
+    return await _execute_set_guild_invite_code(request, guild_actor_id=guild_actor_id, code=code, domain=domain)
 
 
 async def _resync_guild_members(
