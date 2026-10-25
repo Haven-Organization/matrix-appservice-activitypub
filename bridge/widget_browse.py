@@ -51,10 +51,12 @@ new ways to discover a URL worth importing.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import html
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -66,6 +68,8 @@ from bridge import instance_auth
 from bridge.commands import _discover_mastodon_api_reply_notes
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.remote_actor import RemoteActorFetchError, fetch_actor
+from bridge.activitypub.routes import _build_profile_post_views
+from bridge.activitypub.urls import username_from_actor_url
 from bridge.activitypub.webfinger import WebfingerError, resolve_remote_actor_id
 from bridge.instance_auth import InstanceAuthError
 from bridge.widget import _session_user
@@ -1260,9 +1264,129 @@ async def browse_profile(request: Request, actor_id: str) -> JSONResponse:
     return JSONResponse(profile, headers={"Cache-Control": "no-store"})
 
 
+def _post_view_to_widget_post(view: Any) -> dict[str, Any]:
+    """Converts a ``bridge.web_views.PostView`` (built by
+    ``bridge.activitypub.routes._build_post_view``, the same building
+    block the HTML profile page's own post list uses) into the identical
+    normalized post dict shape ``_normalize_status``/
+    ``_normalize_misskey_note``/``_normalize_ap_item`` all already
+    produce -- so ``renderPostCard`` on the frontend needs no changes to
+    render one of these either."""
+    media: list[dict[str, Any]] = []
+    if view.attachment:
+        ap_type = view.attachment.get("type") or ""
+        kind = "image" if ap_type == "Image" else "video" if ap_type == "Video" else None
+        if kind and isinstance(view.attachment.get("url"), str):
+            media.append({"type": kind, "url": view.attachment["url"], "description": ""})
+    favourites = view.reactions.like_count + sum(e.count for e in view.reactions.emojis)
+    created_at = (
+        datetime.fromtimestamp(view.origin_server_ts / 1000, tz=timezone.utc).isoformat()
+        if view.origin_server_ts else None
+    )
+    return {
+        "uri": view.ap_object_id,
+        "url": view.source_url or view.ap_object_id,
+        "created_at": created_at,
+        "content_html": view.content_html,
+        "sensitive": False,
+        "spoiler_text": "",
+        "author": {
+            "actor_id": view.author_profile_url,
+            "display_name": view.author_display_name,
+            "display_name_html": view.author_display_name_html,
+            "handle": view.author_handle,
+            "avatar_url": view.author_avatar_url,
+            "url": view.author_profile_url,
+        },
+        "media": media,
+        # Not tracked per-post by PostView (the HTML page doesn't show
+        # them either) -- favourites alone, from the reactions this bridge
+        # DOES track, same degraded-but-honest shape _normalize_status
+        # falls back to when a field genuinely isn't available.
+        "counts": {"replies": 0, "reblogs": 0, "favourites": favourites},
+        "reactions": [],
+        "in_reply_to": False,
+        "reply_hint_display_name": None,
+        "reply_hint_handle": None,
+        "boosted_by": None,
+        "instance": urlparse(view.ap_object_id).hostname or "",
+    }
+
+
+async def _fetch_local_actor_profile_page(
+    request: Request, *, record: Any, cursor_map: dict[str, str | None]
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """The widget's own equivalent of the public HTML profile page's post
+    list (``bridge.activitypub.routes._build_profile_post_views``), but
+    additionally merged across ``record``'s current Profile Room AND every
+    room it replaced (``ActorRepository.get_profile_room_history`` --
+    same source ``get_outbox`` merges from), neither of which alone
+    covers both: ``get_outbox`` merges rooms but only ever reads ONE
+    shallow batch per room (confirmed live: a profile with plenty of real
+    history came back with only 2 posts), while
+    ``_build_profile_post_views`` deep-paginates properly but only ever
+    looks at the current room, missing anything posted before the
+    Profile Room was last replaced. Reported live 2026-10-25: the
+    widget's own "Posts" list (riding on the shallow ``get_outbox`` path
+    via ``_fetch_outbox_page``) was missing posts the HTML page itself
+    showed.
+
+    ``cursor_map`` is ``{room_id: synapse_pagination_token_or_None}``,
+    carried from the previous page (``None`` for a room whose own history
+    is already exhausted -- never queried again after that). Each room is
+    deep-paginated independently via ``_build_profile_post_views`` (reused
+    verbatim, not reimplemented, via ``dataclasses.replace`` to point the
+    same ``record`` at each room in turn), then every room's results are
+    merged and re-sorted by recency -- same reasoning as ``get_outbox``'s
+    own per-room-then-merge shape, just with real pagination depth this
+    time."""
+    repository = request.app.state.repository
+    past_room_ids = await repository.get_profile_room_history(record.username)
+    room_ids = [record.room_id] + [r for r in past_room_ids if r != record.room_id]
+
+    views = []
+    next_cursor_map: dict[str, str] = {}
+    for room_id in room_ids:
+        if room_id in cursor_map and cursor_map[room_id] is None:
+            continue  # this room's own history was already exhausted on an earlier page
+        room_record = dataclasses.replace(record, room_id=room_id)
+        room_posts, next_token = await _build_profile_post_views(
+            request, room_record, from_token=cursor_map.get(room_id)
+        )
+        views.extend(room_posts)
+        if next_token:
+            next_cursor_map[room_id] = next_token
+    views.sort(key=lambda v: v.origin_server_ts, reverse=True)
+    return [_post_view_to_widget_post(v) for v in views], next_cursor_map
+
+
 @router.get("/widget/api/browse/profile/timeline")
 async def browse_profile_timeline(request: Request, actor_id: str, cursor: str = "") -> JSONResponse:
+    """``cursor`` means two different things depending on whether
+    ``actor_id`` is local or remote -- opaque either way to the frontend,
+    which only ever echoes back whatever ``next_cursor`` it was last
+    given (see ``renderProfilePostFeed``'s own call site): a real AS2
+    collection-page URL for a remote actor (``_fetch_outbox_page``'s own
+    cursor), or a JSON-encoded ``{room_id: token}`` map for a local one
+    (``_fetch_local_actor_profile_page``'s own cursor -- see its
+    docstring for why a local actor needs an entirely different fetch
+    path in the first place, not just a different cursor shape)."""
     _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    username = username_from_actor_url(config.bridge.public_base_url, actor_id)
+    record = await repository.get_local_actor(username) if username else None
+    if record is not None and record.room_id:
+        try:
+            cursor_map: dict[str, str | None] = json.loads(cursor) if cursor else {}
+        except ValueError:
+            cursor_map = {}
+        posts, next_cursor_map = await _fetch_local_actor_profile_page(request, record=record, cursor_map=cursor_map)
+        await _mark_imported(request, posts)
+        return JSONResponse(
+            {"posts": posts, "next_cursor": json.dumps(next_cursor_map) if next_cursor_map else ""},
+            headers={"Cache-Control": "no-store"},
+        )
     posts, next_cursor = await _fetch_outbox_page(request, actor_id=actor_id, cursor=cursor or None)
     await _mark_imported(request, posts)
     return JSONResponse({"posts": posts, "next_cursor": next_cursor or ""}, headers={"Cache-Control": "no-store"})
