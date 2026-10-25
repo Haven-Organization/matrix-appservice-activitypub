@@ -812,6 +812,32 @@ async def widget_upload_video(request: Request, username: str) -> JSONResponse:
     )
 
 
+@router.post("/widget/api/channels/{username}/upload_thumbnail")
+async def widget_upload_thumbnail(request: Request, username: str) -> JSONResponse:
+    """Same shape as ``widget_upload_video`` right above, for a video's
+    thumbnail image instead -- either one the user picked by hand, or one
+    the widget generated itself client-side from a frame of the video
+    (see ``extractVideoThumbnail``), uploaded here exactly the same way
+    either way. The resulting ``mxc://`` goes in ``thumbnail_mxc`` on
+    ``/widget/api/channels/{username}/publish``, which
+    ``_handle_publish`` already reads as a first-class thumbnail source
+    (``info.get(\"thumbnail_url\")``) -- nothing new needed on that end,
+    publishing from the widget just never had a way to set it before."""
+    _session_user(request)
+    config = request.app.state.config
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "No image data received")
+    content_type = request.headers.get("content-type") or "image/jpeg"
+    try:
+        mxc = await request.app.state.synapse.upload_media(
+            data, content_type, f"{username}-thumbnail", as_user_id=_bot_mxid(config),
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "Could not upload that thumbnail to the homeserver.") from exc
+    return JSONResponse({"mxc": mxc}, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/widget/api/channels/{username}/publish")
 async def widget_channel_publish(request: Request, username: str) -> JSONResponse:
     matrix_user_id = _session_user(request)
@@ -1292,6 +1318,7 @@ _WIDGET_HTML = r"""<!doctype html>
     border: 1px solid var(--border); border-radius: var(--radius-inner);
   }
   .file-preview-icon { font-size: 22px; flex-shrink: 0; }
+  .file-preview-thumb-img { width: 48px; height: 27px; object-fit: cover; border-radius: var(--radius-chip); flex-shrink: 0; background: var(--hover); }
   .file-preview-meta { flex: 1; min-width: 0; }
   .file-preview-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file-preview-size { font-size: 12px; }
@@ -3138,6 +3165,39 @@ _WIDGET_HTML = r"""<!doctype html>
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
 
+  // Grabs one frame of videoSrc (an object URL for a locally-staged File,
+  // or a real https:// media URL) as a JPEG Blob -- used both for the
+  // thumbnail preview and the actual upload, so what's previewed is
+  // exactly what gets published. Seeks a little way in rather than
+  // grabbing frame zero: a video's very first frame is often a black
+  // flash/fade-in, so ~1s (or 10% into a very short clip) is the usual
+  // convention for an auto-generated thumbnail.
+  function extractVideoThumbnail(videoSrc) {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+      video.src = videoSrc;
+      video.addEventListener("loadedmetadata", () => {
+        video.currentTime = Math.min(1, (video.duration || 2) * 0.1);
+      });
+      video.addEventListener("seeked", () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((blob) => {
+            if (blob) resolve(blob);
+            else reject(new Error("Could not generate a thumbnail from that video."));
+          }, "image/jpeg", 0.85);
+        } catch (e) { reject(e); }
+      });
+      video.addEventListener("error", () => reject(new Error("Could not load that video to generate a thumbnail.")));
+    });
+  }
+
   function openPublishVideoModal(channelUsername, onDone) {
     const body = el("div", { class: "card profile-modal publish-video-modal" });
     body.appendChild(el("div", { class: "row" }, [
@@ -3206,6 +3266,47 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(filePreview);
     body.appendChild(webmWarning);
 
+    // Thumbnail: pick an image by hand, or leave it and one gets grabbed
+    // automatically from a frame of the video at publish time (only
+    // possible when uploading a file directly -- there's no client-side
+    // way to generate one from a bare pasted mxc:// without fetching it
+    // first, so that path stays manual-thumbnail-only or none at all,
+    // same as before this feature existed).
+    let thumbnailFile = null;
+    const thumbnailInput = el("input", { type: "file", accept: "image/*" });
+    const thumbnailPreview = el("div", { class: "file-preview", style: "display:none" });
+    function clearThumbnail() {
+      thumbnailFile = null;
+      thumbnailInput.value = "";
+      thumbnailPreview.style.display = "none";
+      thumbnailPreview.innerHTML = "";
+      thumbnailInput.style.display = "";
+    }
+    function showThumbnailPreview(file) {
+      thumbnailPreview.innerHTML = "";
+      thumbnailPreview.style.display = "";
+      const img = el("img", { class: "file-preview-thumb-img", src: URL.createObjectURL(file), alt: "" });
+      thumbnailPreview.appendChild(img);
+      thumbnailPreview.appendChild(el("div", { class: "file-preview-meta" }, [
+        el("div", { class: "file-preview-name", text: file.name }),
+        el("div", { class: "file-preview-size muted", text: formatFileSize(file.size) }),
+      ]));
+      thumbnailPreview.appendChild(el("button", {
+        class: "file-preview-remove", text: "✕", title: "Remove",
+        onclick: (e) => { e.preventDefault(); clearThumbnail(); },
+      }));
+      thumbnailInput.style.display = "none";
+    }
+    thumbnailInput.addEventListener("change", () => {
+      const file = thumbnailInput.files[0];
+      if (!file) return;
+      thumbnailFile = file;
+      showThumbnailPreview(file);
+    });
+    body.appendChild(el("div", { class: "sub", text: "Thumbnail (optional) -- leave blank to grab one from the video automatically." }));
+    body.appendChild(el("div", { class: "row" }, [thumbnailInput]));
+    body.appendChild(thumbnailPreview);
+
     const nameInput = el("input", { type: "text", placeholder: "Title" });
     const descInput = el("textarea", { class: "form-textarea", placeholder: "Description (optional)", rows: "3" });
     const tagsInput = el("input", { type: "text", placeholder: "Tags, comma-separated (optional)" });
@@ -3243,12 +3344,33 @@ _WIDGET_HTML = r"""<!doctype html>
       submitBtn.disabled = true;
       const originalText = submitBtn.textContent;
 
-      function doPublish(mxc, filename, mimetype, size) {
+      function uploadThumbnail(blob, filename) {
+        return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_thumbnail", {
+          method: "POST", headers: { "Content-Type": blob.type || "image/jpeg" }, raw: blob,
+        }).then((data) => data.mxc);
+      }
+      function resolveThumbnailMxc() {
+        if (thumbnailFile) return uploadThumbnail(thumbnailFile, thumbnailFile.name);
+        if (!selectedFile) return Promise.resolve(""); // paste-mxc path -- no local video to grab a frame from
+        submitBtn.textContent = "Generating thumbnail…";
+        const objectUrl = URL.createObjectURL(selectedFile);
+        return extractVideoThumbnail(objectUrl)
+          .then((blob) => uploadThumbnail(blob, "thumbnail.jpg"))
+          // Best-effort: a failed auto-thumbnail should never block
+          // publishing the video itself -- same "no thumbnail is just a
+          // degraded case, not an error" fallback _handle_publish's own
+          // confirmation message already describes.
+          .catch(() => "")
+          .finally(() => URL.revokeObjectURL(objectUrl));
+      }
+
+      function doPublish(mxc, filename, mimetype, size, thumbnailMxc) {
         submitBtn.textContent = "Publishing…";
         return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
           method: "POST",
           body: {
             mxc: mxc, filename: filename || "", mimetype: mimetype || "", size: size || null,
+            thumbnail_mxc: thumbnailMxc || "",
             name: nameInput.value.trim(),
             description: descInput.value.trim(),
             tags: tagsInput.value.trim(),
@@ -3269,11 +3391,14 @@ _WIDGET_HTML = r"""<!doctype html>
       let publishPromise;
       if (selectedFile) {
         submitBtn.textContent = "Uploading…";
-        publishPromise = api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
-          method: "POST", headers: { "Content-Type": selectedFile.type || "video/mp4" }, raw: selectedFile,
-        }).then((data) => doPublish(data.mxc, selectedFile.name, data.mimetype, data.size));
+        publishPromise = Promise.all([
+          api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
+            method: "POST", headers: { "Content-Type": selectedFile.type || "video/mp4" }, raw: selectedFile,
+          }),
+          resolveThumbnailMxc(),
+        ]).then(([data, thumbnailMxc]) => doPublish(data.mxc, selectedFile.name, data.mimetype, data.size, thumbnailMxc));
       } else {
-        publishPromise = doPublish(pastedMxc, "", "", null);
+        publishPromise = resolveThumbnailMxc().then((thumbnailMxc) => doPublish(pastedMxc, "", "", null, thumbnailMxc));
       }
       publishPromise
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
