@@ -276,6 +276,12 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
             # can't play at all (confirmed live 2026-10-25, the other
             # half of "some videos not loading").
             "url": m.get("url") if kind in ("video", "audio") else (m.get("preview_url") or m.get("url")),
+            # The real, full-resolution file -- for an image this can
+            # differ from "url" above (a preview thumbnail); for
+            # video/audio it's the same value. Lets the frontend link an
+            # image tile's full size separately from the smaller
+            # thumbnail it actually displays.
+            "full_url": m.get("url"),
             "description": m.get("description") if isinstance(m.get("description"), str) else "",
         })
     booster = status.get("account") if (reblog is not None and isinstance(status.get("account"), dict)) else None

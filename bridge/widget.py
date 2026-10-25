@@ -1266,6 +1266,8 @@ _WIDGET_HTML = r"""<!doctype html>
   .post-header-right { margin-left: auto; flex-shrink: 0; display: flex; align-items: center; gap: 2px; }
   .post-header .name { font-weight: 600; color: var(--text); }
   .post-header .handle, .post-header .time { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .post-header .time { text-decoration: none; }
+  .post-header .time:hover { text-decoration: underline; }
   .view-icon-btn { border: none; background: none; color: var(--muted); font-size: 13px; padding: 0 0 0 4px; cursor: pointer; flex-shrink: 0; line-height: 1; }
   .view-icon-btn:hover { color: var(--text); }
   .post-timestamp-full { font-size: 12px; color: var(--muted); margin: 6px 0; }
@@ -2052,7 +2054,13 @@ _WIDGET_HTML = r"""<!doctype html>
     ]);
     const headerRightChildren = [];
     if (!focused) {
-      headerRightChildren.push(el("span", { class: "time", text: timeAgo(post.created_at), title: fullDateTime(post.created_at) }));
+      // A real <a> (not a click handler on a <span>) so right-click ->
+      // "Copy Link" works too, not just a left-click open -- the ↗ button
+      // right next to it only ever supported the latter.
+      headerRightChildren.push(el("a", {
+        class: "time", text: timeAgo(post.created_at), title: fullDateTime(post.created_at),
+        href: post.url, target: "_blank", rel: "noopener",
+      }));
     }
     headerRightChildren.push(el("button", {
       class: "view-icon-btn", text: "↗", title: "Open on " + (post.instance || "their instance"),
@@ -2066,7 +2074,13 @@ _WIDGET_HTML = r"""<!doctype html>
       children.push(el("div", { class: "post-media" }, post.media.slice(0, 4).map((m) => {
         if (m.type === "video") return el("video", { src: m.url, controls: "", preload: "metadata" });
         if (m.type === "audio") return el("audio", { class: "post-media-audio", src: m.url, controls: "" });
-        return el("img", { src: m.url, alt: m.description || "", loading: "lazy" });
+        // full_url is the real, full-resolution file -- "url" here may be
+        // a smaller preview/thumbnail chosen for fast feed loading (see
+        // _normalize_status's own comment), so the link target and the
+        // thumbnail shown aren't always the same URL.
+        return el("a", { href: m.full_url || m.url, target: "_blank", rel: "noopener" }, [
+          el("img", { src: m.url, alt: m.description || "", loading: "lazy" }),
+        ]);
       })));
     }
     if (focused) {
