@@ -58,8 +58,8 @@ from bridge.commands import (
     _handle_joinguild,
     _handle_link_profile,
     _handle_mute,
-    _handle_rejoin,
     _list_unfollowed_ghost_rooms,
+    _rejoin_invite,
     _RoomListingUnreliable,
     _handle_replace_room,
     _handle_set,
@@ -392,20 +392,88 @@ async def widget_leave_unfollowed_execute(request: Request) -> JSONResponse:
     return await _dispatch(request, body.get("room_id", ""), _execute_leave_unfollowed)
 
 
-@router.post("/widget/api/rejoin")
-async def widget_rejoin(request: Request) -> JSONResponse:
-    """";rejoin profile" + ";rejoin space" back to back -- the self-service
-    recovery shortcut, global like the Identity tab it lives in rather
-    than needing a specific room's own context. Never targets anyone but
-    the caller (no `[@other]` support here) -- that admin-only escape
-    hatch stays chat-only, same scoping decision as the original widget
-    plan's gap audit made for it."""
+_RECOVERY_ROOM_KINDS = ("profile", "notifications", "space")
+
+
+async def _resolve_recovery_room_id(request: Request, *, matrix_user_id: str, kind: str) -> str | None:
+    """The room id for one of the three Account-recovery row kinds, always
+    re-resolved server-side (never trusted from the client) -- shared by
+    widget_recovery_rooms (status) and widget_rejoin_room (the actual
+    invite) so they can never disagree about which room a row means.
+    "profile" is the CURRENTLY ACTIVE identity's Profile Room specifically
+    (not every identity's, unlike ";rejoin profile"/the old blanket
+    "Rejoin my rooms" button this replaces) -- it's shown per-identity in
+    the widget, so its Rejoin button should only ever touch that one row's
+    room. "notifications"/"space" are account-wide, same as the bot DM
+    room and Fediverse space always have been."""
+    repository = request.app.state.repository
+    if kind == "profile":
+        active = await repository.get_active_local_actor(matrix_user_id)
+        return active.room_id if active is not None else None
+    if kind == "notifications":
+        return await repository.get_bot_dm_room(matrix_user_id)
+    if kind == "space":
+        return await repository.get_user_space(matrix_user_id)
+    raise HTTPException(400, "Unknown room kind")
+
+
+@router.get("/widget/api/recovery_rooms")
+async def widget_recovery_rooms(request: Request) -> JSONResponse:
+    """Status (room id + open/rejoin/not_created) for the three bridge-
+    managed rooms tied to this account -- the ACTIVE identity's Profile
+    Room, the account-wide Notifications (bot DM) room, and the account-
+    wide Fediverse Space -- backing the Settings tab's Account recovery
+    section. "Currently in it" is checked live via a joined_members call
+    (the bot is always a member of all three once created, so this never
+    needs the Synapse Admin API the way a bridge-wide room sweep would)
+    rather than trusted from any bridge bookkeeping, since the whole point
+    of this panel is recovering from exactly the kind of state where
+    bookkeeping and reality have diverged (a force-leave, a bad knock
+    rule, ...)."""
+    matrix_user_id = _session_user(request)
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(request.app.state.config)
+
+    async def status_for(kind: str) -> dict:
+        room_id = await _resolve_recovery_room_id(request, matrix_user_id=matrix_user_id, kind=kind)
+        if room_id is None:
+            return {"room_id": None, "status": "not_created"}
+        try:
+            members = await synapse.get_joined_members(room_id, as_user_id=bot_mxid)
+        except SynapseError:
+            # Recorded, but couldn't confirm live membership right now
+            # (room gone, transient error, ...) -- treat the same as "not
+            # currently in it" rather than failing the whole panel; a
+            # Rejoin click's own error will surface anything genuinely
+            # wrong.
+            return {"room_id": room_id, "status": "rejoin"}
+        return {"room_id": room_id, "status": "open" if matrix_user_id in members else "rejoin"}
+
+    return JSONResponse(
+        {kind: await status_for(kind) for kind in _RECOVERY_ROOM_KINDS},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/rejoin_room")
+async def widget_rejoin_room(request: Request) -> JSONResponse:
+    """Re-invite the session's own Matrix user into exactly one of the
+    three Account-recovery rows' rooms -- the per-row "Rejoin" button.
+    Never targets anyone but the caller (no `[@other]` support here) --
+    that admin-only escape hatch stays chat-only, same scoping decision
+    as the rest of this widget's recovery tools."""
     matrix_user_id = _session_user(request)
     body = await request.json()
-    target_room_id = body.get("room_id", "")
+    kind = body.get("kind", "")
+    notice_room_id = body.get("room_id", "")
+    target_room_id = await _resolve_recovery_room_id(request, matrix_user_id=matrix_user_id, kind=kind)
+    if target_room_id is None:
+        raise HTTPException(404, "That room hasn't been created yet")
     try:
-        await _handle_rejoin(request, sender=matrix_user_id, room_id=target_room_id, argument="profile")
-        await _handle_rejoin(request, sender=matrix_user_id, room_id=target_room_id, argument="space")
+        await _rejoin_invite(
+            request, room_id=notice_room_id, target_room_id=target_room_id,
+            target_mxid=matrix_user_id, as_user_id=_bot_mxid(request.app.state.config),
+        )
     except SynapseError as exc:
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
     return JSONResponse({"ok": True})
@@ -3128,6 +3196,64 @@ _WIDGET_HTML = r"""<!doctype html>
     loadLogins();
   }
 
+  // -- Account recovery --------------------------------------------------
+  //
+  // Per-room-type status (Open/Rejoin/Not Created) for the three bridge-
+  // managed rooms tied to this account, replacing the old single blanket
+  // "Rejoin my rooms" button -- see widget_recovery_rooms' own docstring
+  // for why "profile" here means the ACTIVE identity specifically.
+
+  const _RECOVERY_ROWS = [
+    { kind: "profile", label: "Profile Room" },
+    { kind: "notifications", label: "Notifications Room" },
+    { kind: "space", label: "Space" },
+  ];
+
+  function renderAccountRecoveryCard(app) {
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Account recovery" }),
+      el("div", { class: "sub", text: "Locked out of one of these (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
+      list,
+    ]));
+
+    function load() {
+      api("/widget/api/recovery_rooms").then((data) => {
+        list.innerHTML = "";
+        _RECOVERY_ROWS.forEach((row) => {
+          const info = data[row.kind] || { room_id: null, status: "not_created" };
+          const meta = el("div", { style: "min-width:0;" }, [
+            el("div", { text: row.label, style: "font-weight:600;font-size:13px;" }),
+          ]);
+          if (info.room_id) {
+            meta.appendChild(el("div", {
+              class: "muted", text: info.room_id,
+              style: "font-size:11px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+            }));
+          }
+          let actionBtn;
+          if (info.status === "open") {
+            actionBtn = linkButton("Open", matrixToUrl(info.room_id, null));
+          } else if (info.status === "not_created") {
+            actionBtn = el("button", { disabled: "disabled", text: "Not Created" });
+          } else {
+            actionBtn = plainButton("Rejoin", (e) => {
+              e.target.disabled = true;
+              api("/widget/api/rejoin_room", { method: "POST", body: { kind: row.kind, room_id: roomId } })
+                .then(() => { toast("Invited -- check your rooms.", true); load(); })
+                .catch((err) => { toast(err.message, false); e.target.disabled = false; });
+            });
+          }
+          list.appendChild(el("div", { class: "list-item" }, [meta, actionBtn]));
+        });
+      }).catch(() => {
+        list.innerHTML = "";
+        list.appendChild(el("div", { class: "muted", text: "Couldn't load." }));
+      });
+    }
+    load();
+  }
+
   // -- Settings ---------------------------------------------------------------
   //
   // Everything left over once identity switching/creation moved to the
@@ -3148,14 +3274,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
     renderThisRoomSection(app);
     renderInstanceLoginsCard(app);
-
-    app.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Account recovery" }),
-      el("div", { class: "sub", text: "Locked out of your Profile Room or Space (e.g. after a Matrix account deactivation force-left you)? Re-invite yourself." }),
-      el("div", { class: "row" }, [
-        plainButton("Rejoin my rooms", (e) => doAction("/widget/api/rejoin", {}, e.target)),
-      ]),
-    ]));
+    renderAccountRecoveryCard(app);
 
     const leaveCard = el("div", { class: "card" }, [
       el("h2", { text: "Leave unfollowed rooms" }),
