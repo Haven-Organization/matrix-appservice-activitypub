@@ -1651,16 +1651,46 @@ _WIDGET_HTML = r"""<!doctype html>
       .then((data) => {
         toast("Imported.", true);
         post.already_imported = true;
-        // Without these the "Imported" badge that replaces the Import
-        // button would link to matrix.to/#/null until the next full
+        // Without these the "View on Matrix" link that replaces the Import
+        // button would point at matrix.to/#/null until the next full
         // reload re-fetches this post with its real ids (see
         // widget_import's own docstring for why these come back here).
         post.matrix_room_id = data.room_id;
         post.matrix_event_id = data.event_id;
+        // Transient, never persisted or re-fetched from the server --
+        // "✓ Imported" is feedback for the click that JUST happened, not
+        // a status label. A post that was already imported before this
+        // page even loaded (already_imported came back true on the
+        // initial fetch) goes straight to "View on Matrix" instead; see
+        // renderPostCard's own branch for how the two render differently
+        // from the exact same already_imported=true state.
+        post._justImported = true;
         if (onDone) onDone();
       })
       .catch((e) => { toast(e.message, false); })
       .finally(() => { if (btn) btn.disabled = false; });
+  }
+
+  // A standalone card (a profile's own post list, a thread's ancestors/
+  // replies) has nowhere to delegate a real re-render to the way the Home
+  // feed's own cards do (passing renderFeedList as onChange -- see its own
+  // call site -- rebuilds that whole list). Those callers used to pass a
+  // no-op instead, so importPost's own post.already_imported/matrix_room_id/
+  // matrix_event_id updates (see its own comment) never reached the DOM:
+  // the button kept reading "Import" until the next full page load, even
+  // though the import itself had already succeeded (reported live:
+  // importing from a thread's focused post left the button unchanged until
+  // navigating away and back). This swaps just that one card's own node in
+  // place instead, independent of whatever page it's sitting in.
+  function renderLiveCard(post, opts) {
+    const holder = { node: null };
+    function onChange() {
+      const fresh = renderLiveCard(post, opts);
+      holder.node.replaceWith(fresh);
+      holder.node = fresh;
+    }
+    holder.node = renderPostCard(post, onChange, opts);
+    return holder.node;
   }
 
   function renderPostCard(post, onChange, opts) {
@@ -1733,9 +1763,18 @@ _WIDGET_HTML = r"""<!doctype html>
       // matrix.to click listener (MSC2931 navigate) only intercepts
       // actual anchor clicks; the post-card's own click-to-thread
       // handler already ignores anything matching closest("a"), so this
-      // needs no onclick of its own at all.
+      // needs no onclick of its own at all. "✓ Imported" only for the
+      // one render right after a live import click (post._justImported,
+      // set by importPost) -- consumed (cleared) the instant it's read
+      // here, so every OTHER render of an already-imported post -- on
+      // load, or this same card redrawn again later for any other
+      // reason -- reads "View on Matrix" instead. Past that first
+      // moment, "Imported" reads as a status label nobody asked to
+      // toggle, not feedback for an action that just happened.
+      const justImported = post._justImported;
+      post._justImported = false;
       actions.appendChild(el("a", {
-        class: "imported", text: "✓ Imported",
+        class: "imported", text: justImported ? "✓ Imported" : "View on Matrix",
         href: matrixToUrl(post.matrix_room_id, post.matrix_event_id),
         target: "_blank", rel: "noopener",
       }));
@@ -1991,7 +2030,7 @@ _WIDGET_HTML = r"""<!doctype html>
       loading = true;
       api("/widget/api/browse/profile/timeline?actor_id=" + encodeURIComponent(actorId) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""))
         .then((data) => {
-          data.posts.forEach((post) => { post.author = author; feed.appendChild(renderPostCard(post, function () {})); });
+          data.posts.forEach((post) => { post.author = author; feed.appendChild(renderLiveCard(post)); });
           cursor = data.next_cursor || "";
           done = !cursor;
         })
@@ -2172,7 +2211,7 @@ _WIDGET_HTML = r"""<!doctype html>
       const chain = (data.ancestors || []).concat([data.post]);
       chain.forEach((p, i) => {
         const isFocus = i === chain.length - 1;
-        const card = renderPostCard(p, function () {}, { focused: isFocus });
+        const card = renderLiveCard(p, { focused: isFocus });
         card.classList.add(isFocus ? "thread-focus" : "thread-ancestor");
         if (!isFocus) card.classList.add("chain-link");
         rootChain.appendChild(card);
@@ -2187,11 +2226,11 @@ _WIDGET_HTML = r"""<!doctype html>
         // conversation branch, not a flat series.
         data.replies.forEach((reply) => {
           const branch = el("div", { class: "card" });
-          const replyCard = renderPostCard(reply, function () {});
+          const replyCard = renderLiveCard(reply);
           if (reply.op_reply) {
             replyCard.classList.add("chain-link");
             branch.appendChild(replyCard);
-            branch.appendChild(renderPostCard(reply.op_reply, function () {}));
+            branch.appendChild(renderLiveCard(reply.op_reply));
           } else {
             branch.appendChild(replyCard);
           }
