@@ -1202,7 +1202,7 @@ async def _resolve_pretty_url_via_search(request: Request, *, raw_uri: str, matr
 
 
 @router.get("/widget/api/browse/thread")
-async def browse_thread(request: Request, uri: str) -> JSONResponse:
+async def browse_thread(request: Request, uri: str, known_child_uri: str = "") -> JSONResponse:
     matrix_user_id = _session_user(request)
     focus_doc = await _fetch_as2_note(request, uri)
     if focus_doc is None:
@@ -1252,6 +1252,26 @@ async def browse_thread(request: Request, uri: str) -> JSONResponse:
         # descendant's own inReplyTo.
         descendant_pool = await _fetch_context_descendant_pool(request, origin_uri=uri, fallback_object_id=focus_id)
         reply_docs = [d for d in descendant_pool if d.get("inReplyTo") == focus_id][:_THREAD_MAX_REPLIES]
+
+    if known_child_uri and not any(d.get("id") == known_child_uri for d in reply_docs):
+        # A reply the CALLER already knows exists -- see openThreadView's
+        # own frontend comment: this is set only when navigating up to an
+        # ancestor from a thread already open, where we just walked this
+        # exact post's own inReplyTo chain to get here. Fetched and
+        # prepended directly rather than trusted to come out of
+        # _fetch_direct_children/_fetch_context_descendant_pool above,
+        # since BOTH of those can legitimately come up completely empty
+        # for an instance whose Mastodon-API id doesn't match the
+        # canonical AS2 id clicked into (confirmed live 2026-10-25,
+        # nicecrew.digital: its AS2 "replies" collection reports
+        # totalItems: 0 despite real replies existing, and the Mastodon-
+        # API /context guess built from a /objects/<uuid> id 404s because
+        # that instance's actual status id is a DIFFERENT string only its
+        # own /notice/<id> permalink carries, which this fetched AS2
+        # document never exposes anywhere to reconstruct from).
+        known_child_doc = await _fetch_as2_note(request, known_child_uri)
+        if known_child_doc is not None:
+            reply_docs = [known_child_doc, *reply_docs][:_THREAD_MAX_REPLIES]
 
     focus_author_id = focus_doc.get("attributedTo")
     op_reply_docs = await asyncio.gather(

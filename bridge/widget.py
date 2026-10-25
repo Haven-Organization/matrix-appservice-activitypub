@@ -2138,7 +2138,7 @@ _WIDGET_HTML = r"""<!doctype html>
     // which should do its own thing instead.
     card.addEventListener("click", (e) => {
       if (e.target.closest("a, button, .clickable")) return;
-      openThreadView(post.uri);
+      openThreadView(post.uri, opts && opts.knownChildUri);
     });
     card.classList.add("open-thread");
     return card;
@@ -2621,9 +2621,20 @@ _WIDGET_HTML = r"""<!doctype html>
     render();
   }
 
-  function openThreadView(uri) {
+  function openThreadView(uri, knownChildUri) {
     if (!uri) return;
-    threadView = { uri: uri };
+    // knownChildUri: when navigating UP to an ancestor from a thread
+    // already open, we just walked its own inReplyTo chain to get here,
+    // so we already KNOW at least this one reply exists -- see
+    // renderThreadPage's own chain.forEach, which supplies it. Passed
+    // straight through to the backend so it's never at the mercy of
+    // whatever reply-discovery happens to work (or doesn't) on that
+    // instance (confirmed live 2026-10-25: a Pleroma post's own
+    // Mastodon-API-context-search fallback can come up completely empty
+    // even though a reply definitely exists, when the canonical AS2 id
+    // clicked into isn't the same id its Mastodon API actually indexes
+    // by -- see _fetch_context_descendant_pool's own comment).
+    threadView = { uri: uri, knownChildUri: knownChildUri || null };
     profileView = null;
     render();
   }
@@ -2738,7 +2749,8 @@ _WIDGET_HTML = r"""<!doctype html>
     const page = el("div", { class: "profile-page thread-page" }, [el("div", { class: "muted", text: "Loading…" })]);
     app.appendChild(page);
 
-    api("/widget/api/browse/thread?uri=" + encodeURIComponent(view.uri)).then((data) => {
+    const qs = "uri=" + encodeURIComponent(view.uri) + (view.knownChildUri ? "&known_child_uri=" + encodeURIComponent(view.knownChildUri) : "");
+    api("/widget/api/browse/thread?" + qs).then((data) => {
       page.innerHTML = "";
       if (!data.post) {
         page.appendChild(el("div", { class: "muted", text: "Couldn't load that post." }));
@@ -2751,7 +2763,12 @@ _WIDGET_HTML = r"""<!doctype html>
       const chain = (data.ancestors || []).concat([data.post]);
       chain.forEach((p, i) => {
         const isFocus = i === chain.length - 1;
-        const card = renderLiveCard(p, { focused: isFocus });
+        // The next link down this SAME chain is a real, already-known
+        // reply to p -- see openThreadView's own comment for why this
+        // gets threaded through on click instead of trusting reply-
+        // discovery alone once p becomes the new focus.
+        const knownChildUri = !isFocus && chain[i + 1] ? chain[i + 1].uri : null;
+        const card = renderLiveCard(p, { focused: isFocus, knownChildUri: knownChildUri });
         card.classList.add(isFocus ? "thread-focus" : "thread-ancestor");
         if (!isFocus) card.classList.add("chain-link");
         rootChain.appendChild(card);
