@@ -510,9 +510,39 @@ async def send_repost(
             # _build_repost_message's identical guard: an empty
             # social.body/formatted_body would be pure noise, not a
             # disambiguation a compliant client actually needs.
-            if preview_text:
-                notice_content[SOCIAL_BODY_FIELD] = preview_text
-                notice_content[SOCIAL_FORMATTED_BODY_FIELD] = html.escape(preview_text)
+            #
+            # preview_text (used above for the human-readable quote_block_html/
+            # plain_body_full blockquote) is deliberately truncated to
+            # _PREVIEW_TEXT_LIMIT -- fine for a glanceable card, but a
+            # compliant MSC4501 client treating social.body/formatted_body as
+            # the reposted post's real content needs the genuine full text,
+            # not "…"-cut-off mid-word/mid-link (reported live: a verifier
+            # compared this snapshot against the real post and flagged the
+            # truncation as a possible forgery). preview_full_content is the
+            # reposted event's own untouched content dict (see
+            # _fetch_post_preview's docstring), so prefer ITS OWN
+            # SOCIAL_BODY_FIELD/SOCIAL_FORMATTED_BODY_FIELD when it has one --
+            # that's already exactly the quoter's own comment with any
+            # "RT: <link>" quote-post fallback line stripped out (see
+            # _strip_quote_tail/_strip_quote_tail_html), so reusing it here
+            # keeps this snapshot and the original in sync instead of
+            # re-deriving (and risking re-diverging from) that same stripping
+            # logic. Only an ordinary, non-quote post -- which never had a
+            # reason to set those fields itself -- falls back to its own
+            # plain body/formatted_body, still the full untruncated text.
+            if SOCIAL_BODY_FIELD in preview_full_content:
+                social_body = preview_full_content.get(SOCIAL_BODY_FIELD) or ""
+                social_formatted_body = preview_full_content.get(SOCIAL_FORMATTED_BODY_FIELD) or (
+                    html.escape(social_body) if social_body else ""
+                )
+            else:
+                social_body = (preview_full_content.get("body") or "").strip()
+                social_formatted_body = preview_full_content.get("formatted_body") or (
+                    html.escape(social_body) if social_body else ""
+                )
+            if social_body:
+                notice_content[SOCIAL_BODY_FIELD] = social_body
+                notice_content[SOCIAL_FORMATTED_BODY_FIELD] = social_formatted_body
         per_message_profile = await _build_per_message_profile(request, actor_record)
         if per_message_profile is not None:
             notice_content[PER_MESSAGE_PROFILE_FIELD] = per_message_profile
