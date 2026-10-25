@@ -1243,7 +1243,14 @@ _WIDGET_HTML = r"""<!doctype html>
   .nav-item .label { overflow: hidden; text-overflow: ellipsis; }
   #shell.collapsed .nav-item .label { display: none; }
   #shell.collapsed .nav-item { justify-content: center; }
-  #content { padding: 16px; flex: 1; min-width: 0; max-width: 820px; }
+  /* A hard, fixed-pixel cap (not a percentage) -- on a very wide monitor
+     (not split side-by-side with anything else), nicecrew.digital's own
+     timeline column stops growing well short of the full window and
+     leaves the rest of the space to its own sidebar content, rather than
+     letting the reading column itself balloon. We have no sidebar
+     content to put there, so this just stops growing and leaves the
+     space blank -- same effect, simpler cause. */
+  #content { padding: 16px; flex: 1; min-width: 0; max-width: 700px; }
   .placeholder { text-align: center; color: var(--muted); padding: 48px 16px; font-size: 13px; }
   /* A source-level notice (needs sign-in / timed out) sits ABOVE a
      possibly-non-empty post list now, not alone on the page -- the full
@@ -1397,7 +1404,7 @@ _WIDGET_HTML = r"""<!doctype html>
     cursor: pointer; padding: 4px 0 12px; display: block;
   }
   .back-link:hover { color: var(--accent); }
-  .profile-page { max-width: 820px; }
+  .profile-page { max-width: 700px; }
   .profile-banner-wrap {
     position: relative; width: 100%; height: 180px; border-radius: var(--radius-card);
     overflow: hidden; background: var(--hover); margin-bottom: 44px;
