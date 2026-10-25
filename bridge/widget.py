@@ -866,6 +866,9 @@ async def widget_channel_publish(request: Request, username: str) -> JSONRespons
             comments_enabled=body.get("comments_enabled", True) is not False,
             description=(body.get("description") or "").strip(),
             thumbnail_mxc=(body.get("thumbnail_mxc") or "").strip(),
+            duration_ms=body.get("duration_ms") if isinstance(body.get("duration_ms"), (int, float)) else None,
+            width=body.get("width") if isinstance(body.get("width"), (int, float)) else None,
+            height=body.get("height") if isinstance(body.get("height"), (int, float)) else None,
         )
     except SynapseError as exc:
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
@@ -3165,6 +3168,30 @@ _WIDGET_HTML = r"""<!doctype html>
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
 
+  // Reads duration/width/height off a locally-staged File via an
+  // offscreen <video> element, the one piece of real video metadata a
+  // raw-bytes upload can't carry on its own (unlike a native Matrix
+  // client, which probes the file and sets these on content.info BEFORE
+  // sending -- see widget_publish_video's own docstring for why this
+  // matters: PeerTube's remote-video import silently discards a video
+  // with no duration, the exact same "delivery succeeds, nothing ever
+  // appears, no error anywhere" failure class as a missing thumbnail).
+  function probeVideoMetadata(videoSrc) {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.src = videoSrc;
+      video.addEventListener("loadedmetadata", () => {
+        resolve({
+          durationMs: isFinite(video.duration) ? Math.round(video.duration * 1000) : null,
+          width: video.videoWidth || null,
+          height: video.videoHeight || null,
+        });
+      });
+      video.addEventListener("error", () => reject(new Error("Could not read that video's metadata.")));
+    });
+  }
+
   // Grabs one frame of videoSrc (an object URL for a locally-staged File,
   // or a real https:// media URL) as a JPEG Blob -- used both for the
   // thumbnail preview and the actual upload, so what's previewed is
@@ -3210,6 +3237,10 @@ _WIDGET_HTML = r"""<!doctype html>
     // doPublish below), so changing your mind (or picking a different
     // file) never wastes an upload.
     let selectedFile = null;
+    // {durationMs, width, height} or null -- probed the instant a file is
+    // chosen (see probeVideoMetadata's own docstring for why this needs
+    // to happen at all).
+    let selectedFileMeta = null;
     const mxcInput = el("input", { type: "text", placeholder: "mxc://... (paste an existing one)" });
     const fileInput = el("input", { type: "file", accept: "video/*" });
     const webmWarning = el("div", { class: "form-warning", style: "display:none" });
@@ -3217,6 +3248,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
     function clearFile() {
       selectedFile = null;
+      selectedFileMeta = null;
       fileInput.value = "";
       filePreview.style.display = "none";
       filePreview.innerHTML = "";
@@ -3255,6 +3287,11 @@ _WIDGET_HTML = r"""<!doctype html>
       webmWarning.textContent = isWebm
         ? "⚠️ .webm files don't play correctly once federated to PeerTube -- mp4 is the safest choice."
         : "";
+      const objectUrl = URL.createObjectURL(file);
+      probeVideoMetadata(objectUrl)
+        .then((meta) => { if (selectedFile === file) selectedFileMeta = meta; })
+        .catch(() => {}) // best-effort -- publishing still proceeds without duration/dimensions
+        .finally(() => URL.revokeObjectURL(objectUrl));
     });
     mxcInput.addEventListener("input", () => {
       fileInput.disabled = !!mxcInput.value.trim();
@@ -3364,13 +3401,16 @@ _WIDGET_HTML = r"""<!doctype html>
           .finally(() => URL.revokeObjectURL(objectUrl));
       }
 
-      function doPublish(mxc, filename, mimetype, size, thumbnailMxc) {
+      function doPublish(mxc, filename, mimetype, size, thumbnailMxc, meta) {
         submitBtn.textContent = "Publishing…";
         return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
           method: "POST",
           body: {
             mxc: mxc, filename: filename || "", mimetype: mimetype || "", size: size || null,
             thumbnail_mxc: thumbnailMxc || "",
+            duration_ms: meta ? meta.durationMs : null,
+            width: meta ? meta.width : null,
+            height: meta ? meta.height : null,
             name: nameInput.value.trim(),
             description: descInput.value.trim(),
             tags: tagsInput.value.trim(),
@@ -3391,14 +3431,24 @@ _WIDGET_HTML = r"""<!doctype html>
       let publishPromise;
       if (selectedFile) {
         submitBtn.textContent = "Uploading…";
+        // selectedFileMeta is usually already populated (probed the instant
+        // the file was chosen -- see fileInput's own change handler), but a
+        // Publish click right after picking a file could beat that probe to
+        // the punch; re-probing here if it's not ready yet (same function,
+        // same file) is cheap and makes sure duration/width/height are
+        // never silently skipped just from timing.
+        const metaPromise = selectedFileMeta
+          ? Promise.resolve(selectedFileMeta)
+          : probeVideoMetadata(URL.createObjectURL(selectedFile)).catch(() => null);
         publishPromise = Promise.all([
           api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
             method: "POST", headers: { "Content-Type": selectedFile.type || "video/mp4" }, raw: selectedFile,
           }),
           resolveThumbnailMxc(),
-        ]).then(([data, thumbnailMxc]) => doPublish(data.mxc, selectedFile.name, data.mimetype, data.size, thumbnailMxc));
+          metaPromise,
+        ]).then(([data, thumbnailMxc, meta]) => doPublish(data.mxc, selectedFile.name, data.mimetype, data.size, thumbnailMxc, meta));
       } else {
-        publishPromise = resolveThumbnailMxc().then((thumbnailMxc) => doPublish(pastedMxc, "", "", null, thumbnailMxc));
+        publishPromise = resolveThumbnailMxc().then((thumbnailMxc) => doPublish(pastedMxc, "", "", null, thumbnailMxc, null));
       }
       publishPromise
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })

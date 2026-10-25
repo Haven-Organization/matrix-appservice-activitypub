@@ -6544,6 +6544,7 @@ async def widget_publish_video(
     mxc: str, filename: str, mimetype: str, size: int | None,
     name: str, category: str, licence: str, language: str, tags: str,
     sensitive: bool, comments_enabled: bool, description: str, thumbnail_mxc: str,
+    duration_ms: int | None = None, width: int | None = None, height: int | None = None,
 ) -> tuple[bool, str]:
     """Publishes a video to a channel from the widget's own Publish form.
 
@@ -6565,6 +6566,24 @@ async def widget_publish_video(
     whose body is the same ``key: value`` text ``;publish`` itself parses)
     rather than reimplementing any of its validation/AP-building/delivery
     logic.
+
+    ``duration_ms``/``width``/``height`` -- a browser upload has no way to
+    carry real video metadata in the raw bytes POST itself (unlike a
+    native Matrix client, which probes the file and sets these on
+    ``content.info`` before sending), so the widget's own publish form
+    probes them client-side (an offscreen ``<video>`` element) and passes
+    them along here to go in the SAME place a native client's own upload
+    would have put them. Without a real ``duration``, PeerTube's own
+    remote-video validator silently discards the video entirely on
+    import -- same failure class as a missing icon (see
+    ``bridge.peertube``'s own ``DEFAULT_THUMBNAIL_WIDTH``/``HEIGHT``
+    comment for the icon case, and this field's own ``Video.uuid``
+    docstring in ``bridge.activitypub.models`` for the identical
+    "delivery succeeds, video never appears, no error anywhere" pattern)
+    -- confirmed live 2026-10-25: the first two videos ever published
+    through this widget feature had no duration (this parameter didn't
+    exist yet) and never showed up on any following remote instance
+    despite a confirmed-successful federation delivery.
 
     Returns ``(ok, message)`` the same shape ``_handle_create_profile``
     does, for the SAME reason (the widget has nowhere to show a room
@@ -6593,6 +6612,12 @@ async def widget_publish_video(
         info["size"] = size
     if thumbnail_mxc:
         info["thumbnail_url"] = thumbnail_mxc
+    if duration_ms:
+        info["duration"] = duration_ms
+    if width:
+        info["w"] = width
+    if height:
+        info["h"] = height
     video_content: dict[str, Any] = {
         "msgtype": "m.video", "body": filename or "video", "url": mxc, "info": info,
     }
