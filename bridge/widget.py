@@ -1279,6 +1279,26 @@ _WIDGET_HTML = r"""<!doctype html>
     color: #e5484d; font-size: 13px; margin-top: 8px; padding: 8px 10px;
     border: 1px solid #e5484d; border-radius: var(--radius-inner); background: rgba(229,72,77,.08);
   }
+  .form-warning {
+    color: #e5a000; font-size: 13px; margin-top: 8px; padding: 8px 10px;
+    border: 1px solid #e5a000; border-radius: var(--radius-inner); background: rgba(229,160,0,.08);
+  }
+  .form-textarea {
+    font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    border-radius: var(--radius-inner); padding: 8px 10px; width: 100%; resize: vertical;
+  }
+  .file-preview {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px; margin-top: 6px;
+    border: 1px solid var(--border); border-radius: var(--radius-inner);
+  }
+  .file-preview-icon { font-size: 22px; flex-shrink: 0; }
+  .file-preview-meta { flex: 1; min-width: 0; }
+  .file-preview-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-preview-size { font-size: 12px; }
+  .file-preview-remove {
+    border: none; background: none; color: var(--muted); font-size: 14px; cursor: pointer; padding: 4px; flex-shrink: 0;
+  }
+  .file-preview-remove:hover { color: var(--danger); }
 
   /* -- modals (following list, password login) ----------------------------- */
   .modal-backdrop {
@@ -3112,6 +3132,12 @@ _WIDGET_HTML = r"""<!doctype html>
 
   // -- Publish video modal ------------------------------------------------
 
+  function formatFileSize(bytes) {
+    if (!bytes) return "";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
   function openPublishVideoModal(channelUsername, onDone) {
     const body = el("div", { class: "card profile-modal publish-video-modal" });
     body.appendChild(el("div", { class: "row" }, [
@@ -3119,29 +3145,69 @@ _WIDGET_HTML = r"""<!doctype html>
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
 
-    let uploadedMxc = "", uploadedMimetype = "", uploadedSize = null, uploadedFilename = "";
+    // The file picked here is only read into memory and staged -- nothing
+    // is sent to the homeserver until Publish is actually clicked (see
+    // doPublish below), so changing your mind (or picking a different
+    // file) never wastes an upload.
+    let selectedFile = null;
     const mxcInput = el("input", { type: "text", placeholder: "mxc://... (paste an existing one)" });
     const fileInput = el("input", { type: "file", accept: "video/*" });
-    const uploadStatus = el("div", { class: "sub", text: "" });
+    const webmWarning = el("div", { class: "form-warning", style: "display:none" });
+    const filePreview = el("div", { class: "file-preview", style: "display:none" });
+
+    function clearFile() {
+      selectedFile = null;
+      fileInput.value = "";
+      filePreview.style.display = "none";
+      filePreview.innerHTML = "";
+      webmWarning.style.display = "none";
+      fileInput.style.display = "";
+      mxcInput.disabled = false;
+    }
+    function showFilePreview(file) {
+      filePreview.innerHTML = "";
+      filePreview.style.display = "";
+      filePreview.appendChild(el("span", { class: "file-preview-icon", text: "\u{1F3AC}" }));
+      filePreview.appendChild(el("div", { class: "file-preview-meta" }, [
+        el("div", { class: "file-preview-name", text: file.name }),
+        el("div", { class: "file-preview-size muted", text: formatFileSize(file.size) }),
+      ]));
+      filePreview.appendChild(el("button", {
+        class: "file-preview-remove", text: "✕", title: "Remove",
+        onclick: (e) => { e.preventDefault(); clearFile(); },
+      }));
+      fileInput.style.display = "none";
+    }
     fileInput.addEventListener("change", () => {
       const file = fileInput.files[0];
       if (!file) return;
-      uploadStatus.textContent = "Uploading…";
-      api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
-        method: "POST", headers: { "Content-Type": file.type || "video/mp4" }, raw: file,
-      }).then((data) => {
-        uploadedMxc = data.mxc; uploadedMimetype = data.mimetype; uploadedSize = data.size; uploadedFilename = file.name;
-        mxcInput.value = data.mxc;
-        uploadStatus.textContent = "Uploaded: " + file.name;
-      }).catch((e) => { uploadStatus.textContent = ""; toast(e.message, false); });
+      selectedFile = file;
+      mxcInput.value = "";
+      mxcInput.disabled = true;
+      showFilePreview(file);
+      // PeerTube's remote-video (federated) handling doesn't play .webm
+      // correctly, unlike a direct upload through PeerTube's own web UI --
+      // worth a heads-up before someone publishes one and it looks broken
+      // on the other end, not a hard block (this bridge's own
+      // VIDEO_MIMETYPE_ALLOWLIST still accepts it).
+      const isWebm = file.type === "video/webm" || /\.webm$/i.test(file.name);
+      webmWarning.style.display = isWebm ? "" : "none";
+      webmWarning.textContent = isWebm
+        ? "⚠️ .webm files don't play correctly once federated to PeerTube -- mp4 is the safest choice."
+        : "";
     });
+    mxcInput.addEventListener("input", () => {
+      fileInput.disabled = !!mxcInput.value.trim();
+    });
+
     body.appendChild(el("div", { class: "sub", text: "Paste an mxc:// you already have, or upload a video file." }));
     body.appendChild(el("div", { class: "row" }, [mxcInput]));
     body.appendChild(el("div", { class: "row" }, [fileInput]));
-    body.appendChild(uploadStatus);
+    body.appendChild(filePreview);
+    body.appendChild(webmWarning);
 
     const nameInput = el("input", { type: "text", placeholder: "Title" });
-    const descInput = el("textarea", { placeholder: "Description (optional)", rows: "3" });
+    const descInput = el("textarea", { class: "form-textarea", placeholder: "Description (optional)", rows: "3" });
     const tagsInput = el("input", { type: "text", placeholder: "Tags, comma-separated (optional)" });
     const categorySelect = el("select", {}, [el("option", { value: "", text: "(no category)" })]);
     const licenseSelect = el("select", {}, [el("option", { value: "", text: "(no license)" })]);
@@ -3167,34 +3233,50 @@ _WIDGET_HTML = r"""<!doctype html>
 
     const submitBtn = primaryButton("Publish", () => {
       errorBox.style.display = "none";
-      const mxc = (mxcInput.value || "").trim();
-      if (!mxc.startsWith("mxc://")) { errorBox.textContent = "Paste an mxc:// or upload a video file first."; errorBox.style.display = ""; return; }
+      const pastedMxc = (mxcInput.value || "").trim();
+      if (!selectedFile && !pastedMxc.startsWith("mxc://")) {
+        errorBox.textContent = "Paste an mxc:// or choose a video file first.";
+        errorBox.style.display = "";
+        return;
+      }
       if (!nameInput.value.trim()) { errorBox.textContent = "A title is required."; errorBox.style.display = ""; return; }
       submitBtn.disabled = true;
       const originalText = submitBtn.textContent;
-      submitBtn.textContent = "Working…";
-      api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
-        method: "POST",
-        body: {
-          mxc: mxc,
-          filename: mxc === uploadedMxc ? uploadedFilename : "",
-          mimetype: mxc === uploadedMxc ? uploadedMimetype : "",
-          size: mxc === uploadedMxc ? uploadedSize : null,
-          name: nameInput.value.trim(),
-          description: descInput.value.trim(),
-          tags: tagsInput.value.trim(),
-          category: categorySelect.value,
-          license: licenseSelect.value,
-          language: languageInput.value.trim(),
-          sensitive: sensitiveCheck.checked,
-          comments_enabled: commentsCheck.checked,
-        },
-      }).then((data) => {
-        if (data && data.ok === false) { errorBox.textContent = data.message || "Could not publish that video."; errorBox.style.display = ""; return; }
-        toast(data.message || "Submitted.", true);
-        closeModal();
-        if (onDone) onDone();
-      }).catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+
+      function doPublish(mxc, filename, mimetype, size) {
+        submitBtn.textContent = "Publishing…";
+        return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
+          method: "POST",
+          body: {
+            mxc: mxc, filename: filename || "", mimetype: mimetype || "", size: size || null,
+            name: nameInput.value.trim(),
+            description: descInput.value.trim(),
+            tags: tagsInput.value.trim(),
+            category: categorySelect.value,
+            license: licenseSelect.value,
+            language: languageInput.value.trim(),
+            sensitive: sensitiveCheck.checked,
+            comments_enabled: commentsCheck.checked,
+          },
+        }).then((data) => {
+          if (data && data.ok === false) { errorBox.textContent = data.message || "Could not publish that video."; errorBox.style.display = ""; return; }
+          toast(data.message || "Submitted.", true);
+          closeModal();
+          if (onDone) onDone();
+        });
+      }
+
+      let publishPromise;
+      if (selectedFile) {
+        submitBtn.textContent = "Uploading…";
+        publishPromise = api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_video", {
+          method: "POST", headers: { "Content-Type": selectedFile.type || "video/mp4" }, raw: selectedFile,
+        }).then((data) => doPublish(data.mxc, selectedFile.name, data.mimetype, data.size));
+      } else {
+        publishPromise = doPublish(pastedMxc, "", "", null);
+      }
+      publishPromise
+        .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
         .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
     });
     body.appendChild(el("div", { class: "row" }, [submitBtn]));
