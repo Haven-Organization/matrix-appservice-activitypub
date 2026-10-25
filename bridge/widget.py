@@ -1575,12 +1575,55 @@ _WIDGET_HTML = r"""<!doctype html>
 
   let sessionId = null;
 
-  async function api(path, opts) {
+  // Establishes (or re-establishes) this widget's own session with the
+  // bridge backend -- the same OpenID handshake start() runs at launch,
+  // pulled out so api() can also call it on demand when the session it
+  // already has goes stale mid-use.
+  async function establishSession() {
+    const creds = await getOpenIdToken();
+    const session = await api("/widget/api/session", {
+      method: "POST",
+      body: { access_token: creds.access_token, matrix_server_name: creds.matrix_server_name },
+    });
+    sessionId = session.session_id;
+  }
+
+  // Shared across every concurrent 401 so a burst of calls failing at
+  // once (e.g. several in-flight timeline/identity/context requests)
+  // triggers exactly one re-auth, not one per call.
+  let sessionRefreshPromise = null;
+  function refreshSession() {
+    if (!sessionRefreshPromise) {
+      sessionRefreshPromise = establishSession().finally(() => { sessionRefreshPromise = null; });
+    }
+    return sessionRefreshPromise;
+  }
+
+  async function api(path, opts, _isRetry) {
     opts = opts || {};
     const headers = Object.assign(opts.raw ? {} : { "Content-Type": "application/json" }, opts.headers || {});
     if (sessionId) headers["Authorization"] = "Bearer " + sessionId;
     const body = opts.raw ? opts.raw : (opts.body ? JSON.stringify(opts.body) : undefined);
     const res = await fetch(path, { method: opts.method || "GET", headers, body });
+    // A stale widget session (the 1h TTL on OUR OWN session, not the
+    // fediverse instance being browsed) previously surfaced as a dead-end
+    // "Session expired or unknown" error on whatever action happened to
+    // hit it, or silently as an empty "Nothing to show yet" wherever the
+    // caller's own error handling swallowed it (confirmed live 2026-10-25:
+    // this is what a Browse timeline load, a sign-in attempt, and opening
+    // a post link all looked like once the widget had been open long
+    // enough for its session to expire -- three different-looking
+    // symptoms, one root cause). Transparently re-run the same OpenID
+    // handshake start() does and retry this exact call once before
+    // actually giving up -- excluding /widget/api/session itself, so a
+    // genuinely broken session-establishment call fails directly instead
+    // of recursing into itself.
+    if (res.status === 401 && !_isRetry && path !== "/widget/api/session") {
+      try {
+        await refreshSession();
+        return api(path, opts, true);
+      } catch (e) { /* fall through to the normal error handling below */ }
+    }
     let data = {};
     try { data = await res.json(); } catch (e) {}
     if (!res.ok) throw new Error(errorMessage(data, res.status));
@@ -2507,7 +2550,14 @@ _WIDGET_HTML = r"""<!doctype html>
         }
         state.posts = state.posts.concat(data.posts);
       } catch (e) {
+        // Previously silent -- a failed load (e.g. this bridge's own
+        // widget session expiring mid-use, before api()'s own retry-once
+        // fix existed/if that retry also fails) just marked the feed
+        // "done" with zero explanation, rendering as a bare "Nothing to
+        // show yet" indistinguishable from an instance that's genuinely
+        // empty (confirmed live 2026-10-25).
         state.done = true;
+        toast(e.message, false);
       } finally {
         state.loading = false;
         renderFeedList();
