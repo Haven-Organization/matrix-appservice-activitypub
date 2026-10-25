@@ -5745,7 +5745,60 @@ async def _reinvite_to_profile_and_space(
     )
 
 
-async def _handle_create_profile(request: Request, *, sender: str, room_id: str, custom_id: str = "") -> None:
+async def _check_reserved_or_colliding_username(
+    request: Request, username: str, *, allow_own_localpart_for: str | None = None
+) -> str | None:
+    """Returns a human-readable rejection reason if ``username`` can't be
+    claimed for a new identity/PeerTube channel/Lemmy community -- they
+    share one global username namespace (see this function's callers'
+    identical "already taken" checks against each of the three) -- or
+    ``None`` if it's fine. Two independent checks, both guarding against
+    the same underlying problem (a fediverse handle, ``username@domain``,
+    that reads as belonging to someone it doesn't):
+
+    1. ``config.bridge.reserved_usernames`` -- a fixed, configurable list
+       (admin/staff/support-shaped names by default) blocked regardless of
+       whether any matching Matrix account actually exists. Catches the
+       case a live Matrix-user lookup can't: nobody named "admin" has to
+       be registered on THIS homeserver for "admin@yourdomain" showing up
+       in someone's federated timeline to read as this instance's staff.
+
+    2. A live check against a real Matrix user's own localpart on this
+       homeserver (``synapse.get_profile`` -- a plain 404 means nobody by
+       that name exists; any other outcome, including an unrelated error,
+       is treated as "exists" out of caution, since the whole point is
+       not to under-block). Always on, not configurable -- this is about
+       not impersonating a specific real person, not a style preference.
+       ``allow_own_localpart_for``, when given the caller's own mxid,
+       exempts the one case where "collides with a real Matrix user" is
+       actually fine: that user claiming their OWN localpart as their own
+       identity's username (``_handle_create_profile``'s bare form always
+       does exactly this, which is why IT never calls this function at
+       all -- this exemption only matters for the custom-id form, where
+       picking your own localpart on purpose is still valid)."""
+    config = request.app.state.config
+    lowered = username.lower()
+    if lowered in config.bridge.reserved_usernames:
+        return f'"{username}" is reserved and can\'t be used.'
+    if allow_own_localpart_for is not None:
+        own_localpart = sanitize_localpart_component(allow_own_localpart_for[1:].split(":", 1)[0])
+        if lowered == own_localpart.lower():
+            return None
+    synapse = request.app.state.synapse
+    candidate_mxid = f"@{username}:{config.synapse.server_name}"
+    try:
+        await synapse.get_profile(candidate_mxid)
+    except SynapseError as exc:
+        if exc.status_code == 404:
+            return None
+        logger.warning("Could not check whether %s collides with a real Matrix user: %s", candidate_mxid, exc)
+        return f"Could not verify {username} is available right now -- try again shortly."
+    return f"{username} is already a Matrix user's username on this homeserver."
+
+
+async def _handle_create_profile(
+    request: Request, *, sender: str, room_id: str, custom_id: str = ""
+) -> tuple[bool, str | None]:
     """Do everything ``link profile`` otherwise requires the user to have
     already set up manually themselves (their own room, with the bot
     invited into it and given enough power to set its name/avatar) -- create
@@ -5774,7 +5827,12 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
     (``ActorRepository.register_local_actor`` already enforces this -- see
     its own docstring) and is subject to ``bridge.max_identities_per_user``
     (bypassed for a bridge admin, see ``_is_matrix_admin``).
-    """
+
+    Returns ``(ok, message)`` -- the same text already posted as a room
+    notice either way, just also handed back directly so a caller that
+    isn't a chat command (the widget's own "create identity" page, which
+    has nowhere else to show it -- there's no room notice panel there)
+    can display it without needing to go read the room's timeline."""
     repository = request.app.state.repository
     config = request.app.state.config
     synapse = request.app.state.synapse
@@ -5782,13 +5840,13 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
 
     custom_id = custom_id.strip()
     if custom_id and not config.bridge.custom_identities_enabled:
-        await _notice(
-            request, room_id,
+        message = (
             "Custom identity ids aren't enabled on this bridge -- an admin needs to turn on "
             f'bridge.custom_identities_enabled first. Run "{_COMMAND_PREFIX}create profile" with no id '
-            "to link your Matrix username instead.",
+            "to link your Matrix username instead."
         )
-        return
+        await _notice(request, room_id, message)
+        return False, message
 
     existing_identities = await repository.list_local_actors_by_matrix_id(sender)
     is_first_identity_ever = not existing_identities
@@ -5796,8 +5854,9 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
     if custom_id:
         username = sanitize_localpart_component(custom_id)
         if not username:
-            await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}create profile <id>".')
-            return
+            message = f'Usage: "{_COMMAND_PREFIX}create profile <id>".'
+            await _notice(request, room_id, message)
+            return False, message
     else:
         # Bare form -- always the Matrix localpart, unaffected by
         # custom_identities_enabled either way (see this function's own
@@ -5810,9 +5869,19 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
     existing = next((identity for identity in existing_identities if identity.username == username), None)
     if existing is not None and existing.room_id:
         await _reinvite_to_profile_and_space(request, sender=sender, room_id=room_id, actor_record=existing)
-        return
+        return True, None
 
     if existing is None:
+        if custom_id:
+            # Bare-form usernames are exempt -- that's always the sender's
+            # OWN Matrix localpart (see this function's own docstring), so
+            # there's no impersonation question to ask in the first place.
+            rejection = await _check_reserved_or_colliding_username(
+                request, username, allow_own_localpart_for=sender,
+            )
+            if rejection is not None:
+                await _notice(request, room_id, rejection)
+                return False, rejection
         # Channels/communities share this same global username namespace
         # (see _handle_create_channel's identical check) -- a genuinely new
         # identity must not collide with either.
@@ -5821,17 +5890,18 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
             or await repository.get_peertube_channel(username) is not None
             or await repository.get_lemmy_community(username) is not None
         ):
-            await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
-            return
+            message = f"{username}@{config.bridge.domain} is already taken."
+            await _notice(request, room_id, message)
+            return False, message
         if not is_first_identity_ever and not await _is_matrix_admin(request, sender):
             if len(existing_identities) >= config.bridge.max_identities_per_user:
-                await _notice(
-                    request, room_id,
+                message = (
                     f"You already have {len(existing_identities)} identities, the maximum allowed "
                     f'({config.bridge.max_identities_per_user}). Run "{_COMMAND_PREFIX}delete profile" '
-                    "to remove one first.",
+                    "to remove one first."
                 )
-                return
+                await _notice(request, room_id, message)
+                return False, message
 
     try:
         profile = await synapse.get_profile(sender)
@@ -5881,12 +5951,12 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
         )
     except SynapseError as exc:
         logger.warning("Could not create profile room for %s: %s", sender, exc)
-        await _notice(
-            request, room_id,
+        message = (
             f'Could not create a room for you -- you can still make one yourself and run '
-            f'"{_COMMAND_PREFIX}link profile" in it instead.',
+            f'"{_COMMAND_PREFIX}link profile" in it instead.'
         )
-        return
+        await _notice(request, room_id, message)
+        return False, message
 
     if existing is not None:
         record = dataclasses.replace(existing, room_id=new_room_id, display_name=display_name, icon_url=icon_url)
@@ -5943,6 +6013,7 @@ async def _handle_create_profile(request: Request, *, sender: str, room_id: str,
             f'"{_COMMAND_PREFIX}id &lt;number|id&gt;".'
         )
     await _notice(request, room_id, message, html_message=html_message)
+    return True, message
 
 
 async def _resolve_owner_for_new_identity(
@@ -6042,6 +6113,13 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
         return
 
     display_name = rest.strip() or channel_id
+
+    # Unlike a profile's own username, a channel id is never "your own
+    # Matrix localpart" -- no allow_own_localpart_for exemption applies.
+    rejection = await _check_reserved_or_colliding_username(request, channel_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
 
     # Channels and profiles share one global actor-username namespace (see
     # PeerTubeChannelRecord's docstring; both are ultimately served at
@@ -6148,6 +6226,11 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
 
     display_name = rest.strip() or community_id
 
+    rejection = await _check_reserved_or_colliding_username(request, community_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
+
     # Shares the same global actor-username namespace as profiles/channels
     # (all ultimately served at /actor/{username}) -- same reasoning as
     # _handle_create_channel's identical check.
@@ -6231,6 +6314,10 @@ async def _handle_link_community(request: Request, *, sender: str, room_id: str,
     if not community_id:
         await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}link community <id>", run inside the room.')
         return
+    rejection = await _check_reserved_or_colliding_username(request, community_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
     if (
         await repository.get_local_actor(community_id) is not None
         or await repository.get_peertube_channel(community_id) is not None
@@ -6300,6 +6387,10 @@ async def _execute_link_community(request: Request, *, sender: str, room_id: str
     owner = await resolve_acting_identity(request, sender=sender, room_id=room_id)
     if owner is None or not owner.room_id:
         await _notice(request, room_id, "You no longer have a linked profile -- link one first, then try again.")
+        return
+    rejection = await _check_reserved_or_colliding_username(request, community_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
         return
     if (
         await repository.get_local_actor(community_id) is not None

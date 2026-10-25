@@ -50,6 +50,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
   - [Multi-identity support](#multi-identity-support)
     - [Enable custom identities (`bridge.custom_identities_enabled`)](#bridge-custom_identities_enabled)
     - [Max identities per user (`bridge.max_identities_per_user`)](#bridge-max_identities_per_user)
+    - [Reserved usernames (`bridge.reserved_usernames`)](#bridge-reserved_usernames)
     - [Default timeline domains (`bridge.default_timeline_domains`)](#bridge-default_timeline_domains)
   - [Multi-bridge rooms](#multi-bridge-rooms)
     - [Command prefix (`bridge.command_prefix`)](#bridge-command_prefix)
@@ -384,6 +385,18 @@ Whether a Matrix user may own more than one ActivityPub identity, and pick a cus
 **Default:** `5`
 
 Per-user cap on how many ActivityPub identities they may create once [`bridge.custom_identities_enabled`](#bridge-custom_identities_enabled) is on. A bridge admin (see [`bridge.admins`](#bridge-admins) / [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api)) is never subject to this cap.
+
+---
+
+<a id="bridge-reserved_usernames"></a>
+
+#### Reserved usernames (`bridge.reserved_usernames`)
+
+**Default:** `["admin", "administrator", "root", "support", "staff", "moderator", "mod", "help", "security", "abuse", "webmaster", "postmaster", "system", "official", "contact", "noreply", "no-reply", "owner"]`
+
+Usernames (matched case-insensitively) nobody may claim for a new identity's custom id, a PeerTube channel, or a Lemmy community -- they share one global username namespace, served at the same `/actor/{username}` URL shape. Guards against a fediverse handle like `admin@yourdomain` reading as this instance's own staff, regardless of whether anyone has actually registered a same-named Matrix account. Set to `[]` to disable this list entirely.
+
+This is separate from, and in addition to, an always-on check (not configurable) blocking a username that already belongs to a real Matrix user's own localpart on this homeserver -- the one exception being a user claiming their own localpart as their own identity's username, which is always allowed.
 
 ---
 

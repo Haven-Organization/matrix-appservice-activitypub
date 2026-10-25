@@ -18,6 +18,17 @@ import yaml
 DEFAULT_CONFIG_PATH = "config.yaml"
 CONFIG_PATH_ENV_VAR = "BRIDGE_CONFIG"
 
+# Default for BridgeSection.reserved_usernames -- applied whenever the
+# config file doesn't mention the key at all, so a fresh install is
+# protected out of the box rather than needing an operator to know to add
+# it. An explicit (even empty) "reserved_usernames:" in config.yaml always
+# overrides this rather than merging with it.
+DEFAULT_RESERVED_USERNAMES = [
+    "admin", "administrator", "root", "support", "staff", "moderator", "mod",
+    "help", "security", "abuse", "webmaster", "postmaster", "system",
+    "official", "contact", "noreply", "no-reply", "owner",
+]
+
 
 class ConfigError(Exception):
     """Raised when ``config.yaml`` is missing required fields or malformed."""
@@ -337,6 +348,16 @@ class BridgeSection:
     # custom_identities_enabled is on. A bridge admin (see bridge.admins /
     # use_synapse_admin_api) is never subject to this cap.
     max_identities_per_user: int = 5
+    # Usernames (case-insensitive) nobody may claim for a new identity,
+    # PeerTube channel, or Lemmy community -- they share one global
+    # username namespace, see _handle_create_profile's own check. Guards
+    # against impersonating staff/support-style names regardless of
+    # whether anyone has actually registered a same-named Matrix account.
+    # This is in ADDITION to an always-on check against real Matrix users'
+    # own localparts on this homeserver (not configurable -- see
+    # _check_reserved_or_colliding_username). Defaults to
+    # DEFAULT_RESERVED_USERNAMES when unset; set to [] to disable entirely.
+    reserved_usernames: list[str] = field(default_factory=lambda: list(DEFAULT_RESERVED_USERNAMES))
     # Instance domain(s) whose "whole known network" (federated) timeline
     # feeds the widget's own default Home view -- e.g. ["mastodon.social"],
     # or several merged together by recency. Only instances running
@@ -612,6 +633,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
         custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
+        reserved_usernames=[
+            u.strip().lower()
+            for u in (bridge_raw["reserved_usernames"] if "reserved_usernames" in bridge_raw else DEFAULT_RESERVED_USERNAMES)
+            or []
+            if u and u.strip()
+        ],
         default_timeline_domains=[d for d in (bridge_raw.get("default_timeline_domains") or []) if d and d.strip()],
         command_prefix=command_prefix,
         other_bot_prefixes=other_bot_prefixes,
