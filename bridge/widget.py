@@ -531,6 +531,15 @@ async def widget_chat(request: Request) -> JSONResponse:
 
 @router.post("/widget/api/import")
 async def widget_import(request: Request) -> JSONResponse:
+    """``_handle_import`` itself only ever posts a matrix.to link into a
+    Matrix room notice -- it has no return value for an API caller. A
+    Browse-tab post card needs the resulting room/event id immediately
+    (to flip its own "Imported" badge into a working matrix.to link
+    without waiting for a full context/timeline reload), so look it up
+    the same way the timeline's own already-imported badging does
+    (``_mark_imported`` in ``bridge/widget_browse.py``): by AP object id,
+    which for a browsed post is exactly the ``uri`` the card was built
+    from and passes back here unchanged as ``url``."""
     body = await request.json()
     url = body.get("url", "")
     if not isinstance(url, str) or not url:
@@ -540,7 +549,13 @@ async def widget_import(request: Request) -> JSONResponse:
         await _handle_import(request, sender=matrix_user_id, room_id=body["room_id"], url=url)
     except SynapseError as exc:
         raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
-    return JSONResponse({"ok": True})
+    repository = request.app.state.repository
+    federated = await repository.get_federated_event_by_ap_object(url)
+    return JSONResponse({
+        "ok": True,
+        "room_id": federated.room_id if federated is not None else None,
+        "event_id": federated.event_id if federated is not None else None,
+    })
 
 
 @router.post("/widget/api/replace_room")
@@ -1551,7 +1566,17 @@ _WIDGET_HTML = r"""<!doctype html>
   function importPost(post, btn, onDone) {
     if (btn) btn.disabled = true;
     api("/widget/api/import", { method: "POST", body: { url: post.uri, room_id: roomId } })
-      .then(() => { toast("Imported.", true); post.already_imported = true; if (onDone) onDone(); })
+      .then((data) => {
+        toast("Imported.", true);
+        post.already_imported = true;
+        // Without these the "Imported" badge that replaces the Import
+        // button would link to matrix.to/#/null until the next full
+        // reload re-fetches this post with its real ids (see
+        // widget_import's own docstring for why these come back here).
+        post.matrix_room_id = data.room_id;
+        post.matrix_event_id = data.event_id;
+        if (onDone) onDone();
+      })
       .catch((e) => { toast(e.message, false); })
       .finally(() => { if (btn) btn.disabled = false; });
   }
