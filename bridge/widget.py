@@ -1632,6 +1632,19 @@ _WIDGET_HTML = r"""<!doctype html>
     });
   });
 
+  // Closes the identity-switcher dropdown on a click anywhere outside it
+  // -- previously the only way to close it was to re-click the identity
+  // button itself. The dropdown's own popover is appended INSIDE the
+  // identity-card <button> (see renderIdentityCard), so a click that
+  // opened/toggled it already has its own e.stopPropagation() and never
+  // reaches here; this only ever sees clicks that should close it.
+  document.addEventListener("click", (e) => {
+    if (!identityDropdownOpen) return;
+    if (e.target.closest(".identity-card")) return;
+    identityDropdownOpen = false;
+    renderSidebar();
+  });
+
   let openIdResolve = null;
 
   async function getOpenIdToken() {
@@ -1829,6 +1842,7 @@ _WIDGET_HTML = r"""<!doctype html>
     { id: "channels", label: "Channels", icon: "\u{1F4FA}" },
     { id: "communities", label: "Communities", icon: "\u{1F465}" },
     { id: "guilds", label: "Guilds", icon: "\u{1F3F0}" },
+    { id: "profile", label: "Profile", icon: "\u{1F464}" },
     { id: "settings", label: "Settings", icon: "\u{2699}️" },
     { id: "admin", label: "Admin", icon: "\u{1F6E0}️" },
   ];
@@ -1919,23 +1933,28 @@ _WIDGET_HTML = r"""<!doctype html>
       ]),
     ];
     if (hasDropdownContent) {
-      cardChildren.push(el("span", {
-        class: "identity-dropdown-btn", text: "⌄",
-        onclick: (e) => { e.stopPropagation(); identityDropdownOpen = !identityDropdownOpen; renderSidebar(); },
-      }));
+      cardChildren.push(el("span", { class: "identity-dropdown-btn", text: "⌄" }));
     }
+    // The WHOLE button toggles the dropdown now -- it used to jump
+    // straight to "My Profile" (now its own sidebar tab, above Settings),
+    // with only the small chevron opening the dropdown; that made the
+    // dropdown's actual hit target easy to miss.
     const card = el("button", {
       class: "identity-card", title: active ? active.handle : "",
-      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
+      onclick: (e) => {
+        if (!hasDropdownContent) return;
+        e.stopPropagation();
+        identityDropdownOpen = !identityDropdownOpen;
+        renderSidebar();
+      },
     }, cardChildren);
     if (hasDropdownContent && identityDropdownOpen) {
       const pop = el("div", { class: "identity-dropdown" });
       // Every item below needs its own e.stopPropagation() -- the popover
       // is appended INSIDE the identity-card <button> (so it lines up
       // visually, anchored to it), which means an unstopped click bubbles
-      // straight up to that button's own onclick and fires openMyProfile()
-      // right after, same click. That's what made "+ New identity" look
-      // like it "just opens my profile" -- both handlers were firing.
+      // straight up to that button's own onclick and re-toggles the
+      // dropdown right back open, same click.
       otherIdentities.forEach((i) => {
         pop.appendChild(el("button", {
           class: "nav-item", text: i.display_name || i.handle,
@@ -2080,6 +2099,7 @@ _WIDGET_HTML = r"""<!doctype html>
     else if (currentTab === "channels") renderChannelsTab(app);
     else if (currentTab === "communities") renderCommunitiesTab(app);
     else if (currentTab === "guilds") renderGuildsTab(app);
+    else if (currentTab === "profile") renderOwnProfileTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
     else if (currentTab === "admin") renderAdminTab(app);
   }
@@ -2719,10 +2739,13 @@ _WIDGET_HTML = r"""<!doctype html>
     observer.observe(sentinel);
   }
 
-  function renderImportFollowsCard(page, targetRoomId) {
+  function openImportFollowsModal(targetRoomId) {
     const fileInput = el("input", { type: "file", accept: ".csv,.txt" });
-    page.appendChild(el("div", { class: "card" }, [
-      el("h2", { text: "Import a follows list" }),
+    const body = el("div", { class: "card profile-modal" }, [
+      el("div", { class: "row" }, [
+        el("h2", { text: "Import a follows list", style: "margin:0;" }),
+        el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+      ]),
       el("div", { class: "sub", text: "A Pleroma/Akkoma export (one @user@instance.org per line) or a Mastodon follows CSV." }),
       el("div", { class: "row" }, [fileInput]),
       el("div", { class: "row" }, [
@@ -2735,6 +2758,7 @@ _WIDGET_HTML = r"""<!doctype html>
               method: "POST", headers: { "Content-Type": "text/plain" }, raw: file,
             });
             toast("Importing " + result.count + " follows -- a summary will be posted to your Profile Room when it's done.", true);
+            closeModal();
           } catch (err) {
             toast(err.message, false);
           } finally {
@@ -2742,18 +2766,13 @@ _WIDGET_HTML = r"""<!doctype html>
           }
         }),
       ]),
-    ]));
+    ]);
+    openModal(body);
   }
 
   function openAccountProfile(actorId) {
     if (!actorId) return;
     profileView = { mode: "remote", actorId: actorId };
-    threadView = null;
-    render();
-  }
-
-  function openMyProfile() {
-    profileView = { mode: "own" };
     threadView = null;
     render();
   }
@@ -2784,62 +2803,68 @@ _WIDGET_HTML = r"""<!doctype html>
     render();
   }
 
+  // The "Profile" sidebar tab -- was reached by clicking the identity
+  // card itself (now that whole button toggles the identity-switcher
+  // dropdown instead, see renderIdentityCard), so this is a real tab
+  // (dispatched from render() like Settings/Admin), not an overlay --
+  // no "← Back", nowhere to go back TO from a top-level tab.
+  function renderOwnProfileTab(app) {
+    const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+
+    function refresh() {
+      return loadIdentityState().then(() => renderOwn(identityState.active));
+    }
+    function renderOwn(s) {
+      page.innerHTML = "";
+      if (!s) { page.appendChild(el("div", { class: "muted", text: "No identity yet." })); return; }
+      page.appendChild(profileBanner(s.banner_url, async (file) => {
+        try {
+          await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(s.room_id), {
+            method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
+          });
+          toast("Banner updated.", true);
+          refresh();
+        } catch (err) { toast(err.message, false); }
+      }));
+      const followingStat = el("div", { class: "profile-stat clickable", text: "Following: " + s.following_count + "  ›" });
+      followingStat.addEventListener("click", openFollowingList);
+      const statsBox = el("div", { class: "profile-stats" }, [
+        el("div", { class: "profile-stat", text: "Followers: " + s.followers_count }),
+        followingStat,
+      ]);
+      appendProfileIdentity(page, s.icon_url, s.display_name || s.handle, s.handle, statsBox);
+      if (s.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = s.summary; page.appendChild(bio); }
+
+      function visAction(btn, which, hidden, value) {
+        btn.disabled = true;
+        const payload = { username: s.username, which: which };
+        if (hidden !== undefined) payload.hidden = hidden;
+        if (value !== undefined) payload.value = value;
+        api("/widget/api/visibility", { method: "POST", body: payload })
+          .then(() => { toast("Done.", true); refresh(); })
+          .catch((e) => toast(e.message, false))
+          .finally(() => { btn.disabled = false; });
+      }
+      page.appendChild(el("div", { class: "row" }, [
+        toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
+        toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
+        toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
+      ]));
+      if (s.public_url) page.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
+
+      renderProfilePostFeed(page, s.actor_id, { actor_id: s.actor_id, display_name: s.display_name || s.handle, handle: s.handle, avatar_url: s.icon_url, url: s.public_url });
+    }
+    refresh().catch(() => {
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: "Couldn't load your profile." }));
+    });
+  }
+
   function renderProfilePage(app, view) {
     app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { profileView = null; render(); } }));
     const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
     app.appendChild(page);
-
-    if (view.mode === "own") {
-      function refresh() {
-        return loadIdentityState().then(() => renderOwn(identityState.active));
-      }
-      function renderOwn(s) {
-        page.innerHTML = "";
-        if (!s) { page.appendChild(el("div", { class: "muted", text: "No identity yet." })); return; }
-        page.appendChild(profileBanner(s.banner_url, async (file) => {
-          try {
-            await api("/widget/api/upload_banner?room_id=" + encodeURIComponent(s.room_id), {
-              method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, raw: file,
-            });
-            toast("Banner updated.", true);
-            refresh();
-          } catch (err) { toast(err.message, false); }
-        }));
-        const followingStat = el("div", { class: "profile-stat clickable", text: "Following: " + s.following_count + "  ›" });
-        followingStat.addEventListener("click", openFollowingList);
-        const statsBox = el("div", { class: "profile-stats" }, [
-          el("div", { class: "profile-stat", text: "Followers: " + s.followers_count }),
-          followingStat,
-        ]);
-        appendProfileIdentity(page, s.icon_url, s.display_name || s.handle, s.handle, statsBox);
-        if (s.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = s.summary; page.appendChild(bio); }
-
-        function visAction(btn, which, hidden, value) {
-          btn.disabled = true;
-          const payload = { username: s.username, which: which };
-          if (hidden !== undefined) payload.hidden = hidden;
-          if (value !== undefined) payload.value = value;
-          api("/widget/api/visibility", { method: "POST", body: payload })
-            .then(() => { toast("Done.", true); refresh(); })
-            .catch((e) => toast(e.message, false))
-            .finally(() => { btn.disabled = false; });
-        }
-        page.appendChild(el("div", { class: "row" }, [
-          toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
-          toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
-          toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
-        ]));
-        if (s.public_url) page.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
-
-        renderImportFollowsCard(page, s.room_id);
-        renderProfilePostFeed(page, s.actor_id, { actor_id: s.actor_id, display_name: s.display_name || s.handle, handle: s.handle, avatar_url: s.icon_url, url: s.public_url });
-      }
-      refresh().catch(() => {
-        page.innerHTML = "";
-        page.appendChild(el("div", { class: "muted", text: "Couldn't load your profile." }));
-      });
-      return;
-    }
 
     // remote account
     const actorId = view.actorId;
@@ -2962,8 +2987,12 @@ _WIDGET_HTML = r"""<!doctype html>
       api("/widget/api/following").then((data) => {
         body.innerHTML = "";
         body.appendChild(el("div", { class: "row" }, [
-          el("h2", { text: "Following" }),
-          el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+          el("h2", { text: "Following", style: "margin:0;" }),
+          el("button", {
+            class: "modal-close", text: "\u{2B07} Import Follows", style: "margin-left:auto;font-size:13px;",
+            onclick: () => openImportFollowsModal(identityState.active && identityState.active.room_id),
+          }),
+          el("button", { class: "modal-close", text: "✕", onclick: closeModal }),
         ]));
         if (!data.following.length) { body.appendChild(el("div", { class: "muted", text: "Not following anyone yet." })); return; }
         body.appendChild(el("div", { class: "list" }, data.following.map((f) =>
