@@ -583,12 +583,25 @@ async def widget_create_profile(request: Request) -> JSONResponse:
     swallowed if the room doesn't make sense for it), never to decide
     WHICH identity gets created -- safe to call from any room the widget
     happens to be embedded in, including from the sidebar identity
-    switcher rather than a specific room's own tab."""
+    switcher rather than a specific room's own tab.
+
+    Bespoke, not the generic ``_dispatch`` (which always returns
+    ``{"ok": true}`` and leaves failure reasons in a room notice) --
+    ``_handle_create_profile`` now returns ``(ok, message)`` specifically
+    so the widget's own "create identity" page (see its own comment) can
+    show the REAL rejection reason (reserved name, already taken, a real
+    Matrix user's own name, ...) inline, since it has nowhere else to
+    surface a room notice from."""
     body = await request.json()
     custom_id = (body.get("custom_id") or "").strip()
-    return await _dispatch(
-        request, body.get("room_id", ""), _handle_create_profile, custom_id=custom_id
-    )
+    matrix_user_id = _session_user(request)
+    try:
+        ok, message = await _handle_create_profile(
+            request, sender=matrix_user_id, room_id=body.get("room_id", ""), custom_id=custom_id,
+        )
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that action -- try again.") from exc
+    return JSONResponse({"ok": ok, "message": message})
 
 
 @router.post("/widget/api/link_profile")
@@ -1041,11 +1054,9 @@ _WIDGET_HTML = r"""<!doctype html>
     box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px; z-index: 20;
   }
   #shell.collapsed .identity-dropdown { left: 4px; right: auto; width: 200px; }
-  .identity-create-row { display: flex; gap: 4px; align-items: center; padding: 4px; }
-  .identity-create-input {
-    flex: 1; min-width: 0; font-size: 12px; padding: 4px 6px;
-    border: 1px solid var(--border); border-radius: var(--radius-inner);
-    background: var(--bg); color: var(--text);
+  .form-error {
+    color: #e5484d; font-size: 13px; margin-top: 8px; padding: 8px 10px;
+    border: 1px solid #e5484d; border-radius: var(--radius-inner); background: rgba(229,72,77,.08);
   }
 
   /* -- modals (following list, password login) ----------------------------- */
@@ -1374,6 +1385,11 @@ _WIDGET_HTML = r"""<!doctype html>
   // its immediate replies). Mutually exclusive with profileView -- opening
   // one clears the other.
   let threadView = null;
+  // Same idea again, for the "create a new identity" form -- was a cramped
+  // inline row in the sidebar's identity dropdown; moved to a real page so
+  // there's room for a real error message (reserved name, already taken,
+  // belongs to a real Matrix user, ...) instead of a toast easy to miss.
+  let createIdentityView = false;
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -1406,21 +1422,22 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   let identityDropdownOpen = false;
-  // Haven's widget iframe is sandboxed without allow-modals (same root
-  // cause as the confirm() fix elsewhere in this file -- see withConfirm):
-  // window.prompt() silently no-ops there, no dialog, no error, nothing.
-  // "+ New identity" used to call it directly, so inside Haven it looked
-  // like the button did nothing except (see below) fall through to the
-  // card's own "open my profile" click handler. identityCreatePending
-  // swaps the "+ New identity" row for an inline id-input form instead.
-  let identityCreatePending = false;
 
   function renderIdentityCard(bar) {
     if (!ctx) return;
     if (!ctx.has_profile) {
       bar.appendChild(el("button", {
         class: "identity-card", title: "Create your fediverse profile",
-        onclick: (e) => { e.stopPropagation(); createNewIdentity(""); },
+        onclick: (e) => {
+          e.stopPropagation();
+          createNewIdentity("")
+            .then((data) => {
+              if (data && data.ok === false) { toast(data.message || "Could not create a profile.", false); return; }
+              toast("Profile created.", true);
+              return loadContext();
+            })
+            .catch((err) => toast(err.message, false));
+        },
       }, [
         el("span", { class: "icon", text: "\u{2795}" }),
         el("div", { class: "identity-meta" }, [el("div", { class: "name", text: "Create profile" })]),
@@ -1448,7 +1465,7 @@ _WIDGET_HTML = r"""<!doctype html>
     }
     const card = el("button", {
       class: "identity-card", title: active ? active.handle : "",
-      onclick: () => { identityDropdownOpen = false; identityCreatePending = false; openMyProfile(); },
+      onclick: () => { identityDropdownOpen = false; openMyProfile(); },
     }, cardChildren);
     if (hasDropdownContent && identityDropdownOpen) {
       const pop = el("div", { class: "identity-dropdown" });
@@ -1470,61 +1487,69 @@ _WIDGET_HTML = r"""<!doctype html>
         }));
       });
       if (ctx.custom_identities_enabled) {
-        if (identityCreatePending) {
-          const input = el("input", {
-            type: "text", class: "identity-create-input",
-            placeholder: "id (letters, numbers, underscores)",
-            onclick: (e) => e.stopPropagation(),
-            onkeydown: (e) => {
-              e.stopPropagation();
-              if (e.key === "Enter") { e.preventDefault(); submitBtn.click(); }
-            },
-          });
-          const submitBtn = el("button", {
-            class: "nav-item", text: "Create",
-            onclick: (e) => {
-              e.stopPropagation();
-              const customId = input.value.trim();
-              if (!customId) return;
-              identityDropdownOpen = false;
-              identityCreatePending = false;
-              createNewIdentity(customId);
-            },
-          });
-          pop.appendChild(el("div", { class: "identity-create-row" }, [
-            input,
-            submitBtn,
-            el("button", {
-              class: "nav-item", text: "Cancel",
-              onclick: (e) => { e.stopPropagation(); identityCreatePending = false; renderSidebar(); },
-            }),
-          ]));
-          setTimeout(() => input.focus(), 0);
-        } else {
-          pop.appendChild(el("button", {
-            class: "nav-item", text: "+ New identity",
-            onclick: (e) => { e.stopPropagation(); identityCreatePending = true; renderSidebar(); },
-          }));
-        }
+        pop.appendChild(el("button", {
+          class: "nav-item", text: "+ New identity",
+          onclick: (e) => {
+            e.stopPropagation();
+            identityDropdownOpen = false;
+            openCreateIdentity();
+          },
+        }));
       }
       card.appendChild(pop);
     }
     bar.appendChild(card);
   }
 
-  function createNewIdentity(promptOverride) {
+  function createNewIdentity(customId) {
     const needsId = ctx.has_profile; // the very first identity uses the bare form (your Matrix localpart)
-    let customId = "";
-    if (needsId) {
-      // promptOverride always comes from the inline identity-create-row
-      // input above now -- see its own comment for why this can no longer
-      // fall back to window.prompt().
-      customId = (promptOverride || "").trim();
-      if (!customId) return;
-    }
-    api("/widget/api/create_profile", { method: "POST", body: { room_id: roomId, custom_id: customId.trim() } })
-      .then(() => { toast("Identity created.", true); return loadContext(); })
-      .catch((e) => toast(e.message, false));
+    if (needsId && !customId.trim()) return Promise.reject(new Error("Choose an id first."));
+    return api("/widget/api/create_profile", { method: "POST", body: { room_id: roomId, custom_id: customId.trim() } });
+  }
+
+  function openCreateIdentity() {
+    createIdentityView = true;
+    profileView = null;
+    threadView = null;
+    render();
+  }
+
+  function renderCreateIdentityPage(app) {
+    app.appendChild(el("button", {
+      class: "back-link", text: "← Back",
+      onclick: () => { createIdentityView = false; render(); },
+    }));
+    const page = el("div", { class: "profile-page" });
+    page.appendChild(el("h2", { text: "New identity" }));
+    page.appendChild(el("div", { class: "sub", text: "Pick an id for this identity -- letters, numbers, and underscores only. This becomes your fediverse handle: id@" + (ctx.domain || "") + "." }));
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    const input = el("input", {
+      type: "text", placeholder: "id",
+      onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); submitBtn.click(); } },
+    });
+    const submitBtn = primaryButton("Create", () => {
+        errorBox.style.display = "none";
+        submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
+        submitBtn.textContent = "Working…";
+        createNewIdentity(input.value)
+          .then((data) => {
+            if (data && data.ok === false) {
+              errorBox.textContent = data.message || "Could not create that identity.";
+              errorBox.style.display = "";
+              return;
+            }
+            toast("Identity created.", true);
+            createIdentityView = false;
+            return loadContext();
+          })
+          .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
+          .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+    });
+    page.appendChild(el("div", { class: "row" }, [input, submitBtn]));
+    page.appendChild(errorBox);
+    app.appendChild(page);
+    setTimeout(() => input.focus(), 0);
   }
 
   function renderSidebar() {
@@ -1573,12 +1598,13 @@ _WIDGET_HTML = r"""<!doctype html>
     // belongs attached while Home's own timeline is actually showing --
     // otherwise it would keep recording THIS page's scroll position into
     // homeState.scrollY, corrupting what "Back" should restore.
-    const goingToHome = !profileView && !threadView && currentTab === "home";
+    const goingToHome = !profileView && !threadView && !createIdentityView && currentTab === "home";
     if (!goingToHome && window.__homeScrollHandler) {
       window.removeEventListener("scroll", window.__homeScrollHandler);
       window.__homeScrollHandler = null;
     }
 
+    if (createIdentityView) { renderCreateIdentityPage(app); return; }
     if (profileView) { renderProfilePage(app, profileView); return; }
     if (threadView) { renderThreadPage(app, threadView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
