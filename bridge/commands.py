@@ -343,6 +343,7 @@ from bridge.note_mirroring import sync_remote_room_history_visibility as _sync_r
 from bridge.repository import (
     ActorRecord,
     ActorRepository,
+    ChannelRoom,
     FederatedEvent,
     GhostProfile,
     LemmyCommunityRoom,
@@ -3940,7 +3941,10 @@ async def _handle_backfill(request: Request, *, sender: str, room_id: str, argum
     command was run in -- or, run as a reply inside a Matrix thread that
     mirrors an ActivityPub conversation, that specific thread's replies
     instead (resolved via the thread root's own tracked ``ap_object_id``
-    and its live ``replies`` collection).
+    and its live ``replies`` collection). In a guild Channel room,
+    dispatches to ``_handle_guild_channel_backfill`` instead, pulling the
+    Channel's own outbox (every member's messages, not one actor's own
+    posts) -- see that function's own docstring.
 
     Everyone gets ``config.bridge.backfill_default_count`` posts; only a
     Matrix server admin may override that with an explicit ``N``, since an
@@ -3971,6 +3975,13 @@ async def _handle_backfill(request: Request, *, sender: str, room_id: str, argum
         # community's own posts/comments, there's no remote copy of
         # ourselves to backfill from.
         await _notice(request, room_id, "This community is hosted here -- there's nothing to backfill.")
+        return
+
+    channel_room = await repository.get_channel_room_by_room_id(room_id)
+    if channel_room is not None:
+        await _handle_guild_channel_backfill(
+            request, sender=sender, room_id=room_id, argument=argument, channel_room=channel_room,
+        )
         return
 
     remote_room = await repository.get_remote_actor_room_by_room_id(room_id)
@@ -4190,6 +4201,148 @@ async def _resolve_backfill_source(
         raise _BackfillSourceError("Their account doesn't expose an outbox to backfill from.")
     raw_items = await _collect_recent_items(request, outbox, limit=count)
     return raw_items, remote_room.actor_id
+
+
+async def _resolve_guild_channel_backfill_source(
+    request: Request, *, channel_room: ChannelRoom, count: int,
+) -> list[dict]:
+    """Fetches and pages a guild Channel's own outbox -- confirmed by
+    reading Shoot's own source (github.com/MaddyUnderStars/shoot,
+    ``src/util/activitypub/transformers/actor.ts``/``src/http/s2s/
+    channel/$id/index.ts``): every actor it serves, a Channel included,
+    carries a real ``outbox`` field at ``GET /channel/:id/outbox``, a
+    paginated collection of ``Create<Note>`` entries for every message
+    ever sent in it -- the exact same shape ``_collect_recent_items``/
+    ``_note_from_item`` already page and parse for an ordinary actor's
+    own outbox, so no new parsing logic is needed here, just a different
+    source to point them at. Raises ``_BackfillSourceError`` (same
+    convention as ``_resolve_backfill_source``) if the channel's own
+    actor document doesn't expose one -- an instance not running Shoot,
+    or a channel this bridge somehow lost track of."""
+    try:
+        actor_doc = await fetch_actor(request, channel_room.channel_actor_id)
+    except RemoteActorFetchError as exc:
+        raise _BackfillSourceError(f"Couldn't fetch this channel: {exc}") from exc
+    outbox = actor_doc.get("outbox")
+    if not outbox:
+        raise _BackfillSourceError("This channel doesn't expose a message history to backfill from.")
+    return await _collect_recent_items(request, outbox, limit=count)
+
+
+async def _mirror_guild_channel_backfill_items(
+    request: Request, *, raw_items: list[dict], channel_room: ChannelRoom,
+) -> tuple[int, int, int]:
+    """Guild-channel counterpart of ``_mirror_backfilled_notes`` right
+    below -- but mirrors each item through ``bridge.channel_bridge``'s
+    own ``_mirror_channel_note`` (the exact per-message ghost-resolve/
+    dedupe/send logic the LIVE channel-message path already uses), never
+    ``_handle_create``: that resolves rooms via Remote User Room lookup,
+    the wrong room-resolution entirely for a channel message, which
+    always belongs in this one shared ``channel_room`` regardless of
+    which guild member wrote it.
+
+    Unlike an ordinary actor's outbox (always the SAME author), a
+    channel's outbox mixes messages from every member who's ever posted
+    in it, so each item's own ``attributedTo`` decides the ghost -- there
+    is no single ``fallback_author`` to give ``_note_from_item`` (and
+    Shoot's own outbox shape, confirmed above, never needs one: every
+    entry is already a ``Create`` with its ``Note`` embedded and its own
+    ``attributedTo`` set)."""
+    from bridge.channel_bridge import _mirror_channel_note
+
+    notes = []
+    for item in raw_items:
+        note = await _note_from_item(request, item, fallback_author=None)
+        if note:
+            notes.append(note)
+    notes.reverse()  # oldest of the collected batch first, same convention as _mirror_backfilled_notes
+
+    repository = request.app.state.repository
+    imported = 0
+    already = 0
+    failed = 0
+    for activity_json in notes:
+        obj = activity_json.get("object")
+        author_actor_id = obj.get("attributedTo") if isinstance(obj, dict) else None
+        if not isinstance(obj, dict) or not isinstance(author_actor_id, str):
+            failed += 1
+            continue
+        ap_object_id = obj.get("id")
+        already_had = bool(
+            ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None
+        )
+        ok = await _mirror_channel_note(request, obj=obj, author_actor_id=author_actor_id, channel_room=channel_room)
+        if not ok:
+            failed += 1
+        elif already_had:
+            already += 1
+        else:
+            imported += 1
+    return imported, already, failed
+
+
+async def _handle_guild_channel_backfill(
+    request: Request, *, sender: str, room_id: str, argument: str, channel_room: ChannelRoom,
+) -> None:
+    """The guild-Channel counterpart of ``;backfill``'s ordinary
+    Remote-User-Room handling above -- same count-parsing/admin-gating,
+    just pulling from the Channel's own outbox (see
+    ``_resolve_guild_channel_backfill_source``) instead of a single
+    actor's. No thread mode (unlike the Remote-User-Room/Lemmy-community
+    cases): a guild Channel's own reply/thread semantics aren't something
+    this bridge mirrors in any trackable way yet, so there's no thread
+    root to resolve a specific conversation from here."""
+    config = request.app.state.config
+
+    argument = argument.strip()
+    if argument:
+        if not await _is_matrix_admin(request, sender):
+            await _notice(request, room_id, "Only a Matrix server admin can choose a custom backfill count.")
+            return
+        try:
+            count = int(argument)
+        except ValueError:
+            await _notice(request, room_id, f'"{argument}" isn\'t a number.')
+            return
+        if count <= 0:
+            await _notice(request, room_id, "Give a positive number of posts to backfill.")
+            return
+    else:
+        count = config.bridge.backfill_default_count
+
+    await _notice(
+        request, room_id,
+        f"Backfilling up to {count} messages -- this can take a while. I'll post a summary here when it's done.",
+    )
+    task = asyncio.get_running_loop().create_task(
+        _run_guild_channel_backfill(request, room_id=room_id, channel_room=channel_room, count=count)
+    )
+    _RUNNING_BACKFILLS.add(task)
+    task.add_done_callback(_RUNNING_BACKFILLS.discard)
+
+
+async def _run_guild_channel_backfill(
+    request: Request, *, room_id: str, channel_room: ChannelRoom, count: int,
+) -> None:
+    """The background half of ``_handle_guild_channel_backfill``."""
+    try:
+        raw_items = await _resolve_guild_channel_backfill_source(request, channel_room=channel_room, count=count)
+        imported, already, failed = await _mirror_guild_channel_backfill_items(
+            request, raw_items=raw_items, channel_room=channel_room,
+        )
+    except _BackfillSourceError as exc:
+        await _notice(request, room_id, exc.notice)
+        return
+    except Exception:
+        logger.exception("Guild channel backfill crashed in %s", room_id)
+        await _notice(request, room_id, "Backfill hit an unexpected error and stopped early.")
+        return
+
+    summary = f"Backfill finished: {imported} message(s) mirrored, {already} already here"
+    if failed:
+        summary += f", {failed} couldn't be mirrored"
+    summary += "."
+    await _notice(request, room_id, summary)
 
 
 async def _mirror_backfilled_notes(

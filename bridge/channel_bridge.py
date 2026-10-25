@@ -267,6 +267,79 @@ async def _resolve_guild_channel(request: Request, actor_id: str) -> str | None:
     return guild_actor_id
 
 
+async def _mirror_channel_note(
+    request: Request, *, obj: dict, author_actor_id: str, channel_room: ChannelRoom,
+) -> bool:
+    """Mirrors a single channel ``Note`` into ``channel_room`` as its real
+    author's own ghost -- the shared core of ``maybe_handle_channel_message``
+    (the live inbound path, below, which unwraps Shoot's own Announce
+    fan-out first) and ``bridge.commands``' guild-channel ``;backfill``
+    (reading items straight off the channel's own outbox, no Announce
+    involved at all). Returns ``True`` if this resulted in -- or already
+    had -- a mirrored Matrix event; ``False`` for anything that couldn't
+    be shown (no ghost resolvable, Synapse rejected it, empty after
+    sanitizing)."""
+    ap_object_id = obj.get("id")
+    repository = request.app.state.repository
+    if ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None:
+        return True  # already mirrored -- e.g. a redelivered transaction
+
+    resolved = await resolve_and_invite_ghost(request, author_actor_id, channel_room.room_id)
+    if resolved is None:
+        logger.info("Could not resolve a ghost for channel message from %s; dropping", author_actor_id)
+        return False
+    ghost_mxid, _actor_doc = resolved
+
+    synapse = request.app.state.synapse
+    if not await repository.is_channel_member_known(channel_room.room_id, author_actor_id):
+        # About to post as this ghost right now -- can't wait on the usual
+        # invite-then-async-auto-accept path (see resolve_and_invite_ghost's
+        # own docstring), so force the join synchronously, same as every
+        # other "post as a ghost immediately" call site in this bridge.
+        try:
+            await synapse.join_room(channel_room.room_id, as_user_id=ghost_mxid)
+        except SynapseError:
+            logger.info(
+                "Could not join channel-message ghost %s into %s", ghost_mxid, channel_room.room_id, exc_info=True,
+            )
+            return False
+        await repository.record_channel_member(channel_room.room_id, author_actor_id)
+
+    mentions = await resolve_mention_pills(request, room_id=channel_room.room_id, note=obj)
+    plain, safe_html = strip_to_matrix_message(
+        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
+    )
+    if not plain and not safe_html:
+        return False
+
+    message_content: dict = {"msgtype": "m.text", "body": plain}
+    if safe_html:
+        message_content["format"] = "org.matrix.custom.html"
+        message_content["formatted_body"] = safe_html
+
+    federation_config = request.app.state.config.federation
+    try:
+        event_id = await synapse.send_message_event(
+            channel_room.room_id, message_content, as_user_id=ghost_mxid,
+            ts=resolve_event_ts(
+                {"published": obj.get("published")}, max_clock_skew=federation_config.max_clock_skew,
+                max_backdate_days=federation_config.max_backdate_days,
+            ),
+        )
+    except SynapseError:
+        logger.warning("Could not mirror channel message into %s", channel_room.room_id, exc_info=True)
+        return False
+
+    if ap_object_id:
+        await repository.record_federated_event(
+            FederatedEvent(
+                event_id=event_id, room_id=channel_room.room_id, ap_object_id=ap_object_id,
+                author_actor_id=author_actor_id,
+            )
+        )
+    return True
+
+
 async def maybe_handle_channel_message(request: Request, activity: Activity) -> bool:
     """Returns True if ``activity`` was Shoot's guild-Channel fan-out of an
     ordinary channel message (handled, successfully mirrored or not) --
@@ -298,64 +371,7 @@ async def maybe_handle_channel_message(request: Request, activity: Activity) -> 
     if channel_room is None:
         return True
 
-    ap_object_id = obj.get("id")
-    repository = request.app.state.repository
-    if ap_object_id and await repository.get_federated_event_by_ap_object(ap_object_id) is not None:
-        return True  # already mirrored -- e.g. a redelivered transaction
-
-    resolved = await resolve_and_invite_ghost(request, author_actor_id, channel_room.room_id)
-    if resolved is None:
-        logger.info("Could not resolve a ghost for channel message from %s; dropping", author_actor_id)
-        return True
-    ghost_mxid, _actor_doc = resolved
-
-    synapse = request.app.state.synapse
-    if not await repository.is_channel_member_known(channel_room.room_id, author_actor_id):
-        # About to post as this ghost right now -- can't wait on the usual
-        # invite-then-async-auto-accept path (see resolve_and_invite_ghost's
-        # own docstring), so force the join synchronously, same as every
-        # other "post as a ghost immediately" call site in this bridge.
-        try:
-            await synapse.join_room(channel_room.room_id, as_user_id=ghost_mxid)
-        except SynapseError:
-            logger.info(
-                "Could not join channel-message ghost %s into %s", ghost_mxid, channel_room.room_id, exc_info=True,
-            )
-            return True
-        await repository.record_channel_member(channel_room.room_id, author_actor_id)
-
-    mentions = await resolve_mention_pills(request, room_id=channel_room.room_id, note=obj)
-    plain, safe_html = strip_to_matrix_message(
-        obj.get("content") or "", mention_pills=mentions.pills, media_type=obj.get("mediaType"),
-    )
-    if not plain and not safe_html:
-        return True
-
-    message_content: dict = {"msgtype": "m.text", "body": plain}
-    if safe_html:
-        message_content["format"] = "org.matrix.custom.html"
-        message_content["formatted_body"] = safe_html
-
-    federation_config = request.app.state.config.federation
-    try:
-        event_id = await synapse.send_message_event(
-            channel_room.room_id, message_content, as_user_id=ghost_mxid,
-            ts=resolve_event_ts(
-                {"published": obj.get("published")}, max_clock_skew=federation_config.max_clock_skew,
-                max_backdate_days=federation_config.max_backdate_days,
-            ),
-        )
-    except SynapseError:
-        logger.warning("Could not mirror channel message into %s", channel_room.room_id, exc_info=True)
-        return True
-
-    if ap_object_id:
-        await repository.record_federated_event(
-            FederatedEvent(
-                event_id=event_id, room_id=channel_room.room_id, ap_object_id=ap_object_id,
-                author_actor_id=author_actor_id,
-            )
-        )
+    await _mirror_channel_note(request, obj=obj, author_actor_id=author_actor_id, channel_room=channel_room)
     return True
 
 
