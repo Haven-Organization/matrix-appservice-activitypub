@@ -214,6 +214,11 @@ async def widget_context(request: Request, room_id: str) -> JSONResponse:
             "custom_identities_enabled": config.bridge.custom_identities_enabled,
             "peertube_channels_enabled": config.bridge.peertube_channels_enabled,
             "lemmy_community_hosting_enabled": config.bridge.lemmy_community_hosting_enabled,
+            # Admin-curated Browse-instance shortlist (bridge.default_timeline_domains) --
+            # the Browse domain dropdown merges this with the user's own
+            # locally-remembered instances (see renderHomeTimeline's own
+            # domainSelect, which is the only consumer of this field).
+            "default_timeline_domains": config.bridge.default_timeline_domains,
             "room": room,
         },
         headers={"Cache-Control": "no-store"},
@@ -1803,13 +1808,104 @@ _WIDGET_HTML = r"""<!doctype html>
 
   let homeState = null;
 
+  // -- Browse instance picker: homeserver + admin shortlist + the user's
+  // own remembered instances, persisted in localStorage (per-browser,
+  // never sent to or read from the server -- purely a per-viewer
+  // convenience, same category as sidebarCollapsed above). ----------------
+
+  const BROWSE_INSTANCES_STORAGE_KEY = "fediverse-bridge-browse-instances";
+
+  function loadUserBrowseInstances() {
+    try {
+      const raw = localStorage.getItem(BROWSE_INSTANCES_STORAGE_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.filter((d) => typeof d === "string" && d) : [];
+    } catch (e) { return []; }
+  }
+  function addUserBrowseInstance(domain) {
+    const list = loadUserBrowseInstances();
+    if (list.includes(domain)) return;
+    list.push(domain);
+    try { localStorage.setItem(BROWSE_INSTANCES_STORAGE_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+  function normalizeDomain(raw) {
+    return (raw || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+  }
+
+  // Merges the homeserver + admin shortlist (bridge.default_timeline_domains,
+  // see widget_context's own comment) + the user's own remembered instances
+  // into one deduplicated option list, in that priority order, plus a
+  // trailing "+ Add instance" action-option.
+  function browseInstanceOptions(selectedDomain) {
+    const seen = new Set();
+    const options = [{ value: "", label: "My default feed" }];
+    function addDomain(d, suffix) {
+      if (!d || seen.has(d)) return;
+      seen.add(d);
+      options.push({ value: d, label: d + (suffix || "") });
+    }
+    addDomain(ctx.domain, " (your homeserver)");
+    (ctx.default_timeline_domains || []).forEach((d) => addDomain(d));
+    loadUserBrowseInstances().forEach((d) => addDomain(d));
+    // A domain picked via "+ Add instance" that isn't actually saved (the
+    // user cancelled, or it failed to persist) still needs to show up as
+    // the selected option right now, or the <select> would silently fall
+    // back to its first option instead.
+    addDomain(selectedDomain);
+    options.push({ value: "__add__", label: "+ Add instance…" });
+    return options;
+  }
+
+  function openAddBrowseInstanceModal(onAdded) {
+    const body = el("div", { class: "card profile-modal" });
+    const domainInput = el("input", { type: "text", placeholder: "instance.example" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Add an instance to browse" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "row" }, [domainInput]));
+    const errorBox = el("div", { class: "form-error", style: "display:none" });
+    body.appendChild(errorBox);
+    function submit() {
+      const domain = normalizeDomain(domainInput.value);
+      if (!domain) return;
+      addUserBrowseInstance(domain);
+      closeModal();
+      onAdded(domain);
+    }
+    domainInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    body.appendChild(el("div", { class: "row" }, [primaryButton("Add", submit)]));
+    openModal(body);
+    setTimeout(() => domainInput.focus(), 0);
+  }
+
   function renderHomeTimeline(app) {
     if (!homeState) homeState = { mode: "home", domain: "", scope: "federated", cursor: "", homeCursorMap: "", posts: [], loading: false, done: false, unsupported: false, needsLogin: false, needsLoginDomains: [], scrollY: 0 };
     const state = homeState;
 
     const searchInput = el("input", { type: "text", placeholder: "Search @user@instance.org, a name, or paste a post link to import" });
     const searchResults = el("div", { class: "list" });
-    const domainInput = el("input", { type: "text", value: state.domain, placeholder: "instance.example (blank = your default feed)" });
+    function switchToDomain(d) {
+      state.mode = d ? "instance" : "home";
+      state.domain = d;
+      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
+      render();
+    }
+    const domainSelect = el("select", {
+      onchange: () => {
+        const v = domainSelect.value;
+        if (v === "__add__") {
+          openAddBrowseInstanceModal(switchToDomain);
+          domainSelect.value = state.domain || ""; // revert until/unless the modal actually adds one
+          return;
+        }
+        switchToDomain(v);
+      },
+    }, browseInstanceOptions(state.domain).map((o) => {
+      const attrs = { value: o.value, text: o.label };
+      if (o.value === (state.domain || "")) attrs.selected = "selected";
+      return el("option", attrs);
+    }));
 
     function scopeBtn(label, value) {
       return el("button", {
@@ -1851,15 +1947,7 @@ _WIDGET_HTML = r"""<!doctype html>
         });
       } catch (err) { toast(err.message, false); }
     }
-    function runBrowse() {
-      const d = domainInput.value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
-      state.mode = d ? "instance" : "home";
-      state.domain = d;
-      state.posts = []; state.cursor = ""; state.homeCursorMap = ""; state.done = false; state.unsupported = false; state.needsLogin = false; state.scrollY = 0;
-      render();
-    }
     searchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchOrImport(); });
-    domainInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runBrowse(); });
 
     // One box, two jobs: a handle/name looks accounts up (as before); a
     // pasted https:// link is instead handed straight to the existing
@@ -1871,9 +1959,8 @@ _WIDGET_HTML = r"""<!doctype html>
       el("div", { class: "row" }, [searchInput, goBtn]),
       searchResults,
       el("div", { class: "row" }, [
-        domainInput,
+        domainSelect,
         el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
-        primaryButton("Browse", runBrowse),
       ]),
     ];
     if (state.mode === "instance") {
