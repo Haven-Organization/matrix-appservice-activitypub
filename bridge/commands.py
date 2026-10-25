@@ -6121,11 +6121,20 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
         await _notice(request, room_id, rejection)
         return
 
-    # Channels and profiles share one global actor-username namespace (see
-    # PeerTubeChannelRecord's docstring; both are ultimately served at
-    # the same /actor/{username} URL shape), so an id already taken by
-    # either kind is rejected here, not just a same-kind duplicate.
-    if await repository.get_local_actor(channel_id) is not None or await repository.get_peertube_channel(channel_id) is not None:
+    # Channels, profiles, AND communities share one global actor-username
+    # namespace (see PeerTubeChannelRecord's docstring; all three are
+    # ultimately served at the same /actor/{username} URL shape), so an id
+    # already taken by any of the three is rejected here, not just a
+    # same-kind duplicate. This used to only check profiles/channels --
+    # missing the community check meant a channel could silently steal a
+    # live community's id (confirmed never actually exploited, caught by
+    # inspection while auditing this check against its own sibling
+    # functions, all of which already checked all three).
+    if (
+        await repository.get_local_actor(channel_id) is not None
+        or await repository.get_peertube_channel(channel_id) is not None
+        or await repository.get_lemmy_community(channel_id) is not None
+    ):
         await _notice(request, room_id, f"{channel_id}@{config.bridge.domain} is already taken.")
         return
 
@@ -7387,6 +7396,16 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
     if existing is not None and existing.matrix_user_id != sender:
         await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
         return
+    # Same global username namespace as _handle_create_profile's identical
+    # check -- unlike that one, this never had a custom_id to validate (the
+    # bare form always derives from sender's own localpart), but it can
+    # still collide with an existing channel/community of that same name.
+    if existing is None and (
+        await repository.get_peertube_channel(username) is not None
+        or await repository.get_lemmy_community(username) is not None
+    ):
+        await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
+        return
     if existing is not None and existing.room_id:
         await _notice(
             request, room_id,
@@ -7485,6 +7504,12 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
     username = sanitize_localpart_component(sender[1:].split(":", 1)[0])
     existing = await repository.get_local_actor(username)
     if existing is not None and existing.matrix_user_id != sender:
+        await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
+        return
+    if existing is None and (
+        await repository.get_peertube_channel(username) is not None
+        or await repository.get_lemmy_community(username) is not None
+    ):
         await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
         return
     if existing is not None and existing.room_id:
