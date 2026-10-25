@@ -234,15 +234,31 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
     uri = base.get("uri")
     if not isinstance(uri, str) or not uri:
         return None
-    media = [
-        {
-            "type": m.get("type"),
-            "url": m.get("preview_url") or m.get("url"),
+    media = []
+    for m in base.get("media_attachments") or []:
+        if not isinstance(m, dict) or not isinstance(m.get("url"), str):
+            continue
+        # "gifv" is Mastodon's own type for a silent looping video (the
+        # common "gif" meme format, actually served as an mp4) -- a real
+        # video in every way that matters for playback here, just not
+        # spelled "video". Left unmapped, renderPostCard's own type
+        # switch fell through to its <img> fallback for every gifv
+        # attachment, which can't play an mp4 at all (confirmed live
+        # 2026-10-25: this is why "some videos" specifically, not all,
+        # were failing to load -- true "video" attachments worked).
+        kind = "video" if m.get("type") == "gifv" else m.get("type")
+        media.append({
+            "type": kind,
+            # preview_url (a small static thumbnail) is the right choice
+            # for an <img> tile, but a <video>/<audio> element needs the
+            # actual playable file -- using preview_url for those meant
+            # every video/audio attachment pointed a <video>/<audio> tag
+            # at a static image instead of its real media URL, which
+            # can't play at all (confirmed live 2026-10-25, the other
+            # half of "some videos not loading").
+            "url": m.get("url") if kind in ("video", "audio") else (m.get("preview_url") or m.get("url")),
             "description": m.get("description") if isinstance(m.get("description"), str) else "",
-        }
-        for m in (base.get("media_attachments") or [])
-        if isinstance(m, dict) and isinstance(m.get("url"), str)
-    ]
+        })
     booster = status.get("account") if (reblog is not None and isinstance(status.get("account"), dict)) else None
     content_html = base.get("content") if isinstance(base.get("content"), str) else ""
     content_html = _substitute_emoji_html(content_html, _mastodon_emoji_map(base.get("emojis")))
@@ -304,7 +320,16 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
             }
             if booster is not None else None
         ),
-        "instance": instance_domain,
+        # The post's OWN origin, not instance_domain (the instance whose
+        # timeline/search this came from) -- a federated-in post from a
+        # Mastodon-API-compatible instance's timeline still carries its
+        # real home server in its own url/uri (Mastodon never rewrites
+        # these to the local instance), so "Open on ..." must read off
+        # that instead. Using instance_domain here showed "Open on
+        # federation.network" for a post actually authored on
+        # infosec.exchange, just because federation.network's federated
+        # timeline was what surfaced it (confirmed live 2026-10-25).
+        "instance": urlparse(base.get("url") or uri).hostname or instance_domain,
     }
 
 
