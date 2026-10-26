@@ -45,10 +45,12 @@ from bridge.commands import (
     _handle_banner,
     _handle_block,
     _handle_chat,
+    _execute_delete_hosted_entity,
     _handle_create_channel,
     _handle_create_community,
     _handle_create_group,
     _handle_create_profile,
+    _is_owner_or_admin_of_hosted_entity,
     _execute_leave_unfollowed,
     _handle_delete_profile,
     _handle_disallow,
@@ -1221,6 +1223,28 @@ async def widget_group_detail(request: Request, username: str) -> JSONResponse:
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.post("/widget/api/groups/{username}/delete")
+async def widget_delete_group(request: Request, username: str) -> JSONResponse:
+    """Unlike ;delete profile's own widget shortcut (which just re-sends
+    the chat warning, still needing a "confirm" reply in the room), this
+    goes straight to the real, irreversible deletion -- the widget's own
+    modal (see openDeleteGroupModal) IS the confirmation step here, so
+    there's nothing left to confirm afterward. Permission (owner-or-admin)
+    is re-verified fresh inside _execute_delete_hosted_entity regardless
+    of what the frontend already decided to show a Delete button for."""
+    matrix_user_id = _session_user(request)
+    repository = request.app.state.repository
+    group = await repository.get_group(username)
+    if group is None:
+        raise HTTPException(404, "No such group.")
+    if not await _is_owner_or_admin_of_hosted_entity(request, entity=group, sender=matrix_user_id):
+        raise HTTPException(403, "You don't own that group, and you're not a bridge admin.")
+    await _execute_delete_hosted_entity(
+        request, sender=matrix_user_id, room_id=group.room_id, username=username, kind="group",
+    )
+    return JSONResponse({"ok": True})
 
 
 @router.post("/widget/api/banner")
@@ -3624,10 +3648,43 @@ _WIDGET_HTML = r"""<!doctype html>
       if (g.is_owner) {
         page.appendChild(el("div", { class: "sub", text: "You created this group. Just post a message in its room to send it -- no title, no special formatting." }));
       }
+      if (g.is_owner || ctx.is_admin) {
+        page.appendChild(el("div", { class: "row" }, [
+          dangerButton("Delete group", () => openDeleteGroupModal(g, () => { groupView = null; currentTab = "groups"; render(); })),
+        ]));
+      }
     }).catch((e) => {
       page.innerHTML = "";
       page.appendChild(el("div", { class: "muted", text: e.message || "Couldn't load that group." }));
     });
+  }
+
+  function openDeleteGroupModal(group, onDeleted) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Delete " + (group.display_name || group.handle) + "?" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub" }, [
+      el("p", { text: "This cannot be undone. Deleting this group will:" }),
+      el("ul", { style: "margin:0 0 8px 0;padding-left:20px;" }, [
+        el("li", { text: "Notify its followers with a signed Delete, so their side actually cleans up." }),
+        el("li", { text: "Rename this room to end in \" (Deleted)\"." }),
+        el("li", { text: "Permanently erase its fediverse identity -- keys, followers, all of it." }),
+      ]),
+      el("p", { text: "This room itself is left alone -- it can keep being used as an ordinary Matrix room, or be left whenever you like." }),
+    ]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [
+      plainButton("Cancel", closeModal),
+      dangerButton("Delete permanently", (e) => {
+        e.target.disabled = true;
+        api("/widget/api/groups/" + encodeURIComponent(group.username) + "/delete", { method: "POST", body: {} })
+          .then(() => { toast("Group deleted.", true); })
+          .catch((err) => { toast(err.message || "Could not delete that group.", false); e.target.disabled = false; })
+          .finally(() => { closeModal(); if (onDeleted) onDeleted(); });
+      }),
+    ]));
+    openModal(body);
   }
 
   // -- Guilds (Shoot guild bridging): join via invite code, list joined
