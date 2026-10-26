@@ -47,6 +47,7 @@ from bridge.commands import (
     _handle_chat,
     _handle_create_channel,
     _handle_create_community,
+    _handle_create_group,
     _handle_create_profile,
     _execute_leave_unfollowed,
     _handle_delete_profile,
@@ -229,6 +230,8 @@ async def widget_context(request: Request, room_id: str) -> JSONResponse:
             "custom_identities_enabled": config.bridge.custom_identities_enabled,
             "peertube_channels_enabled": config.bridge.peertube_channels_enabled,
             "lemmy_community_hosting_enabled": config.bridge.lemmy_community_hosting_enabled,
+            "group_hosting_enabled": config.bridge.group_hosting_enabled,
+            "group_following_enabled": config.bridge.group_following_enabled,
             # Admin-curated Browse-instance shortlist (bridge.default_timeline_domains) --
             # the Browse domain dropdown merges this with the user's own
             # locally-remembered instances (see renderHomeTimeline's own
@@ -1126,6 +1129,103 @@ async def widget_community_detail(request: Request, username: str) -> JSONRespon
     )
 
 
+@router.get("/widget/api/groups")
+async def widget_groups(request: Request) -> JSONResponse:
+    """Lists BOTH groups this account hosts (own identities' own
+    ``;create group``/``;link group`` rooms) and groups it follows/mirrors
+    (resolved the same way ``;follow`` discovers one -- any of this
+    account's ``following`` rows that happen to be a ``GroupRoom``, see
+    ``bridge.group_bridge.ensure_group_room``) -- unlike Channels/
+    Communities (hosted-only today), "join a remote group" is a
+    first-class part of this feature, see the "Join a group" modal."""
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
+
+    hosted = []
+    if config.bridge.group_hosting_enabled:
+        hosted = [
+            {
+                "username": group.username, "display_name": group.display_name,
+                "owner_username": group.owner_username, "room_id": group.room_id,
+                "icon_url": group.icon_url, "handle": f"{group.username}@{config.bridge.domain}",
+                "kind": "hosted",
+            }
+            for identity in identities
+            for group in await repository.list_groups_by_owner(identity.username)
+        ]
+
+    followed = []
+    if config.bridge.group_following_enabled:
+        seen: set[str] = set()
+        for identity in identities:
+            for actor_id in await repository.list_following(identity.username):
+                if actor_id in seen:
+                    continue
+                group_room = await repository.get_group_room(actor_id)
+                if group_room is None:
+                    continue
+                seen.add(actor_id)
+                remote_username = group_room.display_name or actor_id.rstrip("/").rsplit("/", 1)[-1]
+                domain = urlsplit(actor_id).hostname or ""
+                followed.append({
+                    "username": None, "display_name": group_room.display_name,
+                    "owner_username": None, "room_id": group_room.room_id,
+                    "icon_url": group_room.icon_url, "handle": f"{remote_username}@{domain}" if domain else remote_username,
+                    "kind": "followed",
+                })
+
+    return JSONResponse(
+        {
+            "enabled": config.bridge.group_hosting_enabled or config.bridge.group_following_enabled,
+            "hosting_enabled": config.bridge.group_hosting_enabled,
+            "following_enabled": config.bridge.group_following_enabled,
+            "groups": hosted + followed,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/groups/create")
+async def widget_create_group(request: Request) -> JSONResponse:
+    body = await request.json()
+    group_id = (body.get("id") or "").strip()
+    if not group_id:
+        raise HTTPException(400, "id is required")
+    argument = _build_create_argument(
+        group_id, (body.get("as_identity") or "").strip(), (body.get("display_name") or "").strip()
+    )
+    return await _dispatch(request, body.get("room_id", ""), _handle_create_group, argument=argument)
+
+
+@router.get("/widget/api/groups/{username}")
+async def widget_group_detail(request: Request, username: str) -> JSONResponse:
+    matrix_user_id = _session_user(request)
+    config = request.app.state.config
+    repository = request.app.state.repository
+    group = await repository.get_group(username)
+    if group is None:
+        raise HTTPException(404, "No such group.")
+    base = config.bridge.public_base_url
+    owner = await repository.get_local_actor(group.owner_username)
+    return JSONResponse(
+        {
+            "username": group.username,
+            "display_name": group.display_name,
+            "handle": f"{group.username}@{config.bridge.domain}",
+            "summary": group.summary,
+            "icon_url": group.icon_url,
+            "banner_url": group.banner_url,
+            "room_id": group.room_id,
+            "owner_username": group.owner_username,
+            "is_owner": owner is not None and owner.matrix_user_id == matrix_user_id,
+            "public_url": actor_url(base, group.username),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.post("/widget/api/banner")
 async def widget_banner(request: Request) -> JSONResponse:
     body = await request.json()
@@ -1910,6 +2010,7 @@ _WIDGET_HTML = r"""<!doctype html>
     { id: "home", label: "Home", icon: "\u{1F3E0}" },
     { id: "channels", label: "Channels", icon: "\u{1F4FA}" },
     { id: "communities", label: "Communities", icon: "\u{1F465}" },
+    { id: "groups", label: "Groups", icon: "\u{1F4AC}" },
     { id: "guilds", label: "Guilds", icon: "\u{1F3F0}" },
     { id: "profile", label: "Profile", icon: "\u{1F464}" },
     { id: "settings", label: "Settings", icon: "\u{2699}️" },
@@ -1934,6 +2035,7 @@ _WIDGET_HTML = r"""<!doctype html>
   // others, same convention as profileView/threadView).
   let channelView = null;
   let communityView = null;
+  let groupView = null;
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -2107,17 +2209,19 @@ _WIDGET_HTML = r"""<!doctype html>
     const bar = document.getElementById("sidebar");
     bar.innerHTML = "";
     if (!ctx) return;
-    const anyOverlayShowing = !!(profileView || threadView || createIdentityView || channelView || communityView);
+    const anyOverlayShowing = !!(profileView || threadView || createIdentityView || channelView || communityView || groupView);
     NAV_ITEMS.forEach((t) => {
       if (t.id === "admin" && !ctx.is_admin) return;
       if (t.id === "channels" && !ctx.peertube_channels_enabled) return;
       if (t.id === "communities" && !ctx.lemmy_community_hosting_enabled) return;
+      if (t.id === "groups" && !ctx.group_hosting_enabled && !ctx.group_following_enabled) return;
       bar.appendChild(el("button", {
         class: "nav-item" + (!anyOverlayShowing && t.id === currentTab ? " active" : ""),
         title: t.label,
         onclick: () => {
           currentTab = t.id;
           profileView = null; threadView = null; createIdentityView = false; channelView = null; communityView = null;
+          groupView = null;
           render();
         },
       }, [
@@ -2153,7 +2257,7 @@ _WIDGET_HTML = r"""<!doctype html>
     // belongs attached while Home's own timeline is actually showing --
     // otherwise it would keep recording THIS page's scroll position into
     // homeState.scrollY, corrupting what "Back" should restore.
-    const goingToHome = !profileView && !threadView && !createIdentityView && !channelView && !communityView && currentTab === "home";
+    const goingToHome = !profileView && !threadView && !createIdentityView && !channelView && !communityView && !groupView && currentTab === "home";
     if (!goingToHome && window.__homeScrollHandler) {
       window.removeEventListener("scroll", window.__homeScrollHandler);
       window.__homeScrollHandler = null;
@@ -2164,9 +2268,11 @@ _WIDGET_HTML = r"""<!doctype html>
     if (threadView) { renderThreadPage(app, threadView); return; }
     if (channelView) { renderChannelPage(app, channelView); return; }
     if (communityView) { renderCommunityPage(app, communityView); return; }
+    if (groupView) { renderGroupPage(app, groupView); return; }
     if (currentTab === "home") renderHomeTimeline(app);
     else if (currentTab === "channels") renderChannelsTab(app);
     else if (currentTab === "communities") renderCommunitiesTab(app);
+    else if (currentTab === "groups") renderGroupsTab(app);
     else if (currentTab === "guilds") renderGuildsTab(app);
     else if (currentTab === "profile") renderOwnProfileTab(app);
     else if (currentTab === "settings") renderSettingsTab(app);
@@ -3442,6 +3548,94 @@ _WIDGET_HTML = r"""<!doctype html>
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
   }
 
+  // -- Groups (FEP-1b12 flat-chat groups) -- unlike Channels/Communities,
+  // this list combines groups this account HOSTS with ones it FOLLOWS/
+  // mirrors (see widget_groups' own docstring); "Join a group" reuses
+  // the exact same /widget/api/follow endpoint the ordinary "Follow"
+  // button elsewhere already calls, since _handle_follow itself is what
+  // recognizes a remote FEP-1b12 Group and mirrors it.
+
+  function openJoinGroupModal(onJoined) {
+    const body = el("div", { class: "card profile-modal" });
+    const handleInput = el("input", { type: "text", placeholder: "@user@instance.example or a group URL" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Join a group" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    body.appendChild(el("div", { class: "sub", text: "Paste the group's fediverse handle or profile URL." }));
+    body.appendChild(el("div", { class: "row" }, [handleInput]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [
+      primaryButton("Join", (e) => {
+        if (!handleInput.value.trim()) return;
+        doAction("/widget/api/follow", { handle: handleInput.value.trim(), room_id: roomId }, e.target)
+          .then(() => { closeModal(); if (onJoined) onJoined(); });
+      }),
+    ]));
+    openModal(body);
+    setTimeout(() => handleInput.focus(), 0);
+  }
+
+  function renderGroupsTab(app) {
+    if (!ctx.group_hosting_enabled && !ctx.group_following_enabled) { placeholder(app, "Groups aren't enabled on this bridge."); return; }
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    const headerButtons = [];
+    if (ctx.group_hosting_enabled) {
+      headerButtons.push(primaryButton("Create Group", () => openCreateEntityModal(
+        "Create a group", "Hosts a flat-chat FEP-1b12 group as a Matrix room -- just post a message to send it.",
+        "/widget/api/groups/create", () => render(),
+      )));
+    }
+    if (ctx.group_following_enabled) {
+      headerButtons.push(primaryButton("Join a Group", () => openJoinGroupModal(() => render())));
+    }
+    app.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
+        el("h2", { text: "Groups", style: "margin:0;" }),
+        el("div", { class: "row", style: "flex-wrap:nowrap;" }, headerButtons),
+      ]),
+      list,
+    ]));
+    api("/widget/api/groups").then((data) => {
+      list.innerHTML = "";
+      if (!data.groups.length) { list.appendChild(el("div", { class: "muted", text: "No groups yet." })); return; }
+      data.groups.forEach((g) => {
+        const row = entityListItem(g, (ev) => {
+          if (ev.target.closest("a")) return; // "Open" handles its own click
+          if (g.kind === "hosted") openGroupPage(g.username);
+        });
+        list.appendChild(row);
+      });
+    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  function openGroupPage(username) {
+    groupView = { username: username };
+    profileView = null; threadView = null; createIdentityView = false; channelView = null; communityView = null;
+    render();
+  }
+
+  function renderGroupPage(app, view) {
+    app.appendChild(el("button", { class: "back-link", text: "← Back", onclick: () => { groupView = null; currentTab = "groups"; render(); } }));
+    const page = el("div", { class: "profile-page" }, [el("div", { class: "muted", text: "Loading…" })]);
+    app.appendChild(page);
+    api("/widget/api/groups/" + encodeURIComponent(view.username)).then((g) => {
+      page.innerHTML = "";
+      page.appendChild(profileBanner(g.banner_url, null));
+      const actions = el("div", { class: "row" }, [
+        linkButton("Open", matrixToUrl(g.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", href: g.public_url, target: "_blank", rel: "noopener" }),
+      ]);
+      appendProfileIdentity(page, g.icon_url, g.display_name || g.handle, "@" + g.handle, actions);
+      if (g.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = g.summary; page.appendChild(bio); }
+      if (g.is_owner) {
+        page.appendChild(el("div", { class: "sub", text: "You created this group. Just post a message in its room to send it -- no title, no special formatting." }));
+      }
+    }).catch((e) => {
+      page.innerHTML = "";
+      page.appendChild(el("div", { class: "muted", text: e.message || "Couldn't load that group." }));
+    });
+  }
+
   // -- Guilds (Shoot guild bridging): join via invite code, list joined
   //    guilds, leave, and (admin-only) manage each guild's own stored
   //    invite code -- the widget equivalent of ;joinguild/;leaveguild/
@@ -3572,7 +3766,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
   function openChannelPage(username) {
     channelView = { username: username };
-    profileView = null; threadView = null; createIdentityView = false; communityView = null;
+    profileView = null; threadView = null; createIdentityView = false; communityView = null; groupView = null;
     render();
   }
 
@@ -3645,7 +3839,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
   function openCommunityPage(username) {
     communityView = { username: username };
-    profileView = null; threadView = null; createIdentityView = false; channelView = null;
+    profileView = null; threadView = null; createIdentityView = false; channelView = null; groupView = null;
     render();
   }
 
