@@ -342,7 +342,12 @@ async def _send_outbound_dm(
 
 async def maybe_federate_reply(request: Request, event: dict) -> bool:
     """Returns True if this event was a reply to a federated post (handled,
-    successfully or not) -- callers should not also treat it as a fresh post."""
+    successfully or not), OR if it's a reply to something that was NEVER
+    federated at all -- a purely-local Matrix message with no corresponding
+    AP object -- in which case it's swallowed outright rather than falling
+    through to a later dispatch stage (e.g. ``bridge.profile_posts``) and
+    being published as a decontextualized fresh top-level post. Either way,
+    callers should not also treat it as a fresh post."""
     if event.get("type") not in OUTBOUND_EVENT_TYPES:
         return False
     content = normalized_message_content(event)
@@ -540,7 +545,15 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
                         matrix_event_id=event.get("event_id"), is_reply=True,
                     )
                 return True
-            return False  # replying to a purely-local Matrix message; nothing to federate
+            # Still untracked and not a cross-bridge quote either -- an
+            # ordinary reply to a purely-local Matrix message (e.g. someone
+            # chatting in a Profile/Channel/Group room without an AP
+            # identity of their own). Swallow it outright: returning False
+            # here would let it cascade all the way down to
+            # bridge.profile_posts' catch-all and get published as a fresh,
+            # decontextualized top-level post, which is never what a reply
+            # to non-post content should become.
+            return True
 
     actor_record = await repository.get_local_actor_by_matrix_id(sender)
     if actor_record is None:
