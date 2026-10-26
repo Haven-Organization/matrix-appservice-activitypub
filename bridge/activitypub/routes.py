@@ -345,11 +345,16 @@ async def _build_community_actor(request: Request, community: LemmyCommunityReco
 
 async def _build_group_actor(request: Request, group: GroupRecord) -> Actor:
     """Build the served Actor document for a hosted FEP-1b12 Group: a
-    ``Group``-typed actor, structurally close to ``_build_channel_actor``
-    above (``attributed_to_urls``, a plain list naming the owning Profile)
-    rather than ``_build_community_actor``'s single ``/moderators``
-    collection URL -- FEP-1b12 defines no moderator-collection concept to
-    advertise."""
+    ``Group``-typed actor, structurally close to ``_build_community_actor``
+    above -- ``attributedTo`` is a single bare URL naming this Group's own
+    ``/moderators`` collection (see ``get_moderators``), per FEP-1b12's own
+    requirement that ``attributedTo`` point to a collection, not an actor
+    directly. FEP-1b12 itself defines no real moderation concept to back
+    that collection with, so ``get_moderators`` serves it containing just
+    this Group's owner -- confirmed against real FEP-1b12 implementer
+    feedback (a flat ``attributedTo: [<owner actor id>]``, this function's
+    own shape until 2026-10-26, isn't parsed as a moderator list by most
+    FEP-1b12 clients)."""
     base = request.app.state.config.bridge.public_base_url
     display_name = group.display_name or group.username
     summary = plain_text_to_note_html(group.summary) if group.summary else group.summary
@@ -364,7 +369,7 @@ async def _build_group_actor(request: Request, group: GroupRecord) -> Actor:
         outbox=outbox_url(base, group.username),
         followers=followers_url(base, group.username),
         following=following_url(base, group.username),
-        attributed_to_urls=[actor_url(base, group.owner_username)],
+        attributed_to=moderators_url(base, group.username),
         discoverable=True,
         icon_url=group.icon_url,
         icon_media_type=await resolve_media_type(request, group.icon_url),
@@ -2309,16 +2314,25 @@ async def get_moderators(request: Request, username: str) -> JSONResponse:
     """A hosted Lemmy community's own real moderator list, as Lemmy's own
     ``attributedTo``-named collection convention (see
     ``bridge.lemmy_bridge``'s module docstring) -- this route is what that
-    field actually points at. Permanently empty for anything that isn't a
-    hosted community (a Profile or a PeerTube channel has no equivalent
-    concept)."""
+    field actually points at. A hosted Group has no equivalent moderation
+    concept (FEP-1b12 doesn't define one), but its own ``attributedTo``
+    still points here (see ``_build_group_actor``) since the FEP requires
+    that field to be a collection, not a bare actor id -- served as a
+    single-item collection containing just the Group's owner. Permanently
+    empty for anything else (a Profile or a PeerTube channel has no
+    equivalent concept at all)."""
     base = request.app.state.config.bridge.public_base_url
     record = await _get_actor_or_channel_record(request, username)
-    if not isinstance(record, LemmyCommunityRecord):
-        collection = OrderedCollection(id=moderators_url(base, username), items=[], embed_first=False)
+    if isinstance(record, LemmyCommunityRecord):
+        collection = OrderedCollection(id=moderators_url(base, username), items=list(record.moderator_actor_ids))
+        return _collection_or_page(request, collection)
+    if isinstance(record, GroupRecord):
+        collection = OrderedCollection(
+            id=moderators_url(base, username), items=[actor_url(base, record.owner_username)]
+        )
         return _collection_or_page(request, collection)
 
-    collection = OrderedCollection(id=moderators_url(base, username), items=list(record.moderator_actor_ids))
+    collection = OrderedCollection(id=moderators_url(base, username), items=[], embed_first=False)
     return _collection_or_page(request, collection)
 
 
