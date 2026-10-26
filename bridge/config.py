@@ -310,22 +310,18 @@ class BridgeSection:
     # for anything else. Off by default, same "real, substantial behavior
     # change" reasoning as every other *_enabled flag here.
     lemmy_community_hosting_enabled: bool = False
-    # Whether following a remote FEP-1b12 Group (a flat-chat Group actor --
-    # e.g. Mitra, Friendica, Hubzilla -- NOT a Lemmy community/PeerTube
-    # channel, see bridge.group_bridge.is_generic_group_actor) mirrors it
-    # as a shared Matrix room, with each remote member's message as a
-    # plain Note from their own ghost. Off by default, same reasoning as
-    # lemmy_communities_enabled.
-    group_following_enabled: bool = False
-    # Whether a Matrix room can become a real, federating FEP-1b12 Group
-    # HOSTED by this bridge (";create group"/";link group") -- distinct
-    # from group_following_enabled (mirroring a REMOTE Group): hosting
-    # means this bridge is the authoritative home instance, same new
-    # fan-out responsibility lemmy_community_hosting_enabled describes,
-    # just for a flat chat room instead of a forum. Off by default, same
-    # "real, substantial behavior change" reasoning as every other
-    # *_enabled flag here.
-    group_hosting_enabled: bool = False
+    # Whether FEP-1b12 Groups are enabled at all: hosting your own
+    # (";create group"/";link group") AND following/mirroring a remote one
+    # (a flat-chat Group actor -- e.g. Mitra, Friendica, Hubzilla -- NOT a
+    # Lemmy community/PeerTube channel, see
+    # bridge.group_bridge.is_generic_group_actor) both share this one
+    # flag, unlike Lemmy's separate hosting/following flags: hosting and
+    # following a Group are the same real, substantial behavior change
+    # (this bridge becoming a fan-out point for a flat chat room, in
+    # either direction), with no reason so far to turn on one without the
+    # other. Off by default, same reasoning as every other *_enabled flag
+    # here.
+    groups_enabled: bool = False
     # Whether a remote actor's reply into a conversation that's ALREADY
     # tracked here also gets an annotated "⤵️ Reply to X's post" copy
     # posted into THEIR OWN Remote User Room (not just threaded into the
@@ -648,8 +644,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
             bridge_raw.get("lemmy_community_resync_min_interval_seconds", 60)
         ),
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
-        group_following_enabled=bool(bridge_raw.get("group_following_enabled", False)),
-        group_hosting_enabled=bool(bridge_raw.get("group_hosting_enabled", False)),
+        groups_enabled=bool(bridge_raw.get("groups_enabled", False)),
         custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
         reserved_usernames=[

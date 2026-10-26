@@ -230,8 +230,7 @@ async def widget_context(request: Request, room_id: str) -> JSONResponse:
             "custom_identities_enabled": config.bridge.custom_identities_enabled,
             "peertube_channels_enabled": config.bridge.peertube_channels_enabled,
             "lemmy_community_hosting_enabled": config.bridge.lemmy_community_hosting_enabled,
-            "group_hosting_enabled": config.bridge.group_hosting_enabled,
-            "group_following_enabled": config.bridge.group_following_enabled,
+            "groups_enabled": config.bridge.groups_enabled,
             # Admin-curated Browse-instance shortlist (bridge.default_timeline_domains) --
             # the Browse domain dropdown merges this with the user's own
             # locally-remembered instances (see renderHomeTimeline's own
@@ -1144,7 +1143,7 @@ async def widget_groups(request: Request) -> JSONResponse:
     identities = await repository.list_local_actors_by_matrix_id(matrix_user_id)
 
     hosted = []
-    if config.bridge.group_hosting_enabled:
+    if config.bridge.groups_enabled:
         hosted = [
             {
                 "username": group.username, "display_name": group.display_name,
@@ -1157,7 +1156,7 @@ async def widget_groups(request: Request) -> JSONResponse:
         ]
 
     followed = []
-    if config.bridge.group_following_enabled:
+    if config.bridge.groups_enabled:
         seen: set[str] = set()
         for identity in identities:
             for actor_id in await repository.list_following(identity.username):
@@ -1178,9 +1177,7 @@ async def widget_groups(request: Request) -> JSONResponse:
 
     return JSONResponse(
         {
-            "enabled": config.bridge.group_hosting_enabled or config.bridge.group_following_enabled,
-            "hosting_enabled": config.bridge.group_hosting_enabled,
-            "following_enabled": config.bridge.group_following_enabled,
+            "enabled": config.bridge.groups_enabled,
             "groups": hosted + followed,
         },
         headers={"Cache-Control": "no-store"},
@@ -2214,7 +2211,7 @@ _WIDGET_HTML = r"""<!doctype html>
       if (t.id === "admin" && !ctx.is_admin) return;
       if (t.id === "channels" && !ctx.peertube_channels_enabled) return;
       if (t.id === "communities" && !ctx.lemmy_community_hosting_enabled) return;
-      if (t.id === "groups" && !ctx.group_hosting_enabled && !ctx.group_following_enabled) return;
+      if (t.id === "groups" && !ctx.groups_enabled) return;
       bar.appendChild(el("button", {
         class: "nav-item" + (!anyOverlayShowing && t.id === currentTab ? " active" : ""),
         title: t.label,
@@ -3576,18 +3573,15 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   function renderGroupsTab(app) {
-    if (!ctx.group_hosting_enabled && !ctx.group_following_enabled) { placeholder(app, "Groups aren't enabled on this bridge."); return; }
+    if (!ctx.groups_enabled) { placeholder(app, "Groups aren't enabled on this bridge."); return; }
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
-    const headerButtons = [];
-    if (ctx.group_hosting_enabled) {
-      headerButtons.push(primaryButton("Create Group", () => openCreateEntityModal(
+    const headerButtons = [
+      primaryButton("Create Group", () => openCreateEntityModal(
         "Create a group", "Hosts a flat-chat FEP-1b12 group as a Matrix room -- just post a message to send it.",
         "/widget/api/groups/create", () => render(),
-      )));
-    }
-    if (ctx.group_following_enabled) {
-      headerButtons.push(primaryButton("Join a Group", () => openJoinGroupModal(() => render())));
-    }
+      )),
+      primaryButton("Join a Group", () => openJoinGroupModal(() => render())),
+    ];
     app.appendChild(el("div", { class: "card" }, [
       el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
         el("h2", { text: "Groups", style: "margin:0;" }),

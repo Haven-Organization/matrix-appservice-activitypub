@@ -1982,7 +1982,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
         )
         return
 
-    if config.bridge.group_following_enabled and await is_generic_group_actor(request, actor_doc):
+    if config.bridge.groups_enabled and await is_generic_group_actor(request, actor_doc):
         followed_room_id, follow_error = await establish_group_follow(
             request, sender=sender, actor_record=actor_record, group_actor_id=remote_actor_id,
             actor_doc=actor_doc, handle=handle,
@@ -6849,7 +6849,7 @@ async def _handle_create_group(request: Request, *, sender: str, room_id: str, a
     Same multi-identity disambiguation as ``;create channel``/``;create
     community`` -- see ``_resolve_owner_for_new_identity``."""
     config = request.app.state.config
-    if not config.bridge.group_hosting_enabled:
+    if not config.bridge.groups_enabled:
         await _notice(request, room_id, "Hosting Groups is not enabled on this bridge.")
         return
 
@@ -6945,7 +6945,7 @@ async def _handle_link_group(request: Request, *, sender: str, room_id: str, arg
     same pattern (and the same reason it's confirmation-gated) as
     ``_handle_link_community``."""
     config = request.app.state.config
-    if not config.bridge.group_hosting_enabled:
+    if not config.bridge.groups_enabled:
         await _notice(request, room_id, "Hosting Groups is not enabled on this bridge.")
         return
 

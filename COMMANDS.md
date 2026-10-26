@@ -501,7 +501,7 @@ Following/mirroring a remote Lemmy community (`bridge.lemmy_communities_enabled`
 
 ## Groups
 
-Following/mirroring a remote FEP-1b12 Group (`bridge.group_following_enabled`), and -- separately -- hosting your own, authoritative one (`bridge.group_hosting_enabled`). A Group is a flat chat room, unlike a Lemmy community's forum shape: every message is a plain message, no title convention, no comment tree. See `;follow` above for mirroring a remote Group (it's recognized automatically, just like a Lemmy community or a person), and `;backfill`/the automatic first-join backfill for pulling its history.
+Following/mirroring a remote FEP-1b12 Group, and -- separately -- hosting your own, authoritative one, both gated by one flag (`bridge.groups_enabled`). A Group is a flat chat room, unlike a Lemmy community's forum shape: every message is a plain message, no title convention, no comment tree. See `;follow` above for mirroring a remote Group (it's recognized automatically, just like a Lemmy community or a person), and `;backfill`/the automatic first-join backfill for pulling its history.
 
 ### `;create group <id> [as <number|id>] [display name]`
 

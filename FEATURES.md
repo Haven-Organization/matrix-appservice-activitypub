@@ -141,9 +141,9 @@ A Group is a flat chat room federated as a [FEP-1b12](https://w3id.org/fep/1b12)
 
 Groups get no MSC4501 room type at all (unlike a Profile Room/PeerTube channel's `social.profile` or a Lemmy community's `social.group`) -- a plain Matrix room, same as a DM/Chat ghost room, since neither MSC4501 shape describes a flat chat room.
 
-### Following/mirroring a remote Group
+Opt-in (`bridge.groups_enabled`, off by default -- same "real, substantial behavior change" reasoning as every other hosting/mirroring flag), covering both hosting and following -- unlike Lemmy communities, there's no separate flag for each direction.
 
-Opt-in (`bridge.group_following_enabled`, off by default -- same "real, substantial behavior change" reasoning as every other mirroring flag).
+### Following/mirroring a remote Group
 
 - `;follow` a Group (any `Group`-typed actor that isn't a Lemmy community or a PeerTube channel) like any other fediverse actor, or paste its profile link directly -- it gets a shared, plain Matrix room, not a 1:1 Remote User Room, since many different members post in it. Each poster shows up as their own ghost, resolved per-message, same mechanism as a mirrored Lemmy community.
 - A message in the mirrored room -- reply or not -- federates out as a real `Create<Note>` addressed directly to the Group (never an `Announce`, that's only ever the Group's own home instance's job). Unlike a mirrored Lemmy community, there's no "starting a new post isn't supported" restriction: a Group has no title convention, so a flat top-level message is just as valid as a reply.
@@ -151,7 +151,7 @@ Opt-in (`bridge.group_following_enabled`, off by default -- same "real, substant
 
 ### Hosting your own Group
 
-Opt-in separately (`bridge.group_hosting_enabled`, off by default) -- hosting means this bridge is the authoritative home instance, the same real fan-out responsibility Lemmy community hosting describes, just for a flat chat room.
+Hosting means this bridge is the authoritative home instance, the same real fan-out responsibility Lemmy community hosting describes, just for a flat chat room.
 
 - `;create group <id> [as <number|id>] [name]` mints one from scratch; `;link group <id>` turns an already-existing room into one instead -- see [Commands](COMMANDS.md#groups) for both. This is the natural fit for "I already have a public Matrix room and want to bridge it out to the fediverse."
 - A Matrix member with a linked profile posts by just sending an ordinary message -- no title, no blank-line convention -- federating as a real `Create<Note>` (signed by the poster) plus an `Announce` (signed by the Group) to its followers, the same Create+Announce choreography a hosted Lemmy community uses. A real Matrix thread-reply sets the Note's `inReplyTo`; an ordinary message stays a flat, independent post.
