@@ -53,6 +53,9 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - [Lemmy communities](#lemmy-communities)
   - [`;create community`](#create-community-id-as-numberid-display-name)
   - [`;link community`](#link-community-id)
+- [Groups](#groups)
+  - [`;create group`](#create-group-id-as-numberid-display-name)
+  - [`;link group`](#link-group-id)
 - [Admin](#admin)
   - [`;allow`](#allow-mxidroomhomeserver-value)
   - [`;disallow`](#disallow-mxidroomhomeserver-value)
@@ -141,6 +144,7 @@ Following, messaging, and everyday day-to-day commands.
 **What it does:** Follows the target as your own linked actor.
 - **Genuinely remote target:** creates or reuses a Remote User Room, invites you into it, and delivers a signed `Follow`.
 - **A Lemmy community** (a `Group` actor with its own moderators collection, detected via NodeInfo or the actor document): creates or reuses a SHARED `org.matrix.msc4501.social.group` room instead -- see [Lemmy communities](#lemmy-communities) below.
+- **A FEP-1b12 Group** (any other `Group`-typed actor -- e.g. Mitra, Friendica, Hubzilla): creates or reuses a shared PLAIN room (no MSC4501 room type) instead -- see [Groups](#groups) below.
 - **Actually another local user on this bridge** (tagged directly, or resolved via their own `@user@yourdomain` handle): handled entirely in-process. Invites you straight into their existing Profile Room (never fabricating a ghost for someone with a real Matrix account), records the follow both ways, and DMs them a notification.
 
 **Who can run it:** Requires a linked profile first.
@@ -492,6 +496,34 @@ Following/mirroring a remote Lemmy community (`bridge.lemmy_communities_enabled`
 **Who can run it:** Any local user with a linked profile who controls the target room.
 
 **Notes:** A lasting change to what the room IS, same category as [`;link profile`](#link-profile) -- not reversible by an `;unlink` command (none exists for communities yet).
+
+---
+
+## Groups
+
+Following/mirroring a remote FEP-1b12 Group (`bridge.group_following_enabled`), and -- separately -- hosting your own, authoritative one (`bridge.group_hosting_enabled`). A Group is a flat chat room, unlike a Lemmy community's forum shape: every message is a plain message, no title convention, no comment tree. See `;follow` above for mirroring a remote Group (it's recognized automatically, just like a Lemmy community or a person), and `;backfill`/the automatic first-join backfill for pulling its history.
+
+### `;create group <id> [as <number|id>] [display name]`
+
+**Syntax:** `;create group <id> [as <number|id>] [display name]`. Same grammar as [`;create community`](#create-community-id-as-numberid-display-name).
+
+**What it does:** Mints a real, federating FEP-1b12 Group: a `Group`-typed ActivityPub actor with its own keypair, hosted by this bridge itself. Creates a brand-new Matrix room (bot as creator/admin), invites you and makes one of your Profiles its first moderator (power level 50 -- any member can post, not just the owner, same "no single all-powerful owner" model as a Lemmy community), adds the room widget, and adds it to your personal Fediverse space. Shares the same global actor-username namespace as profiles/channels/communities. Unlike `;create community`, the room gets no MSC4501 `room_type` at all -- `social.group` specifically denotes a forum-of-posts shape, which doesn't describe a flat chat room.
+
+**Who can run it:** Any local user with a linked profile.
+
+**Notes:** To post, just send an ordinary message -- no title line, no blank-line convention. A reply to an existing message threads as a reply over ActivityPub too; an ordinary message is a flat, independent one. If you own more than one identity, say which one moderates it with `as <number|id>`, same as `;create community`.
+
+---
+
+### `;link group <id>`
+
+**Syntax:** `;link group <id>`, run inside the room you want to convert. Sends a warning; reply to THAT message with `confirm` to go ahead.
+
+**What it does:** Turns an already-existing room you control into a real, federating Group, instead of creating a fresh one. Adopts the room's current name/avatar/topic/banner as the Group's starting values (best-effort). Same checks as `;create group` (linked profile required, `<id>` not already taken) plus needing to actually control the room.
+
+**Who can run it:** Any local user with a linked profile who controls the target room.
+
+**Notes:** A lasting change to what the room IS, same category as [`;link profile`](#link-profile)/[`;link community`](#link-community-id) -- not reversible by an `;unlink` command (none exists for Groups yet).
 
 ---
 

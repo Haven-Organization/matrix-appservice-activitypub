@@ -135,6 +135,30 @@ Opt-in separately (`bridge.lemmy_community_hosting_enabled`, off by default) -- 
 - The room's own name/topic/avatar/banner map onto the community's actor document, pushed out as a signed `Update` to followers on every change (reusing PeerTube channels' own `push_channel_update`-style mechanism). `;refresh`, run bare inside the room, re-broadcasts the current state on demand (there's nothing remote to pull from -- this bridge already IS the source).
 - A community has no single owner (`;create community`'s sender becomes its first moderator, nothing more) -- raising anyone's Matrix power level to 50+ in the room makes them a REAL moderator (persisted, and announced to followers via a signed `Add`), unlike the mirrored direction, which can only ever reflect someone else's real list. Banning/redacting works the same way mirroring does, just broadcast to the community's own followers instead of delivered to a single remote inbox.
 
+## Groups (FEP-1b12)
+
+A Group is a flat chat room federated as a [FEP-1b12](https://w3id.org/fep/1b12) `Group` actor -- the "message in a room: Note, join: Follow" shape used by software like Mitra, Friendica, and Hubzilla for ordinary group chat. This is deliberately NOT a Lemmy community, even though both are `Group`-typed: a Lemmy community is forum-shaped (every top-level message is a titled `Page`, real moderator collection); a Group is flat -- every message, reply or not, is a plain `Note`, no title convention, no comment tree, and FEP-1b12 itself defines no moderator-collection concept at all. `;follow` tells the two apart automatically (via NodeInfo software detection, same mechanism that already separates a Lemmy community from a PeerTube channel).
+
+Groups get no MSC4501 room type at all (unlike a Profile Room/PeerTube channel's `social.profile` or a Lemmy community's `social.group`) -- a plain Matrix room, same as a DM/Chat ghost room, since neither MSC4501 shape describes a flat chat room.
+
+### Following/mirroring a remote Group
+
+Opt-in (`bridge.group_following_enabled`, off by default -- same "real, substantial behavior change" reasoning as every other mirroring flag).
+
+- `;follow` a Group (any `Group`-typed actor that isn't a Lemmy community or a PeerTube channel) like any other fediverse actor, or paste its profile link directly -- it gets a shared, plain Matrix room, not a 1:1 Remote User Room, since many different members post in it. Each poster shows up as their own ghost, resolved per-message, same mechanism as a mirrored Lemmy community.
+- A message in the mirrored room -- reply or not -- federates out as a real `Create<Note>` addressed directly to the Group (never an `Announce`, that's only ever the Group's own home instance's job). Unlike a mirrored Lemmy community, there's no "starting a new post isn't supported" restriction: a Group has no title convention, so a flat top-level message is just as valid as a reply.
+- The Group's own first-ever follow on this server triggers a one-time auto-backfill of its latest messages, same as an ordinary followed account or a mirrored Lemmy community.
+
+### Hosting your own Group
+
+Opt-in separately (`bridge.group_hosting_enabled`, off by default) -- hosting means this bridge is the authoritative home instance, the same real fan-out responsibility Lemmy community hosting describes, just for a flat chat room.
+
+- `;create group <id> [as <number|id>] [name]` mints one from scratch; `;link group <id>` turns an already-existing room into one instead -- see [Commands](COMMANDS.md#groups) for both. This is the natural fit for "I already have a public Matrix room and want to bridge it out to the fediverse."
+- A Matrix member with a linked profile posts by just sending an ordinary message -- no title, no blank-line convention -- federating as a real `Create<Note>` (signed by the poster) plus an `Announce` (signed by the Group) to its followers, the same Create+Announce choreography a hosted Lemmy community uses. A real Matrix thread-reply sets the Note's `inReplyTo`; an ordinary message stays a flat, independent post.
+- A message arriving from a remote fediverse user addressed directly to the Group (never Announce-wrapped) is imported the same way, then re-`Announce`d to the Group's own followers, excluding whoever originally sent it.
+- The room's own name/topic/avatar/banner map onto the Group's actor document, pushed out as a signed `Update` to followers on every change.
+- A Group has no single owner (`;create group`'s sender becomes its first moderator, Matrix-power-level only -- FEP-1b12 defines no moderator collection to announce a grant to). Any room member with a linked profile can post, not just the owner.
+
 ## Discovery and federation plumbing
 
 - **HTTP Signatures** on every outbound activity and every inbound delivery, including cross-checking the signing key's actor against the activity's own claimed actor to reject spoofing.

@@ -47,6 +47,9 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
     - [Enable PeerTube channels (`bridge.peertube_channels_enabled`)](#bridge-peertube_channels_enabled)
     - [Followed video media mode (`bridge.follow_video_media_mode`)](#bridge-follow_video_media_mode)
     - [Max embedded video size (`bridge.follow_video_max_embed_mb`)](#bridge-follow_video_max_embed_mb)
+  - [FEP-1b12 Groups](#fep-1b12-groups)
+    - [Enable Group hosting (`bridge.group_hosting_enabled`)](#bridge-group_hosting_enabled)
+    - [Enable Group following (`bridge.group_following_enabled`)](#bridge-group_following_enabled)
   - [Multi-identity support](#multi-identity-support)
     - [Enable custom identities (`bridge.custom_identities_enabled`)](#bridge-custom_identities_enabled)
     - [Max identities per user (`bridge.max_identities_per_user`)](#bridge-max_identities_per_user)
@@ -363,6 +366,28 @@ How a followed PeerTube channel/account's videos show up as posts. `link` always
 **Default:** `100`
 
 Only consulted in `embed` mode, checked against the video's own declared file size before ever starting a download.
+
+---
+
+### FEP-1b12 Groups
+
+<a id="bridge-group_hosting_enabled"></a>
+
+#### Enable Group hosting (`bridge.group_hosting_enabled`)
+
+**Default:** `false`
+
+Whether a Matrix room can become a real, federating FEP-1b12 Group HOSTED by this bridge (`;create group`, `;link group`; see [FEATURES.md](FEATURES.md#groups-fep-1b12)) -- a flat chat room, unlike a Lemmy community's forum shape. Off by default, same "real behavior change" reasoning as every other hosting flag here: this bridge becomes the authoritative home for the Group, responsible for fanning content out to its followers itself.
+
+---
+
+<a id="bridge-group_following_enabled"></a>
+
+#### Enable Group following (`bridge.group_following_enabled`)
+
+**Default:** `false`
+
+Whether following a remote FEP-1b12 Group (e.g. Mitra, Friendica, Hubzilla -- NOT a Lemmy community or PeerTube channel, which are mirrored separately) mirrors it as a shared Matrix room, with each remote member's message appearing from their own ghost. Off by default, same reasoning as `group_hosting_enabled`.
 
 ---
 
