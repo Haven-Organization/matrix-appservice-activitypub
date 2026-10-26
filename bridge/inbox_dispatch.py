@@ -2344,8 +2344,9 @@ async def _echo_reply_in_own_room(
 ) -> None:
     """Post an annotated copy of a just-threaded reply into the REPLIER's
     own Remote User Room: a "⤵️ Reply to <author>'s post" header
-    (the word "post" being a matrix.to event pill to the thread's root)
-    above the reply's own content.
+    (the word "post" being a matrix.to event pill to the specific post
+    actually being replied to, i.e. ``parent``) above the reply's own
+    content.
 
     Two callers, two different reasons:
 
@@ -2398,7 +2399,7 @@ async def _echo_reply_in_own_room(
     specific post this reply is actually replying to, matching the "Reply
     to <author>'s post" header text above -- so an MSC4501-aware client
     can recognize this echo as a cross-posted reply rather than an
-    ordinary top-level post, without needing to resolve ``thread_link``
+    ordinary top-level post, without needing to resolve ``parent_link``
     into the OTHER room this event isn't even in.
     """
     repository = request.app.state.repository
@@ -2424,9 +2425,8 @@ async def _echo_reply_in_own_room(
     if profile is None or not profile.mxid:
         return
 
-    root_event_id = reply_event.thread_root_event_id or parent.event_id
-    thread_link = matrix_to_link(
-        reply_event.room_id, root_event_id, via=[request.app.state.config.synapse.server_name]
+    parent_link = matrix_to_link(
+        parent.room_id, parent.event_id, via=[request.app.state.config.synapse.server_name]
     )
     parent_handle, parent_author_html = await actor_html_with_avatar(request, parent.author_actor_id)
 
@@ -2468,10 +2468,10 @@ async def _echo_reply_in_own_room(
         )
 
     plain_body = f"⤵️ Reply to {parent_handle}'s post:\n\n{plain}".strip()
-    plain_body += f"\n\n{thread_link}"
+    plain_body += f"\n\n{parent_link}"
     header_html = (
         f"<p>⤵️ Reply to {parent_author_html}'s "
-        f'<a href="{html.escape(thread_link, quote=True)}">post</a>:</p>'
+        f'<a href="{html.escape(parent_link, quote=True)}">post</a>:</p>'
     )
     content_html = safe_html or (f"<p>{html.escape(plain)}</p>" if plain else "")
     message_content: dict = {
@@ -2484,7 +2484,7 @@ async def _echo_reply_in_own_room(
         message_content[SOCIAL_RELATES_TO_FIELD] = reply_relates_to
         # A compliant client's replacement for body/formatted_body: the
         # reply's own real text alone, without the "⤵️ Reply to X's post:"
-        # header or the trailing thread_link -- see SOCIAL_BODY_FIELD's own
+        # header or the trailing parent_link -- see SOCIAL_BODY_FIELD's own
         # docstring. Omitted for a caption-less reply (e.g. an image with no
         # text of its own) -- same reasoning, confirmed live 2026-07-13.
         if plain:
