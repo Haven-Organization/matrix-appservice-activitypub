@@ -1949,18 +1949,25 @@ async def _fetch_community_outbox_items(
 
 async def _fetch_group_outbox_items(request: Request, *, group: GroupRecord, base: str) -> list[dict]:
     """A hosted Group's outbox: every currently-tracked message in its
-    room, each reconstructed as its own Create+Announce pair, same
-    ``Announce{Create{Note}}`` shape ``bridge.group_bridge.
-    maybe_distribute_group_message`` itself sends live. Unlike
-    ``_fetch_room_outbox_notes`` (one fixed author per room),
-    a Group room has MANY different authors, so this resolves each
-    message's real author from its own recorded ``FederatedEvent`` rather
-    than assuming a single owner -- deliberately a lighter reconstruction
-    than ``_reconstruct_note_from_matrix_event``'s full pipeline (no
-    mention-pill/attachment/edit handling yet): a remote server
-    refetching this collection sees plain text only for now, an accepted
-    limitation, not a correctness issue (nothing attributes the wrong
-    author)."""
+    room, each reconstructed as a single ``Announce`` activity whose
+    ``object`` is the full embedded ``Create{Note}`` -- per FEP-1b12's own
+    "Announce activity" requirement (the outbox holds ``Announce``s, each
+    wrapping the ORIGINAL activity unchanged, not a separate flat ``Create``
+    alongside it), and the same shape ``bridge.group_bridge.
+    maybe_distribute_group_message`` itself sends live. Confirmed against
+    real FEP-1b12 implementer feedback: this function used to append both a
+    bare ``Create{Note}`` AND a second ``Announce`` whose ``object`` was
+    just the Note's own id (a string) -- two disconnected flat items,
+    rather than one ``Announce`` preserving the original activity.
+
+    Unlike ``_fetch_room_outbox_notes`` (one fixed author per room), a
+    Group room has MANY different authors, so this resolves each message's
+    real author from its own recorded ``FederatedEvent`` rather than
+    assuming a single owner -- deliberately a lighter reconstruction than
+    ``_reconstruct_note_from_matrix_event``'s full pipeline (no
+    mention-pill/attachment/edit handling yet): a remote server refetching
+    this collection sees plain text only for now, an accepted limitation,
+    not a correctness issue (nothing attributes the wrong author)."""
     group_actor_id = actor_url(base, group.username)
     repository: ActorRepository = request.app.state.repository
     synapse = request.app.state.synapse
@@ -2002,10 +2009,9 @@ async def _fetch_group_outbox_items(request: Request, *, group: GroupRecord, bas
         )
         announce_activity = Activity(
             id=f"{federated.ap_object_id}/announces/outbox", type="Announce", actor=group_actor_id,
-            object=federated.ap_object_id, published=published, to=[AS_PUBLIC],
+            object=create_activity.to_dict(), published=published, to=[AS_PUBLIC],
             cc=[followers_url(base, group.username)],
         )
-        items.append(create_activity.to_dict())
         items.append(announce_activity.to_dict())
     return items
 
