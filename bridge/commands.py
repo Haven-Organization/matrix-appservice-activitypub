@@ -395,17 +395,30 @@ _COMMAND_RE = re.compile(rf"\b({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | r
 
 # Anchored to the very start of the line and requires a recognized keyword
 # to immediately follow (unlike _COMMAND_RE, which just looks for one
-# anywhere in the line) -- a bare ";" prefix with no valid command after it
-# is deliberately NOT treated as addressing the bot at all, unlike tagging
-# it directly. Tagging the bot's literal mxid is an unambiguous, deliberate
-# action; a one-character symbol at the start of a line is comparatively
-# likely to appear in someone's ordinary message text for unrelated reasons
-# (a sentence that just starts with ";)", a Lisp snippet, ...) -- requiring
-# an actual known keyword right after it keeps those from being mistaken
-# for a command and swallowed/never federated (see message_addresses_bot).
+# anywhere in the line) -- a bare ";" with no SPACE and no valid keyword
+# after it (e.g. a sentence that just starts with ";)", a Lisp snippet, ...)
+# is deliberately NOT treated as addressing the bot at all, since a
+# one-character symbol with nothing separating it from the next character is
+# comparatively likely to appear in someone's ordinary message text for
+# unrelated reasons. This regex is what actually dispatches a real command
+# (see _extract_prefixed_command); _PREFIX_ADDRESS_RE below is the separate,
+# looser check for "never federate this" that doesn't require a real
+# keyword.
 _PREFIXED_COMMAND_RE = re.compile(
     rf"^{re.escape(_COMMAND_PREFIX)}\s*({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | re.DOTALL
 )
+
+# Looser than _PREFIXED_COMMAND_RE: matches the prefix followed by whitespace
+# (or nothing else at all), with NO requirement that a recognized keyword
+# follows. The prefix immediately followed by whitespace is a strong,
+# deliberate signal that a message was typed as an attempt to address the
+# bot -- unlike the no-space case _PREFIXED_COMMAND_RE's own comment worries
+# about (";)", a Lisp comment's "; text" has a space too, but someone pasting
+# Lisp into chat is accepted collateral here) -- so a message matching this,
+# even with a typo'd or unrecognized command after it, must never be
+# mistaken for ordinary chat and federated out as a post (see
+# message_addresses_bot/maybe_handle_command).
+_PREFIX_ADDRESS_RE = re.compile(rf"^{re.escape(_COMMAND_PREFIX)}(?:\s|$)")
 
 
 def configure_command_prefix(prefix: str) -> None:
@@ -422,11 +435,12 @@ def configure_command_prefix(prefix: str) -> None:
     story anywhere else either, so calling this more than once with the
     same value (e.g. constructing a second app in the same process, as
     tests do) is harmless, just redundant."""
-    global _COMMAND_PREFIX, _PREFIXED_COMMAND_RE
+    global _COMMAND_PREFIX, _PREFIXED_COMMAND_RE, _PREFIX_ADDRESS_RE
     _COMMAND_PREFIX = prefix
     _PREFIXED_COMMAND_RE = re.compile(
         rf"^{re.escape(_COMMAND_PREFIX)}\s*({_COMMAND_KEYWORDS})\b\s*(.*)", re.IGNORECASE | re.DOTALL
     )
+    _PREFIX_ADDRESS_RE = re.compile(rf"^{re.escape(_COMMAND_PREFIX)}(?:\s|$)")
 
 # _SOCIAL_PROFILE_ROOM_TYPE and _KNOCK_JOIN_RULE now live in
 # bridge.note_mirroring (imported above, aliased to these same names) --
@@ -467,13 +481,47 @@ def _bot_mxid(config) -> str:
     return f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
 
 
+def _is_tag_addressed(content: dict, config) -> bool:
+    """Whether ``content`` tags the bot via a proper Matrix intentional
+    mention (``m.mentions.user_ids``) or its bare MXID appearing anywhere in
+    the plain body -- the "someone deliberately tagged the bot" half of
+    ``message_addresses_bot``, split out so ``maybe_handle_command`` can
+    tell that case apart from the looser bare-prefix one (see
+    ``_looks_like_prefix_address``)."""
+    bot_mxid = _bot_mxid(config)
+    mentioned = (content.get("m.mentions") or {}).get("user_ids") or []
+    body = content.get("body") or ""
+    return bot_mxid in mentioned or bot_mxid in body
+
+
+def _looks_like_prefix_address(body: str) -> bool:
+    """True if ``body``'s first line starts with the bare command prefix
+    followed by whitespace, or nothing else at all (see
+    ``_PREFIX_ADDRESS_RE``) -- regardless of whether a recognized keyword
+    follows. Deliberately looser than ``_extract_prefixed_command``: a
+    message typed as an attempt to address the bot (even with a typo'd or
+    unrecognized command after it) must never be mistaken for ordinary chat
+    and federated out as a post."""
+    first_line = body.split("\n", 1)[0]
+    return bool(_PREFIX_ADDRESS_RE.match(first_line))
+
+
+def _is_bare_prefix_message(body: str) -> bool:
+    """True if ``body`` is nothing but the command prefix itself, optionally
+    with surrounding whitespace (e.g. ";" or "; ") -- no keyword, no other
+    content at all."""
+    return body.strip() == _COMMAND_PREFIX
+
+
 def message_addresses_bot(content: dict, config) -> bool:
     """Whether a Matrix message's content tags/addresses the bridge bot --
     via a proper Matrix intentional mention (``m.mentions.user_ids``), the
     bot's bare MXID appearing anywhere in the plain body (some clients never
     send intentional mentions at all, or someone might type the MXID by hand
-    without it becoming a real pill), or the ``;command`` shorthand prefix
-    (see ``_PREFIXED_COMMAND_RE``) at the very start of the message.
+    without it becoming a real pill), the ``;command`` shorthand prefix (see
+    ``_PREFIXED_COMMAND_RE``) at the very start of the message, or just the
+    bare prefix followed by whitespace with no recognized keyword after it
+    at all (see ``_looks_like_prefix_address``).
 
     Used both to recognize a bot command (see ``maybe_handle_command``,
     below) and, independently, as a safety check in the outbound
@@ -490,12 +538,12 @@ def message_addresses_bot(content: dict, config) -> bool:
     ``sender`` against our own ghost namespace, same as it always has for
     the tag-based forms -- this function only decides whether a message
     LOOKS bot-directed, not who gets to act on that."""
-    bot_mxid = _bot_mxid(config)
-    mentioned = (content.get("m.mentions") or {}).get("user_ids") or []
-    body = content.get("body") or ""
-    if bot_mxid in mentioned or bot_mxid in body:
+    if _is_tag_addressed(content, config):
         return True
-    return _extract_prefixed_command(body) is not None
+    body = content.get("body") or ""
+    if _extract_prefixed_command(body) is not None:
+        return True
+    return _looks_like_prefix_address(body)
 
 
 def is_foreign_bot_command(content: dict, config) -> bool:
@@ -687,19 +735,34 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
 
     # The ;prefix form is checked first and, unlike _extract_command, only
     # ever matches when a real keyword immediately follows the prefix (see
-    # _PREFIXED_COMMAND_RE) -- so it's never the reason the fallback below
-    # gets hit; that fallback stays reachable only via the tag-based forms,
-    # exactly as before this shorthand existed.
-    parsed = _extract_prefixed_command(body) or _extract_command(body)
+    # _PREFIXED_COMMAND_RE). _extract_command's anywhere-in-the-line search
+    # is deliberately only tried for a real TAG address (someone
+    # unambiguously mentioned the bot, so searching their sentence for an
+    # intended keyword is reasonable) -- never for the looser bare-prefix
+    # address (_looks_like_prefix_address), where doing the same would risk
+    # e.g. "; I could use some help" being mistaken for a real ;help command
+    # just because "help" appears somewhere in it.
+    tagged = _is_tag_addressed(content, config)
+    parsed = _extract_prefixed_command(body) or (_extract_command(body) if tagged else None)
     if parsed is None:
+        if not tagged and _is_bare_prefix_message(body):
+            # Just the prefix itself ("; " or ";"), with nothing else at
+            # all -- never federate it, but stay silent too: this reads far
+            # more like someone idly typing the prefix (or chat that just
+            # happens to start with it) than a deliberate request for help,
+            # and dumping the full command list for that would be noise in
+            # an otherwise-ordinary conversation.
+            return True
         # Tagging the bot with nothing else recognizable as a command --
-        # either truly nothing beyond the tag/prefix itself, or some other
-        # text that isn't a known command keyword -- once the tag's own
-        # mxid/display name and a bare prefix are stripped out. Show the
-        # full help message directly for the "nothing else" case (most
-        # likely someone just poking the bot to see what it does), and a
-        # brief pointer to it otherwise (already tried to say SOMETHING,
-        # so a whole command table would bury that they got it wrong).
+        # either truly nothing beyond the tag itself, or some other text
+        # that isn't a known command keyword (including the bare-prefix
+        # address case above when there WAS other text after it) -- once
+        # the tag's own mxid/display name and a bare prefix are stripped
+        # out. Show the full help message directly for the "nothing else"
+        # case (most likely someone just poking the bot to see what it
+        # does), and a brief pointer to it otherwise (already tried to say
+        # SOMETHING, so a whole command table would bury that they got it
+        # wrong).
         residue = body.replace(bot_mxid, "")
         if config.appservice.bot_display_name:
             residue = residue.replace(config.appservice.bot_display_name, "")
