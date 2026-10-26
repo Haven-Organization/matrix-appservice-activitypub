@@ -32,6 +32,8 @@ from bridge.repository import (
     ChannelRoom,
     FederatedEvent,
     GhostProfile,
+    GroupRecord,
+    GroupRoom,
     GuildChannel,
     GuildMembership,
     InstanceLoginRecord,
@@ -659,6 +661,35 @@ _SCHEMA_STATEMENTS = [
     )
     """,
     "ALTER TABLE lemmy_community_rooms ADD COLUMN IF NOT EXISTS pending_backfill BOOLEAN NOT NULL DEFAULT FALSE",
+    # A real FEP-1b12 Group HOSTED by this bridge (see GroupRecord's own
+    # docstring -- a flat-chat Group, structurally like peertube_channels,
+    # not lemmy_communities: no moderator_actor_ids equivalent).
+    """
+    CREATE TABLE IF NOT EXISTS hosted_groups (
+        username TEXT PRIMARY KEY,
+        owner_username TEXT NOT NULL,
+        room_id TEXT NOT NULL UNIQUE,
+        public_key_pem TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        icon_url TEXT,
+        banner_url TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_hosted_groups_owner ON hosted_groups (owner_username)",
+    # A mirrored REMOTE FEP-1b12 Group (see GroupRoom's own docstring --
+    # same shape as lemmy_community_rooms minus moderators_url).
+    """
+    CREATE TABLE IF NOT EXISTS group_rooms (
+        group_actor_id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        icon_url TEXT,
+        banner_url TEXT,
+        pending_backfill BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
 ]
 
 _TRANSACTION_RETENTION_SECONDS = 7 * 24 * 3600
@@ -1004,6 +1035,60 @@ class PostgresActorRepository:
             record.public_key_pem, record.private_key_pem,
             record.display_name, record.summary, record.icon_url, record.banner_url,
             json.dumps(list(record.moderator_actor_ids)),
+        )
+
+    # -- hosted Groups (FEP-1b12) ---------------------------------------------
+
+    @staticmethod
+    def _row_to_group(row: asyncpg.Record) -> GroupRecord:
+        return GroupRecord(
+            username=row["username"],
+            owner_username=row["owner_username"],
+            room_id=row["room_id"],
+            public_key_pem=row["public_key_pem"],
+            private_key_pem=row["private_key_pem"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
+        )
+
+    async def get_group(self, username: str) -> GroupRecord | None:
+        row = await self._pool.fetchrow("SELECT * FROM hosted_groups WHERE username = $1", username)
+        return self._row_to_group(row) if row else None
+
+    async def get_group_by_room_id(self, room_id: str) -> GroupRecord | None:
+        if not room_id:
+            return None
+        row = await self._pool.fetchrow("SELECT * FROM hosted_groups WHERE room_id = $1", room_id)
+        return self._row_to_group(row) if row else None
+
+    async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM hosted_groups WHERE owner_username = $1 ORDER BY username", owner_username
+        )
+        return [self._row_to_group(row) for row in rows]
+
+    async def register_group(self, record: GroupRecord) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO hosted_groups
+                (username, owner_username, room_id, public_key_pem, private_key_pem,
+                 display_name, summary, icon_url, banner_url)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (username) DO UPDATE SET
+                owner_username = EXCLUDED.owner_username,
+                room_id = EXCLUDED.room_id,
+                public_key_pem = EXCLUDED.public_key_pem,
+                private_key_pem = EXCLUDED.private_key_pem,
+                display_name = EXCLUDED.display_name,
+                summary = EXCLUDED.summary,
+                icon_url = EXCLUDED.icon_url,
+                banner_url = EXCLUDED.banner_url
+            """,
+            record.username, record.owner_username, record.room_id,
+            record.public_key_pem, record.private_key_pem,
+            record.display_name, record.summary, record.icon_url, record.banner_url,
         )
 
     # -- followers / following ----------------------------------------------
@@ -1842,6 +1927,40 @@ class PostgresActorRepository:
         await self._pool.execute(
             "UPDATE lemmy_community_rooms SET pending_backfill = FALSE WHERE room_id = $1", room_id
         )
+
+    @staticmethod
+    def _row_to_group_room(row) -> GroupRoom:
+        return GroupRoom(
+            group_actor_id=row["group_actor_id"], room_id=row["room_id"],
+            display_name=row["display_name"], icon_url=row["icon_url"], banner_url=row["banner_url"],
+            pending_backfill=row["pending_backfill"],
+        )
+
+    async def get_group_room(self, group_actor_id: str) -> GroupRoom | None:
+        row = await self._pool.fetchrow("SELECT * FROM group_rooms WHERE group_actor_id = $1", group_actor_id)
+        return self._row_to_group_room(row) if row else None
+
+    async def get_group_room_by_room_id(self, room_id: str) -> GroupRoom | None:
+        row = await self._pool.fetchrow("SELECT * FROM group_rooms WHERE room_id = $1", room_id)
+        return self._row_to_group_room(row) if row else None
+
+    async def register_group_room(self, record: GroupRoom) -> None:
+        # pending_backfill deliberately NOT in the DO UPDATE SET -- same
+        # reasoning as register_lemmy_community_room's identical omission.
+        await self._pool.execute(
+            """
+            INSERT INTO group_rooms (group_actor_id, room_id, display_name, icon_url, banner_url, pending_backfill)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (group_actor_id) DO UPDATE SET
+                room_id = EXCLUDED.room_id, display_name = EXCLUDED.display_name,
+                icon_url = EXCLUDED.icon_url, banner_url = EXCLUDED.banner_url
+            """,
+            record.group_actor_id, record.room_id, record.display_name,
+            record.icon_url, record.banner_url, record.pending_backfill,
+        )
+
+    async def mark_group_room_backfill_pending_done(self, room_id: str) -> None:
+        await self._pool.execute("UPDATE group_rooms SET pending_backfill = FALSE WHERE room_id = $1", room_id)
 
     # -- bot DM rooms --------------------------------------------------------
 

@@ -127,6 +127,7 @@ from bridge.repository import (
     RemoteActorRoom,
 )
 from bridge.channel_bridge import ensure_channel_room, maybe_handle_channel_message
+from bridge.group_bridge import maybe_handle_group_announce, maybe_handle_owned_group_create
 from bridge.lemmy_bridge import (
     maybe_handle_community_announce,
     maybe_handle_community_actor_update,
@@ -191,6 +192,10 @@ async def _handle_follow(request: Request, username: str, activity: Activity) ->
         community = await repository.get_lemmy_community(username)
         if community is not None:
             await _handle_community_follow_owned(request, username=username, community=community, activity=activity)
+            return
+        group = await repository.get_group(username)
+        if group is not None:
+            await _handle_group_follow_owned(request, username=username, group=group, activity=activity)
         return
 
     if await repository.is_blocked(username, activity.actor):
@@ -462,6 +467,74 @@ async def _announce_new_community_follower_owned(request: Request, community, fo
             "formatted_body": (
                 f"<p>\U0001F464 {actor_html} is now following your community "
                 f"{html.escape(community.username)}.</p>"
+            ),
+        },
+    )
+
+
+async def _handle_group_follow_owned(request: Request, *, username: str, group, activity: Activity) -> None:
+    """Same Follow/Accept handshake as ``_handle_community_follow_owned``,
+    for one of OUR OWN hosted FEP-1b12 Groups instead."""
+    repository = request.app.state.repository
+    already_following = activity.actor in await repository.list_followers(username)
+    await repository.add_follower(username, activity.actor)
+
+    config = request.app.state.config
+    base = config.bridge.public_base_url
+    accept = Activity(
+        id=f"{actor_url(base, username)}/accepts/{uuid.uuid4().hex}",
+        type="Accept",
+        actor=actor_url(base, username),
+        object=activity.to_dict(),
+    )
+    try:
+        inbox = await _resolve_inbox(request, activity.actor)
+        await deliver_activity(
+            request.app.state.http_client,
+            inbox_url=inbox,
+            activity=accept.to_dict(),
+            key_id=main_key_id(base, username),
+            private_key_pem=group.private_key_pem,
+        )
+    except DeliveryError:
+        logger.warning("Failed to deliver Accept to %s", activity.actor, exc_info=True)
+
+    if not already_following:
+        await _announce_new_group_follower_owned(request, group, activity.actor)
+
+
+async def _announce_new_group_follower_owned(request: Request, group, follower_actor_id: str) -> None:
+    """Same ghost-invite-plus-owner-DM pattern as
+    ``_announce_new_community_follower_owned``, for a hosted Group follow."""
+    resolved = await _resolve_and_invite_ghost(request, follower_actor_id, group.room_id)
+    if resolved is None:
+        return
+    mxid, actor_doc = resolved
+
+    repository = request.app.state.repository
+    owner = await repository.get_local_actor(group.owner_username)
+    if owner is None:
+        return
+    if await is_silenced(repository, group.owner_username, follower_actor_id):
+        return
+
+    domain = urlsplit(follower_actor_id).hostname or ""
+    remote_username = actor_doc.get("preferredUsername") or follower_actor_id.rstrip("/").rsplit("/", 1)[-1]
+    handle = f"@{remote_username}@{domain}"
+    actor_html = notification_actor_html(
+        mxid=mxid, handle=handle, display_name=actor_doc.get("name") or remote_username
+    )
+
+    await notify_user(
+        request,
+        matrix_user_id=owner.matrix_user_id,
+        content={
+            "msgtype": "m.text",
+            "body": f"\U0001F464 {handle} is now following your group {group.username}.",
+            "format": "org.matrix.custom.html",
+            "formatted_body": (
+                f"<p>\U0001F464 {actor_html} is now following your group "
+                f"{html.escape(group.username)}.</p>"
             ),
         },
     )
@@ -2750,6 +2823,12 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     if await maybe_handle_community_announce(request, activity):
         return
 
+    # Same divert-before-repost-logic reasoning, for a mirrored FEP-1b12
+    # Group's own fan-out -- see maybe_handle_group_announce's own
+    # docstring.
+    if await maybe_handle_group_announce(request, activity):
+        return
+
     reposted_id = activity.object_id()
     reposted_target = await repository.get_federated_event_by_ap_object(reposted_id) if reposted_id else None
     if reposted_target is not None:
@@ -3516,13 +3595,19 @@ async def _handle_block(request: Request, username: str, activity: Activity) -> 
         return
     record = await repository.get_local_actor(target_username)
     if record is None:
-        # Might be a PeerTube channel instead (see PeerTubeChannelRecord's
-        # own docstring on the shared username namespace) -- same
-        # sever-the-follow behavior, just no "blocked you" DM: there's no
-        # single Matrix user to notify without resolving the channel's
-        # owner, a fairly minor edge case not worth the extra lookup here.
-        channel = await repository.get_peertube_channel(target_username)
-        if channel is not None:
+        # Might be a PeerTube channel, a hosted Lemmy community, or a
+        # hosted Group instead (see PeerTubeChannelRecord's own docstring
+        # on the shared username namespace) -- same sever-the-follow
+        # behavior, just no "blocked you" DM: there's no single Matrix
+        # user to notify without resolving the owner, a fairly minor edge
+        # case not worth the extra lookup here. The Lemmy/Group branches
+        # were missing entirely before this comment was added -- a block
+        # against either kind silently left a stale follower record.
+        if (
+            await repository.get_peertube_channel(target_username) is not None
+            or await repository.get_lemmy_community(target_username) is not None
+            or await repository.get_group(target_username) is not None
+        ):
             await repository.remove_follower(target_username, activity.actor)
         return
 
@@ -3714,6 +3799,10 @@ async def _handle_create_dispatch(request: Request, username: str, activity: Act
     afterward, which ``_handle_create``'s own generic reply-threading has
     no reason to know about)."""
     if await maybe_handle_owned_community_create(request, activity):
+        return
+    # Same diversion, for a Create addressed directly to one of OUR OWN
+    # hosted Groups -- see maybe_handle_owned_group_create's own docstring.
+    if await maybe_handle_owned_group_create(request, activity):
         return
     await _handle_create(request, username, activity)
 

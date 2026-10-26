@@ -264,6 +264,12 @@ from bridge.inbox_dispatch import (
     _resolve_reply_header_context,
     build_preview_media_content,
 )
+from bridge.group_bridge import (
+    backfill_group_posts,
+    establish_group_follow,
+    is_generic_group_actor,
+    mint_owned_group,
+)
 from bridge.lemmy_bridge import (
     backfill_community_posts,
     backfill_community_thread,
@@ -346,6 +352,7 @@ from bridge.repository import (
     ChannelRoom,
     FederatedEvent,
     GhostProfile,
+    GroupRoom,
     LemmyCommunityRoom,
     PeerTubeChannelRecord,
     PendingGuildFollow,
@@ -863,6 +870,10 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_link_community(
                 request, sender=sender, room_id=room_id, argument=argument[len("community"):].strip()
             )
+        elif subcommand == "create" and (argument.lower() == "group" or argument.lower().startswith("group ")):
+            await _handle_create_group(request, sender=sender, room_id=room_id, argument=argument[len("group"):].strip())
+        elif subcommand == "link" and (argument.lower() == "group" or argument.lower().startswith("group ")):
+            await _handle_link_group(request, sender=sender, room_id=room_id, argument=argument[len("group"):].strip())
         elif subcommand == "publish":
             await _handle_publish(
                 request, sender=sender, room_id=room_id, content=content, command_event_id=event.get("event_id")
@@ -1936,12 +1947,14 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
                     logger.warning("Could not invite %s to %s: %s", sender, remote_room.room_id, exc)
         else:
             community_room = await repository.get_lemmy_community_room(remote_actor_id)
-            if community_room is not None:
+            group_room = await repository.get_group_room(remote_actor_id) if community_room is None else None
+            target_room = community_room or group_room
+            if target_room is not None:
                 try:
-                    await synapse.invite_user(community_room.room_id, sender, as_user_id=bot_mxid)
+                    await synapse.invite_user(target_room.room_id, sender, as_user_id=bot_mxid)
                 except SynapseError as exc:
                     if exc.errcode != "M_FORBIDDEN":
-                        logger.warning("Could not invite %s to %s: %s", sender, community_room.room_id, exc)
+                        logger.warning("Could not invite %s to %s: %s", sender, target_room.room_id, exc)
         await _notice(request, room_id, f"You're already following {handle}.")
         return
 
@@ -1965,6 +1978,30 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
             html_message=(
                 f"Following the Lemmy community {html.escape(handle)}. "
                 f"Posts will appear in {room_pill_html(followed_room_id)}."
+            ),
+        )
+        return
+
+    if config.bridge.group_following_enabled and await is_generic_group_actor(request, actor_doc):
+        followed_room_id, follow_error = await establish_group_follow(
+            request, sender=sender, actor_record=actor_record, group_actor_id=remote_actor_id,
+            actor_doc=actor_doc, handle=handle,
+        )
+        if follow_error is not None:
+            if followed_room_id is not None:
+                await _notice(
+                    request, room_id,
+                    f"Joined the room, but delivering the Follow to {handle} failed "
+                    "(it is not retried automatically yet).",
+                )
+            else:
+                await _notice(request, room_id, f"Could not follow {handle}: {follow_error}.")
+            return
+        await _notice(
+            request, room_id, f"Following the group {handle}. Messages will appear in {followed_room_id}.",
+            html_message=(
+                f"Following the group {html.escape(handle)}. "
+                f"Messages will appear in {room_pill_html(followed_room_id)}."
             ),
         )
         return
@@ -4635,6 +4672,28 @@ async def _run_community_auto_backfill(
     await _notice(request, room_id, summary)
 
 
+async def _run_group_auto_backfill(request: Request, *, room_id: str, group_room: GroupRoom, count: int) -> None:
+    """The one-time auto-backfill a brand-new Group follow's first join
+    triggers -- same mechanism/notice style as
+    ``_run_community_auto_backfill``, always the Group's outbox."""
+    await _notice(
+        request, room_id,
+        f"New follow -- backfilling this group's latest {count} messages now. "
+        "I'll post a summary here when it's done.",
+    )
+    try:
+        imported, already, failed = await backfill_group_posts(request, group_room=group_room, count=count)
+    except Exception:
+        logger.exception("Group auto-backfill crashed in %s", room_id)
+        return
+
+    summary = f"Backfill finished: {imported} message(s) mirrored, {already} already here"
+    if failed:
+        summary += f", {failed} couldn't be mirrored"
+    summary += "."
+    await _notice(request, room_id, summary)
+
+
 async def _handle_widget(request: Request, *, room_id: str) -> None:
     """Adds this bridge's room widget (``bridge.widget``) to the current
     room, on explicit ``;widget`` request -- see
@@ -6163,6 +6222,7 @@ async def _handle_create_profile(
             await repository.get_local_actor(username) is not None
             or await repository.get_peertube_channel(username) is not None
             or await repository.get_lemmy_community(username) is not None
+            or await repository.get_group(username) is not None
         ):
             message = f"{username}@{config.bridge.domain} is already taken."
             await _notice(request, room_id, message)
@@ -6408,6 +6468,7 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
         await repository.get_local_actor(channel_id) is not None
         or await repository.get_peertube_channel(channel_id) is not None
         or await repository.get_lemmy_community(channel_id) is not None
+        or await repository.get_group(channel_id) is not None
     ):
         await _notice(request, room_id, f"{channel_id}@{config.bridge.domain} is already taken.")
         return
@@ -6521,6 +6582,7 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
         await repository.get_local_actor(community_id) is not None
         or await repository.get_peertube_channel(community_id) is not None
         or await repository.get_lemmy_community(community_id) is not None
+        or await repository.get_group(community_id) is not None
     ):
         await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
         return
@@ -6605,6 +6667,7 @@ async def _handle_link_community(request: Request, *, sender: str, room_id: str,
         await repository.get_local_actor(community_id) is not None
         or await repository.get_peertube_channel(community_id) is not None
         or await repository.get_lemmy_community(community_id) is not None
+        or await repository.get_group(community_id) is not None
     ):
         await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
         return
@@ -6679,6 +6742,7 @@ async def _execute_link_community(request: Request, *, sender: str, room_id: str
         await repository.get_local_actor(community_id) is not None
         or await repository.get_peertube_channel(community_id) is not None
         or await repository.get_lemmy_community(community_id) is not None
+        or await repository.get_group(community_id) is not None
     ):
         await _notice(request, room_id, f"{community_id}@{config.bridge.domain} is already taken.")
         return
@@ -6765,6 +6829,304 @@ async def maybe_handle_link_community_confirmation(request: Request, event: dict
     token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
     try:
         await _execute_link_community(request, sender=sender, room_id=room_id, community_id=community_id)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
+async def _handle_create_group(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """``;create group <id> [as <number|id>] [display name]``: mints a
+    real, federating FEP-1b12 Group HOSTED by this bridge (see
+    ``GroupRecord``'s own docstring, and ``bridge.group_bridge``'s
+    module-level docstring for the design) -- a flat chat room, unlike
+    ``;create community``'s forum shape: just post a message to send it,
+    no title convention. Requires ``sender`` to already have a linked
+    Profile; that Profile becomes the group's first moderator (Matrix
+    power level only -- FEP-1b12 has no moderator-collection concept to
+    grant). Run ``;link group`` instead to turn an already-existing room
+    into one.
+
+    Same multi-identity disambiguation as ``;create channel``/``;create
+    community`` -- see ``_resolve_owner_for_new_identity``."""
+    config = request.app.state.config
+    if not config.bridge.group_hosting_enabled:
+        await _notice(request, room_id, "Hosting Groups is not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    raw_id, _, rest = argument.partition(" ")
+    group_id = sanitize_localpart_component(raw_id)
+    if not group_id:
+        await _notice(
+            request, room_id, f'Usage: "{_COMMAND_PREFIX}create group <id> [as <number|id>] [display name]".',
+        )
+        return
+
+    owner, rest, error = await _resolve_owner_for_new_identity(
+        repository, sender=sender, rest=rest.strip(), domain=config.bridge.domain
+    )
+    if error is not None:
+        await _notice(request, room_id, error)
+        return
+    if owner is None or not owner.room_id:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" before creating a group.',
+        )
+        return
+
+    display_name = rest.strip() or group_id
+
+    rejection = await _check_reserved_or_colliding_username(request, group_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
+
+    # Shares the same global actor-username namespace as profiles/channels/
+    # communities -- same reasoning as _handle_create_community's identical
+    # check.
+    if (
+        await repository.get_local_actor(group_id) is not None
+        or await repository.get_peertube_channel(group_id) is not None
+        or await repository.get_lemmy_community(group_id) is not None
+        or await repository.get_group(group_id) is not None
+    ):
+        await _notice(request, room_id, f"{group_id}@{config.bridge.domain} is already taken.")
+        return
+
+    bot_mxid = _bot_mxid(config)
+    try:
+        new_room_id = await synapse.create_room(
+            as_user_id=bot_mxid,
+            name=display_name,
+            invite=[sender],
+            # No room_type at all -- NOT _SOCIAL_GROUP_ROOM_TYPE, which
+            # specifically denotes a Lemmy-style forum-of-posts shape (see
+            # bridge.group_bridge's own module docstring). A plain room,
+            # same as a DM/Chat ghost room.
+            join_rule=_KNOCK_JOIN_RULE,
+            # The creator becomes the group's first moderator (power level
+            # 50) -- any member can post, not just the owner, same "no
+            # single all-powerful owner" framing as a Lemmy community.
+            power_level_content_override={"users": {sender: 50}},
+        )
+    except SynapseError as exc:
+        logger.warning("Could not create group room for %s: %s", sender, exc)
+        await _notice(request, room_id, "Could not create a room for that group.")
+        return
+
+    await mint_owned_group(
+        request, owner=owner, group_id=group_id, room_id=new_room_id,
+        display_name=display_name, summary="", icon_mxc=None, banner_mxc=None,
+    )
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
+
+    message = (
+        f"Created {new_room_id} as the group {group_id}@{config.bridge.domain}, moderated as "
+        f"{owner.username}@{config.bridge.domain} -- you've been invited and made its first moderator "
+        "there. Just post a message to send it -- no title, no special formatting."
+    )
+    html_message = (
+        f"Created {room_pill_html(new_room_id)} as the group {group_id}@{config.bridge.domain}, "
+        f"moderated as {owner.username}@{config.bridge.domain} -- you've been invited and made its first "
+        "moderator there. Just post a message to send it -- no title, no special formatting."
+    )
+    await _notice(request, room_id, message, html_message=html_message)
+
+
+_LINK_GROUP_WARNING_MARKER = "This will make this room a permanent, federating Group"
+
+
+async def _handle_link_group(request: Request, *, sender: str, room_id: str, argument: str) -> None:
+    """First half of a two-step, confirmation-gated ";link group <id>" --
+    same pattern (and the same reason it's confirmation-gated) as
+    ``_handle_link_community``."""
+    config = request.app.state.config
+    if not config.bridge.group_hosting_enabled:
+        await _notice(request, room_id, "Hosting Groups is not enabled on this bridge.")
+        return
+
+    repository = request.app.state.repository
+    owner = await resolve_acting_identity(request, sender=sender, room_id=room_id)
+    if owner is None or not owner.room_id:
+        await _notice(
+            request, room_id,
+            f'You need a linked profile first -- run "{_COMMAND_PREFIX}create profile" or '
+            f'"{_COMMAND_PREFIX}link profile" before linking a group.',
+        )
+        return
+
+    group_id = sanitize_localpart_component(argument.strip())
+    if not group_id:
+        await _notice(request, room_id, f'Usage: "{_COMMAND_PREFIX}link group <id>", run inside the room.')
+        return
+    rejection = await _check_reserved_or_colliding_username(request, group_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
+    if (
+        await repository.get_local_actor(group_id) is not None
+        or await repository.get_peertube_channel(group_id) is not None
+        or await repository.get_lemmy_community(group_id) is not None
+        or await repository.get_group(group_id) is not None
+    ):
+        await _notice(request, room_id, f"{group_id}@{config.bridge.domain} is already taken.")
+        return
+
+    already_used_as = await _room_already_bridged_as(request, room_id)
+    if already_used_as is not None:
+        await _notice(
+            request, room_id,
+            f"This room is already {already_used_as} -- it can't also become a group. Run "
+            f'"{_COMMAND_PREFIX}create group {group_id}" instead for a fresh room of its own.',
+        )
+        return
+
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(
+            request, room_id,
+            f'"{_COMMAND_PREFIX}link group" needs you to actually control this room -- high enough '
+            "power to set its name/avatar yourself -- not just be a member of it. Give yourself (or have "
+            f'an admin give you) a higher power level here, or run "{_COMMAND_PREFIX}create group '
+            f'{group_id}" instead for a fresh room the bot makes you the first moderator of.',
+        )
+        return
+
+    warning = (
+        f"⚠️ {_LINK_GROUP_WARNING_MARKER} ({group_id}@{config.bridge.domain}). From now on, everything "
+        "posted here publishes to the fediverse as a real Group message, and anyone who can already set "
+        "this room's name/avatar becomes a real moderator -- this isn't a one-off action, it's a lasting "
+        "change to what this room IS. This room's own current name/avatar/topic/banner will be adopted as "
+        'the group\'s (best-effort). Reply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {_LINK_GROUP_WARNING_MARKER} ({group_id}@{config.bridge.domain}). From now on, "
+        "everything posted here publishes to the fediverse as a real Group message, and anyone who can "
+        "already set this room's name/avatar becomes a real moderator -- this isn't a one-off action, "
+        "it's a lasting change to what this room IS. This room's own current name/avatar/topic/banner "
+        "will be adopted as the group's (best-effort).</p><p>Reply to THIS message with "
+        '"confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send link-group warning to %s", room_id, exc_info=True)
+
+
+async def _execute_link_group(request: Request, *, sender: str, room_id: str, group_id: str) -> None:
+    """The actual link, run once ``maybe_handle_link_group_confirmation``
+    sees the "confirm" reply -- same re-check-everything-fresh reasoning
+    as ``_execute_link_community``."""
+    config = request.app.state.config
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+
+    owner = await resolve_acting_identity(request, sender=sender, room_id=room_id)
+    if owner is None or not owner.room_id:
+        await _notice(request, room_id, "You no longer have a linked profile -- link one first, then try again.")
+        return
+    rejection = await _check_reserved_or_colliding_username(request, group_id)
+    if rejection is not None:
+        await _notice(request, room_id, rejection)
+        return
+    if (
+        await repository.get_local_actor(group_id) is not None
+        or await repository.get_peertube_channel(group_id) is not None
+        or await repository.get_lemmy_community(group_id) is not None
+        or await repository.get_group(group_id) is not None
+    ):
+        await _notice(request, room_id, f"{group_id}@{config.bridge.domain} is already taken.")
+        return
+    if not await _sender_controls_room(request, room_id=room_id, sender=sender):
+        await _notice(request, room_id, "You no longer control this room -- link group cancelled.")
+        return
+
+    bot_mxid = _bot_mxid(config)
+    display_name = group_id
+    summary = ""
+    icon_mxc = None
+    banner_mxc = None
+    try:
+        name_content = await synapse.get_room_state(room_id, "m.room.name", as_user_id=bot_mxid)
+        display_name = name_content.get("name") or group_id
+    except SynapseError:
+        pass
+    try:
+        topic_content = await synapse.get_room_state(room_id, "m.room.topic", as_user_id=bot_mxid)
+        summary = topic_content.get("topic") or ""
+    except SynapseError:
+        pass
+    try:
+        avatar_content = await synapse.get_room_state(room_id, "m.room.avatar", as_user_id=bot_mxid)
+        icon_mxc = avatar_content.get("url") or None
+    except SynapseError:
+        pass
+    try:
+        banner_content = await synapse.get_room_state(room_id, PROFILE_BANNER_STATE_TYPE, as_user_id=bot_mxid)
+        banner_mxc = banner_content.get("url") or None
+    except SynapseError:
+        pass
+
+    await mint_owned_group(
+        request, owner=owner, group_id=group_id, room_id=room_id,
+        display_name=display_name, summary=summary, icon_mxc=icon_mxc, banner_mxc=banner_mxc,
+    )
+    await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id)
+
+    await _notice(
+        request, room_id, f"Linked! This room now publishes as the group {group_id}@{config.bridge.domain}.",
+    )
+
+
+async def maybe_handle_link_group_confirmation(request: Request, event: dict) -> bool:
+    """Returns True if this event was a "confirm" reply to one of our own
+    ``link group`` warnings -- same stateless-marker mechanism as
+    ``maybe_handle_link_community_confirmation``; must run in the same
+    place in the dispatch chain, for the same reason."""
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    warning_body = (target_event.get("content") or {}).get("body") or ""
+    if _LINK_GROUP_WARNING_MARKER not in warning_body:
+        return False
+
+    match = re.search(r"\(([a-z0-9_]+)@", warning_body)
+    if match is None:
+        return False
+    group_id = match.group(1)
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_link_group(request, sender=sender, room_id=room_id, group_id=group_id)
     finally:
         _command_relates_to_var.reset(token)
     return True
@@ -7828,6 +8190,18 @@ async def _room_already_bridged_as(request: Request, room_id: str) -> str | None
         return "a Shoot guild's Space"
     if await repository.get_peertube_channel_by_room_id(room_id) is not None:
         return "a PeerTube Channel room"
+    # The two Lemmy checks and the two Group checks below were missing
+    # entirely before this comment was added -- the same hijack this
+    # function exists to prevent (confirmed live 2026-08-27, see the
+    # docstring) was still open for every one of these four room kinds.
+    if await repository.get_lemmy_community_by_room_id(room_id) is not None:
+        return "a hosted Lemmy community room"
+    if await repository.get_lemmy_community_room_by_room_id(room_id) is not None:
+        return "a mirrored Lemmy community room"
+    if await repository.get_group_by_room_id(room_id) is not None:
+        return "a hosted Group room"
+    if await repository.get_group_room_by_room_id(room_id) is not None:
+        return "a mirrored Group room"
     if await repository.is_ghost_dm_room(room_id):
         return "a DM room"
     if await repository.is_ghost_chat_room(room_id):
@@ -7900,6 +8274,7 @@ async def _handle_link_profile(request: Request, *, sender: str, room_id: str) -
     if existing is None and (
         await repository.get_peertube_channel(username) is not None
         or await repository.get_lemmy_community(username) is not None
+        or await repository.get_group(username) is not None
     ):
         await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
         return
@@ -8006,6 +8381,7 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
     if existing is None and (
         await repository.get_peertube_channel(username) is not None
         or await repository.get_lemmy_community(username) is not None
+        or await repository.get_group(username) is not None
     ):
         await _notice(request, room_id, f"{username}@{config.bridge.domain} is already taken.")
         return

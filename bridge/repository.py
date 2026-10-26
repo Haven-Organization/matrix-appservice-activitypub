@@ -146,6 +146,33 @@ class LemmyCommunityRecord:
 
 
 @dataclass(frozen=True)
+class GroupRecord:
+    """A real, federating FEP-1b12 ``Group`` HOSTED by this bridge (see
+    ``bridge.commands``'s ``;create group``/``;link group``) -- a plain
+    chat room mirrored out as a flat-``Note`` Group actor, this bridge
+    being its authoritative home. Same ``Group``-typed-actor-with-its-own-
+    keypair shape as ``PeerTubeChannelRecord``/``LemmyCommunityRecord``
+    (and shares their global username namespace), but structurally closer
+    to ``PeerTubeChannelRecord``: FEP-1b12 itself defines no moderator-
+    collection concept, so there's no ``moderator_actor_ids`` equivalent --
+    ``owner_username`` here is bookkeeping (the creator) only, since (like
+    a community, unlike a channel) any room member with a linked profile
+    can post, not just the owner. Unlike ``LemmyCommunityRecord``'s
+    room, a Group's room gets no MSC4501 ``room_type`` at all -- see
+    ``bridge.group_bridge``'s own module docstring."""
+
+    username: str
+    owner_username: str
+    room_id: str
+    public_key_pem: str
+    private_key_pem: str
+    display_name: str = ""
+    summary: str = ""
+    icon_url: str | None = None
+    banner_url: str | None = None
+
+
+@dataclass(frozen=True)
 class ThirdPartyAllowRecord:
     """One admin-granted allowlist entry letting a user/room/homeserver on a
     DIFFERENT Matrix homeserver use the bridge (see the ";allow"/";disallow"/
@@ -323,6 +350,28 @@ class LemmyCommunityRoom:
     # mechanism as RemoteActorRoom.pending_backfill, consumed by
     # bridge.membership.maybe_handle_join the first time anyone actually
     # joins.
+    pending_backfill: bool = False
+
+
+@dataclass(frozen=True)
+class GroupRoom:
+    """Maps a mirrored REMOTE FEP-1b12 ``Group`` (one we follow but don't
+    own) to the Matrix room fanning its members' messages out to many
+    different ghosts -- the mirroring counterpart of ``GroupRecord``
+    (hosting), same relationship ``LemmyCommunityRoom`` has to
+    ``LemmyCommunityRecord``. No ``moderators_url`` equivalent (FEP-1b12
+    defines no moderator collection to track). Member-ghost tracking
+    reuses ``channel_room_members``/``is_channel_member_known``/
+    ``record_channel_member`` as-is, same reasoning as
+    ``LemmyCommunityRoom``'s own docstring."""
+
+    group_actor_id: str
+    room_id: str
+    display_name: str = ""
+    icon_url: str | None = None
+    banner_url: str | None = None
+    # Same one-time auto-backfill mechanism as LemmyCommunityRoom's own
+    # field -- see that docstring.
     pending_backfill: bool = False
 
 
@@ -598,6 +647,20 @@ class ActorRepository(Protocol):
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         """Create or replace a hosted Lemmy community (freshly created, or
         updated display fields / moderator list)."""
+        ...
+
+    async def get_group(self, username: str) -> GroupRecord | None: ...
+
+    async def get_group_by_room_id(self, room_id: str) -> GroupRecord | None: ...
+
+    async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
+        """Every hosted Group ``owner_username`` owns -- same reasoning as
+        ``list_peertube_channels_by_owner``/``list_lemmy_communities_by_owner``."""
+        ...
+
+    async def register_group(self, record: GroupRecord) -> None:
+        """Create or replace a hosted Group (freshly created, or updated
+        display fields)."""
         ...
 
     async def list_followers(self, username: str) -> list[str]:
@@ -929,6 +992,27 @@ class ActorRepository(Protocol):
         ...
 
     async def mark_lemmy_community_backfill_pending_done(self, room_id: str) -> None:
+        """Consume ``room_id``'s one-time ``pending_backfill`` flag."""
+        ...
+
+    async def get_group_room(self, group_actor_id: str) -> GroupRoom | None:
+        """The Matrix room mirroring ``group_actor_id``, or None if we
+        don't follow/mirror that Group at all."""
+        ...
+
+    async def get_group_room_by_room_id(self, room_id: str) -> GroupRoom | None:
+        """The reverse of ``get_group_room`` -- which Group ``room_id``
+        mirrors, or None if it isn't one at all."""
+        ...
+
+    async def register_group_room(self, record: GroupRoom) -> None:
+        """Record a freshly created (or updated) mirrored Group room. Must
+        never clobber an existing row's ``pending_backfill`` -- only
+        ``mark_group_room_backfill_pending_done`` may change it after the
+        row's first creation."""
+        ...
+
+    async def mark_group_room_backfill_pending_done(self, room_id: str) -> None:
         """Consume ``room_id``'s one-time ``pending_backfill`` flag."""
         ...
 
@@ -1435,6 +1519,10 @@ class InMemoryActorRepository:
         self._peertube_channels_by_room_id: dict[str, str] = {}  # room_id -> channel username
         self._lemmy_communities: dict[str, LemmyCommunityRecord] = {}
         self._lemmy_communities_by_room_id: dict[str, str] = {}  # room_id -> community username
+        self._groups: dict[str, GroupRecord] = {}
+        self._groups_by_room_id: dict[str, str] = {}  # room_id -> group username
+        self._group_rooms: dict[str, GroupRoom] = {}
+        self._group_rooms_by_room_id: dict[str, GroupRoom] = {}
         # Keyed by plain username, independent of ``_actors`` -- matches the
         # real sqlite/postgres ``followers``/``following``/``blocked_actors``/
         # ``muted_actors`` tables, which have no foreign key onto
@@ -1606,6 +1694,24 @@ class InMemoryActorRepository:
         self._lemmy_communities[record.username] = record
         if record.room_id:
             self._lemmy_communities_by_room_id[record.room_id] = record.username
+
+    async def get_group(self, username: str) -> GroupRecord | None:
+        return self._groups.get(username)
+
+    async def get_group_by_room_id(self, room_id: str) -> GroupRecord | None:
+        username = self._groups_by_room_id.get(room_id) if room_id else None
+        return self._groups.get(username) if username else None
+
+    async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
+        return [g for g in self._groups.values() if g.owner_username == owner_username]
+
+    async def register_group(self, record: GroupRecord) -> None:
+        existing = self._groups.get(record.username)
+        if existing is not None and existing.room_id and existing.room_id != record.room_id:
+            self._groups_by_room_id.pop(existing.room_id, None)
+        self._groups[record.username] = record
+        if record.room_id:
+            self._groups_by_room_id[record.room_id] = record.username
 
     async def list_followers(self, username: str) -> list[str]:
         return sorted(self._followers.get(username, ()))
@@ -1839,6 +1945,27 @@ class InMemoryActorRepository:
         updated = replace(record, pending_backfill=False)
         self._lemmy_community_rooms[record.community_actor_id] = updated
         self._lemmy_community_rooms_by_room_id[room_id] = updated
+
+    async def get_group_room(self, group_actor_id: str) -> GroupRoom | None:
+        return self._group_rooms.get(group_actor_id)
+
+    async def get_group_room_by_room_id(self, room_id: str) -> GroupRoom | None:
+        return self._group_rooms_by_room_id.get(room_id)
+
+    async def register_group_room(self, record: GroupRoom) -> None:
+        previous = self._group_rooms.get(record.group_actor_id)
+        if previous is not None:
+            record = replace(record, pending_backfill=previous.pending_backfill)
+        self._group_rooms[record.group_actor_id] = record
+        self._group_rooms_by_room_id[record.room_id] = record
+
+    async def mark_group_room_backfill_pending_done(self, room_id: str) -> None:
+        record = self._group_rooms_by_room_id.get(room_id)
+        if record is None:
+            return
+        updated = replace(record, pending_backfill=False)
+        self._group_rooms[record.group_actor_id] = updated
+        self._group_rooms_by_room_id[room_id] = updated
 
     async def record_federated_event(self, record: FederatedEvent, *, is_primary: bool = True) -> None:
         self._federated_by_matrix_event[record.event_id] = record

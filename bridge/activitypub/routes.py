@@ -102,6 +102,7 @@ from bridge.repository import (
     ActorRecord,
     ActorRepository,
     FederatedEvent,
+    GroupRecord,
     LemmyCommunityRecord,
     PeerTubeChannelRecord,
 )
@@ -165,13 +166,14 @@ async def _get_actor_record(request: Request, username: str):
 
 async def _get_actor_or_channel_record(
     request: Request, username: str
-) -> ActorRecord | PeerTubeChannelRecord | LemmyCommunityRecord:
-    """Same as ``_get_actor_record``, but also resolves a PeerTube channel
-    or a hosted Lemmy community username (see ``PeerTubeChannelRecord``'s/
-    ``LemmyCommunityRecord``'s own docstrings on why all three share one
-    global namespace) -- for routes that don't need to build a full Actor
-    document, like ``get_followers``/``get_following``/``post_inbox``, and
-    so work identically for any kind of local actor."""
+) -> ActorRecord | PeerTubeChannelRecord | LemmyCommunityRecord | GroupRecord:
+    """Same as ``_get_actor_record``, but also resolves a PeerTube channel,
+    a hosted Lemmy community, or a hosted Group username (see
+    ``PeerTubeChannelRecord``'s/``LemmyCommunityRecord``'s/``GroupRecord``'s
+    own docstrings on why all four share one global namespace) -- for
+    routes that don't need to build a full Actor document, like
+    ``get_followers``/``get_following``/``post_inbox``, and so work
+    identically for any kind of local actor."""
     repository: ActorRepository = request.app.state.repository
     record = await repository.get_local_actor(username)
     if record is not None:
@@ -182,6 +184,9 @@ async def _get_actor_or_channel_record(
     community = await repository.get_lemmy_community(username)
     if community is not None:
         return community
+    group = await repository.get_group(username)
+    if group is not None:
+        return group
     raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
 
@@ -334,6 +339,42 @@ async def _build_community_actor(request: Request, community: LemmyCommunityReco
             id=main_key_id(base, community.username),
             owner=actor_url(base, community.username),
             public_key_pem=community.public_key_pem,
+        ),
+    )
+
+
+async def _build_group_actor(request: Request, group: GroupRecord) -> Actor:
+    """Build the served Actor document for a hosted FEP-1b12 Group: a
+    ``Group``-typed actor, structurally close to ``_build_channel_actor``
+    above (``attributed_to_urls``, a plain list naming the owning Profile)
+    rather than ``_build_community_actor``'s single ``/moderators``
+    collection URL -- FEP-1b12 defines no moderator-collection concept to
+    advertise."""
+    base = request.app.state.config.bridge.public_base_url
+    display_name = group.display_name or group.username
+    summary = plain_text_to_note_html(group.summary) if group.summary else group.summary
+    return Actor(
+        id=actor_url(base, group.username),
+        type="Group",
+        preferred_username=group.username,
+        name=display_name,
+        summary=summary,
+        url=actor_url(base, group.username),
+        inbox=inbox_url(base, group.username),
+        outbox=outbox_url(base, group.username),
+        followers=followers_url(base, group.username),
+        following=following_url(base, group.username),
+        attributed_to_urls=[actor_url(base, group.owner_username)],
+        discoverable=True,
+        icon_url=group.icon_url,
+        icon_media_type=await resolve_media_type(request, group.icon_url),
+        image_url=group.banner_url,
+        image_media_type=await resolve_media_type(request, group.banner_url),
+        shared_inbox=shared_inbox_url(base),
+        public_key=PublicKey(
+            id=main_key_id(base, group.username),
+            owner=actor_url(base, group.username),
+            public_key_pem=group.public_key_pem,
         ),
     )
 
@@ -506,6 +547,9 @@ async def webfinger(request: Request, resource: str = Query(...)) -> JSONRespons
         community = await repository.get_lemmy_community(username)
         resolved_username = community.username if community is not None else None
     if resolved_username is None:
+        group = await repository.get_group(username)
+        resolved_username = group.username if group is not None else None
+    if resolved_username is None:
         raise HTTPException(status_code=404, detail=f"No such actor: {username}")
 
     document = build_local_webfinger_document(
@@ -567,7 +611,13 @@ async def get_actor(request: Request, username: str) -> Response:
         if channel is None:
             community = await repository.get_lemmy_community(username)
             if community is None:
-                raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+                group = await repository.get_group(username)
+                if group is None:
+                    raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+                # No dedicated HTML browse page for a hosted Group yet
+                # either -- same reasoning as the community branch below.
+                actor = await _build_group_actor(request, group)
+                return _activity_json(actor.to_dict())
             # No dedicated HTML browse page for a hosted community yet
             # (unlike a Profile/channel) -- serves its AP document either
             # way for now; a real page is a reasonable future addition,
@@ -1564,7 +1614,12 @@ async def get_outbox(request: Request, username: str) -> JSONResponse:
         if channel is None:
             community = await repository.get_lemmy_community(username)
             if community is None:
-                raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+                group = await repository.get_group(username)
+                if group is None:
+                    raise HTTPException(status_code=404, detail=f"No such actor: {username}")
+                items = await _fetch_group_outbox_items(request, group=group, base=base)
+                collection = OrderedCollection(id=outbox_url(base, username), items=items, embed_first=False)
+                return _collection_or_page(request, collection)
             # Real-time delivery at post time reaches whoever already
             # follows us directly, but a profile page fetched fresh by a
             # remote server that has never followed us (or is only now
@@ -1887,6 +1942,69 @@ async def _fetch_community_outbox_items(
     return items
 
 
+async def _fetch_group_outbox_items(request: Request, *, group: GroupRecord, base: str) -> list[dict]:
+    """A hosted Group's outbox: every currently-tracked message in its
+    room, each reconstructed as its own Create+Announce pair, same
+    ``Announce{Create{Note}}`` shape ``bridge.group_bridge.
+    maybe_distribute_group_message`` itself sends live. Unlike
+    ``_fetch_room_outbox_notes`` (one fixed author per room),
+    a Group room has MANY different authors, so this resolves each
+    message's real author from its own recorded ``FederatedEvent`` rather
+    than assuming a single owner -- deliberately a lighter reconstruction
+    than ``_reconstruct_note_from_matrix_event``'s full pipeline (no
+    mention-pill/attachment/edit handling yet): a remote server
+    refetching this collection sees plain text only for now, an accepted
+    limitation, not a correctness issue (nothing attributes the wrong
+    author)."""
+    group_actor_id = actor_url(base, group.username)
+    repository: ActorRepository = request.app.state.repository
+    synapse = request.app.state.synapse
+    config = request.app.state.config
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    try:
+        history = await synapse.get_room_messages(
+            group.room_id, limit=OUTBOX_HISTORY_LIMIT, direction="b", as_user_id=bot_mxid
+        )
+    except (SynapseError, httpx.HTTPError):
+        logger.warning("Failed to fetch history for group %s's outbox", group.username, exc_info=True)
+        return []
+
+    items: list[dict] = []
+    for matrix_event in history.get("chunk", []):
+        if matrix_event.get("type") != "m.room.message":
+            continue
+        matrix_event_id = matrix_event.get("event_id")
+        if not matrix_event_id:
+            continue
+        federated = await repository.get_federated_event_by_matrix_event(matrix_event_id)
+        if federated is None:
+            continue
+        content = matrix_event.get("content") or {}
+        body = (content.get("body") or "").strip()
+        if not body:
+            continue
+        published = datetime.fromtimestamp(
+            (matrix_event.get("origin_server_ts") or 0) / 1000, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        note_dict = {
+            "id": federated.ap_object_id, "type": "Note", "attributedTo": federated.author_actor_id,
+            "content": plain_text_to_note_html(body), "mediaType": "text/html", "published": published,
+            "to": [AS_PUBLIC], "cc": [group_actor_id], "audience": group_actor_id,
+        }
+        create_activity = Activity(
+            id=f"{federated.ap_object_id}/activity", type="Create", actor=federated.author_actor_id,
+            object=note_dict, published=published, to=[AS_PUBLIC], cc=[group_actor_id], audience=group_actor_id,
+        )
+        announce_activity = Activity(
+            id=f"{federated.ap_object_id}/announces/outbox", type="Announce", actor=group_actor_id,
+            object=federated.ap_object_id, published=published, to=[AS_PUBLIC],
+            cc=[followers_url(base, group.username)],
+        )
+        items.append(create_activity.to_dict())
+        items.append(announce_activity.to_dict())
+    return items
+
+
 @router.api_route("/actor/{username}/posts/{post_id}", methods=["GET", "HEAD"])
 async def get_lemmy_post(request: Request, username: str, post_id: str) -> Response:
     """Serve a single hosted-Lemmy-community top-level post at its own AP
@@ -2149,6 +2267,7 @@ async def get_followers(request: Request, username: str) -> JSONResponse:
     identity_kind = (
         "channel" if isinstance(record, PeerTubeChannelRecord)
         else "community" if isinstance(record, LemmyCommunityRecord)
+        else "group" if isinstance(record, GroupRecord)
         else "profile"
     )
     hidden = identity_kind == "profile" and await get_effective_setting(
@@ -2171,6 +2290,7 @@ async def get_following(request: Request, username: str) -> JSONResponse:
     identity_kind = (
         "channel" if isinstance(record, PeerTubeChannelRecord)
         else "community" if isinstance(record, LemmyCommunityRecord)
+        else "group" if isinstance(record, GroupRecord)
         else "profile"
     )
     hidden = identity_kind == "profile" and await get_effective_setting(
@@ -2210,13 +2330,13 @@ async def get_featured(request: Request, username: str) -> JSONResponse:
     feature; this route and ``_fetch_featured_notes`` are the other half
     (AP collection reflecting current ``m.room.pinned_events`` state).
 
-    Permanently empty for a PeerTube channel or a hosted Lemmy community
-    (both Group actors) -- pinning is scoped to ordinary Person profiles
-    only for v1, same as ``get_playlists``'s identical
-    stub-for-the-wrong-actor-kind reasoning."""
+    Permanently empty for a PeerTube channel, a hosted Lemmy community, or
+    a hosted Group (all ``Group``-typed actors) -- pinning is scoped to
+    ordinary Person profiles only for v1, same as ``get_playlists``'s
+    identical stub-for-the-wrong-actor-kind reasoning."""
     base = request.app.state.config.bridge.public_base_url
     record = await _get_actor_or_channel_record(request, username)
-    if isinstance(record, (PeerTubeChannelRecord, LemmyCommunityRecord)):
+    if isinstance(record, (PeerTubeChannelRecord, LemmyCommunityRecord, GroupRecord)):
         collection = OrderedCollection(id=featured_url(base, username), items=[], embed_first=False)
         return _collection_or_page(request, collection)
 

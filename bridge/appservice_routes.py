@@ -61,6 +61,7 @@ from bridge.commands import (
     maybe_handle_delete_confirmation,
     maybe_handle_leave_unfollowed_confirmation,
     maybe_handle_link_community_confirmation,
+    maybe_handle_link_group_confirmation,
     maybe_handle_link_profile_confirmation,
     maybe_handle_replace_ghost_room_confirmation,
     maybe_handle_replace_room_confirmation,
@@ -68,6 +69,14 @@ from bridge.commands import (
 )
 from bridge.delete_bridge import maybe_federate_delete
 from bridge.edit_bridge import maybe_federate_edit
+from bridge.group_bridge import (
+    maybe_distribute_group_message,
+    maybe_distribute_group_room_message,
+    maybe_handle_owned_group_avatar_change,
+    maybe_handle_owned_group_banner_change,
+    maybe_handle_owned_group_name_change,
+    maybe_handle_owned_group_topic_change,
+)
 from bridge.lemmy_bridge import (
     maybe_distribute_community_message,
     maybe_distribute_owned_community_message,
@@ -149,7 +158,15 @@ async def _dispatch_outbound_send(request: Request, event: dict) -> None:
                                 request, event
                             )
                             if not handled_as_owned_community_message:
-                                await maybe_distribute_profile_post(request, event)
+                                handled_as_group_room_message = await maybe_distribute_group_room_message(
+                                    request, event
+                                )
+                                if not handled_as_group_room_message:
+                                    handled_as_owned_group_message = await maybe_distribute_group_message(
+                                        request, event
+                                    )
+                                    if not handled_as_owned_group_message:
+                                        await maybe_distribute_profile_post(request, event)
 
 
 async def maybe_handle_encrypted_attachment_confirmation(request: Request, event: dict) -> bool:
@@ -356,6 +373,18 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
     )
     if handled_as_owned_community_power_level_change:
         return
+    handled_as_owned_group_name_change = await maybe_handle_owned_group_name_change(request, event)
+    if handled_as_owned_group_name_change:
+        return
+    handled_as_owned_group_topic_change = await maybe_handle_owned_group_topic_change(request, event)
+    if handled_as_owned_group_topic_change:
+        return
+    handled_as_owned_group_avatar_change = await maybe_handle_owned_group_avatar_change(request, event)
+    if handled_as_owned_group_avatar_change:
+        return
+    handled_as_owned_group_banner_change = await maybe_handle_owned_group_banner_change(request, event)
+    if handled_as_owned_group_banner_change:
+        return
     handled_as_reaction = await maybe_federate_reaction(request, event)
     if handled_as_reaction:
         return
@@ -379,6 +408,9 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
         return
     handled_as_link_community_confirmation = await maybe_handle_link_community_confirmation(request, event)
     if handled_as_link_community_confirmation:
+        return
+    handled_as_link_group_confirmation = await maybe_handle_link_group_confirmation(request, event)
+    if handled_as_link_group_confirmation:
         return
     handled_as_unlink_profile_confirmation = await maybe_handle_unlink_profile_confirmation(request, event)
     if handled_as_unlink_profile_confirmation:

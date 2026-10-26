@@ -31,6 +31,8 @@ from bridge.repository import (
     ChannelRoom,
     FederatedEvent,
     GhostProfile,
+    GroupRecord,
+    GroupRoom,
     GuildChannel,
     GuildMembership,
     InstanceLoginRecord,
@@ -442,6 +444,33 @@ CREATE TABLE IF NOT EXISTS lemmy_community_rooms (
     icon_url TEXT,
     banner_url TEXT,
     moderators_url TEXT,
+    pending_backfill INTEGER NOT NULL DEFAULT 0
+);
+
+-- A real FEP-1b12 Group HOSTED by this bridge (see GroupRecord's own
+-- docstring -- a flat-chat Group, structurally like peertube_channels,
+-- not lemmy_communities: no moderator_actor_ids equivalent).
+CREATE TABLE IF NOT EXISTS hosted_groups (
+    username TEXT PRIMARY KEY,
+    owner_username TEXT NOT NULL,
+    room_id TEXT NOT NULL UNIQUE,
+    public_key_pem TEXT NOT NULL,
+    private_key_pem TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    icon_url TEXT,
+    banner_url TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_groups_owner ON hosted_groups (owner_username);
+
+-- A mirrored REMOTE FEP-1b12 Group (see GroupRoom's own docstring -- same
+-- shape as lemmy_community_rooms minus moderators_url).
+CREATE TABLE IF NOT EXISTS group_rooms (
+    group_actor_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    icon_url TEXT,
+    banner_url TEXT,
     pending_backfill INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -1275,6 +1304,73 @@ class SqliteActorRepository:
 
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         await self._run(self._register_lemmy_community, record)
+
+    @staticmethod
+    def _row_to_group(row: sqlite3.Row) -> GroupRecord:
+        return GroupRecord(
+            username=row["username"],
+            owner_username=row["owner_username"],
+            room_id=row["room_id"],
+            public_key_pem=row["public_key_pem"],
+            private_key_pem=row["private_key_pem"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            icon_url=row["icon_url"],
+            banner_url=row["banner_url"],
+        )
+
+    def _get_group(self, username: str) -> GroupRecord | None:
+        row = self._conn.execute("SELECT * FROM hosted_groups WHERE username = ?", (username,)).fetchone()
+        return self._row_to_group(row) if row else None
+
+    async def get_group(self, username: str) -> GroupRecord | None:
+        return await self._run(self._get_group, username)
+
+    def _get_group_by_room_id(self, room_id: str) -> GroupRecord | None:
+        if not room_id:
+            return None
+        row = self._conn.execute("SELECT * FROM hosted_groups WHERE room_id = ?", (room_id,)).fetchone()
+        return self._row_to_group(row) if row else None
+
+    async def get_group_by_room_id(self, room_id: str) -> GroupRecord | None:
+        return await self._run(self._get_group_by_room_id, room_id)
+
+    def _list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM hosted_groups WHERE owner_username = ? ORDER BY username", (owner_username,)
+        ).fetchall()
+        return [self._row_to_group(row) for row in rows]
+
+    async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
+        return await self._run(self._list_groups_by_owner, owner_username)
+
+    def _register_group(self, record: GroupRecord) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO hosted_groups
+                (username, owner_username, room_id, public_key_pem, private_key_pem,
+                 display_name, summary, icon_url, banner_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                owner_username=excluded.owner_username,
+                room_id=excluded.room_id,
+                public_key_pem=excluded.public_key_pem,
+                private_key_pem=excluded.private_key_pem,
+                display_name=excluded.display_name,
+                summary=excluded.summary,
+                icon_url=excluded.icon_url,
+                banner_url=excluded.banner_url
+            """,
+            (
+                record.username, record.owner_username, record.room_id,
+                record.public_key_pem, record.private_key_pem,
+                record.display_name, record.summary, record.icon_url, record.banner_url,
+            ),
+        )
+        self._conn.commit()
+
+    async def register_group(self, record: GroupRecord) -> None:
+        await self._run(self._register_group, record)
 
     # -- followers / following ----------------------------------------------
 
@@ -2455,6 +2551,53 @@ class SqliteActorRepository:
             community_actor_id=row["community_actor_id"], room_id=row["room_id"],
             display_name=row["display_name"], icon_url=row["icon_url"], banner_url=row["banner_url"],
             moderators_url=row["moderators_url"], pending_backfill=bool(row["pending_backfill"]),
+        )
+
+    def _get_group_room(self, group_actor_id: str) -> GroupRoom | None:
+        row = self._conn.execute("SELECT * FROM group_rooms WHERE group_actor_id = ?", (group_actor_id,)).fetchone()
+        return self._row_to_group_room(row) if row else None
+
+    async def get_group_room(self, group_actor_id: str) -> GroupRoom | None:
+        return await self._run(self._get_group_room, group_actor_id)
+
+    def _get_group_room_by_room_id(self, room_id: str) -> GroupRoom | None:
+        row = self._conn.execute("SELECT * FROM group_rooms WHERE room_id = ?", (room_id,)).fetchone()
+        return self._row_to_group_room(row) if row else None
+
+    async def get_group_room_by_room_id(self, room_id: str) -> GroupRoom | None:
+        return await self._run(self._get_group_room_by_room_id, room_id)
+
+    def _register_group_room(self, record: GroupRoom) -> None:
+        # pending_backfill deliberately NOT in the DO UPDATE SET -- same
+        # reasoning as _register_lemmy_community_room's identical omission.
+        self._conn.execute(
+            """
+            INSERT INTO group_rooms (group_actor_id, room_id, display_name, icon_url, banner_url, pending_backfill)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_actor_id) DO UPDATE SET
+                room_id=excluded.room_id, display_name=excluded.display_name,
+                icon_url=excluded.icon_url, banner_url=excluded.banner_url
+            """,
+            (record.group_actor_id, record.room_id, record.display_name, record.icon_url, record.banner_url, record.pending_backfill),
+        )
+        self._conn.commit()
+
+    async def register_group_room(self, record: GroupRoom) -> None:
+        await self._run(self._register_group_room, record)
+
+    def _mark_group_room_backfill_pending_done(self, room_id: str) -> None:
+        self._conn.execute("UPDATE group_rooms SET pending_backfill = 0 WHERE room_id = ?", (room_id,))
+        self._conn.commit()
+
+    async def mark_group_room_backfill_pending_done(self, room_id: str) -> None:
+        await self._run(self._mark_group_room_backfill_pending_done, room_id)
+
+    @staticmethod
+    def _row_to_group_room(row: sqlite3.Row) -> GroupRoom:
+        return GroupRoom(
+            group_actor_id=row["group_actor_id"], room_id=row["room_id"],
+            display_name=row["display_name"], icon_url=row["icon_url"], banner_url=row["banner_url"],
+            pending_backfill=bool(row["pending_backfill"]),
         )
 
     # -- bot DM rooms --------------------------------------------------------
