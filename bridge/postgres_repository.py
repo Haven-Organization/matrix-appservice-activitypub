@@ -980,6 +980,12 @@ class PostgresActorRepository:
             record.display_name, record.summary, record.icon_url, record.banner_url,
         )
 
+    async def unregister_peertube_channel(self, username: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM peertube_channels WHERE username = $1", username)
+                await conn.execute("DELETE FROM followers WHERE username = $1", username)
+
     # -- hosted Lemmy communities ---------------------------------------------
 
     @staticmethod
@@ -1037,6 +1043,12 @@ class PostgresActorRepository:
             json.dumps(list(record.moderator_actor_ids)),
         )
 
+    async def unregister_lemmy_community(self, username: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM lemmy_communities WHERE username = $1", username)
+                await conn.execute("DELETE FROM followers WHERE username = $1", username)
+
     # -- hosted Groups (FEP-1b12) ---------------------------------------------
 
     @staticmethod
@@ -1090,6 +1102,12 @@ class PostgresActorRepository:
             record.public_key_pem, record.private_key_pem,
             record.display_name, record.summary, record.icon_url, record.banner_url,
         )
+
+    async def unregister_group(self, username: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM hosted_groups WHERE username = $1", username)
+                await conn.execute("DELETE FROM followers WHERE username = $1", username)
 
     # -- followers / following ----------------------------------------------
 

@@ -850,6 +850,12 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
             await _handle_delete_profile(
                 request, sender=sender, room_id=room_id, selector=argument[len("profile"):].strip()
             )
+        elif subcommand == "delete" and (argument.lower() == "channel" or argument.lower().startswith("channel ")):
+            await _handle_delete_channel(request, sender=sender, room_id=room_id, argument=argument[len("channel"):].strip())
+        elif subcommand == "delete" and (argument.lower() == "community" or argument.lower().startswith("community ")):
+            await _handle_delete_community(request, sender=sender, room_id=room_id, argument=argument[len("community"):].strip())
+        elif subcommand == "delete" and (argument.lower() == "group" or argument.lower().startswith("group ")):
+            await _handle_delete_group(request, sender=sender, room_id=room_id, argument=argument[len("group"):].strip())
         elif subcommand == "create" and argument.lower() == "profile":
             await _handle_create_profile(request, sender=sender, room_id=room_id, custom_id="")
         elif subcommand == "create" and argument.lower().startswith("profile "):
@@ -9193,6 +9199,305 @@ async def _execute_delete_profile(request: Request, *, sender: str, room_id: str
             await synapse.send_message_event(notice_room_id, deletion_notice_content, as_user_id=bot_mxid)
         except SynapseError:
             logger.info("Could not send deletion notice to %s", notice_room_id, exc_info=True)
+
+
+# -- ";delete channel"/";delete community"/";delete group" -------------------
+#
+# A shared implementation for all three: unlike a personal Profile (one
+# ActorRecord, "yours" if its matrix_user_id is you), these are each a
+# PeerTubeChannelRecord/LemmyCommunityRecord/GroupRecord sharing the exact
+# same (username, owner_username, room_id, private_key_pem, ...) shape and
+# the exact same destructive choreography (signed Delete to followers,
+# room rename, repository unregister) -- genuinely the same ~80 lines of
+# logic three times over, not "three similar lines," so it's written once
+# and parameterized by `kind` rather than copy-pasted. Permission is
+# owner-OR-admin (unlike ";delete profile", which is always "your own
+# identity only"): these are often managed day-to-day by someone other
+# than whoever happened to run ";create <kind>" originally, and a bridge
+# admin needs an escape hatch regardless of who that was.
+
+_HOSTED_ENTITY_METHODS = {
+    "channel": {
+        "get": "get_peertube_channel", "get_by_room": "get_peertube_channel_by_room_id",
+        "list_by_owner": "list_peertube_channels_by_owner", "unregister": "unregister_peertube_channel",
+    },
+    "community": {
+        "get": "get_lemmy_community", "get_by_room": "get_lemmy_community_by_room_id",
+        "list_by_owner": "list_lemmy_communities_by_owner", "unregister": "unregister_lemmy_community",
+    },
+    "group": {
+        "get": "get_group", "get_by_room": "get_group_by_room_id",
+        "list_by_owner": "list_groups_by_owner", "unregister": "unregister_group",
+    },
+}
+
+_DELETE_CHANNEL_WARNING_MARKER = "This will permanently delete this PeerTube channel"
+_DELETE_COMMUNITY_WARNING_MARKER = "This will permanently delete this Lemmy community"
+_DELETE_GROUP_WARNING_MARKER = "This will permanently delete this Group"
+_DELETE_HOSTED_ENTITY_WARNING_MARKERS = {
+    "channel": _DELETE_CHANNEL_WARNING_MARKER,
+    "community": _DELETE_COMMUNITY_WARNING_MARKER,
+    "group": _DELETE_GROUP_WARNING_MARKER,
+}
+
+
+async def _is_owner_or_admin_of_hosted_entity(request: Request, *, entity, sender: str) -> bool:
+    """Whether ``sender`` may delete ``entity`` (a PeerTubeChannelRecord/
+    LemmyCommunityRecord/GroupRecord) -- its owner, or a bridge admin."""
+    if await _is_matrix_admin(request, sender):
+        return True
+    repository = request.app.state.repository
+    owner = await repository.get_local_actor(entity.owner_username)
+    return owner is not None and owner.matrix_user_id == sender
+
+
+async def _resolve_hosted_entity_for_destructive_command(
+    request: Request, *, sender: str, room_id: str, argument: str, kind: str,
+):
+    """Shared resolver for ";delete channel"/";delete community"/";delete
+    group": an explicit trailing ``<id>`` names the entity directly
+    (checked for ownership/admin regardless of which room the command was
+    run in); omitted, it resolves to the one living in the room the
+    command was run in -- same "explicit argument, or infer from the
+    room you're actually in" convention ";refresh"/";link <kind>" already
+    use elsewhere. Sends its own notice and returns ``None`` on any
+    failure to resolve or authorize."""
+    repository = request.app.state.repository
+    methods = _HOSTED_ENTITY_METHODS[kind]
+    get_by_username = getattr(repository, methods["get"])
+    get_by_room_id = getattr(repository, methods["get_by_room"])
+    list_by_owner = getattr(repository, methods["list_by_owner"])
+
+    argument = argument.strip()
+    if argument:
+        entity = await get_by_username(sanitize_localpart_component(argument))
+        if entity is None:
+            await _notice(request, room_id, f'No {kind} "{argument}" found.')
+            return None
+        if not await _is_owner_or_admin_of_hosted_entity(request, entity=entity, sender=sender):
+            await _notice(request, room_id, f"You don't own that {kind}, and you're not a bridge admin.")
+            return None
+        return entity
+
+    entity = await get_by_room_id(room_id)
+    if entity is not None:
+        if await _is_owner_or_admin_of_hosted_entity(request, entity=entity, sender=sender):
+            return entity
+        await _notice(request, room_id, f"You don't own this {kind}, and you're not a bridge admin.")
+        return None
+
+    # Not run inside one of this kind's own rooms -- if sender owns any,
+    # list them so they can name one explicitly instead of guessing.
+    identities = await repository.list_local_actors_by_matrix_id(sender)
+    owned = [e for identity in identities for e in await list_by_owner(identity.username)]
+    if not owned:
+        await _notice(
+            request, room_id,
+            f'Run "{_COMMAND_PREFIX}delete {kind} <id>" inside the {kind}\'s own room, or name it directly '
+            f"-- you don't own any {kind}s to delete.",
+        )
+        return None
+    if len(owned) == 1:
+        return owned[0]
+    listing = "\n".join(f"- {e.username}" for e in owned)
+    await _notice(
+        request, room_id, f'Which {kind}? Run "{_COMMAND_PREFIX}delete {kind} <id>" with one of:\n{listing}',
+    )
+    return None
+
+
+async def _handle_delete_hosted_entity(request: Request, *, sender: str, room_id: str, argument: str, kind: str) -> None:
+    """First half of a two-step, confirmation-gated ";delete <kind>" --
+    sends an itemized warning (irreversible) and tells the sender to
+    reply "confirm" -- nothing is deleted yet. See
+    ``_resolve_hosted_entity_for_destructive_command`` for how the target
+    is picked, and ``_execute_delete_hosted_entity`` for what actually
+    runs once confirmed."""
+    entity = await _resolve_hosted_entity_for_destructive_command(
+        request, sender=sender, room_id=room_id, argument=argument, kind=kind,
+    )
+    if entity is None:
+        return
+    config = request.app.state.config
+    marker = _DELETE_HOSTED_ENTITY_WARNING_MARKERS[kind]
+    steps = [
+        f"Notify this {kind}'s followers with a signed Delete, so their side actually cleans up.",
+        'Rename this room to end in " (Deleted)".',
+        f"Permanently delete this {kind}'s fediverse identity -- keys, followers, all of it.",
+        "Post a notice here once it's done. This room itself is left alone -- it can keep being used "
+        "as an ordinary Matrix room, or its members can leave whenever they like.",
+    ]
+    warning = (
+        f"⚠️ {marker} ({entity.username}@{config.bridge.domain}). This cannot be undone. Specifically, "
+        "I will:\n" + "\n".join(f"- {step}" for step in steps)
+        + '\n\nReply to THIS message with "confirm" to go ahead.'
+    )
+    formatted_warning = (
+        f"<p>⚠️ {marker} (<strong>{html.escape(entity.username)}@{html.escape(config.bridge.domain)}</strong>). "
+        "This cannot be undone. Specifically, I will:</p><ul>"
+        + "".join(f"<li>{html.escape(step)}</li>" for step in steps)
+        + '</ul><p>Reply to THIS message with "confirm" to go ahead.</p>'
+    )
+    warning_content: dict = {
+        "msgtype": "m.text", "body": warning,
+        "format": "org.matrix.custom.html", "formatted_body": formatted_warning,
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        warning_content["m.relates_to"] = relates_to
+    try:
+        await request.app.state.synapse.send_message_event(room_id, warning_content, as_user_id=_bot_mxid(config))
+    except SynapseError:
+        logger.warning("Failed to send delete-%s warning to %s", kind, room_id, exc_info=True)
+
+
+async def _handle_delete_channel(request: Request, *, sender: str, room_id: str, argument: str = "") -> None:
+    await _handle_delete_hosted_entity(request, sender=sender, room_id=room_id, argument=argument, kind="channel")
+
+
+async def _handle_delete_community(request: Request, *, sender: str, room_id: str, argument: str = "") -> None:
+    await _handle_delete_hosted_entity(request, sender=sender, room_id=room_id, argument=argument, kind="community")
+
+
+async def _handle_delete_group(request: Request, *, sender: str, room_id: str, argument: str = "") -> None:
+    await _handle_delete_hosted_entity(request, sender=sender, room_id=room_id, argument=argument, kind="group")
+
+
+async def _execute_delete_hosted_entity(request: Request, *, sender: str, room_id: str, username: str, kind: str) -> None:
+    """The actual, irreversible deletion -- only ever reached via a
+    confirmed ``_maybe_handle_delete_hosted_entity_confirmation`` (or,
+    from the widget, called directly -- its own modal IS the
+    confirmation step there, same shortcut ``widget_delete_profile``
+    already takes). Re-verifies ownership/admin status fresh here,
+    independent of whatever was checked before the warning was sent --
+    state can change in between."""
+    repository = request.app.state.repository
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = _bot_mxid(config)
+    methods = _HOSTED_ENTITY_METHODS[kind]
+    get_by_username = getattr(repository, methods["get"])
+    unregister = getattr(repository, methods["unregister"])
+
+    entity = await get_by_username(username)
+    if entity is None:
+        await _notice(request, room_id, f"That {kind} no longer exists.")
+        return
+    if not await _is_owner_or_admin_of_hosted_entity(request, entity=entity, sender=sender):
+        await _notice(request, room_id, f"You don't own that {kind}, and you're not a bridge admin.")
+        return
+
+    base = config.bridge.public_base_url
+    actor_id = actor_url(base, entity.username)
+    followers = await repository.list_followers(entity.username)
+    entity_room_id = entity.room_id
+
+    # 1. Tell the fediverse side first, while the key is still valid.
+    delete_activity = Activity(
+        id=f"{actor_id}/deletes/{uuid.uuid4().hex}", type="Delete", actor=actor_id, object=actor_id,
+    )
+    http_client = request.app.state.http_client
+    for follower_actor_id in followers:
+        inbox = await resolve_actor_inbox(request, follower_actor_id)
+        if inbox is None:
+            continue
+        try:
+            await deliver_activity(
+                http_client, inbox_url=inbox, activity=delete_activity.to_dict(),
+                key_id=main_key_id(base, entity.username), private_key_pem=entity.private_key_pem,
+            )
+        except DeliveryError:
+            logger.warning("Failed to deliver Delete to follower %s", follower_actor_id, exc_info=True)
+
+    # 2. Rename the room so it's visually obvious at a glance it's defunct
+    # -- same convention as _execute_delete_profile's identical step.
+    if entity_room_id:
+        try:
+            room_state = await synapse.get_room_state(entity_room_id, "m.room.name", as_user_id=bot_mxid)
+            current_name = room_state.get("name")
+        except SynapseError:
+            current_name = None
+        if current_name and not current_name.endswith(" (Deleted)"):
+            try:
+                await synapse.send_state_event(
+                    entity_room_id, "m.room.name", "", {"name": f"{current_name} (Deleted)"}, as_user_id=bot_mxid,
+                )
+            except SynapseError:
+                logger.info("Could not rename deleted %s room %s", kind, entity_room_id, exc_info=True)
+
+    # 3. Actually erase it: keys, followers, all of it.
+    await unregister(entity.username)
+
+    # 4. Let them know -- same room-survives-untouched framing as
+    # _execute_delete_profile's own final notice.
+    notice_content: dict = {
+        "msgtype": "m.text",
+        "body": f"The {kind} {entity.username}@{config.bridge.domain} has been deleted. This room is no "
+        "longer associated with ActivityPub -- it can keep being used as an ordinary Matrix room, or be "
+        "left whenever you like.",
+    }
+    relates_to = _command_relates_to_var.get()
+    if relates_to:
+        notice_content["m.relates_to"] = relates_to
+    notice_room_id = entity_room_id or room_id
+    if notice_room_id:
+        try:
+            await synapse.send_message_event(notice_room_id, notice_content, as_user_id=bot_mxid)
+        except SynapseError:
+            logger.info("Could not send delete-%s notice to %s", kind, notice_room_id, exc_info=True)
+
+
+async def _maybe_handle_delete_hosted_entity_confirmation(request: Request, event: dict, *, kind: str) -> bool:
+    """Shared "confirm" recognizer for all three -- same stateless-marker
+    pattern as ``maybe_handle_delete_confirmation`` (profiles)."""
+    marker = _DELETE_HOSTED_ENTITY_WARNING_MARKERS[kind]
+    if event.get("type") != "m.room.message":
+        return False
+    content = event.get("content") or {}
+    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+        return False
+    target_event_id = _reply_target_event_id(content)
+    if not target_event_id:
+        return False
+
+    room_id = event.get("room_id", "")
+    sender = event.get("sender", "")
+    if not room_id or not sender:
+        return False
+
+    config = request.app.state.config
+    bot_mxid = _bot_mxid(config)
+    try:
+        target_event = await request.app.state.synapse.get_event(room_id, target_event_id, as_user_id=bot_mxid)
+    except SynapseError:
+        return False
+    if target_event.get("sender") != bot_mxid:
+        return False
+    warned_body = (target_event.get("content") or {}).get("body") or ""
+    if marker not in warned_body:
+        return False
+    username = _extract_warned_username(marker, warned_body)
+    if username is None:
+        return False
+
+    token = _command_relates_to_var.set(_preserve_command_thread(content, event.get("event_id")))
+    try:
+        await _execute_delete_hosted_entity(request, sender=sender, room_id=room_id, username=username, kind=kind)
+    finally:
+        _command_relates_to_var.reset(token)
+    return True
+
+
+async def maybe_handle_delete_channel_confirmation(request: Request, event: dict) -> bool:
+    return await _maybe_handle_delete_hosted_entity_confirmation(request, event, kind="channel")
+
+
+async def maybe_handle_delete_community_confirmation(request: Request, event: dict) -> bool:
+    return await _maybe_handle_delete_hosted_entity_confirmation(request, event, kind="community")
+
+
+async def maybe_handle_delete_group_confirmation(request: Request, event: dict) -> bool:
+    return await _maybe_handle_delete_hosted_entity_confirmation(request, event, kind="group")
 
 
 async def _list_unfollowed_ghost_rooms(

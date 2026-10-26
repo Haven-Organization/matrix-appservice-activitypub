@@ -58,7 +58,10 @@ from bridge.commands import (
     _reply_target_event_id,
     maybe_handle_allow_homeserver_confirmation,
     maybe_handle_command,
+    maybe_handle_delete_channel_confirmation,
+    maybe_handle_delete_community_confirmation,
     maybe_handle_delete_confirmation,
+    maybe_handle_delete_group_confirmation,
     maybe_handle_leave_unfollowed_confirmation,
     maybe_handle_link_community_confirmation,
     maybe_handle_link_group_confirmation,
@@ -402,6 +405,15 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
         return
     handled_as_delete_confirmation = await maybe_handle_delete_confirmation(request, event)
     if handled_as_delete_confirmation:
+        return
+    handled_as_delete_channel_confirmation = await maybe_handle_delete_channel_confirmation(request, event)
+    if handled_as_delete_channel_confirmation:
+        return
+    handled_as_delete_community_confirmation = await maybe_handle_delete_community_confirmation(request, event)
+    if handled_as_delete_community_confirmation:
+        return
+    handled_as_delete_group_confirmation = await maybe_handle_delete_group_confirmation(request, event)
+    if handled_as_delete_group_confirmation:
         return
     handled_as_link_profile_confirmation = await maybe_handle_link_profile_confirmation(request, event)
     if handled_as_link_profile_confirmation:

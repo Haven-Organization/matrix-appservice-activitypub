@@ -635,6 +635,13 @@ class ActorRepository(Protocol):
         already reuses)."""
         ...
 
+    async def unregister_peertube_channel(self, username: str) -> None:
+        """Remove a hosted channel entirely (";delete channel"), along with
+        its follower rows -- same scope as ``unregister_local_actor``, just
+        for a channel instead of a Profile. No-op if the username doesn't
+        exist."""
+        ...
+
     async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None: ...
 
     async def get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None: ...
@@ -649,6 +656,12 @@ class ActorRepository(Protocol):
         updated display fields / moderator list)."""
         ...
 
+    async def unregister_lemmy_community(self, username: str) -> None:
+        """Remove a hosted community entirely (";delete community"), along
+        with its follower rows -- same scope as ``unregister_local_actor``.
+        No-op if the username doesn't exist."""
+        ...
+
     async def get_group(self, username: str) -> GroupRecord | None: ...
 
     async def get_group_by_room_id(self, room_id: str) -> GroupRecord | None: ...
@@ -661,6 +674,12 @@ class ActorRepository(Protocol):
     async def register_group(self, record: GroupRecord) -> None:
         """Create or replace a hosted Group (freshly created, or updated
         display fields)."""
+        ...
+
+    async def unregister_group(self, username: str) -> None:
+        """Remove a hosted Group entirely (";delete group"), along with its
+        follower rows -- same scope as ``unregister_local_actor``. No-op if
+        the username doesn't exist."""
         ...
 
     async def list_followers(self, username: str) -> list[str]:
@@ -1677,6 +1696,12 @@ class InMemoryActorRepository:
         if record.room_id:
             self._peertube_channels_by_room_id[record.room_id] = record.username
 
+    async def unregister_peertube_channel(self, username: str) -> None:
+        existing = self._peertube_channels.pop(username, None)
+        if existing is not None and existing.room_id:
+            self._peertube_channels_by_room_id.pop(existing.room_id, None)
+        self._followers.pop(username, None)
+
     async def get_lemmy_community(self, username: str) -> LemmyCommunityRecord | None:
         return self._lemmy_communities.get(username)
 
@@ -1695,6 +1720,12 @@ class InMemoryActorRepository:
         if record.room_id:
             self._lemmy_communities_by_room_id[record.room_id] = record.username
 
+    async def unregister_lemmy_community(self, username: str) -> None:
+        existing = self._lemmy_communities.pop(username, None)
+        if existing is not None and existing.room_id:
+            self._lemmy_communities_by_room_id.pop(existing.room_id, None)
+        self._followers.pop(username, None)
+
     async def get_group(self, username: str) -> GroupRecord | None:
         return self._groups.get(username)
 
@@ -1712,6 +1743,12 @@ class InMemoryActorRepository:
         self._groups[record.username] = record
         if record.room_id:
             self._groups_by_room_id[record.room_id] = record.username
+
+    async def unregister_group(self, username: str) -> None:
+        existing = self._groups.pop(username, None)
+        if existing is not None and existing.room_id:
+            self._groups_by_room_id.pop(existing.room_id, None)
+        self._followers.pop(username, None)
 
     async def list_followers(self, username: str) -> list[str]:
         return sorted(self._followers.get(username, ()))

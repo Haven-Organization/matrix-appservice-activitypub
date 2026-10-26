@@ -1235,6 +1235,14 @@ class SqliteActorRepository:
     async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         await self._run(self._register_peertube_channel, record)
 
+    def _unregister_peertube_channel(self, username: str) -> None:
+        self._conn.execute("DELETE FROM peertube_channels WHERE username = ?", (username,))
+        self._conn.execute("DELETE FROM followers WHERE username = ?", (username,))
+        self._conn.commit()
+
+    async def unregister_peertube_channel(self, username: str) -> None:
+        await self._run(self._unregister_peertube_channel, username)
+
     @staticmethod
     def _row_to_lemmy_community(row: sqlite3.Row) -> LemmyCommunityRecord:
         return LemmyCommunityRecord(
@@ -1305,6 +1313,14 @@ class SqliteActorRepository:
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         await self._run(self._register_lemmy_community, record)
 
+    def _unregister_lemmy_community(self, username: str) -> None:
+        self._conn.execute("DELETE FROM lemmy_communities WHERE username = ?", (username,))
+        self._conn.execute("DELETE FROM followers WHERE username = ?", (username,))
+        self._conn.commit()
+
+    async def unregister_lemmy_community(self, username: str) -> None:
+        await self._run(self._unregister_lemmy_community, username)
+
     @staticmethod
     def _row_to_group(row: sqlite3.Row) -> GroupRecord:
         return GroupRecord(
@@ -1371,6 +1387,14 @@ class SqliteActorRepository:
 
     async def register_group(self, record: GroupRecord) -> None:
         await self._run(self._register_group, record)
+
+    def _unregister_group(self, username: str) -> None:
+        self._conn.execute("DELETE FROM hosted_groups WHERE username = ?", (username,))
+        self._conn.execute("DELETE FROM followers WHERE username = ?", (username,))
+        self._conn.commit()
+
+    async def unregister_group(self, username: str) -> None:
+        await self._run(self._unregister_group, username)
 
     # -- followers / following ----------------------------------------------
 

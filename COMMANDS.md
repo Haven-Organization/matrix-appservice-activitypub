@@ -67,7 +67,7 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;unlink profile`](#unlink-profile--unlink-profile-numberid)
   - [`;replace room`](#replace-room)
   - [`;replace dm`/`;replace chat`](#replace-dmchat-userinstanceorg)
-  - [`;delete profile`](#delete-profile--delete-profile-numberid)
+  - [`;delete profile`/`;delete channel`/`;delete community`/`;delete group`](#delete-profile--delete-channel--delete-community--delete-group)
 
 ---
 
@@ -95,7 +95,7 @@ Setting up and maintaining your own linked fediverse identity.
 
 **Who can run it:** Any local Matrix user with at least one linked identity -- works (and still shows something useful) even with only one identity, or with multi-identity support off.
 
-**Notes:** A newly created identity never becomes Active automatically unless it's your very first one -- you always keep the Active identity you already had until you explicitly switch. You always have an Active identity once you have at least one (deleting the Active one promotes another automatically -- see [`;delete profile`](#delete-profile)).
+**Notes:** A newly created identity never becomes Active automatically unless it's your very first one -- you always keep the Active identity you already had until you explicitly switch. You always have an Active identity once you have at least one (deleting the Active one promotes another automatically -- see [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group)).
 
 ---
 
@@ -535,7 +535,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 
 **Syntax:** `;allow mxid @user:example.org`, `;allow room !roomid:example.org`, or `;allow homeserver example.org`.
 
-**What it does:** Grants third-party access to whoever `<value>` names -- an exact Matrix user, anyone whose command arrives from a specific room (checked purely by "did this event come from that room," no separate live membership lookup), or every user on a whole homeserver. Every grant gets whatever mode `bridge.third_party_access_mode` currently configures (`follow_only` by default -- `;follow` and interact only, no self-service Profile Room) -- it's a single deployment-wide setting, not chosen per-grant. `mxid` and `room` grants take effect immediately; `homeserver` (trusting an entire remote server's user base) asks for confirmation first, the same "reply confirm" flow as [`;delete profile`](#delete-profile). A `room` grant also warns if the bot isn't currently a member of that room, since the grant only does anything once it is.
+**What it does:** Grants third-party access to whoever `<value>` names -- an exact Matrix user, anyone whose command arrives from a specific room (checked purely by "did this event come from that room," no separate live membership lookup), or every user on a whole homeserver. Every grant gets whatever mode `bridge.third_party_access_mode` currently configures (`follow_only` by default -- `;follow` and interact only, no self-service Profile Room) -- it's a single deployment-wide setting, not chosen per-grant. `mxid` and `room` grants take effect immediately; `homeserver` (trusting an entire remote server's user base) asks for confirmation first, the same "reply confirm" flow as [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group). A `room` grant also warns if the bot isn't currently a member of that room, since the grant only does anything once it is.
 
 **Who can run it:** Matrix server admins only.
 
@@ -547,7 +547,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 
 **Syntax:** Same shape as `;allow` -- `;disallow mxid @user:example.org`, `;disallow room !roomid:example.org`, `;disallow homeserver example.org`.
 
-**What it does:** Removes that grant, immediately, no confirmation needed. Never tears down any identity already provisioned under it -- everything (keys, followers, following, any Profile Room from a past Full period) stays exactly as-is, just no longer reachable/authoritative. Use [`;delete profile`](#delete-profile) (still available to anyone who's ever linked one, allowlisted or not) to actually remove an identity.
+**What it does:** Removes that grant, immediately, no confirmation needed. Never tears down any identity already provisioned under it -- everything (keys, followers, following, any Profile Room from a past Full period) stays exactly as-is, just no longer reachable/authoritative. Use [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group) (still available to anyone who's ever linked one, allowlisted or not) to actually remove an identity.
 
 **Who can run it:** Matrix server admins only.
 
@@ -653,14 +653,20 @@ Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` 
 
 ---
 
-### `;delete profile` / `;delete profile <number|id>`
+### `;delete profile` / `;delete channel` / `;delete community` / `;delete group`
 
-**Syntax:** `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. If you own more than one identity, `;delete profile` alone lists them (numbered, same format as [`;id`](#id)) instead of warning about any one of them -- re-run as `;delete profile <number|id>` to pick which; with exactly one identity, it goes straight to the warning as always.
+**Syntax:**
+- `;delete profile` to start, then reply "confirm" to the bot's own warning message to actually go through. Two-step and confirmation-gated. If you own more than one identity, `;delete profile` alone lists them (numbered, same format as [`;id`](#id)) instead of warning about any one of them -- re-run as `;delete profile <number|id>` to pick which; with exactly one identity, it goes straight to the warning as always.
+- `;delete channel <id>`, `;delete community <id>`, `;delete group <id>` -- same two-step, confirmation-gated shape, for a hosted PeerTube channel/Lemmy community/Group instead of your own profile. The `<id>` can be omitted (`;delete channel`/`;delete community`/`;delete group` bare) when run inside that entity's own room; with it, these work from anywhere. If you own more than one of that kind and don't run it inside one of their rooms, it lists them (by id) instead of warning about any one -- re-run naming one explicitly.
 
 **What it does:**
-1. `;delete profile` (or, with more than one identity, `;delete profile <number|id>`) sends an itemized warning of exactly what will happen to that identity, and nothing else yet.
-2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion: sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room that identity specifically has open (if you have other identities left, their own rooms and your shared Fediverse space are left alone), kicks you from your Fediverse space only if this was your last identity, unlinks the room, renames it to add "(Deleted)", and permanently erases that identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
+1. Sends an itemized warning of exactly what will happen, and nothing else yet.
+2. Replying "confirm" to that specific message (verified by looking up what it replied to) triggers the real deletion:
+   - **Profile:** sends a signed `Delete` to every follower's inbox, kicks you from every other bridge-managed room that identity specifically has open (if you have other identities left, their own rooms and your shared Fediverse space are left alone), kicks you from your Fediverse space only if this was your last identity, unlinks the room, renames it to add "(Deleted)", and permanently erases that identity: keys, followers, following, everything. The room itself is left intact for you to leave whenever you like.
+   - **Channel/community/group:** sends a signed `Delete` to every follower's inbox, renames the room to add "(Deleted)", and permanently erases that channel/community/group: keys, followers, everything. The room itself is left alone -- it can keep being used as an ordinary Matrix room, or its members can leave whenever they like.
 
-**Who can run it:** Any local user with a currently-linked profile. It always acts on whoever sends "confirm" and an identity that's actually theirs, never someone else's.
+**Who can run it:**
+- `;delete profile`: any local user with a currently-linked profile. It always acts on whoever sends "confirm" and an identity that's actually theirs, never someone else's.
+- `;delete channel`/`;delete community`/`;delete group`: that specific entity's owner, or a Matrix server admin -- re-verified fresh at confirmation time, not just when the warning was first sent.
 
-**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message. Of everything in this Danger Zone, this is the only one that can't be undone by any other command -- `;link`/`;unlink`/`;replace` all leave the underlying identity itself intact. Deleting your Active identity automatically promotes another of your remaining identities to Active; deleting your last identity leaves you with none (a valid state, not an error).
+**Notes:** Irreversible. Must be confirmed by replying to the bot's own warning specifically, not just any "confirm" message. Of everything in this Danger Zone, these are the only ones that can't be undone by any other command -- `;link`/`;unlink`/`;replace` all leave the underlying identity itself intact. Deleting your Active profile identity automatically promotes another of your remaining identities to Active; deleting your last one leaves you with none (a valid state, not an error). Deleting a channel/community/group has no such concept -- it's simply gone.
