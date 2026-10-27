@@ -1091,6 +1091,27 @@ async def maybe_federate_reaction_removal(request: Request, event: dict) -> bool
         await repository.remove_reaction(reaction.activity_id)
         return True
 
+    # Only the reactor's OWN redaction of their own reaction (or, per
+    # send_repost's docstring, of the "you reposted" notice card sent into
+    # their OWN Profile Room -- redacting that one is sent by the reactor
+    # too, since they're the one with permission to redact the bot's post
+    # there) means "undo this." A redaction from anyone ELSE must never be
+    # read as the reactor's own intent -- confirmed live 2026-10-26: a
+    # sibling bridge's own bot (@nostr:glowers.club, sharing the room for
+    # its own cross-bridge mirroring) redacted a user's 🔁 reaction event
+    # for reasons unrelated to that user's wishes, and this function, with
+    # no sender check at all, treated it exactly like the user un-reacting
+    # -- sending a real Undo over federation and deleting the repost's own
+    # bookkeeping, even though the user never asked for either.
+    redaction_sender = event.get("sender", "")
+    if redaction_sender != reaction.reactor_matrix_user_id:
+        logger.warning(
+            "Ignoring a redaction of %s's own reaction/repost (%s) sent by someone else (%s) -- "
+            "not treating this as an undo.",
+            reaction.reactor_matrix_user_id, redacted_event_id, redaction_sender,
+        )
+        return True
+
     actor_record = await repository.get_local_actor_by_matrix_id(reaction.reactor_matrix_user_id)
     if actor_record is None:
         await repository.remove_reaction(reaction.activity_id)
