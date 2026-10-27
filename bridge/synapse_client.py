@@ -452,6 +452,18 @@ class SynapseClient:
         )
         return result["room_id"]
 
+    async def resolve_room_alias(self, room_alias: str) -> str:
+        """Look up the room ID a published alias (``#foo:example.org``)
+        currently points to. Raises ``SynapseError`` (``M_NOT_FOUND``) for
+        an alias nobody's published -- callers decide how to surface
+        that, same as everywhere else in this client."""
+        result = await self._request(
+            "GET",
+            f"/_matrix/client/v3/directory/room/{quote(room_alias, safe='')}",
+            token=self._as_token,
+        )
+        return result["room_id"]
+
     async def kick_user(
         self, room_id: str, user_id: str, *, as_user_id: str | None = None, reason: str | None = None
     ) -> None:

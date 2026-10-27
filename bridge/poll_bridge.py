@@ -45,9 +45,15 @@ from fastapi import Request
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note, Question
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
-from bridge.commands import _effective_third_party_mode, is_foreign_bridge_user, is_third_party_still_allowed
+from bridge.commands import is_foreign_bridge_user
 from bridge.note_mirroring import deliver_to_actor_or_followers, refresh_poll_tallies
 from bridge.repository import FederatedEvent, PollVoteRecord
+from bridge.shadow_identity import (
+    effective_identity_tier,
+    ensure_shadow_actor,
+    is_third_party_still_allowed,
+    shadow_created_notice,
+)
 from bridge.synapse_client import SynapseError
 
 logger = logging.getLogger(__name__)
@@ -92,7 +98,7 @@ async def maybe_distribute_profile_poll(request: Request, event: dict) -> bool:
     if actor_record.matrix_user_id != sender:
         return False  # guest polls unsupported -- see this function's own docstring
 
-    if await _effective_third_party_mode(request, actor_record) == "follow_only":
+    if await effective_identity_tier(request, actor_record) == "shadow":
         return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
@@ -202,7 +208,8 @@ async def maybe_federate_poll_vote(request: Request, event: dict) -> bool:
     if username_from_actor_url(base, target.author_actor_id) is not None:
         return True  # a LOCAL actor's own poll -- Matrix already natively tallies this
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         try:
             await request.app.state.synapse.send_message_event(
@@ -217,6 +224,15 @@ async def maybe_federate_poll_vote(request: Request, event: dict) -> bool:
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
         return True
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
 
     if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True

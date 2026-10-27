@@ -569,9 +569,12 @@ async def widget_admin_grants(request: Request) -> JSONResponse:
     grants = await repository.list_third_party_allows()
     return JSONResponse(
         {
-            "mode": config.bridge.third_party_access_mode,
+            "third_party_access": config.bridge.third_party_access,
             "grants": [
-                {"rule_type": g.rule_type, "value": g.value, "granted_by": g.granted_by, "granted_at": g.granted_at}
+                {
+                    "rule_type": g.rule_type, "value": g.value, "tier": g.tier,
+                    "granted_by": g.granted_by, "granted_at": g.granted_at,
+                }
                 for g in grants
             ],
         },
@@ -584,9 +587,13 @@ async def widget_admin_allow(request: Request) -> JSONResponse:
     body = await request.json()
     rule_type = body.get("rule_type", "")
     value = body.get("value", "")
+    tier = body.get("tier", "")
     if rule_type not in _ALLOW_RULE_TYPES or not isinstance(value, str) or not value.strip():
         raise HTTPException(400, f"rule_type must be one of {_ALLOW_RULE_TYPES} and value is required")
-    return await _dispatch(request, body.get("room_id", ""), _handle_allow, argument=f"{rule_type} {value.strip()}")
+    argument = f"{rule_type} {value.strip()}"
+    if isinstance(tier, str) and tier.strip():
+        argument += f" {tier.strip()}"
+    return await _dispatch(request, body.get("room_id", ""), _handle_allow, argument=argument)
 
 
 @router.post("/widget/api/admin/disallow")

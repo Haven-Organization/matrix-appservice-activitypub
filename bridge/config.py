@@ -196,29 +196,29 @@ class BridgeSection:
     # history_visibility to match this setting, so a later config change
     # converges already-existing rooms too, not just newly-created ones.
     world_readable_remote_rooms: bool = False
-    # Whether an admin-allowlisted user on a DIFFERENT Matrix homeserver
-    # (see the `;allow`/`;disallow`/`;allowed` commands) gets treated as a
-    # full local user ("full": self-service `;create profile`/`;link
-    # profile`, their own Profile Room, DM, Chat, everything) or as
-    # follow-and-interact-only ("follow_only", default: no Profile Room, no
-    # `;dm`/`;chat`/`;banner`/`;replace room`/`;backfill`/`;repost` -- their
-    # AP identity is minted automatically on first `;follow`, with a
-    # bridge-held keypair and a profile that always mirrors their live
-    # Matrix display name/avatar, never self-controlled).
-    #
-    # This is a single deployment-wide setting, not per-grant -- every
-    # currently-allowed third party gets whichever mode this says, live,
-    # not whatever mode was in effect when they were first allowed or first
-    # interacted. An allowlisted user with no linked identity yet who was
-    # previously blocked from `;create profile`/`;link profile` under
-    # follow_only immediately gets access to those the moment this flips to
-    # full, with no migration step; someone who already has a Profile Room
-    # from a past "full" period keeps it if this flips back to follow_only,
-    # it just stops being used to represent them on the fediverse (stops
-    # sending posts out, their AP profile reverts to mirroring Matrix)
-    # until this flips to full again -- nothing about an existing identity
-    # is ever deleted or reassigned by changing this alone.
-    third_party_access_mode: str = "follow_only"
+    # Master on/off switch for letting ANY user on a different Matrix
+    # homeserver interact with this bridge at all. Turning this off never
+    # deletes anything -- any third party already allowed or already
+    # holding an AP identity just has every outbound action (posts,
+    # commands, follows) rejected with a notice that third-party access is
+    # currently disabled, until this flips back on. Who specifically is
+    # allowed, and whether they get "full" (self-service `;create
+    # profile`/`;link profile`, their own Profile Room, DM, Chat) or
+    # "shadow" (auto-minted AP identity that always mirrors their live
+    # Matrix display name/avatar, no self-service profile commands) access
+    # is now a per-user/per-homeserver grant via `;allow`/`;disallow`/
+    # `;allowed`, not a deployment-wide mode.
+    third_party_access: bool = True
+    # Migration-only, not a real setting: the OLD bridge.third_party_access_mode
+    # value ("follow_only"/"full"), read straight from the raw YAML if a
+    # deployment's config.yaml still has it, purely so the repository's
+    # one-time per-grant tier backfill (see PostgresActorRepository._migrate/
+    # SqliteActorRepository._migrate) knows whether to default existing
+    # third_party_allowlist rows to "full" or "shadow". None if the key is
+    # absent (a fresh install, or one that's already removed it). Safe to
+    # delete this field entirely once no supported deployment is expected to
+    # still carry the old key.
+    legacy_third_party_access_mode: str | None = None
     # Matrix polls (MSC3381) have no expiry concept, but Mastodon-family
     # receivers are known to refuse a Question with no endTime at all -- see
     # bridge.activitypub.models.Question.end_time. This bridge synthesizes
@@ -576,11 +576,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
             f"bridge.local_profile_room_join_rule must be one of {_valid_join_rules}, "
             f"got {local_profile_room_join_rule!r}"
         )
-    third_party_access_mode = bridge_raw.get("third_party_access_mode", "follow_only")
-    if third_party_access_mode not in ("follow_only", "full"):
-        raise ConfigError(
-            f"bridge.third_party_access_mode must be 'follow_only' or 'full', got {third_party_access_mode!r}"
-        )
     msc4503_external_handle = bridge_raw.get("msc4503_external_handle", "off")
     if msc4503_external_handle not in ("off", "profile", "events", "both"):
         raise ConfigError(
@@ -630,7 +625,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         ghost_room_join_rule=ghost_room_join_rule,
         local_profile_room_join_rule=local_profile_room_join_rule,
         world_readable_remote_rooms=bool(bridge_raw.get("world_readable_remote_rooms", False)),
-        third_party_access_mode=third_party_access_mode,
+        third_party_access=bool(bridge_raw.get("third_party_access", True)),
+        legacy_third_party_access_mode=bridge_raw.get("third_party_access_mode"),
         poll_default_duration_days=int(bridge_raw.get("poll_default_duration_days", 7)),
         admins=list(bridge_raw.get("admins", []) or []),
         use_synapse_admin_api=bool(bridge_raw.get("use_synapse_admin_api", True)),

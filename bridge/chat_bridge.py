@@ -34,7 +34,6 @@ from bridge.activitypub.urls import actor_url, main_key_id
 from bridge.commands import (
     is_foreign_bot_command,
     is_foreign_bridge_user,
-    is_third_party_still_allowed,
     message_addresses_bot,
 )
 from bridge.media import (
@@ -45,6 +44,7 @@ from bridge.media import (
 )
 from bridge.note_mirroring import deliver_to_actor_or_followers
 from bridge.repository import FederatedEvent
+from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,8 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
     if recipient_actor_id is None:
         return False  # shouldn't happen, but nothing to address this to
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         try:
             await request.app.state.synapse.send_message_event(
@@ -102,6 +103,15 @@ async def maybe_federate_chat_message(request: Request, event: dict) -> bool:
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
         return True
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
 
     # A chat room established during a past Full/allowed period keeps
     # existing and receiving Matrix-side messages after a downgrade or

@@ -33,7 +33,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
   - [Third-party access](#third-party-access)
     - [Admins (`bridge.admins`)](#bridge-admins)
     - [Use Synapse Admin API (`bridge.use_synapse_admin_api`)](#bridge-use_synapse_admin_api)
-    - [Third-party access mode (`bridge.third_party_access_mode`)](#bridge-third_party_access_mode)
+    - [Third-party access (`bridge.third_party_access`)](#bridge-third_party_access)
   - [MSC4501 and related proposals](#msc4501-and-related-proposals)
     - [Set MSC4501 relates_to (`bridge.set_msc4501_relates_to`)](#bridge-set_msc4501_relates_to)
     - [MSC4501 content_inline for reposts (`bridge.use_msc4501_content_inline`)](#bridge-use_msc4501_content_inline)
@@ -231,18 +231,22 @@ Turning it off means admin status relies entirely on [`bridge.admins`](#bridge-a
 
 ---
 
-<a id="bridge-third_party_access_mode"></a>
+<a id="bridge-third_party_access"></a>
 
-#### Third-party access mode (`bridge.third_party_access_mode`)
+#### Third-party access (`bridge.third_party_access`)
 
-**Default:** `follow_only`. One of `follow_only`, `full`.
+**Default:** `true`.
 
-What a user on a DIFFERENT homeserver gets once an admin allows them (the `;allow`/`;disallow`/`;allowed` commands):
+Master on/off switch for letting ANY user on a different Matrix homeserver interact with this bridge at all. Turning this off never deletes anything -- a third party already allowed, or already holding an AP identity, just has every outbound action (posts, commands, `;follow`) rejected with a notice that third-party access is currently disabled, until this flips back on.
 
-- `follow_only`: `;follow` and interact only. No Profile Room; their AP identity is minted automatically, always mirroring their live Matrix profile.
-- `full`: identical to a local user, with self-service `;create profile`/`;link profile`, DM, Chat.
+Who specifically is allowed, and whether they get `full` (self-service `;create profile`/`;link profile`, their own Profile Room, DM, Chat) or `shadow` (an auto-minted AP identity that always mirrors their live Matrix display name/avatar, no self-service profile commands) access, is a per-user/per-homeserver/per-room grant via the `;allow`/`;disallow`/`;allowed` commands (see [COMMANDS.md](COMMANDS.md#allow-mxidhomeserverroom-value-fullshadow)), not a config setting -- this switch only gates whether those grants mean anything right now.
 
-A single deployment-wide setting, applied live to everyone currently allowed, not fixed at the time they were first allowed. Flipping it is always safe and reversible: nothing about an already-provisioned identity is ever deleted or reassigned by the change alone.
+```yaml
+bridge:
+  third_party_access: true
+```
+
+**Upgrading from the old `bridge.third_party_access_mode` setting**: that single deployment-wide `follow_only`/`full` switch has been replaced by this on/off toggle plus the per-grant tiers above. On first startup after upgrading, the bridge reads your old `third_party_access_mode` value (if your `config.yaml` still has it) exactly once, to decide whether your existing `;allow`-granted users/homeservers should default to `full` or `shadow` under the new scheme -- nothing about an already-provisioned identity is deleted or reassigned by the upgrade itself. You can remove the old key from `config.yaml` once you've confirmed `;allowed` shows the tiers you expect.
 
 ---
 

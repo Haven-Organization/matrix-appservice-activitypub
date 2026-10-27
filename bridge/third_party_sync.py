@@ -1,21 +1,23 @@
-"""Periodic profile-mirroring sync for Follow-Only third-party identities.
+"""Periodic profile-mirroring sync for shadow-tier identities.
 
-A Follow-Only third-party actor (see ``bridge.repository.ActorRecord.is_third_party``
-and ``bridge.commands._effective_third_party_mode``) is never self-controlled --
-its served AP profile always live-mirrors its current Matrix display name/
-avatar. ``bridge.activitypub.routes._build_actor`` already does this live, on
-every single fetch of the actor document itself, but a remote server that
-already has a CACHED copy of that document (the common case -- most
-implementations don't re-fetch an already-known actor on every interaction)
-only refreshes it on receiving a signed ``Update(Person)``. This sweep is
-what generates that: periodically comparing each such identity's stored
-``display_name``/``icon_url`` against a fresh ``synapse.get_profile()`` call,
-and pushing an ``Update`` (via ``bridge.note_mirroring.push_profile_update``)
-only when something actually changed.
+A shadow identity (see ``bridge.shadow_identity.effective_identity_tier`` --
+first- or third-party, never graduated to a real Profile Room, or a
+third-party identity demoted/banned/parked since) is never self-controlled
+-- its served AP profile always live-mirrors its current Matrix display
+name/avatar. ``bridge.activitypub.routes._build_actor`` already does this
+live, on every single fetch of the actor document itself, but a remote
+server that already has a CACHED copy of that document (the common case --
+most implementations don't re-fetch an already-known actor on every
+interaction) only refreshes it on receiving a signed ``Update(Person)``.
+This sweep is what generates that: periodically comparing each such
+identity's stored ``display_name``/``icon_url`` against a fresh
+``synapse.get_profile()`` call, and pushing an ``Update`` (via
+``bridge.note_mirroring.push_profile_update``) only when something
+actually changed.
 
 Deliberately no per-record cooldown/timestamp -- the sweep interval itself is
 the rate limit for everyone uniformly, so there's nothing to keep in sync
-when the underlying identity's mode changes (see ``ActorRecord.is_third_party``'s
+when the underlying identity's tier changes (see ``ActorRecord.is_third_party``'s
 own docstring for why this feature avoids per-identity cached state in
 general). No config knob either -- simple enough to hardcode.
 """
@@ -39,18 +41,28 @@ SYNC_INTERVAL_SECONDS = 20 * 60
 
 
 async def sync_all_third_party_profiles(app: FastAPI) -> None:
-    """One sweep over every Follow-Only third-party identity (``is_third_party=True``,
-    ``room_id`` empty -- see ``ActorRepository.list_third_party_records``, which
-    already excludes anyone graduated to a real Profile Room)."""
+    """One sweep over every currently shadow-tier identity -- see
+    ``ActorRepository.list_shadow_tier_actors``, which covers first- and
+    third-party alike, including a third-party identity that's demoted/
+    banned/parked despite still having a Profile Room."""
     repository = app.state.repository
     synapse = app.state.synapse
-    base = app.state.config.bridge.public_base_url
-    # push_profile_update/_effective_third_party_mode only ever touch
+    config = app.state.config
+    base = config.bridge.public_base_url
+    # The bridge's own service actor (bridge.service_actor) also has an
+    # empty room_id, same as a genuine shadow identity, but by design, not
+    # because it's unfinished -- never sweep it into this, it's served
+    # from its own static fields (see effective_identity_tier's matching
+    # exclusion), not live-mirrored from the bot's own Matrix profile.
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    # push_profile_update/effective_identity_tier only ever touch
     # request.app.state -- there's no real inbound HTTP request behind a
     # background sweep, so this stands in for one.
     request = SimpleNamespace(app=app)
 
-    for record in await repository.list_third_party_records():
+    for record in await repository.list_shadow_tier_actors():
+        if record.matrix_user_id == bot_mxid:
+            continue
         try:
             profile = await synapse.get_profile(record.matrix_user_id)
         except SynapseError:

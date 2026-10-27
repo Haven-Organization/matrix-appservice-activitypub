@@ -57,9 +57,9 @@ from bridge.activitypub.urls import actor_url, followers_url, main_key_id, usern
 from bridge.commands import (
     is_foreign_bot_command,
     is_foreign_bridge_user,
-    is_third_party_still_allowed,
     message_addresses_bot,
 )
+from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
 from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
@@ -423,7 +423,8 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         if recipient_actor_id is None:
             return False  # shouldn't happen, but nothing to address this to
 
-        actor_record = await repository.get_local_actor_by_matrix_id(sender)
+        resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+        actor_record = resolution.record
         if actor_record is None:
             try:
                 await request.app.state.synapse.send_message_event(
@@ -438,6 +439,15 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             except Exception:
                 logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
             return True
+        if resolution.created:
+            try:
+                await request.app.state.synapse.send_message_event(
+                    room_id,
+                    {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                    as_user_id=bot_mxid,
+                )
+            except Exception:
+                logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
 
         if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
             return True
@@ -521,7 +531,8 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             except SynapseError:
                 pass
             if target_sender and is_foreign_bridge_user(target_sender, config):
-                reply_actor_record = await repository.get_local_actor_by_matrix_id(sender)
+                reply_resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+                reply_actor_record = reply_resolution.record
                 if reply_actor_record is None:
                     try:
                         await request.app.state.synapse.send_message_event(
@@ -536,6 +547,15 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
                     except Exception:
                         logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
                 elif await is_third_party_still_allowed(request, reply_actor_record, room_id=room_id):
+                    if reply_resolution.created:
+                        try:
+                            await request.app.state.synapse.send_message_event(
+                                room_id,
+                                {"msgtype": "m.notice", "body": shadow_created_notice(request, reply_actor_record)},
+                                as_user_id=bot_mxid,
+                            )
+                        except Exception:
+                            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
                     from bridge.reaction_bridge import send_cross_bridge_quote
 
                     caption = strip_reply_fallback(content.get("body") or "")
@@ -555,7 +575,8 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
             # to non-post content should become.
             return True
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         try:
             await request.app.state.synapse.send_message_event(
@@ -570,6 +591,15 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
         return True
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
 
     if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True

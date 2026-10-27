@@ -49,15 +49,15 @@ class ActorRecord:
     summary: str = ""
     icon_url: str | None = None
     banner_url: str | None = None
-    # True for an actor provisioned for a Matrix user on a DIFFERENT
-    # homeserver, admin-allowlisted via the ";allow"/";disallow"/";allowed"
-    # commands (see bridge.commands's _effective_third_party_mode). Never
-    # set for a local user or the bridge's own service actor. This is the
-    # ONLY per-identity state this feature stores -- deliberately NOT a
-    # "current mode" (full/follow_only), which is always computed live from
-    # this flag + the CURRENT config.bridge.third_party_access_mode +
-    # whether room_id is set, never cached, so flipping that config back and
-    # forth never requires migrating or mutating any existing record.
+    # True for an actor whose owning Matrix user is on a DIFFERENT
+    # homeserver than this bridge's own. Never set for a local user or the
+    # bridge's own service actor. This is the ONLY per-identity state this
+    # feature stores -- deliberately NOT a "current tier" (full/shadow),
+    # which is always computed live from this flag + whether room_id is set
+    # + the CURRENT third-party allow-list grant for this mxid/homeserver
+    # (see bridge.shadow_identity.effective_identity_tier), never cached, so
+    # an admin changing a grant or the global bridge.third_party_access
+    # switch never requires migrating or mutating any existing record.
     is_third_party: bool = False
     # ISO-8601 UTC timestamp, stamped once at insert time by the repository
     # implementation (never by a caller) and never changed afterward, even
@@ -174,21 +174,44 @@ class GroupRecord:
 
 @dataclass(frozen=True)
 class ThirdPartyAllowRecord:
-    """One admin-granted allowlist entry letting a user/room/homeserver on a
+    """One admin-granted allowlist entry letting a user/homeserver/room on a
     DIFFERENT Matrix homeserver use the bridge (see the ";allow"/";disallow"/
     ";allowed" commands and ``ActorRecord.is_third_party``).
 
-    ``rule_type`` is ``"mxid"`` (an exact ``@user:server``), ``"room"`` (any
-    sender whose command arrives from this room -- membership is never
-    separately queried, "the bot received this event from an allowlisted
-    room" IS the check), or ``"homeserver"`` (any user on this domain).
-    Checked in that precedence order (most to least specific) by
-    ``ActorRepository.is_third_party_allowed``. ``granted_by``/``granted_at``
-    are audit-trail only, never read for any permission decision.
+    ``rule_type`` is ``"mxid"`` (an exact ``@user:server``), ``"homeserver"``
+    (any user on this domain), or ``"room"`` (any third party, from ANY
+    homeserver, whose event arrives from this specific already-bridged
+    room -- membership is never separately queried, "the bot received this
+    event from this room" IS the check). A ``room`` grant covers ONLY
+    passive content federated out of that room (posts, reactions, replies)
+    -- it deliberately does NOT satisfy the command-dispatch gate
+    (``bridge.commands.maybe_handle_command``), so a room-allowed third
+    party still can't run ``;follow`` or anything else there without an
+    ``mxid``/``homeserver`` grant of their own; ``;follow`` in particular
+    would hand them a signed `Follow` under this bridge's own reputation
+    and continue into a brand new Remote User Room this one room's grant
+    was never meant to cover.
+
+    ``tier`` is ``"full"`` or ``"shadow"`` for ``mxid``/``homeserver`` rows,
+    or ``"banned"`` -- ``mxid`` rows only -- an explicit, persisted override
+    that blocks this one user outright regardless of what their homeserver
+    OR the current room is granted. A ``room`` row is always ``"shadow"``
+    (there's no way to self-provision a full profile "by virtue of a
+    room"), and the room-level grant is evaluated per-ACTION against
+    whichever room that action is actually happening in, never cached on
+    the identity -- getting a shadow identity via one allowed room grants
+    nothing in any other room. Precedence, most to least specific: a
+    ``mxid`` row (any tier, including ``banned``) always wins outright;
+    else a ``homeserver`` row; else, ONLY for actions that consult it at
+    all (not command dispatch), a ``room`` row for the room the action is
+    in. See ``ActorRepository.resolve_third_party_tier``. ``granted_by``/
+    ``granted_at`` are audit-trail only, never read for any permission
+    decision.
     """
 
     rule_type: str
     value: str
+    tier: str
     granted_by: str
     granted_at: str
 
@@ -733,34 +756,59 @@ class ActorRepository(Protocol):
         key's code default. No-op if no override was stored."""
         ...
 
-    async def list_third_party_records(self) -> list[ActorRecord]:
-        """Every ``ActorRecord`` with ``is_third_party=True`` and an empty
-        ``room_id`` -- i.e. every identity currently eligible for the
-        periodic Follow-Only profile-mirroring sync (see
-        ``bridge.third_party_sync``). A record that's graduated to a real
-        Profile Room (``room_id`` set) is deliberately excluded -- that room
-        is authoritative for their profile now, current config permitting
-        (see ``ActorRecord.is_third_party``'s docstring)."""
+    async def list_shadow_tier_actors(self) -> list[ActorRecord]:
+        """Every ``ActorRecord`` currently resolving to the "shadow" tier
+        (see ``bridge.shadow_identity.effective_identity_tier``) -- i.e.
+        every identity eligible for the periodic live-profile-mirroring
+        sync (``bridge.third_party_sync``). This covers THREE cases, not
+        just one: any record with an empty ``room_id`` (first- or
+        third-party, never graduated to a real profile room yet), AND any
+        third-party record WITH a room_id whose current allow-list grant
+        has been demoted away from "full" (a parked, previously-full
+        identity). A genuine local full profile, or a third-party identity
+        still actively granted "full", is excluded -- its own Profile Room
+        is authoritative for it right now."""
         ...
 
     async def list_local_usernames(self) -> list[str]:
         """Every genuine local user with a real Profile Room (``room_id``
-        set) -- the inverse filter of ``list_third_party_records``. Used by
-        ``bridge.outage_recovery`` to find who to DM a summary to."""
+        set) -- NOT the inverse of ``list_shadow_tier_actors`` (a local user
+        with an empty ``room_id`` -- i.e. only a shadow identity so far --
+        is excluded from both). Used by ``bridge.outage_recovery`` to find
+        who to DM a summary to."""
         ...
 
-    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
-        """Grant third-party access to ``value`` (an MXID, room ID, or
-        homeserver domain depending on ``rule_type``). Idempotent -- granting
-        the same ``(rule_type, value)`` again just refreshes ``granted_by``/
-        ``granted_at``."""
+    async def add_third_party_allow(self, rule_type: str, value: str, tier: str, *, granted_by: str) -> None:
+        """Grant third-party access to ``value`` (an MXID, homeserver
+        domain, or room ID depending on ``rule_type``) at ``tier``
+        (``"full"`` or ``"shadow"`` for ``mxid``/``homeserver``; always
+        ``"shadow"`` for ``room"``, there's nothing else a room grant could
+        mean). Idempotent -- granting the same ``(rule_type, value)`` again
+        just overwrites ``tier`` and refreshes ``granted_by``/``granted_at``
+        (this is also how an existing ``"banned"`` mxid row gets
+        un-banned -- allowing them again overwrites it)."""
         ...
 
     async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
-        """Revoke a grant. No-op if it doesn't exist. Never tears down any
-        ``ActorRecord`` already provisioned under this grant -- see this
-        feature's design note in ``bridge.commands`` for why revocation is
-        deliberately non-destructive."""
+        """Revoke a grant by deleting the row entirely -- the ``;disallow``
+        path for ``rule_type="homeserver"``/``"room"`` (neither has a
+        "banned" tier; removal from the list IS the disallow). For
+        ``rule_type="mxid"``, ``;disallow`` calls ``set_third_party_ban``
+        instead, not this method -- see its docstring for why. Never tears
+        down any ``ActorRecord`` already provisioned under this grant --
+        see this feature's design note in ``bridge.shadow_identity`` for why
+        revocation is deliberately non-destructive."""
+        ...
+
+    async def set_third_party_ban(self, mxid: str, *, granted_by: str) -> None:
+        """Upsert a ``rule_type="mxid"`` row for ``mxid`` with ``tier="banned"``.
+        This is a STORED NEGATIVE OVERRIDE, not a deletion -- unlike
+        disallowing a homeserver (plain removal), banning one user has to
+        persist and outrank any ``homeserver``-level grant for that same
+        user (more-specific-wins), including one added or widened later.
+        To un-ban, grant them ``full``/``shadow`` again via
+        ``add_third_party_allow`` -- there's no separate "clear the
+        override, go back to inheriting" operation; granting always wins."""
         ...
 
     async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
@@ -768,16 +816,29 @@ class ActorRepository(Protocol):
         used by the ";allowed" command."""
         ...
 
-    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
-        """Whether ``mxid`` currently has third-party access, checking all
-        three grant kinds in precedence order (exact ``mxid``, then
-        ``room_id`` membership, then ``homeserver``) -- ``True`` as soon as
-        any one matches. This is the single source of truth both the
-        command-dispatch gate AND every outbound-federation re-validation
-        point (reactions, replies, DM, Chat, post distribution -- see
-        ``bridge.commands.is_third_party_still_allowed``) call, so a
-        revoked grant takes effect everywhere at once, live, with nothing
-        cached."""
+    async def resolve_third_party_tier(self, *, mxid: str, homeserver: str, room_id: str) -> str | None:
+        """``"full"``, ``"shadow"``, or ``None`` (no access at all) for this
+        mxid right now. Precedence, most to least specific: a ``mxid`` row
+        (ANY tier, including ``"banned"``) always wins outright -- so
+        ``"banned"`` itself is never returned to a caller, it resolves to
+        ``None`` here (an explicit ban IS "no access", just stored
+        differently than absence). Else a ``homeserver`` row. Else, if
+        ``room_id`` names a currently room-allowed room, ``"shadow"`` --
+        pass ``room_id=""`` to skip this fallback entirely (see below).
+        Only consulted when ``config.bridge.third_party_access`` is already
+        on -- this method itself doesn't know about that global switch.
+
+        The room fallback is deliberately NOT consulted by the
+        command-dispatch gate (``bridge.commands.maybe_handle_command``,
+        which always passes ``room_id=""``) -- see ``ThirdPartyAllowRecord``'s
+        docstring for why a room grant covers passive content only, never
+        commands. Every outbound-federation re-validation point that DOES
+        pass a real ``room_id`` (reactions, replies, DM, Chat, post
+        distribution -- see ``bridge.shadow_identity.is_third_party_still_allowed``/
+        ``ensure_shadow_actor``) gets the fallback, scoped to that specific
+        room and re-evaluated on every single action, never cached on the
+        identity -- a shadow identity minted via one room's grant has no
+        standing in any other room."""
         ...
 
     async def save_instance_login(self, record: InstanceLoginRecord) -> None:
@@ -1783,20 +1844,45 @@ class InMemoryActorRepository:
     async def clear_identity_setting(self, username: str, key: str) -> None:
         self._identity_settings.get(username, {}).pop(key, None)
 
-    async def list_third_party_records(self) -> list[ActorRecord]:
-        return [
-            state.record
-            for state in self._actors.values()
-            if state.record.is_third_party and not state.record.room_id
-        ]
+    def _resolve_third_party_tier_sync(self, *, mxid: str, homeserver: str, room_id: str = "") -> str | None:
+        mxid_row = self._third_party_allows.get(("mxid", mxid))
+        if mxid_row is not None:
+            return None if mxid_row.tier == "banned" else mxid_row.tier
+        homeserver_row = self._third_party_allows.get(("homeserver", homeserver))
+        if homeserver_row is not None:
+            return homeserver_row.tier
+        if room_id and ("room", room_id) in self._third_party_allows:
+            return "shadow"
+        return None
+
+    async def list_shadow_tier_actors(self) -> list[ActorRecord]:
+        results = []
+        for state in self._actors.values():
+            record = state.record
+            if not record.room_id:
+                results.append(record)
+                continue
+            if not record.is_third_party:
+                continue
+            # Room-unaware on purpose, matching effective_identity_tier --
+            # whether a PARKED identity (one that already has a Profile
+            # Room) is still full is a question about its mxid/homeserver
+            # grant alone; a room grant can never produce a full identity
+            # in the first place, so it has nothing to say here.
+            homeserver = record.matrix_user_id.split(":", 1)[1] if ":" in record.matrix_user_id else ""
+            tier = self._resolve_third_party_tier_sync(mxid=record.matrix_user_id, homeserver=homeserver)
+            if tier != "full":
+                results.append(record)
+        return results
 
     async def list_local_usernames(self) -> list[str]:
         return [username for username, state in self._actors.items() if state.record.room_id]
 
-    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+    async def add_third_party_allow(self, rule_type: str, value: str, tier: str, *, granted_by: str) -> None:
         self._third_party_allows[(rule_type, value)] = ThirdPartyAllowRecord(
             rule_type=rule_type,
             value=value,
+            tier=tier,
             granted_by=granted_by,
             granted_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -1804,20 +1890,23 @@ class InMemoryActorRepository:
     async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
         self._third_party_allows.pop((rule_type, value), None)
 
+    async def set_third_party_ban(self, mxid: str, *, granted_by: str) -> None:
+        self._third_party_allows[("mxid", mxid)] = ThirdPartyAllowRecord(
+            rule_type="mxid",
+            value=mxid,
+            tier="banned",
+            granted_by=granted_by,
+            granted_at=datetime.now(timezone.utc).isoformat(),
+        )
+
     async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
         records = self._third_party_allows.values()
         if rule_type is not None:
             records = [r for r in records if r.rule_type == rule_type]
         return sorted(records, key=lambda r: (r.rule_type, r.value))
 
-    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
-        if ("mxid", mxid) in self._third_party_allows:
-            return True
-        if room_id and ("room", room_id) in self._third_party_allows:
-            return True
-        if homeserver and ("homeserver", homeserver) in self._third_party_allows:
-            return True
-        return False
+    async def resolve_third_party_tier(self, *, mxid: str, homeserver: str, room_id: str) -> str | None:
+        return self._resolve_third_party_tier_sync(mxid=mxid, homeserver=homeserver, room_id=room_id)
 
     async def save_instance_login(self, record: InstanceLoginRecord) -> None:
         self._instance_logins[(record.matrix_user_id, record.instance_domain)] = record

@@ -5,8 +5,8 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
 - A command is only recognized on the **first line** of a message. Tagging the bot somewhere in a longer message won't misfire on a command word later in the text.
 - Keyword matching is case-insensitive.
 - Sharing a room with another bot or bridge (a Bluesky/Nostr bridge, another Matrix bot, ...)? List its own command prefix(es) in `bridge.other_bot_prefixes` (see [CONFIG.md](CONFIG.md#bridge-other_bot_prefixes)) so a message meant for IT never gets federated out by this bridge as an ordinary post -- this bridge still correctly never replies to it or tries to parse it as one of its own commands, either.
-- Every command **except `;help` and `;delete profile`** only works for users on the bridge's own homeserver, unless a Matrix server admin has explicitly allowlisted them -- an exact MXID, a room's membership, or a whole homeserver (see [`;allow`](#allow-mxidroomhomeserver-value)). A user on another Matrix server tagging the bot gets told commands aren't available to them unless allowlisted. This stops someone from squatting usernames on your domain or riding your bridge's reputation to follow arbitrary fediverse accounts from outside it, while still letting an admin selectively open the bridge up to trusted outsiders.
-- An allowlisted third-party user gets one of two modes, set once for the whole bridge (`bridge.third_party_access_mode`, default `follow_only`): **Follow Only** (default) -- `;follow` and interact only, no Profile Room, no `;dm`/`;chat`/`;banner`/`;replace room`/`;backfill`/`;repost`, their fediverse identity is minted automatically on first `;follow` and always mirrors their live Matrix name/avatar -- or **Full** -- identical to a local user, including self-service `;create profile`/`;link profile`.
+- Every command **except `;help` and `;delete profile`** only works for users on the bridge's own homeserver, unless a Matrix server admin has explicitly allowlisted them -- an exact MXID or a whole homeserver (see [`;allow`](#allow-mxidhomeserverroom-value-fullshadow)). A user on another Matrix server tagging the bot gets told commands aren't available to them unless allowlisted, and the whole feature can be switched off bridge-wide (`bridge.third_party_access`, on by default -- see [CONFIG.md](CONFIG.md#bridge-third_party_access)). This stops someone from squatting usernames on your domain or riding your bridge's reputation to follow arbitrary fediverse accounts from outside it, while still letting an admin selectively open the bridge up to trusted outsiders.
+- An allowlisted third-party user gets one of two tiers, chosen per-grant (see `;allow` above): **shadow** (the default) -- `;follow` and interact only, no Profile Room, no `;dm`/`;chat`/`;banner`/`;replace room`/`;backfill`/`;repost`, their fediverse identity is minted automatically the first time they do anything that would federate and always mirrors their live Matrix name/avatar -- or **full** -- the ABILITY to self-provision a real Profile Room via `;create profile`/`;link profile`, after which they're identical to a local user. A first-party (this homeserver's own) user goes through the exact same shadow phase automatically, with no allowlisting involved -- it's just how every identity starts before `;create profile`.
 - The bridge's own bot and ghost accounts never trigger commands, so a mirrored post that happens to start with `;` is never misread as one.
 - Tagging the bot with no recognized keyword shows the `;help` section overview (if nothing else was said) or a short pointer to `;help` (if something else was said that just wasn't recognized).
 - If a command was sent as a thread reply, the bot's response(s) stay in that same thread.
@@ -57,8 +57,8 @@ The bridge is controlled from inside Matrix by either tagging/mentioning the bot
   - [`;create group`](#create-group-id-as-numberid-display-name)
   - [`;link group`](#link-group-id)
 - [Admin](#admin)
-  - [`;allow`](#allow-mxidroomhomeserver-value)
-  - [`;disallow`](#disallow-mxidroomhomeserver-value)
+  - [`;allow`](#allow-mxidhomeserverroom-value-fullshadow)
+  - [`;disallow`](#disallow-mxidhomeserverroom-value)
   - [`;allowed`](#allowed)
   - [`;refresh`](#refresh-userinstanceorg)
 - [Widget vs. commands](#widget-vs-commands)
@@ -531,23 +531,30 @@ Following/mirroring a remote FEP-1b12 Group, and -- separately -- hosting your o
 
 Bridge-wide access control and maintenance, gated to a Matrix server admin regardless of allowlisting.
 
-### `;allow mxid|room|homeserver <value>`
+### `;allow mxid|homeserver|room <value> [full|shadow]`
 
-**Syntax:** `;allow mxid @user:example.org`, `;allow room !roomid:example.org`, or `;allow homeserver example.org`.
+**Syntax:** `;allow mxid @user:example.org [full|shadow]`, `;allow homeserver example.org [full|shadow]` (tier defaults to `shadow` if you don't say), or `;allow room [!roomid:example.org|#alias:example.org]` (no tier -- always `shadow`; room is optional).
 
-**What it does:** Grants third-party access to whoever `<value>` names -- an exact Matrix user, anyone whose command arrives from a specific room (checked purely by "did this event come from that room," no separate live membership lookup), or every user on a whole homeserver. Every grant gets whatever mode `bridge.third_party_access_mode` currently configures (`follow_only` by default -- `;follow` and interact only, no self-service Profile Room) -- it's a single deployment-wide setting, not chosen per-grant. `mxid` and `room` grants take effect immediately; `homeserver` (trusting an entire remote server's user base) asks for confirmation first, the same "reply confirm" flow as [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group). A `room` grant also warns if the bot isn't currently a member of that room, since the grant only does anything once it is.
+**What it does:** Grants third-party access to whoever/wherever `<value>` names:
+
+- `mxid`/`homeserver` -- an exact Matrix user, or every user on a whole homeserver -- at `full` tier (self-service `;create profile`/`;link profile`, their own Profile Room, DM, Chat, every command) or `shadow` tier (an auto-minted identity that always mirrors their live Matrix display name/avatar, no self-service profile commands -- they still get `;follow` and ordinary posting/reacting, everywhere). `mxid` grants take effect immediately; `homeserver` (trusting an entire remote server's user base) asks for confirmation first, the same "reply confirm" flow as [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group).
+- `room` -- any third party at all, from any homeserver, gets a shadow identity just by posting/reacting/replying in this one already-bridged room, with no individual or homeserver vetting needed. Always `shadow`, and scoped ONLY to that room and ONLY to passive content -- it does **not** satisfy the command-dispatch gate, so even `;follow` still needs its own `mxid`/`homeserver` grant; following would hand out a real signed `Follow` under this bridge's reputation and continue into a brand new room this grant was never meant to cover. Getting in via one room's grant gives no standing in any other room. Processed immediately even if the bot isn't currently a member of that room (warns, but still applies once it is). Takes a room ID, a `#alias:example.org` (resolved via the homeserver's directory), or no room at all -- run bare (just `;allow room`) from inside the room you want to allow, as long as it's already bridged as something (a Profile Room, Channel, Community, Group, DM/Chat room, ...); run from an unrelated, un-bridged room, it tells you there's nothing to default to and asks you to name one.
+
+Precedence, most to least specific: an `mxid` grant (including a ban, see `;disallow` below) always wins outright; else a `homeserver` grant; else, only for the actions that consult it at all (not commands), a `room` grant for the room the action is actually happening in.
 
 **Who can run it:** Matrix server admins only.
 
-**Notes:** Flipping `bridge.third_party_access_mode` later is always safe and instant for everyone currently allowed -- nothing about an already-provisioned identity is ever deleted or reassigned by a config change alone (see [CONFIG.md](CONFIG.md#third-party-access)).
+**Notes:** Granting `full` only gives the ABILITY to self-provision a profile -- it doesn't create one. Until they run `;create profile`/`;link profile` themselves, a full-granted user still acts through their shadow identity. See [CONFIG.md](CONFIG.md#bridge-third_party_access) for the master on/off switch this all sits under.
 
 ---
 
-### `;disallow mxid|room|homeserver <value>`
+### `;disallow mxid|homeserver|room <value>`
 
-**Syntax:** Same shape as `;allow` -- `;disallow mxid @user:example.org`, `;disallow room !roomid:example.org`, `;disallow homeserver example.org`.
+**Syntax:** `;disallow mxid @user:example.org`, `;disallow homeserver example.org`, or `;disallow room [!roomid:example.org|#alias:example.org]` (room is optional, same default-to-current-room/alias support as `;allow room`).
 
-**What it does:** Removes that grant, immediately, no confirmation needed. Never tears down any identity already provisioned under it -- everything (keys, followers, following, any Profile Room from a past Full period) stays exactly as-is, just no longer reachable/authoritative. Use [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group) (still available to anyone who's ever linked one, allowlisted or not) to actually remove an identity.
+**What it does:** For `homeserver`/`room`, removes that grant outright, immediately, no confirmation needed -- neither has a "banned" state, absence from the allowlist already means not allowed. For `mxid`, this is NOT a removal -- it stores an explicit ban for that one user, which overrides any homeserver- or room-level grant they'd otherwise inherit (so you can block one bad actor on an otherwise-allowed homeserver or room). To lift an mxid ban, just `;allow` them again at `full` or `shadow`.
+
+Either way, never tears down any identity already provisioned under the grant -- everything (keys, followers, following, any Profile Room from a past full period) stays exactly as-is, just no longer reachable/authoritative. Use [`;delete profile`](#delete-profile--delete-channel--delete-community--delete-group) (still available to anyone who's ever linked one, allowlisted or not) to actually remove an identity.
 
 **Who can run it:** Matrix server admins only.
 
@@ -557,7 +564,7 @@ Bridge-wide access control and maintenance, gated to a Matrix server admin regar
 
 **Syntax:** `;allowed`, no argument.
 
-**What it does:** Lists every current third-party access grant, grouped by kind, plus the current global mode they'd all get.
+**What it does:** Lists every current third-party access grant, grouped by kind, with each one's tier (including a banned mxid), plus whether `bridge.third_party_access` is currently on or off.
 
 **Who can run it:** Matrix server admins only.
 
@@ -647,7 +654,7 @@ Confirmed live 2026-08-27 (issue #6): a user who didn't realize `;link profile` 
 
 **What it does:** The DM/Chat-room equivalent of `;replace room`, for the one case that command can't itself reach: if a DM/Chat room ended up end-to-end encrypted (see `;dm`/`;chat`'s own notes -- this bridge has no encryption support at all), the bot can never read anything sent inside it, including a `;replace room` typed there. This command looks up your existing DM/Chat room with the target directly, so it works even against a room that's completely unreadable to the bot. Otherwise identical to `;replace room`'s own DM/Chat handling: new room, predecessor link, old room tombstoned. If the new room *also* comes out encrypted (the homeserver is still misconfigured), nothing is registered or tombstoned -- you're told plainly that a server admin needs to fix it first.
 
-**Who can run it:** That room's owner, or a Matrix server admin. Disabled for third-party accounts in Follow Only mode, same as `;dm`/`;chat` themselves.
+**Who can run it:** That room's owner, or a Matrix server admin. Disabled for third-party accounts at shadow tier, same as `;dm`/`;chat` themselves.
 
 **Notes:** All warning/success notices go to wherever you ran this command, never into the old (possibly unreadable) room. Also works perfectly well on an ordinary, unencrypted DM/Chat room -- it's not encryption-specific, just the only option when it is.
 

@@ -62,6 +62,17 @@
 - `;replace room` recreates the Matrix room behind any identity (Profile Room, Remote User Room, DM, or Chat room) to pick up newer bridge features. It's entirely Matrix-side; nothing is sent over ActivityPub, since the identity itself doesn't change.
 - `;delete profile` is a confirmation-gated, irreversible account deletion. It sends a signed `Delete` to every follower, then erases the local identity.
 
+## Shadow identities and third-party access
+
+Every ActivityPub identity starts out **shadow**: auto-minted the first time its Matrix user does anything that would federate (post, react, reply, `;follow`, ...), with no Profile Room of its own -- its served name/avatar always live-mirror its current Matrix profile, re-fetched on every actor-document request and periodically re-pushed as `Update` to anyone who's cached it. Running `;create profile`/`;link profile` with the default id (no custom id, custom ids disabled, or a custom id that happens to match the default anyway) **graduates** that same identity in place -- same username, same keypair, same followers -- into a **full** one: a self-controlled Profile Room, static display fields, every command. A local (this homeserver's own) user always starts shadow and can always graduate; there's no allowlisting involved for them at all.
+
+A user on a **different** Matrix homeserver needs an admin grant to do anything here, via `;allow`/`;disallow`/`;allowed` (see [COMMANDS.md](COMMANDS.md#allow-mxidhomeserverroom-value-fullshadow)), gated by the master `bridge.third_party_access` switch (see [CONFIG.md](CONFIG.md#bridge-third_party_access)):
+
+- An exact MXID or a whole homeserver can be granted **full** (the ability to self-provision a real profile the same way a local user does -- granting it doesn't create one, they still act through their shadow identity until they run `;create profile` themselves) or **shadow** (the default if you don't say -- everything except self-service profile commands; `;follow` and ordinary posting/reacting still work).
+- A single already-bridged room can be granted third-party access too, independent of who's posting or where they're from: anyone gets a shadow identity just by posting/reacting/replying in that one room, with no individual or homeserver vetting needed. Always shadow, and scoped ONLY to passive content in that specific room -- it deliberately doesn't satisfy the command gate, so even `;follow` still needs its own mxid/homeserver grant. `;allow room` can be run bare (no room named) from inside the room you mean, as long as it's already bridged as something, and takes a room alias as well as a raw room ID.
+- Precedence is always most-to-least specific: an mxid grant (including an explicit ban) wins outright over everything; else a homeserver grant; else, for the actions that consult it, a room grant for wherever the action is actually happening.
+- Revoking a grant, demoting full to shadow, or banning an mxid never deletes or reassigns anything already provisioned -- a demoted full identity keeps its Profile Room, parked and untouched, reverting to live Matrix-mirrored data until (if ever) full access is restored, at which point the same room picks back up right where it left off.
+
 ## Multi-identity support
 
 Opt-in (`bridge.custom_identities_enabled`, off by default -- see [CONFIG.md](CONFIG.md#bridge-custom_identities_enabled)). With it off, the bridge behaves exactly as it always has: one ActivityPub identity per Matrix user, its username always the Matrix localpart.

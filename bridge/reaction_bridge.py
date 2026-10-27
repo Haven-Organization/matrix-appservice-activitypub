@@ -51,7 +51,8 @@ from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
-from bridge.commands import is_foreign_bridge_user, is_third_party_still_allowed
+from bridge.commands import is_foreign_bridge_user
+from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
 from bridge.note_mirroring import (
@@ -860,7 +861,8 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         # function rather than just the repost branch below.
         return True
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         try:
             await request.app.state.synapse.send_message_event(
@@ -875,6 +877,15 @@ async def maybe_federate_reaction(request: Request, event: dict) -> bool:
         except Exception:
             logger.warning("Failed to send link-profile notice to %s", room_id, exc_info=True)
         return True
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
 
     # A local user's ActorRecord existing is enough (it could only have
     # come from an already-gated ;create/;link profile) -- but a

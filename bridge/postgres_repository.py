@@ -89,13 +89,14 @@ _SCHEMA_STATEMENTS = [
     )
     """,
     # Admin-granted third-party access (see ActorRecord.is_third_party and
-    # the ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid',
-    # 'room', or 'homeserver'; value is the corresponding exact MXID/room
-    # ID/domain.
+    # the ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid' or
+    # 'homeserver'; value is the corresponding exact MXID/domain. tier is
+    # 'full'/'shadow' for either rule_type, or 'banned' -- 'mxid' rows only.
     """
     CREATE TABLE IF NOT EXISTS third_party_allowlist (
         rule_type TEXT NOT NULL,
         value TEXT NOT NULL,
+        tier TEXT NOT NULL DEFAULT 'shadow',
         granted_by TEXT NOT NULL,
         granted_at TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (rule_type, value)
@@ -711,17 +712,45 @@ class PostgresActorRepository:
 
     @classmethod
     async def create(
-        cls, dsn: str, *, min_size: int = 1, max_size: int = 10
+        cls, dsn: str, *, min_size: int = 1, max_size: int = 10, legacy_third_party_full: bool = False
     ) -> "PostgresActorRepository":
         pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
         repository = cls(pool)
-        await repository._migrate()
+        await repository._migrate(legacy_third_party_full=legacy_third_party_full)
         return repository
 
-    async def _migrate(self) -> None:
+    async def _migrate(self, *, legacy_third_party_full: bool = False) -> None:
         async with self._pool.acquire() as conn:
             for statement in _SCHEMA_STATEMENTS:
                 await conn.execute(statement)
+            # One-time tier backfill for a database upgrading from the old
+            # single global bridge.third_party_access_mode switch (removed
+            # 2026-10) to the new per-grant full/shadow tier. "ADD COLUMN IF
+            # NOT EXISTS" only actually adds (and defaults existing rows)
+            # the FIRST time this runs against a given database -- every
+            # later startup finds the column already there and no-ops,
+            # leaving any tier an admin has since set via ";allow" alone, so
+            # this is safe to run unconditionally on every connect, not just
+            # once. legacy_third_party_full reflects whatever
+            # bridge.third_party_access_mode (now otherwise unused) was set
+            # to in this deployment's own config file, if any -- a fresh
+            # deployment with no such history just gets the plain 'shadow'
+            # default straight from _SCHEMA_STATEMENTS' own CREATE TABLE.
+            default_tier = "full" if legacy_third_party_full else "shadow"
+            await conn.execute(
+                f"ALTER TABLE third_party_allowlist ADD COLUMN IF NOT EXISTS "
+                f"tier TEXT NOT NULL DEFAULT '{default_tier}'"
+            )
+            # A pre-upgrade database may have 'room' rows from before the
+            # first redesign pass removed that rule_type -- room-scoped
+            # grants are back (see ActorRecord.is_third_party's sibling
+            # docs and _handle_allow), always at 'shadow' tier, so backfill
+            # any surviving legacy room row to that rather than leaving it
+            # at the generic default above (which only matters for brand
+            # new rows, not ones that predate this column).
+            await conn.execute(
+                "UPDATE third_party_allowlist SET tier = 'shadow' WHERE rule_type = 'room' AND tier != 'shadow'"
+            )
 
     async def close(self) -> None:
         await self._pool.close()
@@ -1177,16 +1206,36 @@ class PostgresActorRepository:
             "DELETE FROM identity_settings WHERE username = $1 AND key = $2", username, key
         )
 
-    async def list_third_party_records(self) -> list[ActorRecord]:
-        rows = await self._pool.fetch(
-            "SELECT * FROM local_actors WHERE is_third_party AND room_id = ''"
+    async def list_shadow_tier_actors(self) -> list[ActorRecord]:
+        # Every empty-room_id actor (first- or third-party, never
+        # graduated) PLUS every third-party actor WITH a room_id whose
+        # current grant no longer resolves to "full" (a demoted, parked
+        # identity) -- see ActorRepository.list_shadow_tier_actors. The
+        # tier check for the second group can't be expressed as a plain SQL
+        # join against third_party_allowlist (mxid beats homeserver, and
+        # "banned" has to resolve to not-full), so it's done in Python
+        # against the same resolve_third_party_tier this module already
+        # implements, applied only to the (usually small) set of
+        # third-party actors that have a room at all.
+        no_room_rows = await self._pool.fetch("SELECT * FROM local_actors WHERE room_id = ''")
+        results = [self._row_to_actor(row) for row in no_room_rows]
+        parked_rows = await self._pool.fetch(
+            "SELECT * FROM local_actors WHERE is_third_party AND room_id != ''"
         )
-        return [self._row_to_actor(row) for row in rows]
+        for row in parked_rows:
+            record = self._row_to_actor(row)
+            homeserver = record.matrix_user_id.split(":", 1)[1] if ":" in record.matrix_user_id else ""
+            # Room-unaware on purpose, matching effective_identity_tier --
+            # see InMemoryActorRepository.list_shadow_tier_actors' identical comment.
+            tier = await self.resolve_third_party_tier(mxid=record.matrix_user_id, homeserver=homeserver, room_id="")
+            if tier != "full":
+                results.append(record)
+        return results
 
     async def list_local_usernames(self) -> list[str]:
         # room_id != '' -- a genuine local user with a real Profile Room and
-        # matrix_user_id, not a Follow-Only third-party placeholder (see
-        # list_third_party_records's identical room_id filter, inverted).
+        # matrix_user_id, not a shadow-only placeholder (see
+        # list_shadow_tier_actors's identical room_id filter, inverted).
         rows = await self._pool.fetch("SELECT username FROM local_actors WHERE room_id != ''")
         return [row["username"] for row in rows]
 
@@ -1226,21 +1275,35 @@ class PostgresActorRepository:
 
     # -- third-party allowlist -----------------------------------------------
 
-    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
+    async def add_third_party_allow(self, rule_type: str, value: str, tier: str, *, granted_by: str) -> None:
         await self._pool.execute(
             """
-            INSERT INTO third_party_allowlist (rule_type, value, granted_by, granted_at)
-            VALUES ($1, $2, $3, now())
+            INSERT INTO third_party_allowlist (rule_type, value, tier, granted_by, granted_at)
+            VALUES ($1, $2, $3, $4, now())
             ON CONFLICT (rule_type, value) DO UPDATE SET
+                tier = EXCLUDED.tier,
                 granted_by = EXCLUDED.granted_by,
                 granted_at = EXCLUDED.granted_at
             """,
-            rule_type, value, granted_by,
+            rule_type, value, tier, granted_by,
         )
 
     async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
         await self._pool.execute(
             "DELETE FROM third_party_allowlist WHERE rule_type = $1 AND value = $2", rule_type, value
+        )
+
+    async def set_third_party_ban(self, mxid: str, *, granted_by: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO third_party_allowlist (rule_type, value, tier, granted_by, granted_at)
+            VALUES ('mxid', $1, 'banned', $2, now())
+            ON CONFLICT (rule_type, value) DO UPDATE SET
+                tier = 'banned',
+                granted_by = EXCLUDED.granted_by,
+                granted_at = EXCLUDED.granted_at
+            """,
+            mxid, granted_by,
         )
 
     async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
@@ -1254,31 +1317,32 @@ class PostgresActorRepository:
             ThirdPartyAllowRecord(
                 rule_type=row["rule_type"],
                 value=row["value"],
+                tier=row["tier"],
                 granted_by=row["granted_by"],
                 granted_at=row["granted_at"].isoformat(),
             )
             for row in rows
         ]
 
-    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
+    async def resolve_third_party_tier(self, *, mxid: str, homeserver: str, room_id: str) -> str | None:
         row = await self._pool.fetchrow(
-            "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = $1", mxid
+            "SELECT tier FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = $1", mxid
         )
         if row is not None:
-            return True
+            return None if row["tier"] == "banned" else row["tier"]
+        if homeserver:
+            row = await self._pool.fetchrow(
+                "SELECT tier FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = $1", homeserver
+            )
+            if row is not None:
+                return row["tier"]
         if room_id:
             row = await self._pool.fetchrow(
                 "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'room' AND value = $1", room_id
             )
             if row is not None:
-                return True
-        if homeserver:
-            row = await self._pool.fetchrow(
-                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = $1", homeserver
-            )
-            if row is not None:
-                return True
-        return False
+                return "shadow"
+        return None
 
     # -- instance logins -------------------------------------------------------
 

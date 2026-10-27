@@ -91,15 +91,19 @@ async def _create_repository(config: BridgeConfig) -> ActorRepository:
     imported here, not at module level -- a deployment that stays on the
     sqlite default should never need ``asyncpg`` installed at all just to
     start the bridge."""
+    legacy_third_party_full = config.bridge.legacy_third_party_access_mode == "full"
     if config.storage.backend == "postgresql":
         from bridge.postgres_repository import PostgresActorRepository
 
         pg = config.storage.postgres
         return await PostgresActorRepository.create(
-            pg.resolved_dsn(), min_size=pg.min_pool_size, max_size=pg.max_pool_size
+            pg.resolved_dsn(), min_size=pg.min_pool_size, max_size=pg.max_pool_size,
+            legacy_third_party_full=legacy_third_party_full,
         )
     if config.storage.backend == "sqlite":
-        return SqliteActorRepository(Path(config.storage.data_dir) / "bridge.db")
+        return SqliteActorRepository(
+            Path(config.storage.data_dir) / "bridge.db", legacy_third_party_full=legacy_third_party_full,
+        )
     raise ConfigError(f"Unknown storage.backend {config.storage.backend!r}")
 
 

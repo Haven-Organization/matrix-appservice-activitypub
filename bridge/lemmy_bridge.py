@@ -974,9 +974,26 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
         # bridge's own ghost -- never re-federate.
         return True
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
+
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
-        return True  # no linked fediverse profile -- stays Matrix-only
+        return True  # not eligible for even a shadow identity -- stays Matrix-only
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
+
+    # Re-validated live on every message, not just at creation -- see
+    # channel_bridge.maybe_handle_channel_message's identical comment.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
+        return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
         return True  # already distributed
@@ -1068,9 +1085,12 @@ async def maybe_handle_community_ban(request: Request, event: dict) -> bool:
     if community_room is None:
         return False
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    from bridge.shadow_identity import ensure_shadow_actor
+
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
-        return True  # no local AP identity to sign a Block with
+        return True  # not eligible for even a shadow identity -- no AP identity to sign a Block with
 
     ghost_profile = await repository.get_ghost_profile_by_mxid(banned_mxid)
     if ghost_profile is None:
@@ -1514,7 +1534,10 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
         # bridge's own ghost -- never re-federate.
         return True
 
-    actor_record = await resolve_acting_identity(request, sender=sender, room_id=room_id)
+    from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
+
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         from bridge.commands import _notice
 
@@ -1522,6 +1545,15 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
             request, room_id,
             "You need a linked profile before posting here -- run \";link profile\" in your own room first.",
         )
+        return True
+    if resolution.created:
+        from bridge.commands import _notice
+
+        await _notice(request, room_id, shadow_created_notice(request, actor_record))
+
+    # Re-validated live on every message, not just at creation -- see
+    # channel_bridge.maybe_handle_channel_message's identical comment.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
         return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
@@ -1875,7 +1907,10 @@ async def maybe_handle_owned_community_ban(request: Request, event: dict) -> boo
     if community is None:
         return False
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    from bridge.shadow_identity import ensure_shadow_actor
+
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
         return True
 

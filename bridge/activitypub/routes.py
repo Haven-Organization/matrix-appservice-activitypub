@@ -82,7 +82,8 @@ from bridge.activitypub.urls import (
     username_from_actor_url,
 )
 from bridge.activitypub.webfinger import build_local_webfinger_document, parse_acct
-from bridge.commands import _effective_third_party_mode, is_foreign_bridge_user
+from bridge.commands import is_foreign_bridge_user
+from bridge.shadow_identity import effective_identity_tier
 from bridge.inbox_dispatch import handle_activity
 from bridge.media import media_caption, resolve_reconstructed_attachment
 from bridge.mentions import reconstruct_note_mentions
@@ -193,20 +194,21 @@ async def _get_actor_or_channel_record(
 async def _build_actor(request: Request, record) -> Actor:
     """Build the served Actor document for ``record``.
 
-    A Follow-Only third-party identity (see ``_effective_third_party_mode``)
-    is deliberately never self-controlled -- its served name/avatar/bio
-    always live-mirror its CURRENT Matrix profile (fetched fresh here, not
-    the possibly-stale ``record.display_name``/``icon_url`` columns the
-    periodic sync timer only refreshes every so often) rather than anything
-    it or a past Full period might have set, and it never advertises Chat
-    (independently, ``;chat`` is already blocked outbound -- see
-    ``bridge.commands``'s ``_FOLLOW_ONLY_BLOCKED_ANY_ARG``). A local user
-    (or a Full-mode third party with a real Profile Room) is unchanged from
-    before this feature existed: everything read straight from the stored
-    ``ActorRecord``."""
+    A shadow identity (see ``bridge.shadow_identity.effective_identity_tier``
+    -- first- or third-party, never graduated to a real Profile Room, or a
+    third-party identity demoted/banned/parked since) is deliberately never
+    self-controlled -- its served name/avatar/bio always live-mirror its
+    CURRENT Matrix profile (fetched fresh here, not the possibly-stale
+    ``record.display_name``/``icon_url`` columns the periodic sync timer
+    only refreshes every so often) rather than anything a past full period
+    might have set, and it never advertises Chat (independently, ``;chat``
+    is already blocked outbound for a shadow-tier third party -- see
+    ``bridge.commands``'s ``_SHADOW_TIER_BLOCKED_ANY_ARG``). A full identity
+    is unchanged from before this feature existed: everything read straight
+    from the stored ``ActorRecord``."""
     base = request.app.state.config.bridge.public_base_url
-    mode = await _effective_third_party_mode(request, record)
-    if mode == "follow_only":
+    tier = await effective_identity_tier(request, record)
+    if tier == "shadow":
         synapse = request.app.state.synapse
         try:
             profile = await synapse.get_profile(record.matrix_user_id)

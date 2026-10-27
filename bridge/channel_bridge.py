@@ -62,6 +62,7 @@ from bridge.activitypub.urls import actor_url, followers_url, main_key_id
 from bridge.note_mirroring import resolve_and_invite_ghost, resolve_event_ts, resolve_mention_pills
 from bridge.repository import ChannelRoom, FederatedEvent
 from bridge.room_widget import add_bridge_widget
+from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
 from bridge.spaces import add_channel_room_to_guild_space
 from bridge.synapse_client import SynapseError
 
@@ -429,9 +430,27 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
         # sibling bridge's own ghost -- never re-federate.
         return True
 
-    actor_record = await repository.get_local_actor_by_matrix_id(sender)
+    resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+    actor_record = resolution.record
     if actor_record is None:
-        return True  # a Matrix user with no linked fediverse profile -- stays Matrix-only
+        return True  # not eligible for even a shadow identity -- stays Matrix-only
+    if resolution.created:
+        try:
+            await request.app.state.synapse.send_message_event(
+                room_id,
+                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                as_user_id=bot_mxid,
+            )
+        except Exception:
+            logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
+
+    # Re-validated live on every message, not just at creation -- a grant
+    # (mxid/homeserver/room) can be revoked at any time, and revocation
+    # never tears down the identity itself (see is_third_party_still_allowed's
+    # own docstring), so an already-existing record has to be re-checked
+    # every time, not just a freshly-minted one.
+    if not await is_third_party_still_allowed(request, actor_record, room_id=room_id):
+        return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
         return True  # already distributed (e.g. a redelivered transaction)

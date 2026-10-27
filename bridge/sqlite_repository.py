@@ -83,11 +83,13 @@ CREATE TABLE IF NOT EXISTS active_identity (
 );
 
 -- Admin-granted third-party access (see ActorRecord.is_third_party and the
--- ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid', 'room', or
--- 'homeserver'; value is the corresponding exact MXID/room ID/domain.
+-- ";allow"/";disallow"/";allowed" commands). rule_type is 'mxid' or
+-- 'homeserver'; value is the corresponding exact MXID/domain. tier is
+-- 'full'/'shadow' for either rule_type, or 'banned' -- 'mxid' rows only.
 CREATE TABLE IF NOT EXISTS third_party_allowlist (
     rule_type TEXT NOT NULL,
     value TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'shadow',
     granted_by TEXT NOT NULL,
     granted_at TEXT NOT NULL,
     PRIMARY KEY (rule_type, value)
@@ -483,7 +485,8 @@ class SqliteActorRepository:
     share a single sqlite file between multiple concurrently-running bridge
     processes."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, legacy_third_party_full: bool = False) -> None:
+        self._legacy_third_party_full = legacy_third_party_full
         path = Path(db_path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -900,6 +903,33 @@ class SqliteActorRepository:
                 "ALTER TABLE lemmy_community_rooms ADD COLUMN pending_backfill INTEGER NOT NULL DEFAULT 0"
             )
             self._conn.commit()
+
+        # One-time tier backfill for a database upgrading from the old
+        # single global bridge.third_party_access_mode switch (removed
+        # 2026-10) to the new per-grant full/shadow tier -- see the near-
+        # identical comment in PostgresActorRepository._migrate for the
+        # full reasoning. Only runs the first time (column not yet
+        # present); every later startup leaves any tier an admin has since
+        # set via ";allow" alone, regardless of whether the legacy config
+        # key is still present in this deployment's YAML.
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(third_party_allowlist)")}
+        if "tier" not in columns:
+            default_tier = "full" if self._legacy_third_party_full else "shadow"
+            self._conn.execute(
+                f"ALTER TABLE third_party_allowlist ADD COLUMN tier TEXT NOT NULL DEFAULT '{default_tier}'"
+            )
+            self._conn.commit()
+        # A pre-upgrade database may have 'room' rows from before the first
+        # redesign pass removed that rule_type -- room-scoped grants are
+        # back (see ActorRecord.is_third_party's sibling docs and
+        # _handle_allow), always at 'shadow' tier, so backfill any
+        # surviving legacy room row to that rather than leaving it at the
+        # generic default above (which only matters for brand new rows,
+        # not ones that predate this column).
+        self._conn.execute(
+            "UPDATE third_party_allowlist SET tier = 'shadow' WHERE rule_type = 'room' AND tier != 'shadow'"
+        )
+        self._conn.commit()
 
     async def close(self) -> None:
         # sqlite3's close() is fast/local -- no need for the asyncio.to_thread
@@ -1508,14 +1538,44 @@ class SqliteActorRepository:
     async def clear_identity_setting(self, username: str, key: str) -> None:
         await self._run(self._clear_identity_setting, username, key)
 
-    def _list_third_party_records(self) -> list[ActorRecord]:
-        rows = self._conn.execute(
-            "SELECT * FROM local_actors WHERE is_third_party = 1 AND room_id = ''"
-        ).fetchall()
-        return [self._row_to_actor(row) for row in rows]
+    def _resolve_third_party_tier(self, mxid: str, homeserver: str, room_id: str = "") -> str | None:
+        row = self._conn.execute(
+            "SELECT tier FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = ?", (mxid,)
+        ).fetchone()
+        if row is not None:
+            return None if row["tier"] == "banned" else row["tier"]
+        if homeserver:
+            row = self._conn.execute(
+                "SELECT tier FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = ?",
+                (homeserver,),
+            ).fetchone()
+            if row is not None:
+                return row["tier"]
+        if room_id:
+            row = self._conn.execute(
+                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'room' AND value = ?", (room_id,)
+            ).fetchone()
+            if row is not None:
+                return "shadow"
+        return None
 
-    async def list_third_party_records(self) -> list[ActorRecord]:
-        return await self._run(self._list_third_party_records)
+    def _list_shadow_tier_actors(self) -> list[ActorRecord]:
+        # See the near-identical comment in PostgresActorRepository.list_shadow_tier_actors.
+        no_room_rows = self._conn.execute("SELECT * FROM local_actors WHERE room_id = ''").fetchall()
+        results = [self._row_to_actor(row) for row in no_room_rows]
+        parked_rows = self._conn.execute(
+            "SELECT * FROM local_actors WHERE is_third_party = 1 AND room_id != ''"
+        ).fetchall()
+        for row in parked_rows:
+            record = self._row_to_actor(row)
+            homeserver = record.matrix_user_id.split(":", 1)[1] if ":" in record.matrix_user_id else ""
+            tier = self._resolve_third_party_tier(record.matrix_user_id, homeserver)
+            if tier != "full":
+                results.append(record)
+        return results
+
+    async def list_shadow_tier_actors(self) -> list[ActorRecord]:
+        return await self._run(self._list_shadow_tier_actors)
 
     def _list_local_usernames(self) -> list[str]:
         rows = self._conn.execute("SELECT username FROM local_actors WHERE room_id != ''").fetchall()
@@ -1586,21 +1646,22 @@ class SqliteActorRepository:
 
     # -- third-party allowlist -----------------------------------------------
 
-    def _add_third_party_allow(self, rule_type: str, value: str, granted_by: str) -> None:
+    def _add_third_party_allow(self, rule_type: str, value: str, tier: str, granted_by: str) -> None:
         self._conn.execute(
             """
-            INSERT INTO third_party_allowlist (rule_type, value, granted_by, granted_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO third_party_allowlist (rule_type, value, tier, granted_by, granted_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(rule_type, value) DO UPDATE SET
+                tier=excluded.tier,
                 granted_by=excluded.granted_by,
                 granted_at=excluded.granted_at
             """,
-            (rule_type, value, granted_by, datetime.now(timezone.utc).isoformat()),
+            (rule_type, value, tier, granted_by, datetime.now(timezone.utc).isoformat()),
         )
         self._conn.commit()
 
-    async def add_third_party_allow(self, rule_type: str, value: str, *, granted_by: str) -> None:
-        await self._run(self._add_third_party_allow, rule_type, value, granted_by)
+    async def add_third_party_allow(self, rule_type: str, value: str, tier: str, *, granted_by: str) -> None:
+        await self._run(self._add_third_party_allow, rule_type, value, tier, granted_by)
 
     def _remove_third_party_allow(self, rule_type: str, value: str) -> None:
         self._conn.execute(
@@ -1610,6 +1671,23 @@ class SqliteActorRepository:
 
     async def remove_third_party_allow(self, rule_type: str, value: str) -> None:
         await self._run(self._remove_third_party_allow, rule_type, value)
+
+    def _set_third_party_ban(self, mxid: str, granted_by: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO third_party_allowlist (rule_type, value, tier, granted_by, granted_at)
+            VALUES ('mxid', ?, 'banned', ?, ?)
+            ON CONFLICT(rule_type, value) DO UPDATE SET
+                tier='banned',
+                granted_by=excluded.granted_by,
+                granted_at=excluded.granted_at
+            """,
+            (mxid, granted_by, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+
+    async def set_third_party_ban(self, mxid: str, *, granted_by: str) -> None:
+        await self._run(self._set_third_party_ban, mxid, granted_by)
 
     def _list_third_party_allows(self, rule_type: str | None) -> list[ThirdPartyAllowRecord]:
         if rule_type is not None:
@@ -1625,6 +1703,7 @@ class SqliteActorRepository:
             ThirdPartyAllowRecord(
                 rule_type=row["rule_type"],
                 value=row["value"],
+                tier=row["tier"],
                 granted_by=row["granted_by"],
                 granted_at=row["granted_at"],
             )
@@ -1634,29 +1713,8 @@ class SqliteActorRepository:
     async def list_third_party_allows(self, rule_type: str | None = None) -> list[ThirdPartyAllowRecord]:
         return await self._run(self._list_third_party_allows, rule_type)
 
-    def _is_third_party_allowed(self, mxid: str, homeserver: str, room_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'mxid' AND value = ?", (mxid,)
-        ).fetchone()
-        if row is not None:
-            return True
-        if room_id:
-            row = self._conn.execute(
-                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'room' AND value = ?", (room_id,)
-            ).fetchone()
-            if row is not None:
-                return True
-        if homeserver:
-            row = self._conn.execute(
-                "SELECT 1 FROM third_party_allowlist WHERE rule_type = 'homeserver' AND value = ?",
-                (homeserver,),
-            ).fetchone()
-            if row is not None:
-                return True
-        return False
-
-    async def is_third_party_allowed(self, *, mxid: str, homeserver: str, room_id: str) -> bool:
-        return await self._run(self._is_third_party_allowed, mxid, homeserver, room_id)
+    async def resolve_third_party_tier(self, *, mxid: str, homeserver: str, room_id: str) -> str | None:
+        return await self._run(self._resolve_third_party_tier, mxid, homeserver, room_id)
 
     # -- instance logins -------------------------------------------------------
 

@@ -46,11 +46,11 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import (
-    _effective_third_party_mode,
     is_foreign_bot_command,
     is_foreign_bridge_user,
     message_addresses_bot,
 )
+from bridge.shadow_identity import effective_identity_tier, ensure_shadow_actor, shadow_created_notice
 from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import (
     OUTBOUND_EVENT_TYPES,
@@ -415,27 +415,42 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
             or is_foreign_bridge_user(sender, config)
         ):
             return False  # the bot's / a ghost's own messages -- ours or a sibling bridge's -- are never guest posts
-        guest_record = await repository.get_local_actor_by_matrix_id(sender)
+        guest_resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+        guest_record = guest_resolution.record
         if guest_record is None:
-            return False  # a Matrix user with no linked fediverse profile -- stays Matrix-only, as ever
-        # A DIFFERENT local user with a linked profile posting in someone
-        # else's Profile Room (user-requested, 2026-07-04): federate it as
-        # the GUEST's own post -- minted under their actor, signed by them,
-        # on their outbox -- with the room owner's mention tacked on the
-        # front (below), the nearest fediverse equivalent of walking into
-        # someone's room to talk to them. Without this, the message stayed
-        # Matrix-only, so the owner's later on-Matrix replies to it
-        # federated as fresh context-free posts instead of replies.
+            return False  # not eligible for even a shadow identity (access off, or not allowlisted)
+        if guest_resolution.created:
+            try:
+                await request.app.state.synapse.send_message_event(
+                    room_id,
+                    {"msgtype": "m.notice", "body": shadow_created_notice(request, guest_record)},
+                    as_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
+                )
+            except Exception:
+                logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
+        # A DIFFERENT local user posting in someone else's Profile Room
+        # (user-requested, 2026-07-04): federate it as the GUEST's own post
+        # -- minted under their actor, signed by them, on their outbox --
+        # with the room owner's mention tacked on the front (below), the
+        # nearest fediverse equivalent of walking into someone's room to
+        # talk to them. Without this, the message stayed Matrix-only, so
+        # the owner's later on-Matrix replies to it federated as fresh
+        # context-free posts instead of replies.
         actor_record = guest_record
 
-    # A leftover Profile Room from a past Full period (the room owner's own
-    # post) or a Follow-Only third party posting as a GUEST in someone
-    # else's room (the guest_record reassignment just above) must not
-    # distribute while the poster is currently effective-Follow-Only --
-    # per this feature's truth table, the room stays exactly as-is on the
-    # Matrix side, it just stops being cross-posted to the fediverse. See
-    # _effective_third_party_mode's docstring.
-    if await _effective_third_party_mode(request, actor_record) == "follow_only":
+    # A leftover Profile Room from a past full period (the room owner's own
+    # post) or a shadow-tier THIRD-PARTY identity posting as a GUEST in
+    # someone else's room (the guest_record reassignment just above) must
+    # not distribute while the poster is currently effective-shadow -- per
+    # this feature's truth table, the room stays exactly as-is on the
+    # Matrix side, it just stops being cross-posted to the fediverse.
+    # First-party is deliberately excluded from this check (unlike the
+    # command-dispatch gate, which also only ever restricted third
+    # parties) -- a first-party guest who just got auto-provisioned a
+    # brand new shadow identity (room_id == "") above still gets their
+    # post distributed under it normally; shadow is their default state,
+    # not a restriction. See effective_identity_tier's docstring.
+    if actor_record.is_third_party and await effective_identity_tier(request, actor_record) == "shadow":
         return True
 
     if await repository.get_federated_event_by_matrix_event(matrix_event_id) is not None:
