@@ -287,6 +287,35 @@ class RemoteActorRoom:
 
 
 @dataclass(frozen=True)
+class MappedRoomRecord:
+    """One Matrix room this bridge has mapped to something ActivityPub-side,
+    for the widget's admin "Rooms" view (``ActorRepository.list_all_mapped_rooms``)
+    -- everything EXCEPT the four identity-owning kinds (Profile, PeerTube
+    Channel, hosted Lemmy Community, hosted Group), which already have
+    their own bridge-wide list methods (``list_all_local_actors`` etc.)
+    reused directly by that same view, since each of THOSE rooms IS an
+    identity's own room, not a separate mapping.
+
+    ``kind`` is a short, human-readable label for display, e.g.
+    ``"Lemmy Community (mirrored)"``, ``"Group (mirrored)"``,
+    ``"Shoot Channel"``, ``"Guild Space"``, ``"Personal Space"``,
+    ``"Remote User Room"``, ``"DM"``, ``"Chat"``, ``"Notifications"``.
+    ``maps_to`` is the AP actor/object id (or guild id) the room
+    represents, as plain text for display -- never a Matrix identifier.
+    ``owner_matrix_id`` is the ONE local Matrix user this room belongs to,
+    or ``None`` for a room with no single owner BY DESIGN -- a Remote User
+    Room, Shoot Channel, Guild Space, or mirrored Lemmy/Group room can all
+    have many different local or remote members involved, with no single
+    "owner" column in their own source table at all (see each one's own
+    record type, e.g. ``ChannelRoom``, for why)."""
+
+    room_id: str
+    kind: str
+    maps_to: str
+    owner_matrix_id: str | None
+
+
+@dataclass(frozen=True)
 class PendingGuildFollow:
     """An outstanding FEP-bebd guild-join Follow, between sending it and the
     guild's Accept/Reject arriving back over the inbox -- unlike an ordinary
@@ -570,6 +599,14 @@ class ActorRepository(Protocol):
         entry of this list."""
         ...
 
+    async def list_all_local_actors(self) -> list[ActorRecord]:
+        """Every ``ActorRecord`` on the whole bridge, regardless of owner --
+        bridge-wide counterpart of ``list_local_actors_by_matrix_id``, for
+        the widget's admin "Identities" view (``bridge.widget``). Includes
+        every tier (shadow and full) and both first- and third-party
+        identities, plus the bridge's own service actor."""
+        ...
+
     async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
         """``matrix_user_id``'s current Active identity -- the one used for
         any outgoing action that doesn't already have an implicit identity
@@ -652,6 +689,12 @@ class ActorRepository(Protocol):
         created -- a single profile can own several."""
         ...
 
+    async def list_all_peertube_channels(self) -> list[PeerTubeChannelRecord]:
+        """Every hosted PeerTube channel on the whole bridge, regardless of
+        owner -- bridge-wide counterpart of ``list_peertube_channels_by_owner``,
+        for the widget's admin "Identities" view."""
+        ...
+
     async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         """Create or replace a channel (freshly created, or updated display
         fields via the same generic actor-field commands a Profile Room
@@ -674,6 +717,14 @@ class ActorRepository(Protocol):
         equivalent of ``list_peertube_channels_by_owner``, same reasoning."""
         ...
 
+    async def list_all_lemmy_communities(self) -> list[LemmyCommunityRecord]:
+        """Every HOSTED Lemmy community on the whole bridge, regardless of
+        owner (never mirrored/remote ones -- those have no owner concept
+        at all, see ``LemmyCommunityRoom``/``list_all_mapped_rooms``) --
+        bridge-wide counterpart of ``list_lemmy_communities_by_owner``, for
+        the widget's admin "Identities" view."""
+        ...
+
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         """Create or replace a hosted Lemmy community (freshly created, or
         updated display fields / moderator list)."""
@@ -692,6 +743,13 @@ class ActorRepository(Protocol):
     async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
         """Every hosted Group ``owner_username`` owns -- same reasoning as
         ``list_peertube_channels_by_owner``/``list_lemmy_communities_by_owner``."""
+        ...
+
+    async def list_all_groups(self) -> list[GroupRecord]:
+        """Every HOSTED Group on the whole bridge, regardless of owner
+        (never mirrored/remote ones -- see ``GroupRoom``/
+        ``list_all_mapped_rooms``) -- bridge-wide counterpart of
+        ``list_groups_by_owner``, for the widget's admin "Identities" view."""
         ...
 
     async def register_group(self, record: GroupRecord) -> None:
@@ -910,6 +968,26 @@ class ActorRepository(Protocol):
         expensive at real scale (bridge-wide room count instead of just
         one user's rooms), so never called at all when
         ``bridge.use_synapse_admin_api`` is on."""
+        ...
+
+    async def list_all_mapped_rooms(self) -> list[MappedRoomRecord]:
+        """Every Matrix room this bridge has mapped to something
+        ActivityPub-side, EXCEPT the four identity-owning kinds (Profile,
+        PeerTube Channel, hosted Lemmy Community, hosted Group) -- those
+        are each already covered by their own bridge-wide list method
+        (``list_all_local_actors`` etc.), reused directly by the same
+        caller, since each of those rooms IS that identity's own room, not
+        a separate mapping to union in here. Covers: mirrored Lemmy
+        Community rooms, mirrored Group rooms, Shoot Channel rooms, Shoot
+        Guild Spaces, personal "Fediverse" Spaces, Remote User Rooms, DM
+        rooms, Chat rooms, and the bot DM/Notifications room -- see
+        ``MappedRoomRecord``'s own docstring for the exact ``kind`` labels
+        and which of these have no single ``owner_matrix_id`` by design.
+        Built purely for the widget's admin "Rooms" view
+        (``bridge.widget``); no other caller should depend on this
+        touching every one of these tables in one call, since that's an
+        implementation detail of what the admin view happens to need, not
+        a stable contract."""
         ...
 
     async def get_remote_actor_room_history_actor_id(self, room_id: str) -> str | None:
@@ -1644,6 +1722,9 @@ class InMemoryActorRepository:
         records = [self._actors[u].record for u in usernames if u in self._actors]
         return sorted(records, key=lambda r: r.created_at)
 
+    async def list_all_local_actors(self) -> list[ActorRecord]:
+        return [state.record for state in self._actors.values()]
+
     async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
         username = self._active_identity.get(matrix_user_id)
         if username is not None:
@@ -1749,6 +1830,9 @@ class InMemoryActorRepository:
     async def list_peertube_channels_by_owner(self, owner_username: str) -> list[PeerTubeChannelRecord]:
         return [c for c in self._peertube_channels.values() if c.owner_username == owner_username]
 
+    async def list_all_peertube_channels(self) -> list[PeerTubeChannelRecord]:
+        return list(self._peertube_channels.values())
+
     async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         existing = self._peertube_channels.get(record.username)
         if existing is not None and existing.room_id and existing.room_id != record.room_id:
@@ -1773,6 +1857,9 @@ class InMemoryActorRepository:
     async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
         return [c for c in self._lemmy_communities.values() if c.owner_username == owner_username]
 
+    async def list_all_lemmy_communities(self) -> list[LemmyCommunityRecord]:
+        return list(self._lemmy_communities.values())
+
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
         existing = self._lemmy_communities.get(record.username)
         if existing is not None and existing.room_id and existing.room_id != record.room_id:
@@ -1796,6 +1883,9 @@ class InMemoryActorRepository:
 
     async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
         return [g for g in self._groups.values() if g.owner_username == owner_username]
+
+    async def list_all_groups(self) -> list[GroupRecord]:
+        return list(self._groups.values())
 
     async def register_group(self, record: GroupRecord) -> None:
         existing = self._groups.get(record.username)
@@ -1951,6 +2041,28 @@ class InMemoryActorRepository:
 
     async def list_all_remote_actor_room_ids(self) -> list[str]:
         return list(self._remote_rooms_by_room_id.keys())
+
+    async def list_all_mapped_rooms(self) -> list[MappedRoomRecord]:
+        rows: list[MappedRoomRecord] = []
+        for r in self._lemmy_community_rooms.values():
+            rows.append(MappedRoomRecord(r.room_id, "Lemmy Community (mirrored)", r.community_actor_id, None))
+        for r in self._group_rooms.values():
+            rows.append(MappedRoomRecord(r.room_id, "Group (mirrored)", r.group_actor_id, None))
+        for r in self._channel_rooms.values():
+            rows.append(MappedRoomRecord(r.room_id, "Shoot Channel", r.channel_actor_id, None))
+        for guild_actor_id, space_room_id in self._guild_spaces.items():
+            rows.append(MappedRoomRecord(space_room_id, "Guild Space", guild_actor_id, None))
+        for matrix_user_id, space_room_id in self._user_spaces.items():
+            rows.append(MappedRoomRecord(space_room_id, "Personal Space", matrix_user_id, matrix_user_id))
+        for r in self._remote_rooms.values():
+            rows.append(MappedRoomRecord(r.room_id, "Remote User Room", r.actor_id, None))
+        for (actor_id, matrix_user_id), room_id in self._ghost_dm_rooms.items():
+            rows.append(MappedRoomRecord(room_id, "DM", actor_id, matrix_user_id))
+        for (actor_id, matrix_user_id), room_id in self._ghost_chat_rooms.items():
+            rows.append(MappedRoomRecord(room_id, "Chat", actor_id, matrix_user_id))
+        for matrix_user_id, room_id in self._bot_dm_rooms.items():
+            rows.append(MappedRoomRecord(room_id, "Notifications", "(bridge bot)", matrix_user_id))
+        return rows
 
     async def register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # Same reasoning as register_local_actor: a room replacement moves

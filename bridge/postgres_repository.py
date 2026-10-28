@@ -39,6 +39,7 @@ from bridge.repository import (
     InstanceLoginRecord,
     LemmyCommunityRecord,
     LemmyCommunityRoom,
+    MappedRoomRecord,
     PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
@@ -776,6 +777,10 @@ class PostgresActorRepository:
         )
         return [self._row_to_actor(row) for row in rows]
 
+    async def list_all_local_actors(self) -> list[ActorRecord]:
+        rows = await self._pool.fetch("SELECT * FROM local_actors ORDER BY created_at ASC")
+        return [self._row_to_actor(row) for row in rows]
+
     async def get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
         row = await self._pool.fetchrow(
             "SELECT username FROM active_identity WHERE matrix_user_id = $1", matrix_user_id
@@ -987,6 +992,10 @@ class PostgresActorRepository:
         )
         return [self._row_to_peertube_channel(row) for row in rows]
 
+    async def list_all_peertube_channels(self) -> list[PeerTubeChannelRecord]:
+        rows = await self._pool.fetch("SELECT * FROM peertube_channels ORDER BY username")
+        return [self._row_to_peertube_channel(row) for row in rows]
+
     async def register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         await self._pool.execute(
             """
@@ -1046,6 +1055,10 @@ class PostgresActorRepository:
         rows = await self._pool.fetch(
             "SELECT * FROM lemmy_communities WHERE owner_username = $1 ORDER BY username", owner_username
         )
+        return [self._row_to_lemmy_community(row) for row in rows]
+
+    async def list_all_lemmy_communities(self) -> list[LemmyCommunityRecord]:
+        rows = await self._pool.fetch("SELECT * FROM lemmy_communities ORDER BY username")
         return [self._row_to_lemmy_community(row) for row in rows]
 
     async def register_lemmy_community(self, record: LemmyCommunityRecord) -> None:
@@ -1108,6 +1121,10 @@ class PostgresActorRepository:
         rows = await self._pool.fetch(
             "SELECT * FROM hosted_groups WHERE owner_username = $1 ORDER BY username", owner_username
         )
+        return [self._row_to_group(row) for row in rows]
+
+    async def list_all_groups(self) -> list[GroupRecord]:
+        rows = await self._pool.fetch("SELECT * FROM hosted_groups ORDER BY username")
         return [self._row_to_group(row) for row in rows]
 
     async def register_group(self, record: GroupRecord) -> None:
@@ -1428,6 +1445,28 @@ class PostgresActorRepository:
     async def list_all_remote_actor_room_ids(self) -> list[str]:
         rows = await self._pool.fetch("SELECT room_id FROM remote_actor_rooms")
         return [row["room_id"] for row in rows]
+
+    async def list_all_mapped_rooms(self) -> list[MappedRoomRecord]:
+        rows: list[MappedRoomRecord] = []
+        for row in await self._pool.fetch("SELECT room_id, community_actor_id FROM lemmy_community_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Lemmy Community (mirrored)", row["community_actor_id"], None))
+        for row in await self._pool.fetch("SELECT room_id, group_actor_id FROM group_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Group (mirrored)", row["group_actor_id"], None))
+        for row in await self._pool.fetch("SELECT room_id, channel_actor_id FROM channel_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Shoot Channel", row["channel_actor_id"], None))
+        for row in await self._pool.fetch("SELECT guild_actor_id, space_room_id FROM guild_spaces"):
+            rows.append(MappedRoomRecord(row["space_room_id"], "Guild Space", row["guild_actor_id"], None))
+        for row in await self._pool.fetch("SELECT matrix_user_id, space_room_id FROM user_spaces"):
+            rows.append(MappedRoomRecord(row["space_room_id"], "Personal Space", row["matrix_user_id"], row["matrix_user_id"]))
+        for row in await self._pool.fetch("SELECT room_id, actor_id FROM remote_actor_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Remote User Room", row["actor_id"], None))
+        for row in await self._pool.fetch("SELECT room_id, actor_id, matrix_user_id FROM ghost_dm_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "DM", row["actor_id"], row["matrix_user_id"]))
+        for row in await self._pool.fetch("SELECT room_id, actor_id, matrix_user_id FROM ghost_chat_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Chat", row["actor_id"], row["matrix_user_id"]))
+        for row in await self._pool.fetch("SELECT room_id, matrix_user_id FROM bot_dm_rooms"):
+            rows.append(MappedRoomRecord(row["room_id"], "Notifications", "(bridge bot)", row["matrix_user_id"]))
+        return rows
 
     async def register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # pending_backfill is deliberately NOT in the DO UPDATE SET below --

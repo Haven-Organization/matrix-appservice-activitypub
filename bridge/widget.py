@@ -82,6 +82,7 @@ from bridge.commands import (
     widget_unpublish_video,
 )
 from bridge.identity_settings import get_effective_settings
+from bridge.shadow_identity import effective_identity_tier
 from bridge.spaces import get_guild_invite_code
 from bridge.peertube import (
     COMMON_LANGUAGES,
@@ -604,6 +605,107 @@ async def widget_admin_disallow(request: Request) -> JSONResponse:
     if rule_type not in _ALLOW_RULE_TYPES or not isinstance(value, str) or not value.strip():
         raise HTTPException(400, f"rule_type must be one of {_ALLOW_RULE_TYPES} and value is required")
     return await _dispatch(request, body.get("room_id", ""), _handle_disallow, argument=f"{rule_type} {value.strip()}")
+
+
+@router.get("/widget/api/admin/identities")
+async def widget_admin_identities(request: Request) -> JSONResponse:
+    """Every ActivityPub identity this bridge hosts -- Profiles (full or
+    shadow), PeerTube Channels, hosted Lemmy Communities, hosted Groups --
+    for the Admin page's Identities view. Never serializes
+    ``public_key_pem``/``private_key_pem``, even though the records this
+    reads from carry them; this endpoint is admin-gated, not
+    secret-safe-by-design, so the private keys are simply never put on the
+    wire here at all. Same admin-gating pattern as ``widget_admin_grants``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view bridge identities.")
+    repository = request.app.state.repository
+    config = request.app.state.config
+    domain = config.bridge.domain
+
+    actors = await repository.list_all_local_actors()
+    channels = await repository.list_all_peertube_channels()
+    communities = await repository.list_all_lemmy_communities()
+    groups = await repository.list_all_groups()
+    # Resolves a channel/community/group's owner_username (another local
+    # identity's username) back to the real matrix_user_id it belongs to,
+    # from the actors list already fetched above -- no extra DB round trip.
+    owner_matrix_id_by_username = {a.username: a.matrix_user_id for a in actors}
+
+    identities: list[dict] = []
+    for a in actors:
+        identities.append({
+            "username": a.username,
+            "kind": "profile",
+            "display_name": a.display_name,
+            "handle": f"{a.username}@{domain}",
+            "owner_matrix_id": a.matrix_user_id,
+            "room_id": a.room_id,
+            "tier": await effective_identity_tier(request, a),
+            "is_third_party": a.is_third_party,
+        })
+    for kind, records in (("channel", channels), ("community", communities), ("group", groups)):
+        for r in records:
+            identities.append({
+                "username": r.username,
+                "kind": kind,
+                "display_name": r.display_name,
+                "handle": f"{r.username}@{domain}",
+                "owner_matrix_id": owner_matrix_id_by_username.get(r.owner_username) or f"(owner: {r.owner_username})",
+                "room_id": r.room_id,
+                "tier": None,
+                "is_third_party": False,
+            })
+    return JSONResponse({"identities": identities}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/widget/api/admin/rooms")
+async def widget_admin_rooms(request: Request) -> JSONResponse:
+    """Every Matrix room this bridge has mapped to something
+    ActivityPub-side -- for the Admin page's Rooms view. Combines each
+    identity's own room (Profile/Channel/Community/Group, reusing the
+    same four bridge-wide identity lists ``widget_admin_identities`` uses)
+    with everything ``ActorRepository.list_all_mapped_rooms`` covers (DM,
+    Chat, Remote User Room, Guild Space, Personal Space, mirrored
+    Lemmy/Group/Shoot rooms, Notifications) into one flat list. Same
+    admin-gating pattern as ``widget_admin_grants``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view bridge-mapped rooms.")
+    repository = request.app.state.repository
+    config = request.app.state.config
+    domain = config.bridge.domain
+
+    actors = await repository.list_all_local_actors()
+    channels = await repository.list_all_peertube_channels()
+    communities = await repository.list_all_lemmy_communities()
+    groups = await repository.list_all_groups()
+    mapped = await repository.list_all_mapped_rooms()
+    owner_matrix_id_by_username = {a.username: a.matrix_user_id for a in actors}
+
+    rooms: list[dict] = []
+    for a in actors:
+        if not a.room_id:
+            continue
+        rooms.append({
+            "room_id": a.room_id, "kind": "Profile",
+            "maps_to": f"{a.username}@{domain}", "owner_matrix_id": a.matrix_user_id,
+        })
+    for kind_label, records in (
+        ("Channel (PeerTube)", channels), ("Community (hosted)", communities), ("Group (hosted)", groups),
+    ):
+        for r in records:
+            if not r.room_id:
+                continue
+            rooms.append({
+                "room_id": r.room_id, "kind": kind_label, "maps_to": f"{r.username}@{domain}",
+                "owner_matrix_id": owner_matrix_id_by_username.get(r.owner_username) or f"(owner: {r.owner_username})",
+            })
+    for m in mapped:
+        rooms.append({
+            "room_id": m.room_id, "kind": m.kind, "maps_to": m.maps_to, "owner_matrix_id": m.owner_matrix_id,
+        })
+    return JSONResponse({"rooms": rooms}, headers={"Cache-Control": "no-store"})
 
 
 # -- actions -------------------------------------------------------------------
@@ -2064,6 +2166,11 @@ _WIDGET_HTML = r"""<!doctype html>
   let channelView = null;
   let communityView = null;
   let groupView = null;
+  // Which Admin sub-tab is showing -- module-level (not local to
+  // renderAdminTab) so it survives the re-render doAction() triggers after
+  // every grant/revoke action (loadContext() -> render() re-runs the whole
+  // tree; a local var would silently reset back to "access" each time).
+  let adminSubTab = "access";
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
@@ -4347,24 +4454,50 @@ _WIDGET_HTML = r"""<!doctype html>
   // -- Admin ------------------------------------------------------------------
 
   function renderAdminTab(app) {
-    const RULE_TYPES = ["mxid", "room", "homeserver"];
-    const typeSelect = el("select", { style: "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;" },
-      RULE_TYPES.map((t) => el("option", { value: t, text: t })));
-    const valueInput = el("input", { type: "text", placeholder: "@user:example.org, !room:example.org, or example.org" });
+    app.appendChild(el("div", { class: "row" }, [
+      toggleButton("Access", adminSubTab === "access", () => { adminSubTab = "access"; render(); }),
+      toggleButton("Identities", adminSubTab === "identities", () => { adminSubTab = "identities"; render(); }),
+      toggleButton("Rooms", adminSubTab === "rooms", () => { adminSubTab = "rooms"; render(); }),
+    ]));
+    if (adminSubTab === "identities") renderAdminIdentitiesSubTab(app);
+    else if (adminSubTab === "rooms") renderAdminRoomsSubTab(app);
+    else renderAdminAccessSubTab(app);
+  }
 
+  function renderAdminAccessSubTab(app) {
+    const RULE_TYPES = ["mxid", "homeserver", "room"];
+    const selectStyle = "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;";
+    const typeSelect = el("select", { style: selectStyle }, RULE_TYPES.map((t) => el("option", { value: t, text: t })));
+    const tierSelect = el("select", { style: selectStyle }, ["shadow", "full"].map((t) => el("option", { value: t, text: t })));
+    const valueInput = el("input", {
+      type: "text",
+      placeholder: "@user:example.org, example.org, !room:example.org, or #alias:example.org",
+    });
+
+    function syncTierVisibility() {
+      tierSelect.style.display = typeSelect.value === "room" ? "none" : "";
+    }
+    typeSelect.addEventListener("change", syncTierVisibility);
+    syncTierVisibility();
+
+    const statusLine = el("div", { class: "sub", text: "" });
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
 
     function loadGrants() {
       api("/widget/api/admin/grants").then((data) => {
+        statusLine.textContent = "Third-party access is currently " + (data.third_party_access ? "ON" : "OFF") + ".";
         list.innerHTML = "";
         if (!data.grants.length) {
-          list.appendChild(el("div", { class: "muted", text: "No grants yet — mode: " + data.mode + "." }));
+          list.appendChild(el("div", { class: "muted", text: "No grants yet." }));
           return;
         }
         data.grants.forEach((g) => {
           list.appendChild(el("div", { class: "list-item" }, [
-            el("span", { text: g.rule_type + ": " + g.value }),
-            plainButton("Revoke", (e) =>
+            el("div", {}, [
+              el("div", { style: "font-weight:600;", text: g.rule_type + ": " + g.value }),
+              el("div", { class: "muted", style: "font-size:12px;margin-top:2px;", text: "tier: " + g.tier + " · granted by " + g.granted_by }),
+            ]),
+            dangerButton("Revoke", (e) =>
               doAction("/widget/api/admin/disallow", { rule_type: g.rule_type, value: g.value }, e.target).then(loadGrants)),
           ]));
         });
@@ -4373,18 +4506,139 @@ _WIDGET_HTML = r"""<!doctype html>
 
     app.appendChild(el("div", { class: "card" }, [
       el("h2", { text: "Third-party access" }),
-      el("div", { class: "sub", text: "Let a user, room, or whole homeserver other than your own use this bridge." }),
+      el("div", { class: "sub", text: "Let a user, homeserver, or a single already-bridged room's passive content use this bridge." }),
+      statusLine,
       el("div", { class: "row" }, [
-        typeSelect, valueInput,
+        typeSelect, valueInput, tierSelect,
         primaryButton("Grant", (e) => {
           if (!valueInput.value.trim()) return;
-          doAction("/widget/api/admin/allow", { rule_type: typeSelect.value, value: valueInput.value.trim() }, e.target)
+          const body = { rule_type: typeSelect.value, value: valueInput.value.trim() };
+          if (typeSelect.value !== "room") body.tier = tierSelect.value;
+          doAction("/widget/api/admin/allow", body, e.target)
             .then(() => { valueInput.value = ""; loadGrants(); });
         }),
       ]),
       list,
     ]));
     loadGrants();
+  }
+
+  function renderAdminIdentitiesSubTab(app) {
+    let allItems = [];
+    const filterInput = el("input", { type: "text", placeholder: "Filter by username, owner, display name…" });
+    const kindSelect = el("select", { style: "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;" },
+      ["all", "profile", "channel", "community", "group"].map((k) => el("option", { value: k, text: k === "all" ? "All kinds" : k })));
+    const countLine = el("div", { class: "sub", text: "" });
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+
+    function renderList() {
+      const q = filterInput.value.trim().toLowerCase();
+      const kind = kindSelect.value;
+      const filtered = allItems.filter((it) => {
+        if (kind !== "all" && it.kind !== kind) return false;
+        if (!q) return true;
+        return (it.handle + " " + it.display_name + " " + it.owner_matrix_id + " " + it.room_id).toLowerCase().indexOf(q) !== -1;
+      });
+      list.innerHTML = "";
+      countLine.textContent = filtered.length + " of " + allItems.length + " identities.";
+      if (!filtered.length) {
+        list.appendChild(el("div", { class: "muted", text: "No matching identities." }));
+        return;
+      }
+      filtered.forEach((it) => {
+        const badgeRow = [el("span", { class: "badge", text: it.kind })];
+        if (it.tier) {
+          badgeRow.push(el("span", {
+            class: "badge",
+            style: (it.tier === "shadow" ? "background:var(--hover);color:var(--text);" : "") + "margin-left:4px;",
+            text: it.tier,
+          }));
+        }
+        if (it.is_third_party) {
+          badgeRow.push(el("span", { class: "badge", style: "background:var(--hover);color:var(--text);margin-left:4px;", text: "third-party" }));
+        }
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("div", { style: "flex:1;min-width:0;" }, [
+            el("div", { style: "display:flex;align-items:center;gap:4px;flex-wrap:wrap;" }, badgeRow.concat([
+              el("span", { style: "font-weight:600;word-break:break-all;", text: it.handle }),
+            ])),
+            el("div", { class: "muted", style: "font-size:12px;margin-top:2px;word-break:break-all;",
+              text: "owner: " + it.owner_matrix_id + (it.room_id ? " · room: " + it.room_id : " · no room yet") }),
+          ]),
+        ]));
+      });
+    }
+
+    filterInput.addEventListener("input", renderList);
+    kindSelect.addEventListener("change", renderList);
+
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Identities" }),
+      el("div", { class: "sub", text: "Every ActivityPub identity this bridge hosts -- profiles, channels, communities, and groups." }),
+      el("div", { class: "row" }, [filterInput, kindSelect]),
+      countLine,
+      list,
+    ]));
+
+    api("/widget/api/admin/identities").then((data) => {
+      allItems = data.identities;
+      renderList();
+    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  function renderAdminRoomsSubTab(app) {
+    let allItems = [];
+    const filterInput = el("input", { type: "text", placeholder: "Filter by room id, maps to, owner…" });
+    const kindSelect = el("select", { style: "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;" },
+      [el("option", { value: "all", text: "All kinds" })]);
+    const countLine = el("div", { class: "sub", text: "" });
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+
+    function renderList() {
+      const q = filterInput.value.trim().toLowerCase();
+      const kind = kindSelect.value;
+      const filtered = allItems.filter((it) => {
+        if (kind !== "all" && it.kind !== kind) return false;
+        if (!q) return true;
+        return (it.room_id + " " + it.kind + " " + it.maps_to + " " + (it.owner_matrix_id || "")).toLowerCase().indexOf(q) !== -1;
+      });
+      list.innerHTML = "";
+      countLine.textContent = filtered.length + " of " + allItems.length + " rooms.";
+      if (!filtered.length) {
+        list.appendChild(el("div", { class: "muted", text: "No matching rooms." }));
+        return;
+      }
+      filtered.forEach((it) => {
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("div", { style: "flex:1;min-width:0;" }, [
+            el("div", { style: "display:flex;align-items:center;gap:6px;flex-wrap:wrap;" }, [
+              el("span", { class: "badge", text: it.kind }),
+              el("span", { style: "font-weight:600;word-break:break-all;", text: it.room_id }),
+            ]),
+            el("div", { class: "muted", style: "font-size:12px;margin-top:2px;word-break:break-all;",
+              text: "maps to: " + it.maps_to + " · owner: " + (it.owner_matrix_id || "— shared, no single owner —") }),
+          ]),
+        ]));
+      });
+    }
+
+    filterInput.addEventListener("input", renderList);
+
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Mapped rooms" }),
+      el("div", { class: "sub", text: "Every Matrix room this bridge has mapped to something ActivityPub-side." }),
+      el("div", { class: "row" }, [filterInput, kindSelect]),
+      countLine,
+      list,
+    ]));
+
+    api("/widget/api/admin/rooms").then((data) => {
+      allItems = data.rooms;
+      const kinds = Array.from(new Set(allItems.map((it) => it.kind))).sort();
+      kinds.forEach((k) => kindSelect.appendChild(el("option", { value: k, text: k })));
+      kindSelect.addEventListener("change", renderList);
+      renderList();
+    }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
   }
 
   function primaryButton(label, handler) {

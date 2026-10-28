@@ -38,6 +38,7 @@ from bridge.repository import (
     InstanceLoginRecord,
     LemmyCommunityRecord,
     LemmyCommunityRoom,
+    MappedRoomRecord,
     PeerTubeChannelRecord,
     PendingGuildFollow,
     PollVoteRecord,
@@ -976,6 +977,13 @@ class SqliteActorRepository:
     async def list_local_actors_by_matrix_id(self, matrix_user_id: str) -> list[ActorRecord]:
         return await self._run(self._list_local_actors_by_matrix_id, matrix_user_id)
 
+    def _list_all_local_actors(self) -> list[ActorRecord]:
+        rows = self._conn.execute("SELECT * FROM local_actors ORDER BY created_at ASC").fetchall()
+        return [self._row_to_actor(row) for row in rows]
+
+    async def list_all_local_actors(self) -> list[ActorRecord]:
+        return await self._run(self._list_all_local_actors)
+
     def _get_active_local_actor(self, matrix_user_id: str) -> ActorRecord | None:
         row = self._conn.execute(
             "SELECT username FROM active_identity WHERE matrix_user_id = ?", (matrix_user_id,)
@@ -1237,6 +1245,13 @@ class SqliteActorRepository:
     async def list_peertube_channels_by_owner(self, owner_username: str) -> list[PeerTubeChannelRecord]:
         return await self._run(self._list_peertube_channels_by_owner, owner_username)
 
+    def _list_all_peertube_channels(self) -> list[PeerTubeChannelRecord]:
+        rows = self._conn.execute("SELECT * FROM peertube_channels ORDER BY username").fetchall()
+        return [self._row_to_peertube_channel(row) for row in rows]
+
+    async def list_all_peertube_channels(self) -> list[PeerTubeChannelRecord]:
+        return await self._run(self._list_all_peertube_channels)
+
     def _register_peertube_channel(self, record: PeerTubeChannelRecord) -> None:
         self._conn.execute(
             """
@@ -1303,6 +1318,13 @@ class SqliteActorRepository:
 
     async def list_lemmy_communities_by_owner(self, owner_username: str) -> list[LemmyCommunityRecord]:
         return await self._run(self._list_lemmy_communities_by_owner, owner_username)
+
+    def _list_all_lemmy_communities(self) -> list[LemmyCommunityRecord]:
+        rows = self._conn.execute("SELECT * FROM lemmy_communities ORDER BY username").fetchall()
+        return [self._row_to_lemmy_community(row) for row in rows]
+
+    async def list_all_lemmy_communities(self) -> list[LemmyCommunityRecord]:
+        return await self._run(self._list_all_lemmy_communities)
 
     def _get_lemmy_community_by_room_id(self, room_id: str) -> LemmyCommunityRecord | None:
         if not room_id:
@@ -1389,6 +1411,13 @@ class SqliteActorRepository:
 
     async def list_groups_by_owner(self, owner_username: str) -> list[GroupRecord]:
         return await self._run(self._list_groups_by_owner, owner_username)
+
+    def _list_all_groups(self) -> list[GroupRecord]:
+        rows = self._conn.execute("SELECT * FROM hosted_groups ORDER BY username").fetchall()
+        return [self._row_to_group(row) for row in rows]
+
+    async def list_all_groups(self) -> list[GroupRecord]:
+        return await self._run(self._list_all_groups)
 
     def _register_group(self, record: GroupRecord) -> None:
         self._conn.execute(
@@ -1829,6 +1858,31 @@ class SqliteActorRepository:
 
     async def list_all_remote_actor_room_ids(self) -> list[str]:
         return await self._run(self._list_all_remote_actor_room_ids)
+
+    def _list_all_mapped_rooms(self) -> list[MappedRoomRecord]:
+        rows: list[MappedRoomRecord] = []
+        for row in self._conn.execute("SELECT room_id, community_actor_id FROM lemmy_community_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Lemmy Community (mirrored)", row["community_actor_id"], None))
+        for row in self._conn.execute("SELECT room_id, group_actor_id FROM group_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Group (mirrored)", row["group_actor_id"], None))
+        for row in self._conn.execute("SELECT room_id, channel_actor_id FROM channel_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Shoot Channel", row["channel_actor_id"], None))
+        for row in self._conn.execute("SELECT guild_actor_id, space_room_id FROM guild_spaces").fetchall():
+            rows.append(MappedRoomRecord(row["space_room_id"], "Guild Space", row["guild_actor_id"], None))
+        for row in self._conn.execute("SELECT matrix_user_id, space_room_id FROM user_spaces").fetchall():
+            rows.append(MappedRoomRecord(row["space_room_id"], "Personal Space", row["matrix_user_id"], row["matrix_user_id"]))
+        for row in self._conn.execute("SELECT room_id, actor_id FROM remote_actor_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Remote User Room", row["actor_id"], None))
+        for row in self._conn.execute("SELECT room_id, actor_id, matrix_user_id FROM ghost_dm_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "DM", row["actor_id"], row["matrix_user_id"]))
+        for row in self._conn.execute("SELECT room_id, actor_id, matrix_user_id FROM ghost_chat_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Chat", row["actor_id"], row["matrix_user_id"]))
+        for row in self._conn.execute("SELECT room_id, matrix_user_id FROM bot_dm_rooms").fetchall():
+            rows.append(MappedRoomRecord(row["room_id"], "Notifications", "(bridge bot)", row["matrix_user_id"]))
+        return rows
+
+    async def list_all_mapped_rooms(self) -> list[MappedRoomRecord]:
+        return await self._run(self._list_all_mapped_rooms)
 
     def _register_remote_actor_room(self, record: RemoteActorRoom) -> None:
         # pending_backfill is deliberately NOT in the DO UPDATE SET below --
