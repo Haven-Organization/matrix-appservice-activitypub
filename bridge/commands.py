@@ -513,13 +513,6 @@ def _looks_like_prefix_address(body: str) -> bool:
     return bool(_PREFIX_ADDRESS_RE.match(first_line))
 
 
-def _is_bare_prefix_message(body: str) -> bool:
-    """True if ``body`` is nothing but the command prefix itself, optionally
-    with surrounding whitespace (e.g. ";" or "; ") -- no keyword, no other
-    content at all."""
-    return body.strip() == _COMMAND_PREFIX
-
-
 def message_addresses_bot(content: dict, config) -> bool:
     """Whether a Matrix message's content tags/addresses the bridge bot --
     via a proper Matrix intentional mention (``m.mentions.user_ids``), the
@@ -716,24 +709,28 @@ async def maybe_handle_command(request: Request, event: dict) -> bool:
     tagged = _is_tag_addressed(content, config)
     parsed = _extract_prefixed_command(body) or (_extract_command(body) if tagged else None)
     if parsed is None:
-        if not tagged and _is_bare_prefix_message(body):
-            # Just the prefix itself ("; " or ";"), with nothing else at
-            # all -- never federate it, but stay silent too: this reads far
-            # more like someone idly typing the prefix (or chat that just
-            # happens to start with it) than a deliberate request for help,
-            # and dumping the full command list for that would be noise in
-            # an otherwise-ordinary conversation.
+        if not tagged:
+            # Addressed only via the loose bare-prefix form (";" or
+            # "; <unrecognized text>"), never a real @-tag/mxid mention --
+            # never federate it, but stay silent too, regardless of whether
+            # there's other text after the prefix. This used to only apply
+            # to a truly bare "; "/";" with nothing else; unrecognized text
+            # after it (e.g. "; yes", meant as ordinary in-room chat that
+            # just happens to start with the prefix) got the "not sure what
+            # you mean" notice instead, which read as the bot nagging over
+            # a plain reply to another human in the room -- confirmed live
+            # 2026-10-28. A real @-tag/mxid mention below is still an
+            # unambiguous, deliberate attempt to address the bot, so THAT
+            # case keeps the nag/help-dump behavior.
             return True
         # Tagging the bot with nothing else recognizable as a command --
         # either truly nothing beyond the tag itself, or some other text
-        # that isn't a known command keyword (including the bare-prefix
-        # address case above when there WAS other text after it) -- once
-        # the tag's own mxid/display name and a bare prefix are stripped
-        # out. Show the full help message directly for the "nothing else"
-        # case (most likely someone just poking the bot to see what it
-        # does), and a brief pointer to it otherwise (already tried to say
-        # SOMETHING, so a whole command table would bury that they got it
-        # wrong).
+        # that isn't a known command keyword, once the tag's own mxid/
+        # display name and a bare prefix are stripped out. Show the full
+        # help message directly for the "nothing else" case (most likely
+        # someone just poking the bot to see what it does), and a brief
+        # pointer to it otherwise (already tried to say SOMETHING, so a
+        # whole command table would bury that they got it wrong).
         residue = body.replace(bot_mxid, "")
         if config.appservice.bot_display_name:
             residue = residue.replace(config.appservice.bot_display_name, "")
