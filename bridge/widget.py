@@ -1740,12 +1740,6 @@ _WIDGET_HTML = r"""<!doctype html>
   .identity-dropdown-btn {
     border: none; background: none; color: var(--muted); padding: 4px; cursor: pointer; font-size: 12px; flex-shrink: 0;
   }
-  .identity-dropdown {
-    position: absolute; bottom: 100%; left: 8px; right: 8px; margin-bottom: 4px;
-    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-inner);
-    box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 4px; z-index: 20;
-  }
-  #shell.collapsed .identity-dropdown { left: 4px; right: auto; width: 200px; }
   .form-error {
     color: #e5484d; font-size: 13px; margin-top: 8px; padding: 8px 10px;
     border: 1px solid #e5484d; border-radius: var(--radius-inner); background: rgba(229,72,77,.08);
@@ -1931,19 +1925,6 @@ _WIDGET_HTML = r"""<!doctype html>
     });
   });
 
-  // Closes the identity-switcher dropdown on a click anywhere outside it
-  // -- previously the only way to close it was to re-click the identity
-  // button itself. The dropdown's own popover is appended INSIDE the
-  // identity-card <button> (see renderIdentityCard), so a click that
-  // opened/toggled it already has its own e.stopPropagation() and never
-  // reaches here; this only ever sees clicks that should close it.
-  document.addEventListener("click", (e) => {
-    if (!identityDropdownOpen) return;
-    if (e.target.closest(".identity-card")) return;
-    identityDropdownOpen = false;
-    renderSidebar();
-  });
-
   let openIdResolve = null;
 
   async function getOpenIdToken() {
@@ -2057,12 +2038,12 @@ _WIDGET_HTML = r"""<!doctype html>
   }
 
   async function doAction(path, body, busyBtn) {
-    let originalText = null;
-    if (busyBtn) {
-      busyBtn.disabled = true;
-      originalText = busyBtn.textContent;
-      busyBtn.textContent = "Working…";
-    }
+    // Every button is icon-only now (see primaryButton/plainButton/etc.),
+    // so this no longer swaps in a "Working…" text label while in flight
+    // -- that would transiently blow out a fixed-width icon button. The
+    // :disabled opacity dimming (see the plain `button` CSS) is the only
+    // busy indicator now.
+    if (busyBtn) busyBtn.disabled = true;
     try {
       await api(path, { method: "POST", body: Object.assign({ room_id: roomId }, body || {}) });
       toast("Done.", true);
@@ -2073,10 +2054,7 @@ _WIDGET_HTML = r"""<!doctype html>
       // busyBtn may already be a detached node by now if the action's own
       // loadContext() re-render replaced it -- touching a detached node is
       // harmless (a silent no-op), so no extra guard needed here.
-      if (busyBtn) {
-        busyBtn.disabled = false;
-        if (originalText !== null) busyBtn.textContent = originalText;
-      }
+      if (busyBtn) busyBtn.disabled = false;
     }
   }
 
@@ -2131,8 +2109,8 @@ _WIDGET_HTML = r"""<!doctype html>
     return url;
   }
 
-  function linkButton(label, href) {
-    return el("a", { class: "link-button", text: label, href: href, target: "_blank", rel: "noopener" });
+  function linkButton(icon, title, href) {
+    return el("a", { class: "link-button", text: title, title: title, "aria-label": title, href: href, target: "_blank", rel: "noopener" });
   }
 
   let ctx = null;
@@ -2202,7 +2180,6 @@ _WIDGET_HTML = r"""<!doctype html>
     identityState.active = active ? await api("/widget/api/identities/settings?username=" + encodeURIComponent(active.username)) : null;
   }
 
-  let identityDropdownOpen = false;
 
   function renderIdentityCard(bar) {
     if (!ctx) return;
@@ -2241,50 +2218,62 @@ _WIDGET_HTML = r"""<!doctype html>
     if (hasDropdownContent) {
       cardChildren.push(el("span", { class: "identity-dropdown-btn", text: "⌄" }));
     }
-    // The WHOLE button toggles the dropdown now -- it used to jump
-    // straight to "My Profile" (now its own sidebar tab, above Settings),
-    // with only the small chevron opening the dropdown; that made the
-    // dropdown's actual hit target easy to miss.
+    // The WHOLE button opens the switcher now -- it used to jump straight
+    // to "My Profile" (now its own sidebar tab, above Settings), with only
+    // the small chevron opening the dropdown; that made the dropdown's
+    // actual hit target easy to miss.
+    //
+    // This used to be an absolutely-positioned popover anchored INSIDE the
+    // identity-card button, nested inside #sidebar. #sidebar has its own
+    // overflow-y: auto (for the nav list when it's taller than the
+    // viewport), and an ancestor with any non-"visible" overflow clips an
+    // absolutely-positioned descendant to its own box regardless of
+    // z-index -- confirmed live 2026-10-27: with the sidebar collapsed,
+    // the popover's #shell.collapsed-only 200px width badly overflowed the
+    // 56px collapsed sidebar, which also forces overflow-x: auto per the
+    // CSS overflow spec (an ancestor with overflow-y set and overflow-x
+    // still "visible" computes overflow-x as "auto" too) -- so the menu
+    // rendered clipped/behind the page with a stray horizontal scrollbar
+    // in the sidebar. Reusing the existing openModal()/closeModal()
+    // machinery (appended straight to document.body, position: fixed,
+    // immune to any ancestor's overflow) sidesteps the whole class of bug
+    // instead of hand-rolling a portal-positioned popover.
     const card = el("button", {
       class: "identity-card", title: active ? active.handle : "",
       onclick: (e) => {
         if (!hasDropdownContent) return;
         e.stopPropagation();
-        identityDropdownOpen = !identityDropdownOpen;
-        renderSidebar();
+        openIdentitySwitchModal(otherIdentities);
       },
     }, cardChildren);
-    if (hasDropdownContent && identityDropdownOpen) {
-      const pop = el("div", { class: "identity-dropdown" });
-      // Every item below needs its own e.stopPropagation() -- the popover
-      // is appended INSIDE the identity-card <button> (so it lines up
-      // visually, anchored to it), which means an unstopped click bubbles
-      // straight up to that button's own onclick and re-toggles the
-      // dropdown right back open, same click.
-      otherIdentities.forEach((i) => {
-        pop.appendChild(el("button", {
-          class: "nav-item", text: i.display_name || i.handle,
-          onclick: (e) => {
-            e.stopPropagation();
-            identityDropdownOpen = false;
-            api("/widget/api/identities/switch", { method: "POST", body: { room_id: roomId, username: i.username } })
-              .then(() => loadContext()).catch((e2) => toast(e2.message, false));
-          },
-        }));
-      });
-      if (ctx.custom_identities_enabled) {
-        pop.appendChild(el("button", {
-          class: "nav-item", text: "+ New identity",
-          onclick: (e) => {
-            e.stopPropagation();
-            identityDropdownOpen = false;
-            openCreateIdentity();
-          },
-        }));
-      }
-      card.appendChild(pop);
-    }
     bar.appendChild(card);
+  }
+
+  function openIdentitySwitchModal(otherIdentities) {
+    const body = el("div", { class: "card profile-modal" });
+    body.appendChild(el("div", { class: "row" }, [
+      el("h2", { text: "Switch identity" }),
+      el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
+    ]));
+    const list = el("div", { class: "list" });
+    otherIdentities.forEach((i) => {
+      list.appendChild(el("button", {
+        class: "nav-item", text: i.display_name || i.handle,
+        onclick: () => {
+          closeModal();
+          api("/widget/api/identities/switch", { method: "POST", body: { room_id: roomId, username: i.username } })
+            .then(() => loadContext()).catch((e2) => toast(e2.message, false));
+        },
+      }));
+    });
+    if (ctx.custom_identities_enabled) {
+      list.appendChild(el("button", {
+        class: "nav-item", text: "+ New identity",
+        onclick: () => { closeModal(); openCreateIdentity(); },
+      }));
+    }
+    body.appendChild(list);
+    openModal(body);
   }
 
   function createNewIdentity(customId) {
@@ -2313,11 +2302,9 @@ _WIDGET_HTML = r"""<!doctype html>
       type: "text", placeholder: "id",
       onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); submitBtn.click(); } },
     });
-    const submitBtn = primaryButton("Create", () => {
+    const submitBtn = primaryButton("\u{2713}", "Create", () => {
         errorBox.style.display = "none";
         submitBtn.disabled = true;
-        const originalText = submitBtn.textContent;
-        submitBtn.textContent = "Working…";
         createNewIdentity(input.value)
           .then((data) => {
             if (data && data.ok === false) {
@@ -2330,7 +2317,7 @@ _WIDGET_HTML = r"""<!doctype html>
             return loadContext();
           })
           .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
-          .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+          .finally(() => { submitBtn.disabled = false; });
     });
     page.appendChild(el("div", { class: "row" }, [input, submitBtn]));
     page.appendChild(errorBox);
@@ -2583,7 +2570,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }));
     } else {
       actions.appendChild(el("button", {
-        text: "⬇ Import",
+        text: "⬇ Import", title: "Import", "aria-label": "Import",
         onclick: (e) => { e.stopPropagation(); importPost(post, e.target, onChange); },
       }));
     }
@@ -2660,7 +2647,7 @@ _WIDGET_HTML = r"""<!doctype html>
   // trailing "+ Add instance" action-option.
   function browseInstanceOptions(selectedDomain) {
     const seen = new Set();
-    const options = [{ value: "", label: "Whole Known Network" }];
+    const options = [{ value: "", label: "All Instances" }];
     function addDomain(d, suffix) {
       if (!d || seen.has(d)) return;
       seen.add(d);
@@ -2696,7 +2683,7 @@ _WIDGET_HTML = r"""<!doctype html>
       onAdded(domain);
     }
     domainInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-    body.appendChild(el("div", { class: "row modal-actions" }, [primaryButton("Add", submit)]));
+    body.appendChild(el("div", { class: "row modal-actions" }, [primaryButton("\u{2795}", "Add", submit)]));
     openModal(body);
     setTimeout(() => domainInput.focus(), 0);
   }
@@ -2725,8 +2712,8 @@ _WIDGET_HTML = r"""<!doctype html>
     ]));
     body.appendChild(el("div", { class: "sub", text: "You're signed into " + domain + " -- removing it from this list will also sign you out there." }));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      plainButton("Cancel", closeModal),
-      dangerButton("Remove and sign out", (e) => {
+      plainButton("\u{2715}", "Cancel", closeModal),
+      dangerButton("\u{1F5D1}\u{FE0F}", "Remove and sign out", (e) => {
         e.target.disabled = true;
         removeUserBrowseInstance(domain);
         api("/widget/api/browse/login/logout", { method: "POST", body: { domain: domain } })
@@ -2779,9 +2766,9 @@ _WIDGET_HTML = r"""<!doctype html>
       return el("option", attrs);
     }));
 
-    function scopeBtn(label, value) {
+    function scopeBtn(icon, title, value) {
       return el("button", {
-        class: state.scope === value ? "active" : "", text: label,
+        class: state.scope === value ? "active" : "", text: title, title: title, "aria-label": title,
         onclick: () => {
           if (state.scope === value) return;
           state.scope = value;
@@ -2826,17 +2813,20 @@ _WIDGET_HTML = r"""<!doctype html>
     // pasted https:// link is instead handed straight to the existing
     // import action -- "pull in anything from a link or handle" without
     // needing a separate "Import a post" card.
-    const goBtn = primaryButton("Go", runSearchOrImport);
+    const goBtn = primaryButton("\u{1F50D}", "Go", runSearchOrImport);
     const browseRow = [
       domainSelect,
-      el("div", { class: "scope-toggle" }, [scopeBtn("Local", "local"), scopeBtn("Federated", "federated")]),
+      el("div", { class: "scope-toggle" }, [
+        scopeBtn("\u{1F3E0}", "Local", "local"),
+        scopeBtn("\u{1F310}", "Federated", "federated"),
+      ]),
     ];
     // Only ever offered for an instance the user added themselves -- never
     // the homeserver (not this bridge's to remove) or one of the admin's
     // own bridge.default_timeline_domains (an admin decision, not a
     // per-user one) -- see removeBrowseInstance's own docstring.
     if (state.mode === "instance" && state.domain && loadUserBrowseInstances().includes(state.domain)) {
-      browseRow.push(dangerButton("Remove", () => removeBrowseInstance(state.domain, () => switchToDomain(""))));
+      browseRow.push(dangerButton("\u{1F5D1}\u{FE0F}", "Remove", () => removeBrowseInstance(state.domain, () => switchToDomain(""))));
     }
     const controlsChildren = [
       el("h2", { text: "Browse the fediverse" }),
@@ -2848,7 +2838,7 @@ _WIDGET_HTML = r"""<!doctype html>
       controlsChildren.push(el("div", { class: "sub" }, [
         el("span", { text: "Browsing " + state.domain + " (" + state.scope + ") — " }),
         el("a", {
-          href: "#", text: "back to Whole Known Network",
+          href: "#", text: "back to All Instances",
           onclick: (e) => { e.preventDefault(); switchToDomain(""); },
         }),
       ]));
@@ -2875,9 +2865,9 @@ _WIDGET_HTML = r"""<!doctype html>
         const retry = () => { state.done = false; state.needsLogin = false; loadMore(); };
         feed.appendChild(el("div", { class: "placeholder" }, [
           el("div", { text: state.domain + " needs you to be signed in to view this.", style: "margin-bottom:10px" }),
-          primaryButton("Sign in with OAuth", (e) => startOAuthLogin(state.domain, e.target, retry)),
+          primaryButton("\u{1F511}", "Sign in with OAuth", (e) => startOAuthLogin(state.domain, e.target, retry)),
           el("div", { style: "margin-top:8px" }, [
-            plainButton("Use username/password instead", () => openPasswordLoginForm(state.domain, retry)),
+            plainButton("\u{1F510}", "Use username/password instead", () => openPasswordLoginForm(state.domain, retry)),
           ]),
         ]));
         return;
@@ -2890,7 +2880,7 @@ _WIDGET_HTML = r"""<!doctype html>
           el("div", { text: "Some of your feed sources need you to be signed in:", style: "margin-bottom:10px" }),
           ...state.needsLoginDomains.map((d) => el("div", { class: "row", style: "justify-content:center" }, [
             el("span", { text: d, style: "align-self:center" }),
-            primaryButton("Sign in", () => openSignInModal(d, retry)),
+            primaryButton("\u{1F511}", "Sign in", () => openSignInModal(d, retry)),
           ])),
         ]));
       }
@@ -2904,7 +2894,7 @@ _WIDGET_HTML = r"""<!doctype html>
               : "These sources didn't respond in time: " + state.timedOutDomains.join(", ")),
             style: "margin-bottom:10px",
           }),
-          plainButton("Retry", retry),
+          plainButton("\u{1F504}", "Retry", retry),
         ]));
       }
       if (!state.posts.length && !state.loading) {
@@ -3059,7 +3049,7 @@ _WIDGET_HTML = r"""<!doctype html>
       el("div", { class: "sub", text: "A Pleroma/Akkoma export (one @user@instance.org per line) or a Mastodon follows CSV." }),
       el("div", { class: "row" }, [fileInput]),
       el("div", { class: "row modal-actions" }, [
-        primaryButton("Import follows", async (e) => {
+        primaryButton("\u{1F4E5}", "Import follows", async (e) => {
           const file = fileInput.files[0];
           if (!file) { toast("Choose a file first.", false); return; }
           e.target.disabled = true;
@@ -3157,9 +3147,9 @@ _WIDGET_HTML = r"""<!doctype html>
           .finally(() => { btn.disabled = false; });
       }
       page.appendChild(el("div", { class: "row" }, [
-        toggleButton(s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
-        toggleButton(s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
-        toggleButton(s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
+        toggleButton(s.hide_followers ? "\u{1F648}" : "\u{1F441}\u{FE0F}", s.hide_followers ? "Followers: hidden" : "Followers: visible", s.hide_followers, (e) => visAction(e.target, "followers", !s.hide_followers, undefined)),
+        toggleButton(s.hide_following ? "\u{1F648}" : "\u{1F441}\u{FE0F}", s.hide_following ? "Following: hidden" : "Following: visible", s.hide_following, (e) => visAction(e.target, "following", !s.hide_following, undefined)),
+        toggleButton("\u{1F310}", s.discoverable ? "Discoverable" : "Not discoverable", s.discoverable, (e) => visAction(e.target, "discoverable", undefined, !s.discoverable)),
       ]));
       if (s.public_url) page.appendChild(el("div", { class: "sub" }, [el("a", { href: s.public_url, target: "_blank", text: "View public profile →" })]));
 
@@ -3179,31 +3169,30 @@ _WIDGET_HTML = r"""<!doctype html>
     // remote account
     const actorId = view.actorId;
     function profileAction(path, p, btn) {
-      let originalText = null;
-      if (btn) { btn.disabled = true; originalText = btn.textContent; btn.textContent = "Working…"; }
+      if (btn) btn.disabled = true;
       api(path, { method: "POST", body: { room_id: roomId, handle: p.handle } })
         .then(() => { toast("Done.", true); return refresh(); })
         .catch((e) => toast(e.message, false))
-        .finally(() => { if (btn) { btn.disabled = false; if (originalText !== null) btn.textContent = originalText; } });
+        .finally(() => { if (btn) btn.disabled = false; });
     }
     function renderRemote(p) {
       page.innerHTML = "";
       page.appendChild(profileBanner(p.banner_url, null));
       const actions = el("div", { class: "row" }, [
         p.is_following
-          ? dangerButton("Unfollow", (e) => profileAction("/widget/api/unfollow", p, e.target))
-          : primaryButton("Follow", (e) => profileAction("/widget/api/follow", p, e.target)),
-        plainButton("DM", (e) => profileAction("/widget/api/dm", p, e.target)),
-        plainButton("Chat", (e) => profileAction("/widget/api/chat", p, e.target)),
+          ? dangerButton("\u{2796}", "Unfollow", (e) => profileAction("/widget/api/unfollow", p, e.target))
+          : primaryButton("\u{2795}", "Follow", (e) => profileAction("/widget/api/follow", p, e.target)),
+        plainButton("\u{2709}\u{FE0F}", "DM", (e) => profileAction("/widget/api/dm", p, e.target)),
+        plainButton("\u{1F4AC}", "Chat", (e) => profileAction("/widget/api/chat", p, e.target)),
       ]);
       appendProfileIdentity(page, p.avatar_url, p.display_name, p.handle, actions);
       if (p.bio_html) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = p.bio_html; page.appendChild(bio); }
       page.appendChild(el("div", { class: "row" }, [
-        toggleButton(p.is_muted ? "Muted" : "Mute", p.is_muted, (e) =>
+        toggleButton("\u{1F507}", p.is_muted ? "Muted" : "Mute", p.is_muted, (e) =>
           profileAction(p.is_muted ? "/widget/api/unmute" : "/widget/api/mute", p, e.target)),
         p.is_blocked
-          ? plainButton("Unblock", (e) => profileAction("/widget/api/unblock", p, e.target))
-          : dangerButton("Block", withConfirm(
+          ? plainButton("\u{1F513}", "Unblock", (e) => profileAction("/widget/api/unblock", p, e.target))
+          : dangerButton("\u{1F6AB}", "Block", withConfirm(
               "Block this account? This cuts any follow and kicks you from their rooms.",
               (btn) => profileAction("/widget/api/block", p, btn)
             )),
@@ -3299,7 +3288,7 @@ _WIDGET_HTML = r"""<!doctype html>
         body.appendChild(el("div", { class: "row" }, [
           el("h2", { text: "Following", style: "margin:0;" }),
           el("button", {
-            class: "modal-close", text: "\u{2B07} Import Follows", style: "margin-left:auto;font-size:13px;",
+            class: "modal-close", text: "\u{2B07} Import Follows", title: "Import Follows", "aria-label": "Import Follows", style: "margin-left:auto;font-size:13px;",
             onclick: () => openImportFollowsModal(identityState.active && identityState.active.room_id),
           }),
           el("button", { class: "modal-close", text: "✕", onclick: closeModal }),
@@ -3308,7 +3297,7 @@ _WIDGET_HTML = r"""<!doctype html>
         body.appendChild(el("div", { class: "list" }, data.following.map((f) =>
           el("div", { class: "list-item" }, [
             el("span", { class: "clickable", text: f.display_name || f.handle, onclick: () => openAccountProfile(f.actor_id) }),
-            plainButton("Unfollow", (e) => doAction("/widget/api/unfollow", { handle: f.handle }, e.target).then(load)),
+            plainButton("\u{2796}", "Unfollow", (e) => doAction("/widget/api/unfollow", { handle: f.handle }, e.target).then(load)),
           ])
         )));
       }).catch(() => { body.innerHTML = ""; body.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
@@ -3371,10 +3360,10 @@ _WIDGET_HTML = r"""<!doctype html>
       el("button", { class: "modal-close", text: "✕", onclick: closeModal, style: "margin-left:auto" }),
     ]));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      primaryButton("Sign in with OAuth", (e) => startOAuthLogin(domain, e.target, () => { closeModal(); if (onDone) onDone(); })),
+      primaryButton("\u{1F511}", "Sign in with OAuth", (e) => startOAuthLogin(domain, e.target, () => { closeModal(); if (onDone) onDone(); })),
     ]));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      plainButton("Use username/password instead", () => { closeModal(); openPasswordLoginForm(domain, onDone); }),
+      plainButton("\u{1F510}", "Use username/password instead", () => { closeModal(); openPasswordLoginForm(domain, onDone); }),
     ]));
     openModal(body);
   }
@@ -3392,7 +3381,7 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "row" }, [domainInput]));
     body.appendChild(el("div", { class: "row" }, [userInput, passInput]));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      primaryButton("Sign in", (e) => {
+      primaryButton("\u{2713}", "Sign in", (e) => {
         if (!domainInput.value.trim() || !userInput.value || !passInput.value) return;
         e.target.disabled = true;
         api("/widget/api/browse/login/password", {
@@ -3409,30 +3398,40 @@ _WIDGET_HTML = r"""<!doctype html>
 
   function renderInstanceLoginsCard(app) {
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+    // The "sign in to a new instance" row is always the LAST item in this
+    // same .list, not a separate row below it, so its input/button line up
+    // with every existing login's own .list-item (domain text on the
+    // left, one action button on the right) instead of reading as a
+    // disconnected form stacked underneath.
+    const domainInput = el("input", { type: "text", placeholder: "instance.example", style: "flex:1;min-width:120px;" });
     function loadLogins() {
       api("/widget/api/browse/login/list").then((data) => {
         list.innerHTML = "";
-        if (!data.logins.length) { list.appendChild(el("div", { class: "muted", text: "Not signed into any instance." })); return; }
+        if (!data.logins.length) list.appendChild(el("div", { class: "muted", text: "Not signed into any instance yet." }));
         data.logins.forEach((l) => {
           list.appendChild(el("div", { class: "list-item" }, [
             el("span", { text: l.domain + (l.account_handle ? " (" + l.account_handle + ")" : "") + " — " + l.auth_method }),
-            plainButton("Log out", (e) => doAction("/widget/api/browse/login/logout", { domain: l.domain }, e.target).then(loadLogins)),
+            plainButton("\u{1F6AA}", "Log out", (e) => doAction("/widget/api/browse/login/logout", { domain: l.domain }, e.target).then(loadLogins)),
           ]));
         });
+        list.appendChild(el("div", { class: "list-item" }, [
+          domainInput,
+          primaryButton("\u{1F511}", "Sign in", () => {
+            const domain = domainInput.value.trim();
+            if (!domain) { toast("Enter an instance domain first.", false); return; }
+            // Same OAuth-vs-password choice popup used elsewhere (see
+            // openSignInModal) instead of two separate buttons inline --
+            // this card is narrow, same reasoning that popup's own
+            // docstring already gives for the Whole Known Network notice.
+            openSignInModal(domain, () => { domainInput.value = ""; loadLogins(); });
+          }),
+        ]));
       }).catch(() => {});
     }
-    const domainInput = el("input", { type: "text", placeholder: "instance.example" });
     app.appendChild(el("div", { class: "card" }, [
       el("h2", { text: "Instance sign-ins" }),
       el("div", { class: "sub", text: "Sign in to view a locked-down instance's timeline or search in the Browse/Home tabs." }),
       list,
-      el("div", { class: "row" }, [
-        domainInput,
-        primaryButton("Sign in with OAuth", (e) => startOAuthLogin(domainInput.value.trim(), e.target, loadLogins)),
-      ]),
-      el("div", { class: "row" }, [
-        plainButton("Use username/password instead", () => openPasswordLoginForm(domainInput.value.trim(), loadLogins)),
-      ]),
     ]));
     loadLogins();
   }
@@ -3474,11 +3473,11 @@ _WIDGET_HTML = r"""<!doctype html>
           }
           let actionBtn;
           if (info.status === "open") {
-            actionBtn = linkButton("Open", matrixToUrl(info.room_id, null));
+            actionBtn = linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(info.room_id, null));
           } else if (info.status === "not_created") {
-            actionBtn = el("button", { disabled: "disabled", text: "Not Created" });
+            actionBtn = el("button", { disabled: "disabled", text: "Not Created", title: "Not created yet", "aria-label": "Not created yet" });
           } else {
-            actionBtn = plainButton("Rejoin", (e) => {
+            actionBtn = plainButton("\u{1F504}", "Rejoin", (e) => {
               e.target.disabled = true;
               api("/widget/api/rejoin_room", { method: "POST", body: { kind: row.kind, room_id: roomId } })
                 .then(() => { toast("Invited -- check your rooms.", true); load(); })
@@ -3507,7 +3506,7 @@ _WIDGET_HTML = r"""<!doctype html>
         el("h2", { text: "Get started" }),
         el("div", { class: "sub", text: "You don't have a fediverse profile yet." }),
         el("div", { class: "row" }, [
-          primaryButton("Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
+          primaryButton("\u{1FAAA}", "Create my profile", (e) => doAction("/widget/api/create_profile", {}, e.target)),
         ]),
       ]));
       return;
@@ -3521,7 +3520,7 @@ _WIDGET_HTML = r"""<!doctype html>
       el("h2", { text: "Leave unfollowed rooms" }),
       el("div", { class: "sub", text: "Remove yourself from every Remote User Room for an account none of your identities follow." }),
       el("div", { class: "row" }, [
-        plainButton("Preview", async (e) => {
+        plainButton("\u{1F441}\u{FE0F}", "Preview", async (e) => {
           e.target.disabled = true;
           try {
             const data = await api("/widget/api/leave_unfollowed/preview");
@@ -3545,13 +3544,11 @@ _WIDGET_HTML = r"""<!doctype html>
               }
               result.appendChild(el("div", { class: "row" }, [
                 dangerButton(
-                  "Confirm: leave " + data.rooms.length + " room" + (data.rooms.length === 1 ? "" : "s"),
+                  "\u{1F6AA}", "Leave " + data.rooms.length + " unfollowed room" + (data.rooms.length === 1 ? "" : "s"),
                   withConfirm(
                     "Remove yourself from " + data.rooms.length + " room(s)? This cannot be undone.",
                     async (btn) => {
-                      const original = btn.textContent;
                       btn.disabled = true;
-                      btn.textContent = "Working…";
                       try {
                         await api("/widget/api/leave_unfollowed/execute", {
                           method: "POST", body: { room_id: roomId },
@@ -3568,7 +3565,6 @@ _WIDGET_HTML = r"""<!doctype html>
                       } catch (err) {
                         toast(err.message, false);
                         btn.disabled = false;
-                        btn.textContent = original;
                       }
                     }
                   )
@@ -3607,7 +3603,7 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "sub", text: sub }));
     body.appendChild(el("div", { class: "row" }, row));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      primaryButton("Create", (e) => {
+      primaryButton("\u{2795}", "Create", (e) => {
         if (!idInput.value.trim()) return;
         doAction(createPath, {
           id: idInput.value.trim(),
@@ -3627,7 +3623,7 @@ _WIDGET_HTML = r"""<!doctype html>
         el("div", { class: "name", text: e.display_name || e.username }),
         el("div", { class: "handle", text: "@" + e.handle }),
       ]),
-      linkButton("Open", matrixToUrl(e.room_id, null)),
+      linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(e.room_id, null)),
     ]);
   }
 
@@ -3637,7 +3633,7 @@ _WIDGET_HTML = r"""<!doctype html>
     app.appendChild(el("div", { class: "card" }, [
       el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
         el("h2", { text: "PeerTube Channels", style: "margin:0;" }),
-        primaryButton("Create Channel", () => openCreateEntityModal(
+        primaryButton("\u{2795}", "Create Channel", () => openCreateEntityModal(
           "Create a channel", "Hosts a PeerTube-compatible video channel as a Matrix room.",
           "/widget/api/channels/create", () => render(),
         )),
@@ -3663,7 +3659,7 @@ _WIDGET_HTML = r"""<!doctype html>
     app.appendChild(el("div", { class: "card" }, [
       el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
         el("h2", { text: "Lemmy Communities", style: "margin:0;" }),
-        primaryButton("Create Community", () => openCreateEntityModal(
+        primaryButton("\u{2795}", "Create Community", () => openCreateEntityModal(
           "Create a community", "Hosts a Lemmy-compatible community as a Matrix room.",
           "/widget/api/communities/create", () => render(),
         )),
@@ -3700,7 +3696,7 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "sub", text: "Paste the group's fediverse handle or profile URL." }));
     body.appendChild(el("div", { class: "row" }, [handleInput]));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      primaryButton("Join", (e) => {
+      primaryButton("\u{1F517}", "Join", (e) => {
         if (!handleInput.value.trim()) return;
         doAction("/widget/api/follow", { handle: handleInput.value.trim(), room_id: roomId }, e.target)
           .then(() => { closeModal(); if (onJoined) onJoined(); });
@@ -3714,11 +3710,11 @@ _WIDGET_HTML = r"""<!doctype html>
     if (!ctx.groups_enabled) { placeholder(app, "Groups aren't enabled on this bridge."); return; }
     const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
     const headerButtons = [
-      primaryButton("Create Group", () => openCreateEntityModal(
+      primaryButton("\u{2795}", "Create Group", () => openCreateEntityModal(
         "Create a group", "Hosts a flat-chat FEP-1b12 group as a Matrix room -- just post a message to send it.",
         "/widget/api/groups/create", () => render(),
       )),
-      primaryButton("Join a Group", () => openJoinGroupModal(() => render())),
+      primaryButton("\u{1F517}", "Join a Group", () => openJoinGroupModal(() => render())),
     ];
     app.appendChild(el("div", { class: "card" }, [
       el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
@@ -3754,8 +3750,8 @@ _WIDGET_HTML = r"""<!doctype html>
       page.innerHTML = "";
       page.appendChild(profileBanner(g.banner_url, null));
       const actions = el("div", { class: "row" }, [
-        linkButton("Open", matrixToUrl(g.room_id, null)),
-        el("a", { class: "link-button", text: "View public page", href: g.public_url, target: "_blank", rel: "noopener" }),
+        linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(g.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", title: "View public page", "aria-label": "View public page", href: g.public_url, target: "_blank", rel: "noopener" }),
       ]);
       appendProfileIdentity(page, g.icon_url, g.display_name || g.handle, "@" + g.handle, actions);
       if (g.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = g.summary; page.appendChild(bio); }
@@ -3764,7 +3760,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }
       if (g.is_owner || ctx.is_admin) {
         page.appendChild(el("div", { class: "row" }, [
-          dangerButton("Delete group", () => openDeleteGroupModal(g, () => { groupView = null; currentTab = "groups"; render(); })),
+          dangerButton("\u{1F5D1}\u{FE0F}", "Delete group", () => openDeleteGroupModal(g, () => { groupView = null; currentTab = "groups"; render(); })),
         ]));
       }
     }).catch((e) => {
@@ -3789,8 +3785,8 @@ _WIDGET_HTML = r"""<!doctype html>
       el("p", { text: "This room itself is left alone -- it can keep being used as an ordinary Matrix room, or be left whenever you like." }),
     ]));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      plainButton("Cancel", closeModal),
-      dangerButton("Delete permanently", (e) => {
+      plainButton("\u{2715}", "Cancel", closeModal),
+      dangerButton("\u{1F5D1}\u{FE0F}", "Delete permanently", (e) => {
         e.target.disabled = true;
         api("/widget/api/groups/" + encodeURIComponent(group.username) + "/delete", { method: "POST", body: {} })
           .then(() => { toast("Group deleted.", true); })
@@ -3819,7 +3815,7 @@ _WIDGET_HTML = r"""<!doctype html>
     body.appendChild(el("div", { class: "row" }, [domainInput]));
     const errorBox = el("div", { class: "form-error", style: "display:none" });
     body.appendChild(errorBox);
-    const submitBtn = primaryButton("Join", () => {
+    const submitBtn = primaryButton("\u{1F517}", "Join", () => {
       errorBox.style.display = "none";
       const code = codeInput.value.trim();
       const domain = domainInput.value.trim();
@@ -3843,8 +3839,8 @@ _WIDGET_HTML = r"""<!doctype html>
     ]));
     body.appendChild(el("div", { class: "sub", text: "This drops it on this bridge's own side. Its Space and Channel rooms are untouched -- leave them yourself in Matrix if you don't want them anymore." }));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      plainButton("Cancel", closeModal),
-      dangerButton("Leave", (e) => {
+      plainButton("\u{2715}", "Cancel", closeModal),
+      dangerButton("\u{1F6AA}", "Leave", (e) => {
         e.target.disabled = true;
         api("/widget/api/guilds/leave", { method: "POST", body: { guild_actor_id: guild.guild_actor_id } })
           .then((data) => { toast((data && data.message) || "Left.", true); })
@@ -3876,7 +3872,7 @@ _WIDGET_HTML = r"""<!doctype html>
       .catch(() => { loadingNote.textContent = "Couldn't load the current code."; });
     const errorBox = el("div", { class: "form-error", style: "display:none" });
     body.appendChild(errorBox);
-    const submitBtn = primaryButton("Save", () => {
+    const submitBtn = primaryButton("\u{1F4BE}", "Save", () => {
       errorBox.style.display = "none";
       const code = codeInput.value.trim();
       const domain = domainInput.value.trim();
@@ -3900,7 +3896,7 @@ _WIDGET_HTML = r"""<!doctype html>
     app.appendChild(el("div", { class: "card" }, [
       el("div", { class: "row", style: "justify-content:space-between;align-items:center;flex-wrap:nowrap;" }, [
         el("h2", { text: "Guilds", style: "margin:0;" }),
-        primaryButton("Join Guild", () => openJoinGuildModal(loadGuilds)),
+        primaryButton("\u{1F517}", "Join Guild", () => openJoinGuildModal(loadGuilds)),
       ]),
       list,
     ]));
@@ -3911,9 +3907,9 @@ _WIDGET_HTML = r"""<!doctype html>
         list.innerHTML = "";
         if (!data.guilds.length) { list.appendChild(el("div", { class: "muted", text: "Not a member of any guilds yet." })); return; }
         data.guilds.forEach((g) => {
-          const actions = [plainButton("Leave", () => openLeaveGuildModal(g, loadGuilds))];
-          if (data.is_admin) actions.unshift(plainButton("Invite Code", () => openGuildInviteCodeModal(g)));
-          if (g.space_room_id) actions.unshift(linkButton("Open", matrixToUrl(g.space_room_id, null)));
+          const actions = [plainButton("\u{1F6AA}", "Leave", () => openLeaveGuildModal(g, loadGuilds))];
+          if (data.is_admin) actions.unshift(plainButton("\u{1F39F}\u{FE0F}", "Invite Code", () => openGuildInviteCodeModal(g)));
+          if (g.space_room_id) actions.unshift(linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(g.space_room_id, null)));
           list.appendChild(el("div", { class: "list-item" }, [
             avatarEl(g.icon_url, g.name, "sm"),
             el("div", { class: "meta", style: "flex:1;min-width:0;" }, [
@@ -3957,8 +3953,8 @@ _WIDGET_HTML = r"""<!doctype html>
     tile.appendChild(links);
     if (isOwner) {
       tile.appendChild(el("div", { class: "row video-tile-actions" }, [
-        plainButton("Edit", () => openEditVideoModal(channelUsername, v, onChanged)),
-        dangerButton("Delete", () => openDeleteVideoModal(channelUsername, v, onChanged)),
+        plainButton("\u{270F}\u{FE0F}", "Edit", () => openEditVideoModal(channelUsername, v, onChanged)),
+        dangerButton("\u{1F5D1}\u{FE0F}", "Delete", () => openDeleteVideoModal(channelUsername, v, onChanged)),
       ]));
     }
     return tile;
@@ -3972,14 +3968,14 @@ _WIDGET_HTML = r"""<!doctype html>
       page.innerHTML = "";
       page.appendChild(profileBanner(c.banner_url, null));
       const actions = el("div", { class: "row" }, [
-        linkButton("Open", matrixToUrl(c.room_id, null)),
-        el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
+        linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(c.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", title: "View public page", "aria-label": "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
       ]);
       appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
       if (c.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = c.summary; page.appendChild(bio); }
       if (c.is_owner) {
         page.appendChild(el("div", { class: "row" }, [
-          primaryButton("Publish Video", () => openPublishVideoModal(c.username, () => { loadVideos(); })),
+          primaryButton("\u{1F4E4}", "Publish Video", () => openPublishVideoModal(c.username, () => { loadVideos(); })),
         ]));
       }
       page.appendChild(el("h2", { text: "Videos" }));
@@ -4016,8 +4012,8 @@ _WIDGET_HTML = r"""<!doctype html>
       page.innerHTML = "";
       page.appendChild(profileBanner(c.banner_url, null));
       const actions = el("div", { class: "row" }, [
-        linkButton("Open", matrixToUrl(c.room_id, null)),
-        el("a", { class: "link-button", text: "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
+        linkButton("\u{2197}\u{FE0F}", "Open", matrixToUrl(c.room_id, null)),
+        el("a", { class: "link-button", text: "View public page", title: "View public page", "aria-label": "View public page", href: c.public_url, target: "_blank", rel: "noopener" }),
       ]);
       appendProfileIdentity(page, c.icon_url, c.display_name || c.handle, "@" + c.handle, actions);
       if (c.summary) { const bio = el("div", { class: "profile-bio" }); bio.innerHTML = c.summary; page.appendChild(bio); }
@@ -4227,7 +4223,7 @@ _WIDGET_HTML = r"""<!doctype html>
     const errorBox = el("div", { class: "form-error", style: "display:none" });
     body.appendChild(errorBox);
 
-    const submitBtn = primaryButton("Publish", () => {
+    const submitBtn = primaryButton("\u{1F4E4}", "Publish", () => {
       errorBox.style.display = "none";
       const pastedMxc = (mxcInput.value || "").trim();
       if (!selectedFile && !pastedMxc.startsWith("mxc://")) {
@@ -4237,7 +4233,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }
       if (!nameInput.value.trim()) { errorBox.textContent = "A title is required."; errorBox.style.display = ""; return; }
       submitBtn.disabled = true;
-      const originalText = submitBtn.textContent;
+      const originalTitle = submitBtn.title;
 
       function uploadThumbnail(blob, filename) {
         return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/upload_thumbnail", {
@@ -4247,7 +4243,7 @@ _WIDGET_HTML = r"""<!doctype html>
       function resolveThumbnailMxc() {
         if (thumbnailFile) return uploadThumbnail(thumbnailFile, thumbnailFile.name);
         if (!selectedFile) return Promise.resolve(""); // paste-mxc path -- no local video to grab a frame from
-        submitBtn.textContent = "Generating thumbnail…";
+        submitBtn.title = "Generating thumbnail…";
         const objectUrl = URL.createObjectURL(selectedFile);
         return extractVideoThumbnail(objectUrl)
           .then((blob) => uploadThumbnail(blob, "thumbnail.jpg"))
@@ -4260,7 +4256,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }
 
       function doPublish(mxc, filename, mimetype, size, thumbnailMxc, meta) {
-        submitBtn.textContent = "Publishing…";
+        submitBtn.title = "Publishing…";
         return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/publish", {
           method: "POST",
           body: {
@@ -4288,7 +4284,7 @@ _WIDGET_HTML = r"""<!doctype html>
 
       let publishPromise;
       if (selectedFile) {
-        submitBtn.textContent = "Uploading…";
+        submitBtn.title = "Uploading…";
         // selectedFileMeta is usually already populated (probed the instant
         // the file was chosen -- see fileInput's own change handler), but a
         // Publish click right after picking a file could beat that probe to
@@ -4310,7 +4306,7 @@ _WIDGET_HTML = r"""<!doctype html>
       }
       publishPromise
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
-        .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+        .finally(() => { submitBtn.disabled = false; submitBtn.title = originalTitle; });
     });
     body.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(body);
@@ -4389,14 +4385,14 @@ _WIDGET_HTML = r"""<!doctype html>
     const errorBox = el("div", { class: "form-error", style: "display:none" });
     modalBody.appendChild(errorBox);
 
-    const submitBtn = primaryButton("Save Changes", () => {
+    const submitBtn = primaryButton("\u{1F4BE}", "Save Changes", () => {
       errorBox.style.display = "none";
       if (!nameInput.value.trim()) { errorBox.textContent = "A title is required."; errorBox.style.display = ""; return; }
       submitBtn.disabled = true;
-      const originalText = submitBtn.textContent;
+      const originalTitle = submitBtn.title;
 
       function doEdit(thumbnailMxc) {
-        submitBtn.textContent = "Saving…";
+        submitBtn.title = "Saving…";
         return api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/videos/" + encodeURIComponent(video.id) + "/edit", {
           method: "POST",
           body: {
@@ -4425,7 +4421,7 @@ _WIDGET_HTML = r"""<!doctype html>
         : doEdit("");
       editPromise
         .catch((e) => { errorBox.textContent = e.message; errorBox.style.display = ""; })
-        .finally(() => { submitBtn.disabled = false; submitBtn.textContent = originalText; });
+        .finally(() => { submitBtn.disabled = false; submitBtn.title = originalTitle; });
     });
     modalBody.appendChild(el("div", { class: "row modal-actions" }, [submitBtn]));
     openModal(modalBody);
@@ -4439,8 +4435,8 @@ _WIDGET_HTML = r"""<!doctype html>
     ]));
     body.appendChild(el("div", { class: "sub", text: "This retracts the video from federation. The underlying Matrix video message is left untouched, so you can publish it again afterward." }));
     body.appendChild(el("div", { class: "row modal-actions" }, [
-      plainButton("Cancel", closeModal),
-      dangerButton("Delete", (e) => {
+      plainButton("\u{2715}", "Cancel", closeModal),
+      dangerButton("\u{1F5D1}\u{FE0F}", "Delete", (e) => {
         e.target.disabled = true;
         api("/widget/api/channels/" + encodeURIComponent(channelUsername) + "/videos/" + encodeURIComponent(video.id) + "/unpublish", { method: "POST", body: {} })
           .then((data) => { toast((data && data.message) || "Submitted.", true); })
@@ -4455,9 +4451,9 @@ _WIDGET_HTML = r"""<!doctype html>
 
   function renderAdminTab(app) {
     app.appendChild(el("div", { class: "row" }, [
-      toggleButton("Access", adminSubTab === "access", () => { adminSubTab = "access"; render(); }),
-      toggleButton("Identities", adminSubTab === "identities", () => { adminSubTab = "identities"; render(); }),
-      toggleButton("Rooms", adminSubTab === "rooms", () => { adminSubTab = "rooms"; render(); }),
+      toggleButton("\u{1F511}", "Access", adminSubTab === "access", () => { adminSubTab = "access"; render(); }),
+      toggleButton("\u{1FAAA}", "Identities", adminSubTab === "identities", () => { adminSubTab = "identities"; render(); }),
+      toggleButton("\u{1F6AA}", "Rooms", adminSubTab === "rooms", () => { adminSubTab = "rooms"; render(); }),
     ]));
     if (adminSubTab === "identities") renderAdminIdentitiesSubTab(app);
     else if (adminSubTab === "rooms") renderAdminRoomsSubTab(app);
@@ -4497,7 +4493,7 @@ _WIDGET_HTML = r"""<!doctype html>
               el("div", { style: "font-weight:600;", text: g.rule_type + ": " + g.value }),
               el("div", { class: "muted", style: "font-size:12px;margin-top:2px;", text: "tier: " + g.tier + " · granted by " + g.granted_by }),
             ]),
-            dangerButton("Revoke", (e) =>
+            dangerButton("\u{1F5D1}\u{FE0F}", "Revoke", (e) =>
               doAction("/widget/api/admin/disallow", { rule_type: g.rule_type, value: g.value }, e.target).then(loadGrants)),
           ]));
         });
@@ -4510,11 +4506,25 @@ _WIDGET_HTML = r"""<!doctype html>
       statusLine,
       el("div", { class: "row" }, [
         typeSelect, valueInput, tierSelect,
-        primaryButton("Grant", (e) => {
+        primaryButton("\u{2705}", "Grant", (e) => {
           if (!valueInput.value.trim()) return;
           const body = { rule_type: typeSelect.value, value: valueInput.value.trim() };
           if (typeSelect.value !== "room") body.tier = tierSelect.value;
           doAction("/widget/api/admin/allow", body, e.target)
+            .then(() => { valueInput.value = ""; loadGrants(); });
+        }),
+        // Free-form, unlike "Revoke" above -- that one only ever acts on an
+        // EXISTING grant row. This acts directly on whatever's typed into
+        // the same type/value inputs the Grant button uses, so an mxid can
+        // be banned (overriding a wider homeserver/room grant --
+        // more-specific-wins) before it ever has a grant row of its own.
+        // Same /widget/api/admin/disallow endpoint and _handle_disallow
+        // logic "Revoke" already uses (mxid -> persisted ban, homeserver/
+        // room -> plain removal), just reachable without a row to click.
+        dangerButton("\u{1F6AB}", "Disallow", (e) => {
+          if (!valueInput.value.trim()) return;
+          const body = { rule_type: typeSelect.value, value: valueInput.value.trim() };
+          doAction("/widget/api/admin/disallow", body, e.target)
             .then(() => { valueInput.value = ""; loadGrants(); });
         }),
       ]),
@@ -4641,17 +4651,21 @@ _WIDGET_HTML = r"""<!doctype html>
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
   }
 
-  function primaryButton(label, handler) {
-    return el("button", { class: "primary", onclick: handler, text: label });
+  // Visible text is back (the `icon` argument every call site passes is
+  // now unused -- left in place rather than touching every one of these
+  // call sites again) -- every button still carries its own label as a
+  // title/aria-label tooltip too, from the icon-only pass this replaces.
+  function primaryButton(icon, title, handler) {
+    return el("button", { class: "primary", onclick: handler, title: title, "aria-label": title, text: title });
   }
-  function plainButton(label, handler) {
-    return el("button", { onclick: handler, text: label });
+  function plainButton(icon, title, handler) {
+    return el("button", { onclick: handler, title: title, "aria-label": title, text: title });
   }
-  function dangerButton(label, handler) {
-    return el("button", { class: "danger", onclick: handler, text: label });
+  function dangerButton(icon, title, handler) {
+    return el("button", { class: "danger", onclick: handler, title: title, "aria-label": title, text: title });
   }
-  function toggleButton(label, on, handler) {
-    return el("button", { class: on ? "toggle-on" : "", onclick: handler, text: label });
+  function toggleButton(icon, title, on, handler) {
+    return el("button", { class: on ? "toggle-on" : "", onclick: handler, title: title, "aria-label": title, text: title });
   }
 
   // Replaces window.confirm() for a destructive action's click handler --
@@ -4673,11 +4687,11 @@ _WIDGET_HTML = r"""<!doctype html>
       btn.disabled = true;
       const row = el("div", { class: "confirm-row" }, [
         el("span", { class: "muted", text: message }),
-        dangerButton("Yes", () => {
+        dangerButton("\u{2713}", "Yes", () => {
           row.remove();
           Promise.resolve(run(btn)).finally(() => { delete btn.dataset.confirmPending; });
         }),
-        plainButton("Cancel", () => {
+        plainButton("\u{2715}", "Cancel", () => {
           row.remove();
           btn.disabled = false;
           delete btn.dataset.confirmPending;
@@ -4701,22 +4715,22 @@ _WIDGET_HTML = r"""<!doctype html>
       const card = el("div", { class: "card" }, [el("h2", { text: "This room: your profile" })]);
       if (r.is_owner) {
         card.appendChild(el("div", { class: "row" }, [
-          plainButton("Replace this room", withConfirm(
+          plainButton("\u{1F501}", "Replace this room", withConfirm(
             "Create a fresh replacement room and retire this one?",
             (btn) => doAction("/widget/api/replace_room", {}, btn)
           )),
-          dangerButton("Unlink profile", withConfirm(
+          dangerButton("\u{2702}\u{FE0F}", "Unlink profile", withConfirm(
             "Detach this room from your identity? You can relink later.",
             (btn) => doAction("/widget/api/unlink_profile", {}, btn)
           )),
-          dangerButton("Delete profile", withConfirm(
+          dangerButton("\u{1F5D1}\u{FE0F}", "Delete profile", withConfirm(
             "Permanently delete your fediverse identity and notify followers? This cannot be undone.",
             (btn) => doAction("/widget/api/delete_profile", {}, btn)
           )),
         ]));
       } else {
         card.appendChild(el("div", { class: "row" }, [
-          plainButton("Link this room to my profile", (e) => doAction("/widget/api/link_profile", {}, e.target)),
+          plainButton("\u{1F517}", "Link this room to my profile", (e) => doAction("/widget/api/link_profile", {}, e.target)),
         ]));
       }
       app.appendChild(card);
@@ -4724,19 +4738,19 @@ _WIDGET_HTML = r"""<!doctype html>
       const card = el("div", { class: "card" }, [
         el("h2", { text: "This room: " + (r.display_name || "Fediverse account") }),
         el("div", { class: "row" }, [
-          plainButton("View full profile", () => openAccountProfile(r.actor_id)),
+          plainButton("\u{1F441}\u{FE0F}", "View full profile", () => openAccountProfile(r.actor_id)),
           r.is_following ? el("span", { class: "badge", text: "Following" }) : null,
         ].filter(Boolean)),
       ]);
       const backfillRow = el("div", { class: "row" }, [
-        primaryButton("Backfill latest " + ctx.backfill_default_count + " posts", (e) => doAction("/widget/api/backfill", {}, e.target)),
+        primaryButton("\u{2B07}\u{FE0F}", "Backfill latest " + ctx.backfill_default_count + " posts", (e) => doAction("/widget/api/backfill", {}, e.target)),
       ]);
       if (ctx.is_admin) {
         const countInput = el("input", { type: "number", min: "1", placeholder: "custom count" });
         backfillRow.appendChild(countInput);
-        backfillRow.appendChild(plainButton("Backfill custom amount", (e) =>
+        backfillRow.appendChild(plainButton("\u{2B07}\u{FE0F}", "Backfill custom amount", (e) =>
           doAction("/widget/api/backfill", { count: parseInt(countInput.value || "0", 10) }, e.target)));
-        backfillRow.appendChild(plainButton("Replace this room", withConfirm(
+        backfillRow.appendChild(plainButton("\u{1F501}", "Replace this room", withConfirm(
           "Create a fresh replacement room for this account and retire this one?",
           (btn) => doAction("/widget/api/replace_room", {}, btn)
         )));
@@ -4747,8 +4761,8 @@ _WIDGET_HTML = r"""<!doctype html>
       app.appendChild(el("div", { class: "card" }, [
         el("h2", { text: "This room: " + (kind === "dm" ? "Direct message" : "Chat") }),
         el("div", { class: "row" }, [
-          plainButton("Mute", (e) => doAction("/widget/api/mute", {}, e.target)),
-          dangerButton("Block", withConfirm(
+          plainButton("\u{1F507}", "Mute", (e) => doAction("/widget/api/mute", {}, e.target)),
+          dangerButton("\u{1F6AB}", "Block", withConfirm(
             "Block this account?",
             (btn) => doAction("/widget/api/block", {}, btn)
           )),
@@ -4781,14 +4795,14 @@ _WIDGET_HTML = r"""<!doctype html>
     app.appendChild(el("div", { class: "card" }, [
       el("h2", { text: "Couldn't connect" }),
       el("div", { class: "sub", text: message }),
-      el("div", { class: "row" }, [primaryButton("Retry", () => start())]),
+      el("div", { class: "row" }, [primaryButton("\u{1F504}", "Retry", () => start())]),
     ]));
   }
 
   function showConnectingState() {
     const app = document.getElementById("app");
     app.innerHTML = "";
-    const cancelBtn = plainButton("Cancel", () => {
+    const cancelBtn = plainButton("\u{2715}", "Cancel", () => {
       startGeneration++;
       showConnectErrorState("Cancelled.");
     });
