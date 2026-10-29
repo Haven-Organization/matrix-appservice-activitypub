@@ -2478,12 +2478,13 @@ _WIDGET_HTML = r"""<!doctype html>
     const children = [];
     if (post.boosted_by) {
       const b = post.boosted_by;
+      const canOpenBooster = !!(b.actor_id || b.handle);
       const line = document.createElement("div");
-      line.className = "boosted-by" + (b.actor_id ? " clickable" : "");
+      line.className = "boosted-by" + (canOpenBooster ? " clickable" : "");
       line.appendChild(document.createTextNode("\u{1F501} "));
       line.appendChild(nameNode("span", "", b.display_name || b.handle, b.display_name_html, null));
-      line.appendChild(document.createTextNode(" boosted"));
-      if (b.actor_id) line.addEventListener("click", (e) => { e.stopPropagation(); openAccountProfile(b.actor_id); });
+      line.appendChild(document.createTextNode(" reposted"));
+      if (canOpenBooster) line.addEventListener("click", (e) => { e.stopPropagation(); openAccountProfile(b.actor_id, b.handle); });
       children.push(line);
     }
     if (post.in_reply_to) {
@@ -2495,8 +2496,17 @@ _WIDGET_HTML = r"""<!doctype html>
       });
       children.push(replyLine);
     }
-    const hasAuthorProfile = !!post.author.actor_id;
-    const openAuthor = (e) => { if (e) e.stopPropagation(); if (hasAuthorProfile) openAccountProfile(post.author.actor_id); };
+    // A Misskey-family remote author has no cross-instance actor id the
+    // timeline/home feed can give us up front (see _misskey_actor_id's
+    // own docstring) -- openAccountProfile falls back to a live WebFinger
+    // lookup off the handle in that case, same resolution the search box's
+    // own exact "@user@host" lookup already does, rather than leaving the
+    // avatar/name dead with no way into that profile at all (confirmed
+    // live 2026-10-28: this is why clicking worked from a thread view,
+    // which always resolves a real actor id via its own AS2 fetch, but
+    // not from the feed).
+    const hasAuthorProfile = !!(post.author.actor_id || post.author.handle);
+    const openAuthor = (e) => { if (e) e.stopPropagation(); if (hasAuthorProfile) openAccountProfile(post.author.actor_id, post.author.handle); };
     const headerLeft = el("div", { class: "post-header-left" }, [
       nameNode("span", "name" + (hasAuthorProfile ? " clickable" : ""), post.author.display_name, post.author.display_name_html, openAuthor),
       el("span", { class: "handle" + (hasAuthorProfile ? " clickable" : ""), text: post.author.handle, onclick: openAuthor }),
@@ -2545,7 +2555,7 @@ _WIDGET_HTML = r"""<!doctype html>
     const counts = post.counts || { replies: 0, reblogs: 0, favourites: 0 };
     children.push(el("div", { class: "post-counts" }, [
       el("span", { class: "count-item", text: "\u{1F4AC} " + counts.replies, title: "Replies" }),
-      el("span", { class: "count-item", text: "\u{1F501} " + counts.reblogs, title: "Boosts" }),
+      el("span", { class: "count-item", text: "\u{1F501} " + counts.reblogs, title: "Reposts" }),
       el("span", { class: "count-item", text: "⭐ " + counts.favourites, title: "Favourites" }),
     ]));
     if (post.reactions && post.reactions.length) {
@@ -2941,7 +2951,23 @@ _WIDGET_HTML = r"""<!doctype html>
           state.unsupported = !data.supported;
           state.needsLogin = !!data.needs_login;
         }
-        state.posts = state.posts.concat(data.posts);
+        // "home" mode merges each configured/added instance's OWN
+        // federated timeline (see browse_home's own docstring) with no
+        // dedup on the backend -- the exact same post, posted or boosted
+        // into view by more than one of those instances, previously
+        // showed up as two adjacent identical cards (confirmed live
+        // 2026-10-29, both carrying the same uri). Drop anything whose
+        // uri is already in this feed, checked against every post loaded
+        // so far (not just this page), so a duplicate can't resurface a
+        // few pages later either -- state.posts always holds the real
+        // current URIs across however many times loadMore has already
+        // run, regardless of which source(s) ever sent it.
+        const seenUris = new Set(state.posts.map((p) => p.uri));
+        const freshPosts = data.posts.filter((p) => {
+          if (!p.uri || !seenUris.has(p.uri)) { if (p.uri) seenUris.add(p.uri); return true; }
+          return false;
+        });
+        state.posts = state.posts.concat(freshPosts);
       } catch (e) {
         // Previously silent -- a failed load (e.g. this bridge's own
         // widget session expiring mid-use, before api()'s own retry-once
@@ -3070,9 +3096,9 @@ _WIDGET_HTML = r"""<!doctype html>
     openModal(body);
   }
 
-  function openAccountProfile(actorId) {
-    if (!actorId) return;
-    profileView = { mode: "remote", actorId: actorId };
+  function openAccountProfile(actorId, handle) {
+    if (!actorId && !handle) return;
+    profileView = { mode: "remote", actorId: actorId || null, handle: handle || null };
     threadView = null;
     render();
   }
@@ -3167,7 +3193,7 @@ _WIDGET_HTML = r"""<!doctype html>
     app.appendChild(page);
 
     // remote account
-    const actorId = view.actorId;
+    let actorId = view.actorId;
     function profileAction(path, p, btn) {
       if (btn) btn.disabled = true;
       api(path, { method: "POST", body: { room_id: roomId, handle: p.handle } })
@@ -3205,7 +3231,21 @@ _WIDGET_HTML = r"""<!doctype html>
     function refresh() {
       return api("/widget/api/browse/profile?actor_id=" + encodeURIComponent(actorId)).then((p) => { renderRemote(p); return p; });
     }
-    refresh().catch(() => {
+    // No actor id up front -- just a handle, from a source that can't
+    // give us a cross-instance actor id of its own (a Misskey-family
+    // remote author; see renderPostCard's own comment). Resolve one via
+    // the same live WebFinger lookup the search box's exact "@user@host"
+    // search already does, then load the profile normally -- the
+    // "Loading…" placeholder above covers this extra round trip too.
+    function resolveThenRefresh() {
+      return api("/widget/api/browse/search?q=" + encodeURIComponent(view.handle)).then((data) => {
+        const account = data.accounts && data.accounts[0];
+        if (!account || !account.actor_id) throw new Error("Couldn't find that account.");
+        actorId = account.actor_id;
+        return refresh();
+      });
+    }
+    (actorId ? refresh() : resolveThenRefresh()).catch(() => {
       page.innerHTML = "";
       page.appendChild(el("div", { class: "muted", text: "Couldn't load that profile." }));
     });
