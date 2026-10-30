@@ -27,6 +27,7 @@ from fastapi import Request
 from bridge.activitypub.urls import media_url, resolve_own_media_proxy_mxc
 from bridge.repository import ActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
+from bridge.shared_encrypted_media import PROMPT_FIELD, announce_if_needed, ask_in_turn
 
 logger = logging.getLogger(__name__)
 
@@ -748,16 +749,20 @@ async def _send_encrypted_attachment_confirmation_request(
     except SynapseError:
         pass
 
-    warning = (
-        f"⚠️{display_name}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. To send it to the fediverse, I will "
-        "need to upload a decrypted copy to your homeserver.\n\n"
-        'Reply to this message with "confirm" to send the decrypted copy.'
-    )
+    # With sibling bridges sharing the copy (encrypted_media.bridges), one
+    # question covers them all: see bridge.shared_encrypted_media.
+    if config.encrypted_media.bridges:
+        what = (
+            "To post it to your linked networks, the bridges need one decrypted copy of it on your "
+            "homeserver, which they all share."
+        )
+    else:
+        what = "To send it to the fediverse, I will need to upload a decrypted copy to your homeserver."
+    how = 'Reply "confirm" to this message, or react with 👍, to upload it.'
+    warning = f"⚠️{display_name}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. {what}\n\n{how}"
     pill = f'<a href="https://matrix.to/#/{html.escape(sender, quote=True)}">{html.escape(display_name)}</a>'
     formatted_warning = (
-        f"<p>⚠️{pill}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. To send it to the fediverse, I will "
-        "need to upload a decrypted copy to your homeserver.</p>"
-        '<p>Reply to this message with "confirm" to send the decrypted copy.</p>'
+        f"<p>⚠️{pill}, {ENCRYPTED_ATTACHMENT_WARNING_MARKER}. {html.escape(what)}</p><p>{html.escape(how)}</p>"
     )
     warning_content = {
         "msgtype": "m.text",
@@ -765,6 +770,7 @@ async def _send_encrypted_attachment_confirmation_request(
         "format": "org.matrix.custom.html",
         "formatted_body": formatted_warning,
         "m.mentions": {"user_ids": [sender]},
+        PROMPT_FIELD: {"prompt_for": trigger_event_id},
         "m.relates_to": {
             "rel_type": "m.thread",
             "event_id": trigger_event_id,
@@ -805,10 +811,12 @@ async def resolve_attachment_or_request_confirmation(
     repository = request.app.state.repository
     cached = await repository.get_custom_emoji_mxc(encrypted_mxc)
     if cached:
+        # Shared with the sibling bridges too, unless one already has.
+        announce_if_needed(request, room_id=room_id, post_event_id=trigger_event_id, content=dict(content),
+                           plaintext_mxc=cached)
         content["url"] = cached
         return True  # already confirmed and resolved earlier, apply it and proceed transparently
 
-    await _send_encrypted_attachment_confirmation_request(
-        request, room_id=room_id, sender=sender, trigger_event_id=trigger_event_id,
-    )
+    # Asked now, or after the sibling bridges before this one had their turn.
+    await ask_in_turn(request, room_id=room_id, sender=sender, trigger_event_id=trigger_event_id)
     return False

@@ -1672,6 +1672,28 @@ async def get_outbox(request: Request, username: str) -> JSONResponse:
     return _collection_or_page(request, collection)
 
 
+@router.get("/actor/{username}/notes/{note_id}/matrix")
+async def get_note_matrix_source(request: Request, username: str, note_id: str) -> JSONResponse:
+    """The Matrix post a public note of ours was made from: its room, event
+    and sender. Lets another bridge on this domain (matrix-appservice-nostr,
+    seeing this note republished on Nostr by Mostr with a ``proxy`` tag
+    naming it) point at the original Matrix post instead of copying it.
+    Same visibility as the note itself: 404 for anything ``get_note`` would
+    refuse."""
+    base = request.app.state.config.bridge.public_base_url
+    record = await _get_actor_record(request, username)
+    repository: ActorRepository = request.app.state.repository
+    federated = await repository.get_federated_event_by_ap_object(f"{base}/actor/{username}/notes/{note_id}")
+    if federated is None or federated.author_actor_id != actor_url(base, username):
+        raise HTTPException(status_code=404, detail="Not Found")
+    if await _is_private_room(repository, federated.room_id):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return JSONResponse(
+        {"room_id": federated.room_id, "event_id": federated.event_id, "sender": record.matrix_user_id},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 @router.get("/actor/{username}/notes/{note_id}")
 async def get_note(request: Request, username: str, note_id: str) -> Response:
     """Serve a single distributed post at its own AP object IRI.

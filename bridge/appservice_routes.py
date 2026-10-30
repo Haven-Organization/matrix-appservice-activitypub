@@ -92,6 +92,7 @@ from bridge.lemmy_bridge import (
     maybe_handle_owned_community_topic_change,
 )
 from bridge.media import ENCRYPTED_ATTACHMENT_WARNING_MARKER, decrypt_and_reupload_encrypted_attachment
+from bridge.shared_encrypted_media import maybe_handle_shared_encrypted_media
 from bridge.membership import maybe_accept_invite, maybe_handle_join, maybe_handle_knock, maybe_handle_leave
 from bridge.poll_bridge import maybe_distribute_profile_poll, maybe_federate_poll_close, maybe_federate_poll_vote
 from bridge.peertube import (
@@ -207,7 +208,23 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
     sender = event.get("sender", "")
     if not room_id or not sender:
         return False
+    return await resume_encrypted_attachment(
+        request, room_id=room_id, sender=sender, warning_event_id=target_event_id,
+        confirm_event_id=event.get("event_id") or "",
+    )
 
+
+async def resume_encrypted_attachment(
+    request: Request, *, room_id: str, sender: str, warning_event_id: str, confirm_event_id: str,
+) -> bool:
+    """The confirmed half of ``maybe_handle_encrypted_attachment_confirmation``,
+    shared with a ✅/👍 reaction on the same warning (see
+    ``bridge.shared_encrypted_media.maybe_handle_shared_encrypted_media``).
+    Returns False if ``warning_event_id`` isn't one of our own encrypted-
+    attachment warnings, True otherwise (handled, or claimed and ignored).
+    With ``encrypted_media.bridges`` set, the decrypted copy is also
+    announced in the room for the sibling bridges to use."""
+    target_event_id = warning_event_id
     config = request.app.state.config
     bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
     synapse = request.app.state.synapse
@@ -265,7 +282,7 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
                         "rel_type": "m.thread",
                         "event_id": original_event_id,
                         "is_falling_back": True,
-                        "m.in_reply_to": {"event_id": event.get("event_id") or original_event_id},
+                        "m.in_reply_to": {"event_id": confirm_event_id or original_event_id},
                     },
                 },
                 as_user_id=bot_mxid,
@@ -275,6 +292,10 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
         return True
 
     effective_content["url"] = resolved_mxc
+    from bridge.shared_encrypted_media import announce
+
+    await announce(request, room_id=room_id, post_event_id=original_event_id,
+                   content=effective_content, plaintext_mxc=resolved_mxc)
     await _dispatch_outbound_send(request, original_event)
     try:
         await synapse.send_message_event(
@@ -286,7 +307,7 @@ async def maybe_handle_encrypted_attachment_confirmation(request: Request, event
                     "rel_type": "m.thread",
                     "event_id": original_event_id,
                     "is_falling_back": True,
-                    "m.in_reply_to": {"event_id": event.get("event_id") or original_event_id},
+                    "m.in_reply_to": {"event_id": confirm_event_id or original_event_id},
                 },
             },
             as_user_id=bot_mxid,
@@ -319,6 +340,11 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
     """
     handled_as_invite = await maybe_accept_invite(request, event)
     if handled_as_invite:
+        return
+    # Before reactions are federated: a 👍 confirming an encrypted-attachment
+    # question, or a sibling bridge's announced decrypted copy.
+    handled_as_shared_encrypted_media = await maybe_handle_shared_encrypted_media(request, event)
+    if handled_as_shared_encrypted_media:
         return
     handled_as_knock = await maybe_handle_knock(request, event)
     if handled_as_knock:

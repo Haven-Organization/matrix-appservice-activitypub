@@ -68,6 +68,14 @@ storage:
   # settings.
   backend: sqlite
 
+# Encrypted attachments shared with the sibling bridges on this server
+# (matrix-appservice-nostr, matrix-appservice-atproto): list every bridge's
+# bot, this one included, in the order they ask, so the sender is asked
+# once and the file is decrypted once.
+# encrypted_media:
+#   bridges: ["@fediverse:example.org", "@bluesky:example.org", "@nostr:example.org"]
+#   wait_seconds: 5
+
 logging:
   # ERROR by default to keep the service journal quiet -- switch to INFO
   # temporarily (systemctl edit / restart) only while actively investigating

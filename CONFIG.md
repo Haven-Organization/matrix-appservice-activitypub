@@ -580,6 +580,15 @@ A mirrored post's Matrix event shows the real ActivityPub `published` time, trus
 
 ---
 
+## `encrypted_media`
+
+An image or video forwarded out of an end-to-end encrypted room keeps its file encrypted, with the key in the message. Federating it needs a decrypted copy on the homeserver, so the bot asks the sender first: reply "confirm", or react 👍 (any skin tone). matrix-appservice-nostr and matrix-appservice-atproto do the same, and on one server they can share it, so the sender is asked once and the file is decrypted once (see `bridge/shared_encrypted_media.py`).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `bridges` | `[]` | The bot MXIDs of this server's bridges that share one decrypted copy, this one included, in the order they ask. The first asks straight away; each later one waits its turn and asks only if no bridge before it did. The bridge that asked announces its copy in the room (a hidden `software.haven.decrypted_media` event), and the others check it is exactly the sender's file before using it. Empty: this bridge asks on its own, as before. Give every listed bridge the same list. |
+| `wait_seconds` | `5` | How long each bridge waits after the one before it, before asking itself. |
+
 ## `logging`
 
 <a id="logging-level"></a>

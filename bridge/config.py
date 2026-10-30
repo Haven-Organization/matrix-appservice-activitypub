@@ -517,6 +517,17 @@ class LoggingSection:
 
 
 @dataclass(frozen=True)
+class EncryptedMediaSection:
+    """Encrypted attachments shared with the sibling bridges on this server
+    (see ``bridge.shared_encrypted_media``). ``bridges``: their bot MXIDs,
+    this one included, in the order they ask the sender to confirm. Empty:
+    this bridge asks on its own, as it always has."""
+
+    bridges: tuple[str, ...] = ()
+    wait_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     bridge: BridgeSection
     synapse: SynapseSection
@@ -524,6 +535,7 @@ class BridgeConfig:
     storage: StorageSection
     federation: FederationSection
     logging: LoggingSection
+    encrypted_media: EncryptedMediaSection = EncryptedMediaSection()
 
 
 def _require(section: dict[str, Any], key: str, section_name: str) -> Any:
@@ -710,6 +722,17 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
     logging_raw = raw.get("logging", {}) or {}
     logging_section = LoggingSection(level=logging_raw.get("level", "INFO"))
 
+    encrypted_raw = raw.get("encrypted_media", {}) or {}
+    shared_bridges = encrypted_raw.get("bridges") or []
+    if not isinstance(shared_bridges, list) or not all(
+        isinstance(b, str) and b.startswith("@") and ":" in b for b in shared_bridges
+    ):
+        raise ConfigError('encrypted_media.bridges must be a list of bot MXIDs (e.g. "@fediverse:example.org")')
+    wait_seconds = float(encrypted_raw.get("wait_seconds", 5))
+    if not 0 <= wait_seconds <= 60:
+        raise ConfigError("encrypted_media.wait_seconds must be between 0 and 60")
+    encrypted_media_section = EncryptedMediaSection(bridges=tuple(shared_bridges), wait_seconds=wait_seconds)
+
     return BridgeConfig(
         bridge=bridge_section,
         synapse=synapse_section,
@@ -717,4 +740,5 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         storage=storage_section,
         federation=federation_section,
         logging=logging_section,
+        encrypted_media=encrypted_media_section,
     )
