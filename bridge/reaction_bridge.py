@@ -55,6 +55,7 @@ from bridge.commands import is_foreign_bridge_user
 from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
 from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
 from bridge.matrix_links import matrix_to_link
+from bridge.media import build_ap_attachment
 from bridge.note_mirroring import (
     PER_MESSAGE_PROFILE_FIELD,
     SOCIAL_BODY_FIELD,
@@ -722,6 +723,23 @@ async def send_cross_bridge_quote(
     ):
         return True
 
+    # The target's own real media (not just this function's scaled-down
+    # preview_image/preview_video, which only ever fed the Matrix-side echo
+    # card below) -- attached to the actual federated Note, not merely
+    # described in its text, so a remote follower sees the reposted/
+    # replied-to image or video inline rather than having to follow
+    # link_for_note to see it at all (confirmed live 2026-10-30: neither a
+    # cross-bridge repost nor reply ever attached anything, text-only, even
+    # for an original post that was entirely a video with no caption).
+    # build_ap_attachment only recognizes a plain content.url -- an
+    # encrypted sibling-bridge attachment nobody's ever confirmed through
+    # THIS bridge's own confirm flow is skipped here, same best-effort
+    # fallback as everywhere else in this module; real-world sibling-bridge
+    # media observed live is unencrypted.
+    attachment = build_ap_attachment(base, preview_full_content) if preview_full_content else None
+    if attachment is not None:
+        await repository.mark_media_published(preview_full_content["url"])
+
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if is_reply:
         reply_handle = None if original_handle == "a post" else original_handle
@@ -731,6 +749,7 @@ async def send_cross_bridge_quote(
     note = Note(
         id=note_id, attributed_to=own_actor_id, content=note_html, published=published,
         to=[AS_PUBLIC], cc=[followers_url(base, actor_record.username)],
+        attachment=[attachment] if attachment else [],
     )
     create_activity = Activity(
         id=f"{note_id}/activity", type="Create", actor=own_actor_id, object=note,

@@ -61,6 +61,7 @@ from bridge.media import (
 )
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.note_mirroring import (
+    PER_MESSAGE_PROFILE_FIELD,
     PROFILE_BANNER_STATE_TYPE,
     SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
@@ -366,6 +367,67 @@ async def _maybe_handle_sibling_bridge_reply(
     )
 
 
+async def _maybe_handle_sibling_bridge_repost(
+    request: Request, *, relates_to: dict, body: str, actor_record, room_id: str, matrix_event_id: str,
+) -> bool:
+    """Publishes a real AP ``Create<Note>`` for a Profile-Room ``org.matrix.
+    msc4501.social.relates_to`` repost record whose ``sender`` is a SIBLING
+    BRIDGE's own ghost (Bluesky/Nostr -- see ``bridge.commands.
+    is_foreign_bridge_user``), the exact repost-side counterpart of
+    ``_maybe_handle_sibling_bridge_reply`` above.
+
+    Distinct from reposting one of THIS bridge's own (native AP) posts,
+    which stays on the ``_maybe_suppress_msc4501_repost_record``/
+    ``_maybe_handle_msc4501_quote_post`` path below (a real tracked
+    ``FederatedEvent`` exists there, so an ``Announce``/``quote_uri`` makes
+    sense) -- a sibling bridge's mirrored content is never ActivityPub, so
+    there's no foreign object to ``Announce`` or quote, same reasoning
+    ``_maybe_handle_sibling_bridge_reply`` already gives for the reply
+    case.
+
+    The record arrives here two different ways, both ending up with the
+    same shape: a genuine Matrix client (e.g. Haven) reposting a sibling
+    ghost's post FROM INSIDE Matrix sends it as the room owner directly;
+    the sibling bridge's own app (Bluesky's/Nostr's native UI) reposting
+    something mirrors the action back in as the SIBLING BRIDGE'S OWN bot,
+    tagged with a ``com.beeper.per_message_profile`` naming the owner --
+    ``maybe_distribute_profile_post``'s own sender-routing carve-out
+    (confirmed live 2026-10-30, a Bluesky-native repost that otherwise
+    never reached this function at all, see that carve-out's own comment)
+    is what lets the second shape reach here as the owner's own post in
+    the first place.
+
+    Delegates to ``send_cross_bridge_quote`` exactly like the reply case --
+    one proven attribution/external_url/media-attachment/dedup
+    implementation. ``caption`` is "" for a caption-less repost (``body``
+    is nothing but the bare matrix.to permalink, per MSC4501's own
+    convention -- same check ``_maybe_suppress_msc4501_repost_record``
+    uses) or the real added commentary for a quote-post, same distinction
+    the native-AP-repost path makes between those two functions.
+    ``skip_echo=True`` for the same reason ``_maybe_handle_sibling_bridge_
+    reply`` passes it: the triggering ``matrix_event_id`` is already
+    sitting in the room as a real, visible record (either the client's own
+    message, or the sibling bridge's own mirrored repost record) -- a
+    second synthetic echo on top would just be a duplicate.
+
+    Returns ``False`` only if the reposted event itself can no longer be
+    fetched at all (see ``send_cross_bridge_quote``'s own return-False
+    case) -- nothing coherent to publish in that case either."""
+    target_room_id = relates_to.get("room_id")
+    target_event_id = relates_to.get("event_id")
+    if not target_room_id or not target_event_id:
+        return False
+
+    from bridge.reaction_bridge import send_cross_bridge_quote
+
+    caption = "" if _BARE_MATRIX_LINK_BODY_RE.match(body) else body
+    return await send_cross_bridge_quote(
+        request, actor_record=actor_record, target_room_id=target_room_id, target_event_id=target_event_id,
+        caption=caption, reactor_matrix_user_id=actor_record.matrix_user_id, matrix_event_id=matrix_event_id,
+        is_reply=False, skip_echo=True,
+    )
+
+
 async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     """Returns True if this event belonged to a linked Profile Room (handled,
     successfully distributed or not) -- callers shouldn't process it further."""
@@ -409,34 +471,57 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     room_owner = actor_record
     if actor_record.matrix_user_id != sender:
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-        if (
+        # A sibling bridge's OWN bot (not a puppeted ghost) posting its
+        # native MSC4501 repost record into the room OWNER's own Profile
+        # Room, under a com.beeper.per_message_profile naming the owner
+        # themselves: this is the sibling bridge mirroring the owner's OWN
+        # repost action, done on Bluesky/Nostr's own app, not a stray
+        # message from an unrelated bot (confirmed live 2026-10-30: a
+        # Bluesky repost of another account's post showed up this way,
+        # sender=@bluesky's own bot mxid, per_message_profile.id=the owner's
+        # own mxid). Without this carve-out, is_foreign_bridge_user below
+        # treated it exactly like any other sibling-bridge bot message and
+        # bailed out before ever reaching the SOCIAL_REL_TYPE_REPOST
+        # handling further down -- confirmed live the same day, nothing
+        # federated at all for this kind of repost. actor_record stays the
+        # room owner's own record (no reassignment needed, unlike the real
+        # guest-post case below).
+        sibling_repost_for_owner = (
+            is_foreign_bridge_user(sender, config)
+            and (content.get(PER_MESSAGE_PROFILE_FIELD) or {}).get("id") == actor_record.matrix_user_id
+            and (content.get(SOCIAL_RELATES_TO_FIELD) or {}).get("rel_type") == SOCIAL_REL_TYPE_REPOST
+        )
+        if sibling_repost_for_owner:
+            pass
+        elif (
             sender == bot_mxid
             or sender.startswith(f"@{config.appservice.user_prefix}")
             or is_foreign_bridge_user(sender, config)
         ):
             return False  # the bot's / a ghost's own messages -- ours or a sibling bridge's -- are never guest posts
-        guest_resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
-        guest_record = guest_resolution.record
-        if guest_record is None:
-            return False  # not eligible for even a shadow identity (access off, or not allowlisted)
-        if guest_resolution.created:
-            try:
-                await request.app.state.synapse.send_message_event(
-                    room_id,
-                    {"msgtype": "m.notice", "body": shadow_created_notice(request, guest_record)},
-                    as_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
-                )
-            except Exception:
-                logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
-        # A DIFFERENT local user posting in someone else's Profile Room
-        # (user-requested, 2026-07-04): federate it as the GUEST's own post
-        # -- minted under their actor, signed by them, on their outbox --
-        # with the room owner's mention tacked on the front (below), the
-        # nearest fediverse equivalent of walking into someone's room to
-        # talk to them. Without this, the message stayed Matrix-only, so
-        # the owner's later on-Matrix replies to it federated as fresh
-        # context-free posts instead of replies.
-        actor_record = guest_record
+        else:
+            guest_resolution = await ensure_shadow_actor(request, sender=sender, room_id=room_id)
+            guest_record = guest_resolution.record
+            if guest_record is None:
+                return False  # not eligible for even a shadow identity (access off, or not allowlisted)
+            if guest_resolution.created:
+                try:
+                    await request.app.state.synapse.send_message_event(
+                        room_id,
+                        {"msgtype": "m.notice", "body": shadow_created_notice(request, guest_record)},
+                        as_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
+                    )
+                except Exception:
+                    logger.warning("Failed to send shadow-identity-created notice to %s", room_id, exc_info=True)
+            # A DIFFERENT local user posting in someone else's Profile Room
+            # (user-requested, 2026-07-04): federate it as the GUEST's own post
+            # -- minted under their actor, signed by them, on their outbox --
+            # with the room owner's mention tacked on the front (below), the
+            # nearest fediverse equivalent of walking into someone's room to
+            # talk to them. Without this, the message stayed Matrix-only, so
+            # the owner's later on-Matrix replies to it federated as fresh
+            # context-free posts instead of replies.
+            actor_record = guest_record
 
     # A leftover Profile Room from a past full period (the room owner's own
     # post) or a shadow-tier THIRD-PARTY identity posting as a GUEST in
@@ -501,6 +586,16 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
 
     if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
         social_repost_body = (content.get("body") or "").strip()
+        repost_target_sender = relates_to.get("sender") or ""
+        if is_foreign_bridge_user(repost_target_sender, config):
+            if await _maybe_handle_sibling_bridge_repost(
+                request, relates_to=relates_to, body=social_repost_body,
+                actor_record=actor_record, room_id=room_id, matrix_event_id=matrix_event_id,
+            ):
+                return True
+            # Couldn't fetch the reposted event at all -- nothing coherent
+            # to publish, so this falls through to the same bare-permalink
+            # suppression a native-ghost repost record already gets below.
         if await _maybe_suppress_msc4501_repost_record(
             request, relates_to=relates_to, body=social_repost_body,
             reposter_matrix_user_id=actor_record.matrix_user_id,
