@@ -8221,16 +8221,50 @@ async def _sender_controls_room(request: Request, *, room_id: str, sender: str) 
     to be trusted with linking it as their own fediverse identity --
     concretely, whether Matrix's own power_levels would let them set
     m.room.name themselves, the same state event ``;link profile`` itself
-    tries to set. Fails CLOSED (False) if power_levels can't even be read
-    -- unlike the room name/avatar sync later in this function, which is
+    tries to set. Fails CLOSED (False) if room state can't even be read --
+    unlike the room name/avatar sync later in this function, which is
     best-effort and fine to silently skip, this is the actual security
-    gate, so an unverifiable room must never be treated as controlled."""
+    gate, so an unverifiable room must never be treated as controlled.
+
+    Room version 12+ gives a room's creator(s) -- the ``m.room.create``
+    event's own ``sender``, plus any ``additional_creators`` -- implicit,
+    PERMANENT infinite power, and its auth rules forbid them from EVER
+    appearing in ``power_levels``' ``users`` map. A plain
+    ``power_levels.users.get(sender, users_default)`` lookup never finds
+    the real owner of a v12+ room, so creator status has to be checked for
+    separately there (confirmed live 2026-11-01: a v12 room's actual
+    creator was told by ``;link group`` that they didn't control their own
+    room, while another member who merely had an explicit power_levels
+    entry passed fine). This bypass is gated on the room actually BEING
+    v12+, not just applied to whoever created any room: below v12 a
+    creator's power is ordinary and fully mutable (self-demotable, and a
+    later admin can hold a higher PL than them), so the plain power_levels
+    lookup must stay the sole authority there, same as before this
+    existed."""
     config = request.app.state.config
     synapse = request.app.state.synapse
     try:
-        power_levels = await synapse.get_room_state(room_id, "m.room.power_levels", as_user_id=_bot_mxid(config))
+        state_events = await synapse.get_full_room_state(room_id, as_user_id=_bot_mxid(config))
     except SynapseError:
         return False
+    power_levels: dict[str, Any] = {}
+    creators: set[str] = set()
+    is_v12_plus = False
+    for event in state_events:
+        if event.get("type") == "m.room.power_levels":
+            power_levels = event.get("content") or {}
+        elif event.get("type") == "m.room.create":
+            create_content = event.get("content") or {}
+            try:
+                is_v12_plus = int(create_content.get("room_version", "1")) >= 12
+            except ValueError:
+                is_v12_plus = False  # a non-numeric (e.g. org.*-namespaced) version is never v12+
+            if is_v12_plus:
+                if event.get("sender"):
+                    creators.add(event["sender"])
+                creators.update(create_content.get("additional_creators") or [])
+    if is_v12_plus and sender in creators:
+        return True
     users_default = power_levels.get("users_default", 0)
     sender_level = power_levels.get("users", {}).get(sender, users_default)
     required_level = power_levels.get("events", {}).get("m.room.name", power_levels.get("state_default", 50))
