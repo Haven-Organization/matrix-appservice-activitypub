@@ -5165,6 +5165,21 @@ def _reply_target_event_id(content: dict) -> str | None:
     return in_reply_to.get("event_id")
 
 
+def _is_confirm_reply_body(body: str) -> bool:
+    """Whether a reply's (already ``strip_reply_fallback``ed) body counts as
+    confirming one of the bot's own "reply with confirm" warnings -- every
+    ``;link group``/``;link community``/``;link profile``/``;delete ...``/
+    etc. two-step confirmation flow in this module shares this single
+    check, rather than each repeating its own literal ``== "confirm"``.
+    Accepts a bare ``confirm`` (what every warning's own instructions say
+    to type) AND ``;confirm`` (the configured command prefix + ``confirm``)
+    -- never mentioned in the warning text itself, just quietly also
+    recognized since a user naturally tried it anyway (confirmed live
+    2026-11-01) and there's no reason not to let it work."""
+    normalized = body.strip().lower()
+    return normalized == "confirm" or normalized == f"{_COMMAND_PREFIX}confirm"
+
+
 def _direct_reply_target_event_id(content: dict) -> str | None:
     """Like ``_reply_target_event_id``, but for ``;publish``/``;unpublish``/
     ``;edit`` specifically: these need the EXACT message being replied to
@@ -6803,7 +6818,7 @@ async def maybe_handle_link_community_confirmation(request: Request, event: dict
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -6826,7 +6841,14 @@ async def maybe_handle_link_community_confirmation(request: Request, event: dict
     if _LINK_COMMUNITY_WARNING_MARKER not in warning_body:
         return False
 
-    match = re.search(r"\(([a-z0-9_]+)@", warning_body)
+    # Character class must match sanitize_localpart_component's own allowed
+    # set (bridge/ghosts.py's _UNSAFE_CHARS_RE: a-z0-9._=-/), not just
+    # a-z0-9_ -- a community/group id sanitized from a room alias like
+    # "#hwtofedi:doesnmlab.xyz" keeps its dot (e.g. "_hwtofedi_doesnmlab.xyz"),
+    # and a too-narrow class here makes the whole match fail, silently
+    # dropping every "confirm" reply for such an id (confirmed live
+    # 2026-11-01: a real ";link group" confirm got "Not sure what you mean").
+    match = re.search(r"\(([a-z0-9._=\-/]+)@", warning_body)
     if match is None:
         return False
     community_id = match.group(1)
@@ -7101,7 +7123,7 @@ async def maybe_handle_link_group_confirmation(request: Request, event: dict) ->
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -7124,7 +7146,11 @@ async def maybe_handle_link_group_confirmation(request: Request, event: dict) ->
     if _LINK_GROUP_WARNING_MARKER not in warning_body:
         return False
 
-    match = re.search(r"\(([a-z0-9_]+)@", warning_body)
+    # See the identical comment in maybe_handle_link_community_confirmation
+    # above -- same bug, same fix: the character class has to match every
+    # char sanitize_localpart_component can actually produce, not just
+    # a-z0-9_.
+    match = re.search(r"\(([a-z0-9._=\-/]+)@", warning_body)
     if match is None:
         return False
     group_id = match.group(1)
@@ -8594,7 +8620,7 @@ async def maybe_handle_link_profile_confirmation(request: Request, event: dict) 
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -8784,7 +8810,7 @@ async def maybe_handle_unlink_profile_confirmation(request: Request, event: dict
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -8917,7 +8943,7 @@ async def maybe_handle_delete_confirmation(request: Request, event: dict) -> boo
     # what was actually typed (for clients that don't render rich replies)
     # -- has to come off before comparing, or a genuine "confirm" reply
     # would never match.
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -9489,7 +9515,7 @@ async def _maybe_handle_delete_hosted_entity_confirmation(request: Request, even
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -9664,7 +9690,7 @@ async def maybe_handle_leave_unfollowed_confirmation(request: Request, event: di
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -9950,7 +9976,7 @@ async def maybe_handle_replace_room_confirmation(request: Request, event: dict) 
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -10125,7 +10151,7 @@ async def maybe_handle_replace_ghost_room_confirmation(request: Request, event: 
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
@@ -11058,7 +11084,7 @@ async def maybe_handle_allow_homeserver_confirmation(request: Request, event: di
     if event.get("type") != "m.room.message":
         return False
     content = event.get("content") or {}
-    if strip_reply_fallback(content.get("body") or "").strip().lower() != "confirm":
+    if not _is_confirm_reply_body(strip_reply_fallback(content.get("body") or "")):
         return False
     target_event_id = _reply_target_event_id(content)
     if not target_event_id:
