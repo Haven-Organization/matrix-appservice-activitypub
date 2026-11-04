@@ -232,9 +232,38 @@ async def handle_announcement(request: Request, event: dict) -> None:
             logger.warning("%s announced a copy of %s that isn't the same file; ignored", sender, encrypted_mxc)
             return
         await repository.record_custom_emoji_mxc(encrypted_mxc, plaintext_mxc)
+    if await repository.get_federated_event_by_matrix_event(post_event_id) is not None:
+        return  # announced twice, or seen both live and on looking back
     # Its usual path finds the copy in the cache (resolve_attachment_or_request_confirmation),
-    # and every usual check applies; a post already sent isn't sent again.
+    # and every usual check applies.
     await _dispatch_outbound_send(request, post)
+    if await repository.get_federated_event_by_matrix_event(post_event_id) is not None:
+        await _sent_after_sibling(request, room_id, post_event_id)
+
+
+async def _sent_after_sibling(request: Request, room_id: str, post_event_id: str) -> None:
+    """Sent with a copy another bridge made after its question was answered:
+    say so too, under that question, so each bridge's outcome shows. A file
+    that was simply known already (nobody asked) stays quiet, as it does at
+    the bridge that made the copy."""
+    prompt = next((e for e in await _related(request, room_id, post_event_id)
+                   if e.get("type") == "m.room.message"
+                   and ((e.get("content") or {}).get(PROMPT_FIELD) or {}).get("prompt_for") == post_event_id), None)
+    if prompt is None:
+        return
+    try:
+        await request.app.state.synapse.send_message_event(
+            room_id,
+            {
+                "msgtype": "m.notice",
+                "body": "✅ Sent.",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": post_event_id, "is_falling_back": True,
+                                 "m.in_reply_to": {"event_id": prompt["event_id"]}},
+            },
+            as_user_id=_bot(request.app.state.config),
+        )
+    except SynapseError:
+        logger.warning("Failed to send sent-confirmation notice to %s", room_id, exc_info=True)
 
 
 # -- the chain hook --------------------------------------------------------------------------
