@@ -99,6 +99,7 @@ from bridge.note_mirroring import (
     import_video,
     is_silenced,
     maybe_send_poll_end,
+    merge_quote_preview_attachment,
     mirror_chat_message,
     mirror_direct_message,
     mirrored_post_event_type,
@@ -113,9 +114,12 @@ from bridge.note_mirroring import (
     upsert_poll_tally_reply,
 )
 from bridge.note_mirroring import attach_media_to_content as _attach_media_to_content
+from bridge.note_mirroring import extract_quote_uri as _extract_quote_uri
 from bridge.note_mirroring import resolve_and_invite_ghost as _resolve_and_invite_ghost
 from bridge.note_mirroring import set_ghost_room_banner as _set_ghost_room_banner
 from bridge.note_mirroring import source_post_url as _source_post_url
+from bridge.note_mirroring import strip_quote_tail as _strip_quote_tail
+from bridge.note_mirroring import strip_quote_tail_html as _strip_quote_tail_html
 from bridge.repository import (
     ActorRecord,
     FederatedEvent,
@@ -747,42 +751,6 @@ def build_preview_media_content(
     }
 
 
-def merge_quote_preview_attachment(
-    content: dict, *, preview_image: dict[str, object] | None, preview_video: dict[str, object] | None,
-) -> dict:
-    """If ``content`` (a quote-post's own mirrored Matrix event, already
-    built by ``_handle_create`` -- caption text/HTML, ``m.mentions``,
-    ``external_url``, and whatever ``_attach_media_to_content`` did with
-    the quoting post's OWN attachments, if it had any) is still a plain
-    ``m.text``, upgrades it to a real ``m.image``/``m.video`` attachment
-    for the QUOTED post's preview media instead -- same reasoning as
-    ``build_preview_media_content`` (Element X doesn't render an inline
-    ``<img>`` in a caption at all), just merged into an already-built
-    content dict rather than one built fresh, since this one has other
-    fields on it worth keeping.
-
-    A quoting post that already has its own attachment is left exactly as
-    ``_attach_media_to_content`` built it: one Matrix event can only ever
-    carry one real attachment, and the quoter's own is what they actually
-    posted, so it always wins over the thing they merely quoted -- the
-    quoted post's preview stays text-only (see ``_quoted_post_render``'s
-    ``quote_block_html``) in that case, same as it's always been."""
-    preview_media = preview_video or preview_image
-    if content.get("msgtype") != "m.text" or preview_media is None:
-        return content
-    return {
-        **content,
-        "msgtype": "m.video" if preview_video is not None else "m.image",
-        "filename": preview_media["filename"],
-        "url": preview_media["mxc"],
-        "info": {
-            "mimetype": preview_media["mimetype"],
-            "w": preview_media["width"],
-            "h": preview_media["height"],
-        },
-    }
-
-
 async def _notify_post_owner(
     request: Request, *, target: FederatedEvent, actor_id: str, actor_doc: dict, verb_phrase: str,
     reaction_emoji: str | None = None, reaction_emoji_mxc: str | None = None,
@@ -1138,59 +1106,6 @@ async def _resolve_dm_recipient(request: Request, username: str, obj: dict, acti
     return None
 
 
-_QUOTE_FIELDS = ("quoteUri", "quoteUrl", "_misskey_quote")
-
-
-def _extract_quote_uri(note: dict) -> str | None:
-    """The URI of the post ``note`` quotes/reposts, if any -- checked under
-    every field name a real implementation might send it as (see
-    ``bridge.activitypub.models.Note.quote_uri``'s docstring for why
-    there's more than one)."""
-    for field_name in _QUOTE_FIELDS:
-        value = note.get(field_name)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _strip_quote_tail(body: str, quote_uri: str) -> str:
-    """Drop a trailing line that's just the quoted post's own link -- e.g.
-    Akkoma appends a plain-text "RT: <link>" fallback to a quote-post's OWN
-    content for receivers that don't understand ``quoteUri``, which reads
-    as redundant clutter once ``_quoted_post_render`` is rendering our own
-    proper quote line/preview from ``quote_uri`` anyway. A no-op if the
-    body doesn't actually end with it (some implementations don't add a
-    fallback at all)."""
-    lines = body.rstrip().split("\n")
-    if lines and lines[-1].strip().endswith(quote_uri):
-        lines.pop()
-    return "\n".join(lines).rstrip()
-
-
-def _strip_quote_tail_html(safe_html: str, quote_uri: str) -> str:
-    """HTML counterpart of ``_strip_quote_tail`` -- the same fallback is
-    typically wrapped in markup here (``<br>``s, a ``<span>``, ...) rather
-    than plain newlines, so a trailing-line check can't find it. Strips a
-    trailing anchor whose ``href`` is exactly ``quote_uri``, plus any
-    immediately-surrounding whitespace/``<br>``/``<span>`` wrapper -- a
-    no-op if the markup doesn't actually end in one (this is inherently a
-    best-effort heuristic against one observed real-world shape, not a full
-    HTML parse, so a differently-structured fallback just won't match). The
-    fallback is usually the tail of the note's own single wrapping ``<p>``
-    (Akkoma appends it inside the same paragraph as the caption), so the
-    match is allowed to land right before a trailing ``</p>`` rather than
-    only at the very end of the string -- otherwise that closing tag alone
-    stops the anchor from ever being recognized as "trailing" and the whole
-    strip silently no-ops."""
-    escaped_uri = re.escape(html.escape(quote_uri, quote=True))
-    pattern = re.compile(
-        rf"(?:<span>)?\s*(?:<br\s*/?>\s*)*(?:RT|QT|RE)?:?\s*"
-        rf'<a[^>]*?href="{escaped_uri}"[^>]*>.*?</a>\s*(?:</span>)?\s*(?=(?:</p>)?\s*$)',
-        re.IGNORECASE | re.DOTALL,
-    )
-    return pattern.sub("", safe_html).rstrip()
-
-
 async def _maybe_import_quoted_note(
     request: Request, quoted_obj: dict, quoted_author_id: str | None
 ) -> FederatedEvent | None:
@@ -1410,6 +1325,63 @@ async def _quoted_post_render(
         quoted_ref=quoted_ref, full_content=full_content,
         quoted_sender=quoted_sender, quoted_displayname=quoted_displayname,
     )
+
+
+async def _quote_import_kwargs(request: Request, obj: dict) -> dict:
+    """Pre-computes every ``import_note`` ``quote_*`` kwarg for ``obj``, if
+    ``obj`` itself has a ``quoteUri``/``quoteUrl``/``_misskey_quote`` --
+    shared by every call site in this module that mirrors ``obj`` as a flat
+    post via ``import_note`` rather than through ``_handle_create``'s own
+    top-level case (which renders this same ``_quoted_post_render`` result
+    inline instead, since it never calls ``import_note`` for its own
+    post). Returns ``{}`` (no quote kwargs to add) when ``obj`` has no
+    quote field at all -- every caller can unconditionally splat this into
+    its own ``import_note`` call.
+
+    Without this, a quote-post imported any way OTHER than through
+    ``_handle_create``'s own top-level ``Create`` handling -- the mention-
+    only carve-out, an ancestor-chain's untracked root, or an ``Announce``'s
+    reposted-object import -- silently lost every visible trace of being a
+    repost/quote of something else, mirroring as nothing but its own
+    (often near-empty, just a mention tag) caption. Confirmed live
+    2026-11-06 for the ancestor-chain-root case: a quote-post whose target
+    wasn't already tracked got imported as a thread's untracked root with
+    none of this wired in, showing up with only its bare ``@mention`` and
+    nothing else.
+
+    Deliberately NOT applied to ``_maybe_import_quoted_note``'s own
+    ``import_note`` call (the quote TARGET's import, inside
+    ``_quoted_post_render`` itself) -- that target recursively having its
+    OWN ``quoteUri`` would mean calling back into ``_quoted_post_render``
+    from here, with no depth limit against a pathological (or malicious)
+    quote cycle. Same "doesn't walk further" scope boundary that
+    function's own docstring already draws for a quote target that's
+    ALSO a reply."""
+    quote_uri = _extract_quote_uri(obj)
+    if not quote_uri:
+        return {}
+    quote_render = await _quoted_post_render(
+        request, quote_uri, quoter_has_own_attachment=bool(extract_attachments(obj))
+    )
+    quote_social_relates_to = None
+    if (
+        request.app.state.config.bridge.set_msc4501_relates_to
+        and quote_render.quoted_ref is not None
+        and quote_render.quoted_sender is not None
+    ):
+        quoted_room_id, quoted_event_id = quote_render.quoted_ref
+        quote_social_relates_to = social_relates_to(
+            SOCIAL_REL_TYPE_REPOST, event_id=quoted_event_id, room_id=quoted_room_id,
+            sender=quote_render.quoted_sender, displayname=quote_render.quoted_displayname,
+            via=[request.app.state.config.synapse.server_name], content=quote_render.full_content,
+        )
+    return {
+        "quote_uri": quote_uri,
+        "quote_tail": (quote_render.plain_tail, quote_render.html_tail),
+        "quote_social_relates_to": quote_social_relates_to,
+        "quote_preview_image": quote_render.preview_image,
+        "quote_preview_video": quote_render.preview_video,
+    }
 
 
 async def _maybe_handle_poll_vote(request: Request, obj: dict, activity: Activity) -> bool:
@@ -1882,6 +1854,7 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
         reply_header = _render_reply_header(unresolved_reply_context) if unresolved_reply_context is not None else None
         await import_note(
             request, note=obj, author_actor_id=activity.actor, author_doc=author_doc, reply_header=reply_header,
+            **await _quote_import_kwargs(request, obj),
         )
         return
 
@@ -2205,7 +2178,8 @@ async def _backfill_ancestor_chain(
         except RemoteActorFetchError:
             root_author_doc = {}
         imported = await import_note(
-            request, note=root_note, author_actor_id=root_author, author_doc=root_author_doc
+            request, note=root_note, author_actor_id=root_author, author_doc=root_author_doc,
+            **await _quote_import_kwargs(request, root_note),
         )
         parent = imported.federated_event
         if parent is None:
@@ -2913,7 +2887,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
             reply_header = _render_reply_header(context)
         imported = await import_note(
             request, note=obj, author_actor_id=original_author_id, author_doc=original_actor_doc,
-            reply_header=reply_header,
+            reply_header=reply_header, **await _quote_import_kwargs(request, obj),
         )
         imported_attachment_mxc = imported.first_attachment_mxc
         imported_attachment_width = imported.first_attachment_width

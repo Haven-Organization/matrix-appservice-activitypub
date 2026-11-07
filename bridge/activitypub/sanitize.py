@@ -124,7 +124,7 @@ class _SanitizingParser(HTMLParser):
             # jammed onto one line in ``plain`` (though ``safe_html`` was
             # fine, since the html side only ever lost the ``<br>`` tag
             # itself, not neighboring text), which then made
-            # ``_strip_quote_tail`` in bridge.inbox_dispatch delete the
+            # ``strip_quote_tail`` in bridge.note_mirroring delete the
             # WHOLE merged line -- caption included -- instead of just the
             # fallback's own line.
             self._emit_html("<br>")

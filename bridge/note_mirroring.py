@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -2488,9 +2489,106 @@ async def activity_lock(key: str):
             _activity_locks.pop(key, None)
 
 
+_QUOTE_FIELDS = ("quoteUri", "quoteUrl", "_misskey_quote")
+
+
+def extract_quote_uri(note: dict) -> str | None:
+    """The URI of the post ``note`` quotes/reposts, if any -- checked under
+    every field name a real implementation might send it as (see
+    ``bridge.activitypub.models.Note.quote_uri``'s docstring for why
+    there's more than one). Lives here (not ``bridge.inbox_dispatch``,
+    where it's actually used from) because ``import_note`` below also
+    needs it, for a quote-post that only ever reaches this module's own
+    import path (an ancestor-chain root, a mention-only carve-out, ...)
+    rather than ``inbox_dispatch._handle_create``'s own top-level case --
+    see this module's own docstring on why anything more than one of
+    ``commands``/``inbox_dispatch`` needs has to live here."""
+    for field_name in _QUOTE_FIELDS:
+        value = note.get(field_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def strip_quote_tail(body: str, quote_uri: str) -> str:
+    """Drop a trailing line that's just the quoted post's own link -- e.g.
+    Akkoma appends a plain-text "RT: <link>" fallback to a quote-post's OWN
+    content for receivers that don't understand ``quoteUri``, which reads
+    as redundant clutter once a proper quote line/preview is rendered from
+    ``quote_uri`` anyway. A no-op if the body doesn't actually end with it
+    (some implementations don't add a fallback at all)."""
+    lines = body.rstrip().split("\n")
+    if lines and lines[-1].strip().endswith(quote_uri):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def strip_quote_tail_html(safe_html: str, quote_uri: str) -> str:
+    """HTML counterpart of ``strip_quote_tail`` -- the same fallback is
+    typically wrapped in markup here (``<br>``s, a ``<span>``, ...) rather
+    than plain newlines, so a trailing-line check can't find it. Strips a
+    trailing anchor whose ``href`` is exactly ``quote_uri``, plus any
+    immediately-surrounding whitespace/``<br>``/``<span>`` wrapper -- a
+    no-op if the markup doesn't actually end in one (this is inherently a
+    best-effort heuristic against one observed real-world shape, not a full
+    HTML parse, so a differently-structured fallback just won't match). The
+    fallback is usually the tail of the note's own single wrapping ``<p>``
+    (Akkoma appends it inside the same paragraph as the caption), so the
+    match is allowed to land right before a trailing ``</p>`` rather than
+    only at the very end of the string -- otherwise that closing tag alone
+    stops the anchor from ever being recognized as "trailing" and the whole
+    strip silently no-ops."""
+    escaped_uri = re.escape(html.escape(quote_uri, quote=True))
+    pattern = re.compile(
+        rf"(?:<span>)?\s*(?:<br\s*/?>\s*)*(?:RT|QT|RE)?:?\s*"
+        rf'<a[^>]*?href="{escaped_uri}"[^>]*>.*?</a>\s*(?:</span>)?\s*(?=(?:</p>)?\s*$)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    return pattern.sub("", safe_html).rstrip()
+
+
+def merge_quote_preview_attachment(
+    content: dict, *, preview_image: dict[str, object] | None, preview_video: dict[str, object] | None,
+) -> dict:
+    """If ``content`` (a quote-post's own mirrored Matrix event -- caption
+    text/HTML, ``m.mentions``, ``external_url``, and whatever
+    ``attach_media_to_content`` did with the quoting post's OWN
+    attachments, if it had any) is still a plain ``m.text``, upgrades it to
+    a real ``m.image``/``m.video`` attachment for the QUOTED post's preview
+    media instead -- same reasoning as ``bridge.inbox_dispatch.
+    build_preview_media_content`` (Element X doesn't render an inline
+    ``<img>`` in a caption at all), just merged into an already-built
+    content dict rather than one built fresh, since this one has other
+    fields on it worth keeping.
+
+    A quoting post that already has its own attachment is left exactly as
+    ``attach_media_to_content`` built it: one Matrix event can only ever
+    carry one real attachment, and the quoter's own is what they actually
+    posted, so it always wins over the thing they merely quoted -- the
+    quoted post's preview stays text-only in that case, same as it's
+    always been."""
+    preview_media = preview_video or preview_image
+    if content.get("msgtype") != "m.text" or preview_media is None:
+        return content
+    return {
+        **content,
+        "msgtype": "m.video" if preview_video is not None else "m.image",
+        "filename": preview_media["filename"],
+        "url": preview_media["mxc"],
+        "info": {
+            "mimetype": preview_media["mimetype"],
+            "w": preview_media["width"],
+            "h": preview_media["height"],
+        },
+    }
+
+
 async def import_note(
     request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None,
     reply_header: tuple[str, str] | None = None,
+    quote_uri: str | None = None, quote_tail: tuple[str, str] | None = None,
+    quote_social_relates_to: dict | None = None,
+    quote_preview_image: dict[str, object] | None = None, quote_preview_video: dict[str, object] | None = None,
 ) -> ImportedNote:
     """Mirror ``note`` (an already-fetched, already-type-checked Note, with
     its author already resolved/fetched too) into a Remote User Room for
@@ -2520,6 +2618,22 @@ async def import_note(
     this is the only way such a post ever gets ANY indication it's a reply
     at all, since this function itself never walks ``note.inReplyTo``.
 
+    ``quote_uri``/``quote_tail``/``quote_social_relates_to``/
+    ``quote_preview_image``/``quote_preview_video``, if given, are a
+    caller's own pre-computed ``bridge.inbox_dispatch._quoted_post_render``
+    result (plus the quote URI itself, for stripping a redundant "RT:
+    <link>"-shaped fallback tail some implementations append to their own
+    content) -- this function never extracts or resolves a quote target
+    itself, same reasoning as ``reply_header`` above: ``note`` being
+    imported here instead of through ``_handle_create``'s own top-level
+    case (an ancestor-chain root, a mention-only carve-out, a quote's own
+    quote target, ...) must never mean its own ``quoteUri`` silently goes
+    unrendered. Confirmed live 2026-11-06: a quote-post whose target wasn't
+    already tracked got imported as an ancestor-chain root with none of
+    this wired in at all, mirroring as nothing but its bare mention tag --
+    every visible trace of it being a repost/quote of something else was
+    lost.
+
     Serializes concurrent calls for the SAME ``note`` (see ``activity_lock``)
     -- two different inbound deliveries can legitimately both want to
     import the exact same post at the same time (e.g. it arrives as its
@@ -2533,12 +2647,16 @@ async def import_note(
         # Nothing to key a lock (or future dedup lookups) on regardless.
         return await _import_note_locked(
             request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter,
-            reply_header=reply_header,
+            reply_header=reply_header, quote_uri=quote_uri, quote_tail=quote_tail,
+            quote_social_relates_to=quote_social_relates_to,
+            quote_preview_image=quote_preview_image, quote_preview_video=quote_preview_video,
         )
     async with activity_lock(ap_object_id):
         return await _import_note_locked(
             request, note=note, author_actor_id=author_actor_id, author_doc=author_doc, inviter=inviter,
-            reply_header=reply_header,
+            reply_header=reply_header, quote_uri=quote_uri, quote_tail=quote_tail,
+            quote_social_relates_to=quote_social_relates_to,
+            quote_preview_image=quote_preview_image, quote_preview_video=quote_preview_video,
         )
 
 
@@ -2823,6 +2941,9 @@ async def ensure_remote_actor_room(
 async def _import_note_locked(
     request: Request, *, note: dict, author_actor_id: str, author_doc: dict, inviter: str | None = None,
     reply_header: tuple[str, str] | None = None,
+    quote_uri: str | None = None, quote_tail: tuple[str, str] | None = None,
+    quote_social_relates_to: dict | None = None,
+    quote_preview_image: dict[str, object] | None = None, quote_preview_video: dict[str, object] | None = None,
 ) -> ImportedNote:
     """``import_note``'s actual body, run while holding that post's own
     ``activity_lock`` -- see ``import_note``'s own docstring for why."""
@@ -2889,10 +3010,41 @@ async def _import_note_locked(
         safe_html = await inline_custom_emoji(
             request.app.state.http_client, synapse, repository, safe_html, note.get("tag") or [], subject_id=ap_object_id
         )
+    if quote_uri:
+        # Drop a quote-post's own "RT: <link>"-shaped plaintext fallback
+        # (some implementations append one for receivers that don't
+        # understand quoteUri/quoteUrl) before it ends up duplicated
+        # alongside the quote_tail this function's caller already rendered
+        # from the SAME quote_uri -- see import_note's own docstring for
+        # why this function, not _handle_create, is the one handling it
+        # here.
+        plain = strip_quote_tail(plain, quote_uri)
+        if safe_html:
+            safe_html = strip_quote_tail_html(safe_html, quote_uri)
     message_content: dict = {"msgtype": "m.text", "body": plain}
     if safe_html and safe_html != plain:
         message_content["format"] = "org.matrix.custom.html"
         message_content["formatted_body"] = safe_html
+    if quote_tail is not None:
+        quote_plain_tail, quote_html_tail = quote_tail
+        if quote_plain_tail:
+            message_content["body"] += f"\n\n{quote_plain_tail}"
+        if quote_html_tail:
+            message_content["format"] = "org.matrix.custom.html"
+            message_content["formatted_body"] = (
+                message_content.get("formatted_body") or html.escape(plain)
+            ) + quote_html_tail
+    if (
+        request.app.state.config.bridge.set_msc4501_relates_to
+        and quote_social_relates_to is not None
+    ):
+        message_content[SOCIAL_RELATES_TO_FIELD] = quote_social_relates_to
+        # Same reasoning/omission-on-empty as _handle_create's identical
+        # assignment -- see SOCIAL_BODY_FIELD's own docstring.
+        if plain:
+            message_content[SOCIAL_BODY_FIELD] = plain
+            if "formatted_body" in message_content:
+                message_content[SOCIAL_FORMATTED_BODY_FIELD] = safe_html or html.escape(plain)
     if mentions.mentioned_locals:
         # A pill alone (the <a href="matrix.to/..."> above) only makes the
         # mention a clickable link -- an intentional mention (MSC3952) is
@@ -2917,6 +3069,19 @@ async def _import_note_locked(
     # ActivityPub post always maps to exactly one Matrix event now.
     attachments = extract_attachments(note)
     message_content, first_attachment_mxc = await attach_media_to_content(request, message_content, attachments)
+    if quote_preview_image is not None or quote_preview_video is not None:
+        # The quoted post's own preview media, promoted to this event's
+        # real attachment slot IF the quoter didn't already use it for
+        # their own (see merge_quote_preview_attachment's docstring) --
+        # must run after attach_media_to_content above, which is what
+        # actually decides whether the quoter's own attachment took that
+        # slot already.
+        message_content = merge_quote_preview_attachment(
+            message_content, preview_image=quote_preview_image, preview_video=quote_preview_video,
+        )
+        merged_url = message_content.get("url")
+        if isinstance(merged_url, str) and merged_url.startswith("mxc://"):
+            first_attachment_mxc = merged_url
     first_attachment_info = message_content.get("info") or {}
     first_attachment_width = first_attachment_info.get("w")
     first_attachment_height = first_attachment_info.get("h")
