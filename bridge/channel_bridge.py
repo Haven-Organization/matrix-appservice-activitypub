@@ -57,7 +57,7 @@ from bridge.activitypub.delivery import DeliveryError, deliver_activity
 from bridge.activitypub.models import Activity, Note
 from bridge.activitypub.nodeinfo import remote_software_name
 from bridge.activitypub.remote_actor import RemoteActorFetchError, fetch_actor
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_to_matrix_message
+from bridge.activitypub.sanitize import matrix_body_to_note_html, strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
 from bridge.note_mirroring import resolve_and_invite_ghost, resolve_event_ts, resolve_mention_pills
 from bridge.repository import ChannelRoom, FederatedEvent
@@ -481,7 +481,7 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
     # changes.
     channel_domain = urlsplit(channel_room.channel_actor_id).hostname or ""
     software = await remote_software_name(request, channel_domain) if channel_domain else None
-    content_html = body if software == "shoot" else plain_text_to_note_html(body)
+    content_html = body if software == "shoot" else matrix_body_to_note_html(body, content.get("formatted_body"))
 
     note = Note(
         id=note_id,

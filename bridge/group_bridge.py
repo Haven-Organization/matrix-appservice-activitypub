@@ -66,7 +66,7 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_to_matrix_message
+from bridge.activitypub.sanitize import matrix_body_to_note_html, plain_text_to_note_html, strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url, username_from_actor_url
 from bridge.crypto import generate_keypair
 from bridge.identity_resolution import resolve_acting_identity
@@ -446,7 +446,8 @@ async def maybe_distribute_group_room_message(request: Request, event: dict) -> 
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     note = Note(
-        id=note_id, attributed_to=own_actor_id, content=plain_text_to_note_html(body), published=published,
+        id=note_id, attributed_to=own_actor_id,
+        content=matrix_body_to_note_html(body, content.get("formatted_body")), published=published,
         to=[AS_PUBLIC], cc=[group_room.group_actor_id, followers_url(base, actor_record.username)],
         in_reply_to=parent.ap_object_id if is_reply else None,
         audience=group_room.group_actor_id, tag=[{"type": "Mention", "href": group_room.group_actor_id}],
@@ -815,7 +816,7 @@ async def maybe_distribute_group_message(request: Request, event: dict) -> bool:
 
     obj_dict: dict = {
         "id": own_object_id, "type": "Note", "attributedTo": own_actor_id,
-        "content": plain_text_to_note_html(body) if body else "", "mediaType": "text/html",
+        "content": matrix_body_to_note_html(body, content.get("formatted_body")) if body else "", "mediaType": "text/html",
         "published": published, "to": [AS_PUBLIC], "cc": [group_actor_id], "audience": group_actor_id,
         "tag": [{"type": "Mention", "href": group_actor_id}],
     }

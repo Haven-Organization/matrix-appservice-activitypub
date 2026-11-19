@@ -52,7 +52,7 @@ from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.nodeinfo import remote_software_name
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
+from bridge.activitypub.sanitize import matrix_body_to_note_html, strip_reply_fallback, strip_reply_fallback_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, username_from_actor_url
 from bridge.commands import (
     is_foreign_bot_command,
@@ -214,7 +214,7 @@ async def _send_outbound_dm(
     public case's ``to``/``cc`` addressing and recipient resolution are
     different enough that sharing would need more branching than it'd save.
 
-    ``content``'s HTML wrapping (``plain_text_to_note_html`` -- every other
+    ``content``'s HTML wrapping (``matrix_body_to_note_html`` -- every other
     outbound Note, DM or public, gets this) assumes a Mastodon-family
     recipient that renders ``content`` as sanitized HTML. Confirmed live
     2026-07-14: Shoot (github.com/MaddyUnderStars/shoot) stores AND
@@ -284,7 +284,10 @@ async def _send_outbound_dm(
     software = await remote_software_name(request, recipient_domain) if recipient_domain else None
     # See this function's own docstring -- Shoot renders `content` completely
     # raw, so the usual HTML wrapping shows up as literal tag text there.
-    content_html = body if software == "shoot" else plain_text_to_note_html(body, mention_links)
+    formatted_body = strip_reply_fallback_html(content.get("formatted_body") or "")
+    content_html = (
+        body if software == "shoot" else matrix_body_to_note_html(body, formatted_body, mention_links)
+    )
 
     note = Note(
         id=note_id,
@@ -714,10 +717,11 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
     mention_cc += participant_cc
 
     # Real fediverse clients write a mention's <a> into their post's HTML
-    # themselves; ours builds content from a plain Matrix body instead, so
-    # it has to add that anchor itself -- see plain_text_to_note_html.
+    # themselves; a hand-typed plain mention needs its own anchor added
+    # here too -- see bridge.activitypub.sanitize.matrix_body_to_note_html.
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
     emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
+    formatted_body = strip_reply_fallback_html(content.get("formatted_body") or "")
 
     note_id = f"{actor_url(base, actor_record.username)}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -725,7 +729,7 @@ async def maybe_federate_reply(request: Request, event: dict) -> bool:
     note = Note(
         id=note_id,
         attributed_to=actor_url(base, actor_record.username),
-        content=plain_text_to_note_html(body, mention_links) if body else "",
+        content=matrix_body_to_note_html(body, formatted_body, mention_links) if body else "",
         published=published,
         to=[AS_PUBLIC],
         # Deduped: someone can arrive here twice over -- e.g. as the reply

@@ -63,7 +63,13 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback, strip_to_matrix_message
+from bridge.activitypub.sanitize import (
+    matrix_body_to_note_html,
+    plain_text_to_note_html,
+    strip_reply_fallback,
+    strip_reply_fallback_html,
+    strip_to_matrix_message,
+)
 from bridge.activitypub.urls import (
     actor_url,
     followers_url,
@@ -1023,7 +1029,7 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
     note_id = f"{own_actor_id}/notes/{uuid.uuid4().hex}"
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    content_html = plain_text_to_note_html(body)
+    content_html = matrix_body_to_note_html(body, content.get("formatted_body"))
     note = Note(
         id=note_id, attributed_to=own_actor_id, content=content_html, published=published,
         to=[AS_PUBLIC], cc=[community_room.community_actor_id, followers_url(base, actor_record.username)],
@@ -1578,7 +1584,8 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
         if not body:
             return False
         note = Note(
-            id=own_object_id, attributed_to=own_actor_id, content=plain_text_to_note_html(body), published=published,
+            id=own_object_id, attributed_to=own_actor_id,
+            content=matrix_body_to_note_html(body, content.get("formatted_body")), published=published,
             to=[AS_PUBLIC], cc=[community_actor_id], in_reply_to=parent.ap_object_id,
             audience=community_actor_id, tag=[{"type": "Mention", "href": community_actor_id}],
         )
@@ -1602,6 +1609,11 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
                 "the title, a blank line, then the body.",
             )
             return True
+        # Plain-only, deliberately: `body` here is just the half of the
+        # message AFTER the title split above, and there's no HTML-side
+        # equivalent of that split -- the full formatted_body still has
+        # the title's own line/markup in it too, which would show up
+        # duplicated inside the content if used here.
         plain_text_body = plain_text_to_note_html(body) if body else ""
         obj_dict = {
             "id": own_object_id, "type": "Page", "attributedTo": own_actor_id, "name": title,
@@ -1715,6 +1727,9 @@ async def maybe_federate_owned_community_edit(
         title, body = _title_and_body_from_message(raw_body)
         if not title:
             return True  # can't rebuild a titleless Page -- leave the old title/body in place
+        # Plain-only, deliberately -- see maybe_distribute_owned_community_message's
+        # identical comment: `body` is only the half after the title split,
+        # with no HTML-side equivalent of that split.
         obj_dict = {
             "id": federated.ap_object_id, "type": "Page", "attributedTo": own_actor_id, "name": title,
             "content": plain_text_to_note_html(body) if body else "", "mediaType": "text/html",
@@ -1734,7 +1749,10 @@ async def maybe_federate_owned_community_edit(
         )
         note = Note(
             id=federated.ap_object_id, attributed_to=own_actor_id,
-            content=plain_text_to_note_html(raw_body) if raw_body else "", published=published, updated=updated,
+            content=matrix_body_to_note_html(
+                raw_body, strip_reply_fallback_html(new_content.get("formatted_body") or "")
+            ) if raw_body else "",
+            published=published, updated=updated,
             to=[AS_PUBLIC], cc=[community_actor_id], in_reply_to=in_reply_to, audience=community_actor_id,
             tag=[{"type": "Mention", "href": community_actor_id}],
         )

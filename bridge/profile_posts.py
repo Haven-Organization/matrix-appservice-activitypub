@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import logging
 import re
 import uuid
@@ -43,7 +44,7 @@ import httpx
 from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
-from bridge.activitypub.sanitize import plain_text_to_note_html
+from bridge.activitypub.sanitize import matrix_body_to_note_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import (
     is_foreign_bot_command,
@@ -664,6 +665,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         mention_tags += mxid_tags
         mention_cc += mxid_cc
 
+    formatted_body = content.get("formatted_body")
     if actor_record is not room_owner:
         # Guest post: tack the room owner's mention onto the front (unless
         # the guest already mentioned them themselves -- no double-tagging,
@@ -674,12 +676,17 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
         already_mentioned = owner_actor_id in {tag.get("href") for tag in mention_tags} or owner_handle in body
         if not already_mentioned:
             body = f"{owner_handle} {body}".strip()
+            # formatted_body owes the same tack-on, or it'd build content
+            # missing the owner mention entirely once matrix_body_to_note_html
+            # prefers it over the (correctly updated) plain body below.
+            if isinstance(formatted_body, str) and formatted_body.strip():
+                formatted_body = f"{html.escape(owner_handle)} {formatted_body}"
             mention_tags.insert(0, {"type": "Mention", "href": owner_actor_id, "name": owner_handle})
             mention_cc.insert(0, owner_actor_id)
 
     # Real fediverse clients write a mention's <a> into their post's HTML
-    # themselves; ours builds content from a plain Matrix body instead, so
-    # it has to add that anchor itself -- see plain_text_to_note_html.
+    # themselves; a hand-typed plain mention needs its own anchor added
+    # here too -- see bridge.activitypub.sanitize.matrix_body_to_note_html.
     mention_links = {tag["name"]: tag["href"] for tag in mention_tags if tag.get("name") and tag.get("href")}
     emoji_tags = await extract_outbound_emoji_tags(repository, base, content.get("formatted_body"))
 
@@ -689,7 +696,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
     note = Note(
         id=note_id,
         attributed_to=actor_url(base, actor_record.username),
-        content=plain_text_to_note_html(body, mention_links) if body else "",
+        content=matrix_body_to_note_html(body, formatted_body, mention_links) if body else "",
         published=published,
         to=[AS_PUBLIC],
         cc=[followers_url(base, actor_record.username), *mention_cc],

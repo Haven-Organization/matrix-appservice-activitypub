@@ -30,6 +30,7 @@ that's built, an edit of a DM simply stays Matrix-only (the old behavior).
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from fastapi import Request
 
 from bridge.activitypub.models import AS_PUBLIC, Activity, Note
-from bridge.activitypub.sanitize import plain_text_to_note_html, strip_reply_fallback
+from bridge.activitypub.sanitize import matrix_body_to_note_html, strip_reply_fallback, strip_reply_fallback_html
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id
 from bridge.custom_emoji import extract_outbound_emoji_tags
 from bridge.media import build_ap_attachment, media_caption, resolve_attachment_or_request_confirmation
@@ -137,6 +138,8 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         mention_tags += mxid_tags
         mention_cc += mxid_cc
 
+    formatted_body = strip_reply_fallback_html(new_content.get("formatted_body") or "")
+
     # A guest post's owner-mention tack (see bridge.profile_posts) is part
     # of the delivered content, so the edited content owes it too -- same
     # rule as the serving routes' _guest_post_owner_mention.
@@ -146,6 +149,8 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
         owner_actor_id = actor_url(base, room_owner.username)
         if owner_actor_id not in {tag.get("href") for tag in mention_tags} and owner_handle not in body:
             body = f"{owner_handle} {body}".strip()
+            if formatted_body:
+                formatted_body = f"{html.escape(owner_handle)} {formatted_body}"
             mention_tags.insert(0, {"type": "Mention", "href": owner_actor_id, "name": owner_handle})
             mention_cc.insert(0, owner_actor_id)
 
@@ -180,7 +185,7 @@ async def maybe_federate_edit(request: Request, event: dict) -> bool:
     note = Note(
         id=federated.ap_object_id,  # SAME id -- this is an edit, not a new post
         attributed_to=own_actor_id,
-        content=plain_text_to_note_html(body, mention_links) if body else "",
+        content=matrix_body_to_note_html(body, formatted_body, mention_links) if body else "",
         published=published or updated,
         updated=updated,
         to=[AS_PUBLIC],

@@ -336,3 +336,168 @@ _REPLY_FALLBACK_RE = re.compile(r"^(?:>.*\n)+\n?")
 def strip_reply_fallback(body: str) -> str:
     """Remove the leading rich-reply quote block Matrix clients prepend to reply bodies."""
     return _REPLY_FALLBACK_RE.sub("", body, count=1).strip()
+
+
+_REPLY_FALLBACK_HTML_RE = re.compile(r"^\s*<mx-reply>.*?</mx-reply>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reply_fallback_html(formatted_body: str) -> str:
+    """The ``formatted_body`` counterpart of ``strip_reply_fallback`` --
+    Matrix clients wrap the same leading rich-reply quote block in a
+    ``<mx-reply>...</mx-reply>`` element on the HTML side instead of the
+    plain side's ``>``-quoted lines. Must run before
+    ``matrix_formatted_body_to_note_html``/``matrix_body_to_note_html`` on
+    any reply's ``formatted_body``, or the quoted parent gets rendered a
+    second time (once by this bridge's own real ``inReplyTo``/thread
+    handling, once more baked into the reply's own content)."""
+    return _REPLY_FALLBACK_HTML_RE.sub("", formatted_body, count=1).strip()
+
+
+_MATRIX_TO_PREFIXES = ("https://matrix.to/", "http://matrix.to/")
+_OUTBOUND_BLOCK_START_RE = re.compile(r"^\s*<(p|ul|ol|blockquote|pre)\b", re.IGNORECASE)
+
+
+class _OutboundHtmlParser(HTMLParser):
+    """Parses a Matrix event's ``formatted_body`` for use as an outbound AP
+    Note's ``content`` -- the inverse direction of ``_SanitizingParser``
+    (which sanitizes an INBOUND Note's content for Matrix). Reuses the
+    exact same tag/attribute allow-list (``ul``/``ol``/``li`` included --
+    see ``_ALLOWED_TAGS`` above), so a Matrix-side bulleted/numbered list,
+    bold, link, etc. survives onto the AP side as real markup instead of
+    being flattened to plain escaped text one line at a time the way
+    ``plain_text_to_note_html`` (the fallback for a message with no
+    ``formatted_body`` at all, or whose HTML sanitizes down to nothing)
+    always has.
+
+    A ``matrix.to`` pill anchor (Matrix's own internal link scheme for a
+    user/room mention) is unwrapped to its plain inner text rather than
+    kept as a link -- a ``matrix.to`` URL is meaningless to anyone outside
+    Matrix. This means a real pill mention loses its clickable link
+    styling specifically when the SAME message also has other HTML
+    formatting worth preserving (a list, bold, ...): it still renders as
+    plain visible text, and the ``Mention`` tag/``cc`` that actually
+    notifies the account is computed independently of this content HTML
+    and is completely unaffected -- only the inline clickable-link styling
+    is lost here, a deliberate, narrow, purely cosmetic gap, rather than
+    threading mxid-aware pill resolution through every
+    ``bridge.mentions.resolve_pill_mentions`` call site for it."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.html_parts: list[str] = []
+        self._anchor_href: str | None = None
+        self._anchor_buffer: list[str] = []
+
+    def _emit(self, s: str) -> None:
+        (self._anchor_buffer if self._anchor_href is not None else self.html_parts).append(s)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in _ALLOWED_TAGS:
+            return
+        if tag == "br":
+            self._emit("<br>")
+            return
+        if tag == "a":
+            if self._anchor_href is not None:
+                return  # a nested <a> isn't valid HTML; ignore rather than corrupt the buffer
+            allowed_attrs = _ALLOWED_ATTRS.get(tag, set())
+            kept = {
+                name: value
+                for name, value in attrs
+                if name in allowed_attrs and value and value.startswith(_ALLOWED_URL_SCHEMES)
+            }
+            self._anchor_href = kept.get("href") or ""
+            self._anchor_buffer = []
+            return
+        self._emit(f"<{tag}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag not in _ALLOWED_TAGS:
+            return
+        if tag == "a":
+            if self._anchor_href is None:
+                return  # a stray </a> with no matching open
+            inner_html = "".join(self._anchor_buffer)
+            href = self._anchor_href
+            self._anchor_href = None
+            if href and not href.startswith(_MATRIX_TO_PREFIXES):
+                self.html_parts.append(f'<a href="{html.escape(href, quote=True)}">{inner_html}</a>')
+            else:
+                self.html_parts.append(inner_html)
+            return
+        self._emit(f"</{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_data(self, data: str) -> None:
+        self._emit(html.escape(data))
+
+    def flush_unclosed_anchor(self) -> None:
+        """See ``_SanitizingParser``'s identical method -- same reasoning."""
+        if self._anchor_href is None:
+            return
+        self.html_parts.append("".join(self._anchor_buffer))
+        self._anchor_href = None
+
+
+def matrix_formatted_body_to_note_html(formatted_body: str, mention_links: dict[str, str] | None = None) -> str:
+    """Sanitize a Matrix event's ``formatted_body`` for use as an outbound
+    AP Note's ``content``, preserving real markup (lists, bold, links...)
+    -- see ``_OutboundHtmlParser``. Returns ``""`` if it sanitizes down to
+    nothing, so the caller (``matrix_body_to_note_html``) knows to fall
+    back to the plain-``body``-only path instead.
+
+    ``mention_links`` is applied exactly like ``plain_text_to_note_html``'s
+    own (a literal substring replace of each resolved handle's text with a
+    real anchor) -- it still finds and links a hand-typed ``@user@host``
+    mention, which reads identically in both ``body`` and
+    ``formatted_body``; it does NOT relink a real pill mention (see the
+    class docstring above for why that's an accepted, cosmetic-only gap).
+    """
+    parser = _OutboundHtmlParser()
+    parser.feed(formatted_body)
+    parser.close()
+    parser.flush_unclosed_anchor()
+    html_out = "".join(parser.html_parts).strip()
+    if not html_out:
+        return ""
+    for handle, href in (mention_links or {}).items():
+        escaped_handle = html.escape(handle)
+        if escaped_handle not in html_out:
+            continue
+        anchor = (
+            f'<a href="{html.escape(href, quote=True)}" class="mention" '
+            f'rel="nofollow noopener noreferrer" target="_blank">{escaped_handle}</a>'
+        )
+        html_out = html_out.replace(escaped_handle, anchor)
+    if not _OUTBOUND_BLOCK_START_RE.match(html_out):
+        html_out = f"<p>{html_out}</p>"
+    return html_out
+
+
+def matrix_body_to_note_html(
+    body: str, formatted_body: str | None = None, mention_links: dict[str, str] | None = None,
+) -> str:
+    """Build an outbound AP Note's ``content`` from a Matrix message: uses
+    ``formatted_body``'s real HTML (preserving a bulleted/numbered list,
+    bold, a link, ...) when there is one and it actually sanitizes down to
+    something, else falls back to ``plain_text_to_note_html`` -- the
+    plain-``body``-only path every outbound Note built before this one
+    used exclusively, which flattens a list to unindented ``"- item"``
+    lines with no list markup at all (the reported gap this fixes).
+
+    Callers whose ``body`` is a REPLY's text must pass a ``formatted_body``
+    already run through ``strip_reply_fallback_html`` first, same as
+    ``body`` itself is expected to already be ``strip_reply_fallback``ed --
+    otherwise the quoted parent renders a second time, baked into the
+    reply's own content. Callers that further transform ``body`` in a way
+    with no HTML equivalent (e.g. ``bridge.lemmy_bridge._title_and_body_
+    from_message``'s plain-text title/body split) must NOT pass
+    ``formatted_body`` through here at all -- it still contains the title
+    text too, which would then show up duplicated inside the content."""
+    if isinstance(formatted_body, str) and formatted_body.strip():
+        html_out = matrix_formatted_body_to_note_html(formatted_body, mention_links)
+        if html_out:
+            return html_out
+    return plain_text_to_note_html(body, mention_links)

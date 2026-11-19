@@ -56,7 +56,7 @@ from bridge.activitypub.nodeinfo import (
     build_nodeinfo_discovery_document,
     build_nodeinfo_document,
 )
-from bridge.activitypub.sanitize import plain_text_to_note_html
+from bridge.activitypub.sanitize import matrix_body_to_note_html, plain_text_to_note_html
 from bridge.activitypub.signatures import SignatureError, verify_incoming_request
 from bridge.custom_emoji import apply_resolved_emoji
 from bridge.identity_settings import get_effective_setting
@@ -782,7 +782,8 @@ def _reconstruct_note_body(
                 content_html = build_sibling_reply_note_content(body, external_url, handle)
                 return body, content_html, None
     body = media_caption(event_content) if attachment is not None else (event_content.get("body") or "").strip()
-    return body, (plain_text_to_note_html(body) if body else ""), None
+    content_html = matrix_body_to_note_html(body, event_content.get("formatted_body")) if body else ""
+    return body, content_html, None
 
 
 def _effective_event_content(matrix_event: dict) -> dict:
@@ -1150,7 +1151,10 @@ async def _build_post_view(
         owner_handle, owner_actor_id = guest_mention
         if owner_handle not in body:
             body = f"{owner_handle} {body}".strip()
-            content_html = plain_text_to_note_html(body, {owner_handle: owner_actor_id})
+            formatted_body = event_content.get("formatted_body")
+            if isinstance(formatted_body, str) and formatted_body.strip():
+                formatted_body = f"{html.escape(owner_handle)} {formatted_body}"
+            content_html = matrix_body_to_note_html(body, formatted_body, {owner_handle: owner_actor_id})
     if not body and attachment is None:
         return None
     content_html = await _linkify_post_mentions(request, content_html, event_content)
@@ -1443,7 +1447,7 @@ async def _reconstruct_note_from_matrix_event(
             request, body=body, event_content=raw_event_content,
             in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
         )
-        content_html = plain_text_to_note_html(body, mention_links)
+        content_html = matrix_body_to_note_html(body, event_content.get("formatted_body"), mention_links)
 
     origin_server_ts = matrix_event.get("origin_server_ts") or 0
     return Note(
@@ -1820,7 +1824,7 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
             request, body=_body, event_content=raw_event_content,
             in_reply_to=in_reply_to, sender_actor_id=actor_url(base, username),
         )
-        content_html = plain_text_to_note_html(_body, mention_links)
+        content_html = matrix_body_to_note_html(_body, event_content.get("formatted_body"), mention_links)
 
     guest_mention = await _guest_post_owner_mention(request, federated)
     if guest_mention is not None:
@@ -1828,7 +1832,10 @@ async def get_note(request: Request, username: str, note_id: str) -> Response:
         tacked_body = _body if owner_handle in _body else f"{owner_handle} {_body}".strip()
         if tacked_body:
             mention_links = {**mention_links, owner_handle: owner_actor_id}
-            content_html = plain_text_to_note_html(tacked_body, mention_links)
+            formatted_body = event_content.get("formatted_body")
+            if owner_handle not in _body and isinstance(formatted_body, str) and formatted_body.strip():
+                formatted_body = f"{html.escape(owner_handle)} {formatted_body}"
+            content_html = matrix_body_to_note_html(tacked_body, formatted_body, mention_links)
         note_tags.append({"type": "Mention", "href": owner_actor_id, "name": owner_handle})
 
     note = Note(
@@ -1888,6 +1895,10 @@ async def _reconstruct_lemmy_page(
         "type": "Page",
         "attributedTo": federated.author_actor_id,
         "name": title,
+        # Plain-only, deliberately -- see bridge.lemmy_bridge.
+        # maybe_distribute_owned_community_message's identical comment:
+        # `body` is only the half after the title split above, with no
+        # HTML-side equivalent of that split.
         "content": plain_text_to_note_html(body) if body else "",
         "mediaType": "text/html",
         "published": _matrix_ts_to_iso(matrix_event.get("origin_server_ts")),
@@ -2024,7 +2035,8 @@ async def _fetch_group_outbox_items(request: Request, *, group: GroupRecord, bas
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         note_dict = {
             "id": federated.ap_object_id, "type": "Note", "attributedTo": federated.author_actor_id,
-            "content": plain_text_to_note_html(body), "mediaType": "text/html", "published": published,
+            "content": matrix_body_to_note_html(body, content.get("formatted_body")),
+            "mediaType": "text/html", "published": published,
             "to": [AS_PUBLIC], "cc": [group_actor_id], "audience": group_actor_id,
         }
         create_activity = Activity(
