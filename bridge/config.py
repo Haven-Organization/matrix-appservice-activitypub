@@ -456,8 +456,12 @@ class AppserviceSection:
     as_token: str
     user_prefix: str = "ap_"
     bot_localpart: str = "bridgebot"
-    # Optional display name / avatar for the bot's own Matrix profile, applied
-    # (idempotently) on every startup. Leave unset to not manage either.
+    # Optional display name / avatar for the bot's own Matrix profile,
+    # applied idempotently at startup and again immediately whenever either
+    # changes -- including live via the widget's Admin -> Settings page/API
+    # (see bridge.bridge_settings), not just a config.yaml edit + restart.
+    # Leave unset to not manage either; unsetting never clears an existing
+    # value on the bot's profile, it just stops updating it.
     bot_display_name: str | None = None
     # An mxc:// URI -- upload an image with any Matrix client (or reuse one
     # already on your server) and use its mxc:// URI here.

@@ -95,6 +95,43 @@ async def ensure_ghost_user(
     return mxid
 
 
+async def sync_bot_profile(
+    synapse: SynapseClient, *, server_name: str, localpart: str,
+    display_name: str | None, avatar_mxc: str | None,
+) -> None:
+    """Push the bridge bot's own display name/avatar to its Matrix profile,
+    if either differs from what's there now. ``None`` for either field
+    means "don't manage this one" -- it's left exactly as it is, never
+    cleared (matches ``AppserviceSection.bot_display_name``/
+    ``bot_avatar_mxc``'s own documented semantics).
+
+    Compare-first, not just a bare call to ``ensure_ghost_user``: a
+    redundant PUT makes Synapse schedule an ``update_join_states`` task
+    rewriting the bot's member event in every room it's in, and an avatar
+    PUT right after a displayname one cancels that still-running task,
+    tripping a real Synapse double-pop bug (a ``KeyError`` traceback,
+    diagnosed live 2026-07-04). Originally only ever called once at
+    startup for exactly that reason, but the compare-first guard itself
+    has no startup-only state -- safe to call again any time either field
+    changes live (see ``bridge.bridge_settings``), not just once per
+    process lifetime.
+    """
+    if not display_name and not avatar_mxc:
+        return
+    mxid = f"@{localpart}:{server_name}"
+    try:
+        bot_profile = await synapse.get_profile(mxid)
+    except SynapseError:
+        bot_profile = {}
+    if (display_name and bot_profile.get("displayname") != display_name) or (
+        avatar_mxc and bot_profile.get("avatar_url") != avatar_mxc
+    ):
+        await ensure_ghost_user(
+            synapse, server_name=server_name, localpart=localpart,
+            display_name=display_name, avatar_mxc=avatar_mxc,
+        )
+
+
 async def _sync_room_avatars(
     synapse: SynapseClient, repository: ActorRepository, *, actor_id: str, mxid: str, avatar_mxc: str
 ) -> None:

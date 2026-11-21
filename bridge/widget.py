@@ -37,6 +37,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, media_url
 from bridge.bridge_settings import SettingError, apply_override, clear_override, effective_config, known_settings, value_of
+from bridge.ghosts import sync_bot_profile
 from bridge.commands import (
     _ALLOW_RULE_TYPES,
     _bot_mxid,
@@ -712,13 +713,23 @@ async def widget_admin_rooms(request: Request) -> JSONResponse:
 
 async def _refresh_effective_config(request: Request) -> None:
     """Rebuild ``app.state.config`` from ``app.state.base_config`` plus
-    whatever's now stored, after a settings mutation. Also re-applies
-    ``bridge.command_prefix`` (a module-level global in
-    ``bridge.commands`` that otherwise only ever takes effect at
-    startup, not just re-read live off ``app.state.config`` like
-    everything else)."""
+    whatever's now stored, after a settings mutation. Also re-applies the
+    handful of settings that otherwise only ever take effect at startup
+    (not just re-read live off ``app.state.config`` like everything
+    else): ``bridge.command_prefix`` (a module-level global in
+    ``bridge.commands``) and the bot's own Matrix profile
+    (``appservice.bot_display_name``/``bot_avatar_mxc``, see
+    ``bridge.ghosts.sync_bot_profile`` -- same call ``bridge.server``'s
+    own startup makes, safe to repeat any time either field changes)."""
     config = request.app.state.config = await effective_config(request.app.state.base_config, request.app.state.repository)
     configure_command_prefix(config.bridge.command_prefix)
+    await sync_bot_profile(
+        request.app.state.synapse,
+        server_name=config.synapse.server_name,
+        localpart=config.appservice.bot_localpart,
+        display_name=config.appservice.bot_display_name,
+        avatar_mxc=config.appservice.bot_avatar_mxc,
+    )
 
 
 @router.get("/widget/api/admin/settings")

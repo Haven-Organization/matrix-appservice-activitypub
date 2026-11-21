@@ -27,7 +27,7 @@ from bridge.appservice_routes import router as appservice_router
 from bridge.bridge_settings import effective_config
 from bridge.commands import configure_command_prefix
 from bridge.config import BridgeConfig, ConfigError
-from bridge.ghosts import ensure_ghost_user
+from bridge.ghosts import sync_bot_profile
 from bridge.outage_recovery import outage_recovery_loop
 from bridge.repository import ActorRepository
 from bridge.service_actor import load_or_create_service_actor
@@ -187,33 +187,17 @@ def create_app(
         )
         await _wait_for_synapse_ready(app.state.synapse, config.synapse.base_url)
 
-        if config.appservice.bot_display_name or config.appservice.bot_avatar_mxc:
-            # Compare-first: only push the bot's profile when it actually
-            # differs from config. ensure_ghost_user PUTs unconditionally,
-            # and each PUT makes Synapse schedule an update_join_states
-            # task rewriting the bot's member event in EVERY room it's in
-            # (hundreds here) -- the avatar PUT then cancels the still-
-            # running displayname task, which trips Synapse's double-pop
-            # bug and logs a "KeyError: '<task id>'" traceback on every
-            # single bridge restart (diagnosed live, 2026-07-04). A normal
-            # restart changes nothing, so it should touch nothing.
-            bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
-            try:
-                bot_profile = await app.state.synapse.get_profile(bot_mxid)
-            except SynapseError:
-                bot_profile = {}
-            desired_name = config.appservice.bot_display_name
-            desired_avatar = config.appservice.bot_avatar_mxc
-            if (desired_name and bot_profile.get("displayname") != desired_name) or (
-                desired_avatar and bot_profile.get("avatar_url") != desired_avatar
-            ):
-                await ensure_ghost_user(
-                    app.state.synapse,
-                    server_name=config.synapse.server_name,
-                    localpart=config.appservice.bot_localpart,
-                    display_name=desired_name,
-                    avatar_mxc=desired_avatar,
-                )
+        # app.state.config here, not the raw config object -- so a stored
+        # bridge_settings override for either field (see
+        # bridge.bridge_settings) is already honored on this very first
+        # application, not just once an admin changes something later.
+        await sync_bot_profile(
+            app.state.synapse,
+            server_name=config.synapse.server_name,
+            localpart=config.appservice.bot_localpart,
+            display_name=app.state.config.appservice.bot_display_name,
+            avatar_mxc=app.state.config.appservice.bot_avatar_mxc,
+        )
 
         sync_task = asyncio.create_task(third_party_profile_sync_loop(app))
         outage_task = asyncio.create_task(outage_recovery_loop(app))

@@ -253,8 +253,8 @@ _REGISTRY: dict[str, BridgeSettingDefinition] = {
         _str_field("appservice.as_token", "appservice", "as_token", "AppService token", "The AppService registration's as_token.", editable=False, sensitive=True),
         _str_field("appservice.user_prefix", "appservice", "user_prefix", "Ghost user prefix", "Localpart prefix for every ghost this bridge registers. Set once at deployment.", editable=False),
         _str_field("appservice.bot_localpart", "appservice", "bot_localpart", "Bot localpart", "The bridge bot's own localpart. Set once at deployment.", editable=False),
-        _str_field("appservice.bot_display_name", "appservice", "bot_display_name", "Bot display name", "Display name pushed to the bot's own Matrix profile, applied only once at startup. Leave unset to not manage it.", editable=False, nullable=True),
-        _str_field("appservice.bot_avatar_mxc", "appservice", "bot_avatar_mxc", "Bot avatar", "An mxc:// URI pushed to the bot's own Matrix profile, applied only once at startup.", editable=False, nullable=True),
+        _str_field("appservice.bot_display_name", "appservice", "bot_display_name", "Bot display name", "Display name pushed to the bot's own Matrix profile. Applied immediately on change (see bridge.ghosts.sync_bot_profile), not just at startup. Leave unset to not manage it -- unsetting never clears an existing name, it just stops updating it.", nullable=True),
+        _str_field("appservice.bot_avatar_mxc", "appservice", "bot_avatar_mxc", "Bot avatar", "An mxc:// URI pushed to the bot's own Matrix profile. Same immediate-apply and \"never clears\" behavior as the display name above.", nullable=True),
         # -- storage: config.yaml-only (backend choice + connection details) --
         _str_field("storage.backend", "storage", "backend", "Storage backend", "\"sqlite\" or \"postgresql\". Set once at deployment -- switching requires a real data migration.", editable=False),
         _str_field("storage.data_dir", "storage", "data_dir", "Data directory", "Where sqlite's own data file (and other on-disk state) lives.", editable=False),

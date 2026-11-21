@@ -90,7 +90,7 @@ These are documented inline in `config.example.yaml` and only summarised here.
 | `appservice.registration_path`, `id`, `hs_token`, `as_token` | required | AppService identity and its two secrets. |
 | `appservice.user_prefix` | `ap_` | Username prefix of ghost users. Changing it later orphans existing ghosts and needs the registration file regenerated. |
 | `appservice.bot_localpart` | `bridgebot` | The bot's username. |
-| `appservice.bot_display_name` / `bot_avatar_mxc` | unset (not managed) | The bot's own profile, applied at startup. |
+| `appservice.bot_display_name` / `bot_avatar_mxc` | unset (not managed) | The bot's own profile. Also editable live, from the widget's Admin -> Settings page. |
 | `storage.backend` | `sqlite` | `sqlite` or `postgresql`. See [`storage`](#storage). |
 | `storage.data_dir` | `./data` | Where `bridge.db` (and its keys) is kept, for the `sqlite` backend. |
 | `logging.level` | `ERROR` | Log level. |
@@ -267,7 +267,7 @@ bridge:
   allow_db_setting_overrides: false
 ```
 
-A handful of settings (this one, [`bridge.admins`](#bridge-admins), [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api), connection/topology settings, secrets like the connection/signing tokens, and anything applied only once at startup) are always `config.yaml`-only and never show up as editable on the Settings page, regardless of this switch -- see that page's own documentation for the full list and why.
+A handful of settings (this one, [`bridge.admins`](#bridge-admins), [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api), connection/topology settings, and secrets like the connection/signing tokens) are always `config.yaml`-only and never show up as editable on the Settings page, regardless of this switch -- see that page's own documentation for the full list and why.
 
 ---
 
