@@ -36,10 +36,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, media_url
+from bridge.bridge_settings import SettingError, apply_override, clear_override, effective_config, known_settings, value_of
 from bridge.commands import (
     _ALLOW_RULE_TYPES,
     _bot_mxid,
     _COMMAND_PREFIX,
+    configure_command_prefix,
     _handle_allow,
     _handle_backfill,
     _handle_banner,
@@ -706,6 +708,106 @@ async def widget_admin_rooms(request: Request) -> JSONResponse:
             "room_id": m.room_id, "kind": m.kind, "maps_to": m.maps_to, "owner_matrix_id": m.owner_matrix_id,
         })
     return JSONResponse({"rooms": rooms}, headers={"Cache-Control": "no-store"})
+
+
+async def _refresh_effective_config(request: Request) -> None:
+    """Rebuild ``app.state.config`` from ``app.state.base_config`` plus
+    whatever's now stored, after a settings mutation. Also re-applies
+    ``bridge.command_prefix`` (a module-level global in
+    ``bridge.commands`` that otherwise only ever takes effect at
+    startup, not just re-read live off ``app.state.config`` like
+    everything else)."""
+    config = request.app.state.config = await effective_config(request.app.state.base_config, request.app.state.repository)
+    configure_command_prefix(config.bridge.command_prefix)
+
+
+@router.get("/widget/api/admin/settings")
+async def widget_admin_settings(request: Request) -> JSONResponse:
+    """Every registered bridge-wide setting (see ``bridge.bridge_settings``)
+    -- for the Admin page's Settings view, which doubles as live
+    documentation of every setting this bridge has, not just the ones it
+    can change from here. A ``sensitive`` setting's value is never put on
+    the wire by this route, at all, regardless of its ``editable`` state.
+    Same admin-gating pattern as ``widget_admin_grants``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view bridge settings.")
+    repository = request.app.state.repository
+    base_config = request.app.state.base_config
+    config = request.app.state.config
+    overrides_enabled = base_config.bridge.allow_db_setting_overrides
+    stored = await repository.get_bridge_settings() if overrides_enabled else {}
+
+    settings = [
+        {
+            "key": definition.key,
+            "section": definition.section,
+            "label": definition.label,
+            "description": definition.description,
+            "type": definition.value_type,
+            "enum_choices": list(definition.enum_choices) if definition.enum_choices else None,
+            # Forced false deployment-wide, regardless of the registry's own
+            # value, while the lockdown switch is off -- see overrides_enabled.
+            "editable": definition.editable and overrides_enabled,
+            "sensitive": definition.sensitive,
+            "source": "database" if definition.key in stored else "config",
+            "value": None if definition.sensitive else value_of(config, definition),
+        }
+        for definition in known_settings()
+    ]
+    return JSONResponse(
+        {"settings": settings, "overrides_enabled": overrides_enabled},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/admin/settings/{key}")
+async def widget_admin_set_setting(request: Request, key: str) -> JSONResponse:
+    """Store one setting override. Same admin-gating pattern as
+    ``widget_admin_grants``; the lockdown check below runs before any
+    key lookup, so turning ``bridge.allow_db_setting_overrides`` off
+    rejects every key uniformly, not just the ones it would otherwise
+    recognize."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can change bridge settings.")
+    if not request.app.state.base_config.bridge.allow_db_setting_overrides:
+        raise HTTPException(
+            400,
+            "Database setting overrides are disabled -- set bridge.allow_db_setting_overrides: "
+            "true in config.yaml to re-enable this.",
+        )
+    body = await request.json()
+    try:
+        value = await apply_override(request.app.state.repository, key, body.get("value"))
+    except SettingError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await _refresh_effective_config(request)
+    logger.info("Bridge setting %r set to %r by %s.", key, value, matrix_user_id)
+    return JSONResponse({"key": key, "value": value, "source": "database"})
+
+
+@router.post("/widget/api/admin/settings/{key}/reset")
+async def widget_admin_reset_setting(request: Request, key: str) -> JSONResponse:
+    """Clear one stored override, reverting ``key`` to its config.yaml
+    value. Same gating/lockdown-check pattern as ``widget_admin_set_setting``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can change bridge settings.")
+    if not request.app.state.base_config.bridge.allow_db_setting_overrides:
+        raise HTTPException(
+            400,
+            "Database setting overrides are disabled -- set bridge.allow_db_setting_overrides: "
+            "true in config.yaml to re-enable this.",
+        )
+    try:
+        await clear_override(request.app.state.repository, key)
+    except SettingError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await _refresh_effective_config(request)
+    logger.info("Bridge setting %r reset to its config.yaml value by %s.", key, matrix_user_id)
+    definition = next(d for d in known_settings() if d.key == key)
+    return JSONResponse({"key": key, "value": value_of(request.app.state.config, definition), "source": "config"})
 
 
 # -- actions -------------------------------------------------------------------
@@ -4494,9 +4596,11 @@ _WIDGET_HTML = r"""<!doctype html>
       toggleButton("\u{1F511}", "Access", adminSubTab === "access", () => { adminSubTab = "access"; render(); }),
       toggleButton("\u{1FAAA}", "Identities", adminSubTab === "identities", () => { adminSubTab = "identities"; render(); }),
       toggleButton("\u{1F6AA}", "Rooms", adminSubTab === "rooms", () => { adminSubTab = "rooms"; render(); }),
+      toggleButton("\u{2699}\u{FE0F}", "Settings", adminSubTab === "settings", () => { adminSubTab = "settings"; render(); }),
     ]));
     if (adminSubTab === "identities") renderAdminIdentitiesSubTab(app);
     else if (adminSubTab === "rooms") renderAdminRoomsSubTab(app);
+    else if (adminSubTab === "settings") renderAdminSettingsSubTab(app);
     else renderAdminAccessSubTab(app);
   }
 
@@ -4689,6 +4793,153 @@ _WIDGET_HTML = r"""<!doctype html>
       kindSelect.addEventListener("change", renderList);
       renderList();
     }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+  }
+
+  function renderAdminSettingsSubTab(app) {
+    // Every registered bridge setting, editable or not -- this page
+    // doubles as live documentation of all of them (see
+    // bridge.bridge_settings), not just the ones it can change. A
+    // sensitive setting's value never arrives in `data.settings` at all
+    // (see widget_admin_settings), so there's nothing to accidentally
+    // render here even by mistake.
+    let allItems = [];
+    const selectStyle = "font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;";
+    const filterInput = el("input", { type: "text", placeholder: "Filter by key, label, description…" });
+    const sectionSelect = el("select", { style: selectStyle }, [el("option", { value: "all", text: "All sections" })]);
+    const countLine = el("div", { class: "sub", text: "" });
+    const banner = el("div", { class: "muted", style: "display:none;margin-top:4px;" });
+    const list = el("div", { class: "list" }, [el("div", { class: "muted", text: "Loading…" })]);
+
+    function valueControl(item) {
+      if (item.sensitive) {
+        return el("div", { class: "muted", style: "font-size:12px;", text: "\u{1F512} Set in config.yaml -- not shown here." });
+      }
+      if (item.type === "bool") {
+        return el("input", Object.assign({ type: "checkbox" }, item.value ? { checked: "checked" } : {}, item.editable ? {} : { disabled: "disabled" }));
+      }
+      if (item.type === "enum") {
+        return el("select", Object.assign({ style: selectStyle }, item.editable ? {} : { disabled: "disabled" }),
+          (item.enum_choices || []).map((choice) =>
+            el("option", Object.assign({ value: choice, text: choice }, choice === item.value ? { selected: "selected" } : {}))));
+      }
+      if (item.type === "list_str") {
+        return el("textarea", Object.assign(
+          {
+            rows: "3",
+            style: "width:100%;font:inherit;font-size:13px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:var(--radius-inner);padding:8px 10px;",
+          },
+          item.editable ? {} : { disabled: "disabled" },
+          { text: (item.value || []).join("\n") },
+        ));
+      }
+      const inputType = (item.type === "int" || item.type === "float") ? "number" : "text";
+      return el("input", Object.assign(
+        { type: inputType, value: item.value === null || item.value === undefined ? "" : String(item.value) },
+        item.type === "float" ? { step: "any" } : {},
+        item.editable ? {} : { disabled: "disabled" },
+      ));
+    }
+
+    function coerceValue(item, control) {
+      if (item.type === "bool") return control.checked;
+      if (item.type === "int") {
+        const n = parseInt(control.value, 10);
+        if (Number.isNaN(n)) throw new Error("Enter a whole number.");
+        return n;
+      }
+      if (item.type === "float") {
+        const n = parseFloat(control.value);
+        if (Number.isNaN(n)) throw new Error("Enter a number.");
+        return n;
+      }
+      if (item.type === "list_str") {
+        return control.value.split("\n").map((s) => s.trim()).filter((s) => s.length);
+      }
+      return control.value;
+    }
+
+    function renderList() {
+      const q = filterInput.value.trim().toLowerCase();
+      const section = sectionSelect.value;
+      const filtered = allItems.filter((it) => {
+        if (section !== "all" && it.section !== section) return false;
+        if (!q) return true;
+        return (it.key + " " + it.label + " " + it.description).toLowerCase().indexOf(q) !== -1;
+      });
+      list.innerHTML = "";
+      countLine.textContent = filtered.length + " of " + allItems.length + " settings.";
+      if (!filtered.length) {
+        list.appendChild(el("div", { class: "muted", text: "No matching settings." }));
+        return;
+      }
+      filtered.forEach((it) => {
+        const control = valueControl(it);
+        const badges = [el("span", { class: "badge", text: it.section })];
+        if (it.sensitive) {
+          badges.push(el("span", { class: "badge", style: "background:var(--hover);color:var(--text);margin-left:4px;", text: "secret" }));
+        } else if (!it.editable) {
+          badges.push(el("span", { class: "badge", style: "background:var(--hover);color:var(--text);margin-left:4px;", text: "config.yaml only" }));
+        } else {
+          badges.push(el("span", {
+            class: "badge", style: "background:var(--hover);color:var(--text);margin-left:4px;",
+            text: it.source === "database" ? "database override" : "config.yaml",
+          }));
+        }
+
+        const actions = [];
+        if (it.editable) {
+          actions.push(primaryButton("\u{1F4BE}", "Save", (e) => {
+            let value;
+            try { value = coerceValue(it, control); } catch (err) { toast(err.message, false); return; }
+            doAction("/widget/api/admin/settings/" + encodeURIComponent(it.key), { value: value }, e.target).then(loadSettings);
+          }));
+          if (it.source === "database") {
+            actions.push(plainButton("\u{21A9}\u{FE0F}", "Reset to config.yaml value", (e) =>
+              doAction("/widget/api/admin/settings/" + encodeURIComponent(it.key) + "/reset", {}, e.target).then(loadSettings)));
+          }
+        }
+
+        list.appendChild(el("div", { class: "list-item" }, [
+          el("div", { style: "flex:1;min-width:0;" }, [
+            el("div", { style: "display:flex;align-items:center;gap:4px;flex-wrap:wrap;" }, badges.concat([
+              el("span", { style: "font-weight:600;word-break:break-all;margin-left:4px;", text: it.label }),
+            ])),
+            el("div", { class: "muted", style: "font-size:11px;margin-top:2px;word-break:break-all;font-family:monospace;", text: it.key }),
+            el("div", { class: "muted", style: "font-size:12px;margin-top:2px;", text: it.description }),
+            el("div", { style: "margin-top:6px;max-width:320px;" }, [control]),
+          ]),
+          el("div", { class: "row" }, actions),
+        ]));
+      });
+    }
+
+    function loadSettings() {
+      api("/widget/api/admin/settings").then((data) => {
+        allItems = data.settings;
+        banner.style.display = data.overrides_enabled ? "none" : "";
+        banner.textContent = data.overrides_enabled ? "" :
+          "Database setting overrides are disabled for this deployment (bridge.allow_db_setting_overrides: false) -- every setting below is config.yaml only.";
+        const sections = Array.from(new Set(allItems.map((it) => it.section))).sort();
+        sectionSelect.innerHTML = "";
+        sectionSelect.appendChild(el("option", { value: "all", text: "All sections" }));
+        sections.forEach((s) => sectionSelect.appendChild(el("option", { value: s, text: s })));
+        sectionSelect.addEventListener("change", renderList);
+        renderList();
+      }).catch(() => { list.innerHTML = ""; list.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
+    }
+
+    filterInput.addEventListener("input", renderList);
+
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Settings" }),
+      el("div", { class: "sub", text: "Every bridge setting, documented here whether or not it can be changed from this page." }),
+      banner,
+      el("div", { class: "row" }, [filterInput, sectionSelect]),
+      countLine,
+      list,
+    ]));
+
+    loadSettings();
   }
 
   // Visible text is back (the `icon` argument every call site passes is

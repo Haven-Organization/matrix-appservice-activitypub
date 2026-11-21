@@ -337,6 +337,17 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (username, key)
     )
     """,
+    # Bridge-wide behavior setting overrides (see bridge.bridge_settings).
+    # Global, not per-identity. Sparse, same convention as
+    # identity_settings above: a row only exists when its value differs
+    # from config.yaml.
+    """
+    CREATE TABLE IF NOT EXISTS bridge_settings (
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (key)
+    )
+    """,
     # Per-subject resolved custom emoji (see ActorRepository.record_resolved_emoji)
     # -- subject_id is either a post's ap_object_id (content emoji) or a
     # remote actor's own actor_id (display-name emoji). Lets a later
@@ -1222,6 +1233,22 @@ class PostgresActorRepository:
         await self._pool.execute(
             "DELETE FROM identity_settings WHERE username = $1 AND key = $2", username, key
         )
+
+    async def get_bridge_settings(self) -> dict[str, str]:
+        rows = await self._pool.fetch("SELECT key, value FROM bridge_settings")
+        return {row["key"]: row["value"] for row in rows}
+
+    async def set_bridge_setting(self, key: str, value: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO bridge_settings (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            key, value,
+        )
+
+    async def clear_bridge_setting(self, key: str) -> None:
+        await self._pool.execute("DELETE FROM bridge_settings WHERE key = $1", key)
 
     async def list_shadow_tier_actors(self) -> list[ActorRecord]:
         # Every empty-room_id actor (first- or third-party, never

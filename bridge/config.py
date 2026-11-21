@@ -263,6 +263,18 @@ class BridgeSection:
     # turning this off -- don't just assume it works the same as the
     # Synapse-backed path.
     use_synapse_admin_api: bool = True
+    # Master off-switch for the whole bridge_settings DB-override mechanism
+    # (see bridge.bridge_settings) -- most settings in this file can also be
+    # set from the widget's Admin -> Settings page, with a stored database
+    # value always taking priority over this file. On by default. Set to
+    # false to lock this deployment to config.yaml-only regardless of who
+    # later gets admin access. Existing bridge_settings rows are left
+    # untouched (not deleted) and simply ignored while this is off, so
+    # flipping it back on resumes exactly where it left off. Always read
+    # from the raw, unmerged config object (never the effective one a DB
+    # override could have touched), so a stored override can never disable
+    # this lockdown itself.
+    allow_db_setting_overrides: bool = True
     # Whether Matrix rooms can be turned into PeerTube-compatible video
     # channels at all (;create channel, ;publish, and friends). Off by
     # default: this is a real, substantial behavior change, not a purely

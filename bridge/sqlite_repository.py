@@ -304,6 +304,15 @@ CREATE TABLE IF NOT EXISTS identity_settings (
     PRIMARY KEY (username, key)
 );
 
+-- Bridge-wide behavior setting overrides (see bridge.bridge_settings).
+-- Global, not per-identity. Sparse, same convention as identity_settings
+-- above: a row only exists when its value differs from config.yaml.
+CREATE TABLE IF NOT EXISTS bridge_settings (
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (key)
+);
+
 -- Per-subject resolved custom emoji (see ActorRepository.record_resolved_emoji)
 -- -- subject_id is either a post's ap_object_id (content emoji) or a remote
 -- actor's own actor_id (display-name emoji). Lets a later re-render show
@@ -1566,6 +1575,33 @@ class SqliteActorRepository:
 
     async def clear_identity_setting(self, username: str, key: str) -> None:
         await self._run(self._clear_identity_setting, username, key)
+
+    def _get_bridge_settings(self) -> dict[str, str]:
+        rows = self._conn.execute("SELECT key, value FROM bridge_settings").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    async def get_bridge_settings(self) -> dict[str, str]:
+        return await self._run(self._get_bridge_settings)
+
+    def _set_bridge_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO bridge_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        self._conn.commit()
+
+    async def set_bridge_setting(self, key: str, value: str) -> None:
+        await self._run(self._set_bridge_setting, key, value)
+
+    def _clear_bridge_setting(self, key: str) -> None:
+        self._conn.execute("DELETE FROM bridge_settings WHERE key = ?", (key,))
+        self._conn.commit()
+
+    async def clear_bridge_setting(self, key: str) -> None:
+        await self._run(self._clear_bridge_setting, key)
 
     def _resolve_third_party_tier(self, mxid: str, homeserver: str, room_id: str = "") -> str | None:
         row = self._conn.execute(

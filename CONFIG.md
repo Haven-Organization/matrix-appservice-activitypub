@@ -34,6 +34,8 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
     - [Admins (`bridge.admins`)](#bridge-admins)
     - [Use Synapse Admin API (`bridge.use_synapse_admin_api`)](#bridge-use_synapse_admin_api)
     - [Third-party access (`bridge.third_party_access`)](#bridge-third_party_access)
+  - [Admin-editable settings](#admin-editable-settings)
+    - [Allow database setting overrides (`bridge.allow_db_setting_overrides`)](#bridge-allow_db_setting_overrides)
   - [MSC4501 and related proposals](#msc4501-and-related-proposals)
     - [Set MSC4501 relates_to (`bridge.set_msc4501_relates_to`)](#bridge-set_msc4501_relates_to)
     - [MSC4501 content_inline for reposts (`bridge.use_msc4501_content_inline`)](#bridge-use_msc4501_content_inline)
@@ -247,6 +249,25 @@ bridge:
 ```
 
 **Upgrading from the old `bridge.third_party_access_mode` setting**: that single deployment-wide `follow_only`/`full` switch has been replaced by this on/off toggle plus the per-grant tiers above. On first startup after upgrading, the bridge reads your old `third_party_access_mode` value (if your `config.yaml` still has it) exactly once, to decide whether your existing `;allow`-granted users/homeservers should default to `full` or `shadow` under the new scheme -- nothing about an already-provisioned identity is deleted or reassigned by the upgrade itself. You can remove the old key from `config.yaml` once you've confirmed `;allowed` shows the tiers you expect.
+
+---
+
+### Admin-editable settings
+
+<a id="bridge-allow_db_setting_overrides"></a>
+
+#### Allow database setting overrides (`bridge.allow_db_setting_overrides`)
+
+**Default:** `true`
+
+Most settings in this file can also be set from the widget's Admin → Settings page instead, with a database value always taking priority over whatever's in `config.yaml` while it exists. Set this to `false` to disable that entirely and lock the deployment to `config.yaml` only -- the Settings page still shows every setting and its current value for documentation, but every control is disabled, and any override already stored in the database is left untouched (not deleted) and simply ignored until this is turned back on.
+
+```yaml
+bridge:
+  allow_db_setting_overrides: false
+```
+
+A handful of settings (this one, [`bridge.admins`](#bridge-admins), [`bridge.use_synapse_admin_api`](#bridge-use_synapse_admin_api), connection/topology settings, secrets like the connection/signing tokens, and anything applied only once at startup) are always `config.yaml`-only and never show up as editable on the Settings page, regardless of this switch -- see that page's own documentation for the full list and why.
 
 ---
 

@@ -24,6 +24,7 @@ from bridge.activitypub.routes import router as activitypub_router
 from bridge.activitypub.signatures import ActorKeyCache
 from bridge.activitypub.urls import main_key_id
 from bridge.appservice_routes import router as appservice_router
+from bridge.bridge_settings import effective_config
 from bridge.commands import configure_command_prefix
 from bridge.config import BridgeConfig, ConfigError
 from bridge.ghosts import ensure_ghost_user
@@ -134,8 +135,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.config = config
+        # Exactly what config.yaml says, never mutated -- see
+        # bridge.bridge_settings for the merged app.state.config every
+        # other read site in the codebase actually uses.
+        app.state.base_config = config
         app.state.repository = repository or await _create_repository(config)
+        app.state.config = await effective_config(config, app.state.repository)
+        # Re-applied here (in case a stored bridge.command_prefix override
+        # exists) -- create_app already called this once above with just
+        # config.yaml's value, before a repository existed to check against.
+        configure_command_prefix(app.state.config.bridge.command_prefix)
 
         # Moved ahead of http_client/key_cache below (only needs the
         # repository) so its key material is available to sign THEIR own

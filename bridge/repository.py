@@ -814,6 +814,23 @@ class ActorRepository(Protocol):
         key's code default. No-op if no override was stored."""
         ...
 
+    async def get_bridge_settings(self) -> dict[str, str]:
+        """Every stored bridge-wide setting OVERRIDE (see
+        ``bridge.bridge_settings``), as raw strings. Sparse, same
+        convention as ``get_identity_settings`` above, just global instead
+        of per-identity. Typed parsing/merging happens in
+        ``bridge.bridge_settings``, not here."""
+        ...
+
+    async def set_bridge_setting(self, key: str, value: str) -> None:
+        """Upsert one bridge-wide setting override."""
+        ...
+
+    async def clear_bridge_setting(self, key: str) -> None:
+        """Remove one bridge-wide setting override, reverting ``key`` back
+        to its config.yaml value. No-op if no override was stored."""
+        ...
+
     async def list_shadow_tier_actors(self) -> list[ActorRecord]:
         """Every ``ActorRecord`` currently resolving to the "shadow" tier
         (see ``bridge.shadow_identity.effective_identity_tier``) -- i.e.
@@ -1697,6 +1714,8 @@ class InMemoryActorRepository:
         # Keyed by plain username same as _followers/_following above. A
         # channel's settings live independently of any _actors entry too.
         self._identity_settings: dict[str, dict[str, str]] = {}
+        # Global, not keyed by username -- see bridge.bridge_settings.
+        self._bridge_settings: dict[str, str] = {}
 
     async def get_local_actor(self, username: str) -> ActorRecord | None:
         state = self._actors.get(username)
@@ -1933,6 +1952,15 @@ class InMemoryActorRepository:
 
     async def clear_identity_setting(self, username: str, key: str) -> None:
         self._identity_settings.get(username, {}).pop(key, None)
+
+    async def get_bridge_settings(self) -> dict[str, str]:
+        return dict(self._bridge_settings)
+
+    async def set_bridge_setting(self, key: str, value: str) -> None:
+        self._bridge_settings[key] = value
+
+    async def clear_bridge_setting(self, key: str) -> None:
+        self._bridge_settings.pop(key, None)
 
     def _resolve_third_party_tier_sync(self, *, mxid: str, homeserver: str, room_id: str = "") -> str | None:
         mxid_row = self._third_party_allows.get(("mxid", mxid))
