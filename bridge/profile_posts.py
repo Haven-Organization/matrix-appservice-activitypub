@@ -509,7 +509,7 @@ async def maybe_distribute_profile_post(request: Request, event: dict) -> bool:
                 try:
                     await request.app.state.synapse.send_message_event(
                         room_id,
-                        {"msgtype": "m.notice", "body": shadow_created_notice(request, guest_record)},
+                        {"msgtype": "m.notice", "body": await shadow_created_notice(request, guest_record)},
                         as_user_id=f"@{config.appservice.bot_localpart}:{config.synapse.server_name}",
                     )
                 except Exception:

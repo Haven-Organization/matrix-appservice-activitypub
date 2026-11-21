@@ -228,7 +228,7 @@ async def maybe_federate_poll_vote(request: Request, event: dict) -> bool:
         try:
             await request.app.state.synapse.send_message_event(
                 room_id,
-                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                {"msgtype": "m.notice", "body": await shadow_created_notice(request, actor_record)},
                 as_user_id=bot_mxid,
             )
         except Exception:

@@ -990,7 +990,7 @@ async def maybe_distribute_community_message(request: Request, event: dict) -> b
         try:
             await request.app.state.synapse.send_message_event(
                 room_id,
-                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                {"msgtype": "m.notice", "body": await shadow_created_notice(request, actor_record)},
                 as_user_id=bot_mxid,
             )
         except Exception:
@@ -1555,7 +1555,7 @@ async def maybe_distribute_owned_community_message(request: Request, event: dict
     if resolution.created:
         from bridge.commands import _notice
 
-        await _notice(request, room_id, shadow_created_notice(request, actor_record))
+        await _notice(request, room_id, await shadow_created_notice(request, actor_record))
 
     # Re-validated live on every message, not just at creation -- see
     # channel_bridge.maybe_handle_channel_message's identical comment.

@@ -438,7 +438,7 @@ async def maybe_distribute_channel_message(request: Request, event: dict) -> boo
         try:
             await request.app.state.synapse.send_message_event(
                 room_id,
-                {"msgtype": "m.notice", "body": shadow_created_notice(request, actor_record)},
+                {"msgtype": "m.notice", "body": await shadow_created_notice(request, actor_record)},
                 as_user_id=bot_mxid,
             )
         except Exception:

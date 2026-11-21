@@ -283,15 +283,35 @@ async def ensure_shadow_actor(request: "Request", *, sender: str, room_id: str) 
     return ShadowResolution(record, True)
 
 
-def shadow_created_notice(request: "Request", record: ActorRecord) -> str:
+async def shadow_created_notice(request: "Request", record: ActorRecord) -> str:
     """The one-time notice sent the moment ``ensure_shadow_actor`` actually
     creates a new identity (``ShadowResolution.created`` True) -- fires
     uniformly everywhere that happens, not just on ``;follow``, since
-    every chokepoint now goes through the same function."""
+    every chokepoint now goes through the same function.
+
+    For a third-party ``record``, checks the SAME room-blind tier
+    (``room_id=""``) the command dispatcher itself uses to gate
+    ``;create profile`` (see ``bridge.commands.maybe_handle_command``) --
+    a sender whose only grant is room-scoped resolves to ``None`` here,
+    same as there, since a room grant was never meant to satisfy the
+    command gate at all. Telling such a sender to run ``;create profile``
+    "anytime" would be straightforwardly false: the bot would refuse the
+    command outright, before even reaching its shadow-tier-specific
+    refusal. A first-party sender is never checked here -- they're never
+    restricted either way (see this module's own docstring)."""
     config = request.app.state.config
     prefix = config.bridge.command_prefix
-    return (
+    intro = (
         f"I've created a shadow fediverse identity for you: @{record.username}@{config.bridge.domain}. "
         "It mirrors your Matrix display name/avatar automatically, and has no profile of its own yet. "
-        f'Run "{prefix}create profile" anytime to turn it into a full, customizable profile.'
     )
+    if record.is_third_party:
+        tier = await resolve_third_party_tier(
+            request.app.state.repository,
+            mxid=record.matrix_user_id,
+            homeserver=homeserver_of(record.matrix_user_id),
+            room_id="",
+        )
+        if tier != "full":
+            return intro + "Ask a bridge admin to grant you full access (not just room access) to turn it into one yourself."
+    return intro + f'Run "{prefix}create profile" anytime to turn it into a full, customizable profile.'

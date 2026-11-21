@@ -1913,7 +1913,7 @@ async def _handle_follow(request: Request, *, sender: str, room_id: str, handle:
         )
         return
     if resolution.created:
-        await _notice(request, room_id, shadow_created_notice(request, actor_record))
+        await _notice(request, room_id, await shadow_created_notice(request, actor_record))
 
     if await repository.is_following(actor_record.username, remote_actor_id):
         # Same re-invite reasoning as _follow_local_actor's identical
