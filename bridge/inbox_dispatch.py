@@ -707,6 +707,39 @@ async def _fetch_post_preview(
     return body, full_content, image, video
 
 
+def quote_block_html(preview_text: str, preview_full_content: dict) -> str:
+    """The ``<blockquote>...</blockquote>`` HTML for a repost/reply/quote
+    notice's human-readable tail (the plain, non-MSC4501 half every
+    client renders -- see ``SOCIAL_FORMATTED_BODY_FIELD`` for the
+    compliant-client half, which already does this correctly).
+
+    Prefers the original post's own real ``formatted_body`` -- same
+    SOCIAL_BODY_FIELD/SOCIAL_FORMATTED_BODY_FIELD-first fallback chain
+    ``send_repost`` already uses for that compliant-client field, so a
+    repost of a quote-post quotes the SAME text both places -- over a
+    bare ``html.escape(preview_text)``, since the latter throws away any
+    custom-emoji ``<img>`` the original's ``formatted_body`` already
+    resolved (reported live: a reposted post's own custom emoji showed as
+    a bare shortcode in this blockquote while the exact same text's
+    MSC4501 copy rendered the image). Only safe while ``preview_text``
+    is the UNTRUNCATED original body -- ``_fetch_post_preview`` appends
+    "…" when it truncates, and hand-truncating real HTML isn't safe, so
+    that case (and a post with no ``formatted_body`` at all) falls back
+    to the plain-text behavior exactly as before."""
+    if not preview_text:
+        return ""
+    if not preview_text.endswith("…"):
+        if SOCIAL_BODY_FIELD in preview_full_content:
+            formatted = preview_full_content.get(SOCIAL_FORMATTED_BODY_FIELD) or (
+                html.escape(preview_full_content.get(SOCIAL_BODY_FIELD) or "") or None
+            )
+        else:
+            formatted = preview_full_content.get("formatted_body")
+        if formatted:
+            return f"<blockquote>{formatted}</blockquote>"
+    return f"<blockquote>{html.escape(preview_text)}</blockquote>"
+
+
 def build_preview_media_content(
     *, plain_body: str, formatted_caption: str,
     preview_image: dict[str, object] | None, preview_video: dict[str, object] | None,
@@ -844,7 +877,7 @@ async def _notify_post_owner(
     mxid = ghost_mxid(config.appservice.user_prefix, reactor_username, domain, config.synapse.server_name)
     link = matrix_to_link(target.room_id, target.event_id)
 
-    preview_text, _full_content, preview_image, preview_video = await _fetch_post_preview(request, target)
+    preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(request, target)
     preview_media = preview_video or preview_image
 
     # preview_text alongside preview_media means the post had BOTH media
@@ -879,9 +912,7 @@ async def _notify_post_owner(
     actor_html = notification_actor_html(
         mxid=mxid, handle=handle, display_name=actor_doc.get("name") or reactor_username
     )
-    quote_html = ""
-    if preview_text:
-        quote_html = f"<blockquote>{html.escape(preview_text)}</blockquote>"
+    quote_html = quote_block_html(preview_text, preview_full_content)
 
     # "your post" is a literal substring of every verb_phrase this is ever
     # called with ("liked your post", "reacted to your post with X",
@@ -1309,7 +1340,7 @@ async def _quoted_post_render(
     if show_media_inline:
         img_html = f'<img src="{html.escape(str(preview_media["mxc"]), quote=True)}" width="{_PREVIEW_IMAGE_SIZE}">'
         quote_block_parts.append(f"{img_html}<br>{html.escape(media_filename)}")
-    quote_block_html = f"<blockquote>{'<br>'.join(quote_block_parts)}</blockquote>" if quote_block_parts else ""
+    quoted_block_html = f"<blockquote>{'<br>'.join(quote_block_parts)}</blockquote>" if quote_block_parts else ""
 
     plain_tail = f"\U0001F501 reposted {quoted_handle}'s post:"
     if has_real_caption:
@@ -1319,7 +1350,7 @@ async def _quoted_post_render(
     plain_tail += f"\n{post_link}"
 
     post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
-    html_tail = f"<p>\U0001F501 reposted {quoted_author_html}'s {post_pill_html}</p>{quote_block_html}"
+    html_tail = f"<p>\U0001F501 reposted {quoted_author_html}'s {post_pill_html}</p>{quoted_block_html}"
     return QuotedPostRender(
         plain_tail=plain_tail, html_tail=html_tail, preview_image=preview_image, preview_video=preview_video,
         quoted_ref=quoted_ref, full_content=full_content,

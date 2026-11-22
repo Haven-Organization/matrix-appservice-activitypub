@@ -53,7 +53,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import is_foreign_bridge_user
 from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
-from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content
+from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content, quote_block_html
 from bridge.matrix_links import matrix_to_link
 from bridge.media import build_ap_attachment
 from bridge.note_mirroring import (
@@ -424,7 +424,7 @@ async def send_repost(
         # attach the media preview, so neither half of the post vanishes
         # from the card (confirmed live 2026-07-03: a captioned image's
         # repost card showed neither the caption nor a working embed).
-        quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
+        quote_html = quote_block_html(preview_text, preview_full_content)
 
         _, reposter_html = await actor_html_with_avatar(request, own_actor_id)
         original_handle, original_author_html = await actor_html_with_avatar(request, target_author_actor_id)
@@ -442,7 +442,7 @@ async def send_repost(
 
         post_pill_html = f'<a href="{html.escape(post_link, quote=True)}">post</a>'
         formatted_caption = (
-            f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
+            f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_html}"
         )
 
         # Used to deliberately never set org.matrix.msc4501.social.relates_to
@@ -776,7 +776,7 @@ async def send_cross_bridge_quote(
 
     verb = "replied to" if is_reply else "reposted"
     emoji = "↩️" if is_reply else "\U0001F501"
-    quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
+    quote_html = quote_block_html(preview_text, preview_full_content)
     plain_body = f"{emoji} {verb} {original_handle}'s post:"
     if preview_text:
         plain_body += f"\n> {preview_text}"
@@ -787,7 +787,7 @@ async def send_cross_bridge_quote(
     caption_html = f"<p>{html.escape(caption)}</p>" if caption else ""
     formatted_caption = (
         caption_html
-        + f"<p>{emoji} {verb} {html.escape(original_handle)}'s {post_pill_html}</p>{quote_block_html}"
+        + f"<p>{emoji} {verb} {html.escape(original_handle)}'s {post_pill_html}</p>{quote_html}"
     )
     echo_content = build_preview_media_content(
         plain_body=plain_body, formatted_caption=formatted_caption,

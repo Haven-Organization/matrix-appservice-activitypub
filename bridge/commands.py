@@ -270,6 +270,7 @@ from bridge.inbox_dispatch import (
     _resolve_ancestor_chain,
     _resolve_reply_header_context,
     build_preview_media_content,
+    quote_block_html,
 )
 from bridge.group_bridge import (
     backfill_group_posts,
@@ -5955,7 +5956,7 @@ async def _handle_repost(
     # and a real caption (_fetch_post_preview only returns caption-worthy
     # text for media posts) -- quote the caption AND attach the media
     # preview, same as bridge.reaction_bridge.send_repost's identical card.
-    quote_block_html = f"<blockquote>{html.escape(preview_text)}</blockquote>" if preview_text else ""
+    quote_html = quote_block_html(preview_text, preview_full_content or {})
 
     _, reposter_html = await actor_html_with_avatar(request, own_actor_id)
     original_handle, original_author_html = await actor_html_with_avatar(request, target_author_actor_id)
@@ -5973,7 +5974,7 @@ async def _handle_repost(
     caption_html = f"<p>{html.escape(caption)}</p>"
     formatted_caption = (
         caption_html
-        + f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_block_html}"
+        + f"<p>\U0001F501 {reposter_html} reposted {original_author_html}'s {post_pill_html}</p>{quote_html}"
     )
     echo_content = build_preview_media_content(
         plain_body=plain_body, formatted_caption=formatted_caption,
