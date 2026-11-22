@@ -56,6 +56,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -132,6 +133,12 @@ _PAGE_SIZE = 20
 _HOME_FEED_SOURCE_TIMEOUT = 8.0
 
 _EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_+-]+):")
+
+# actor_id -> (fetched_at, shortcode->url map off that actor's own AS2 `tag`
+# array). Same TTL/shape as nodeinfo.remote_software_name's own cache --
+# see _emoji_map_with_actor_fallback for why this is needed at all.
+_ACTOR_EMOJI_CACHE_TTL = 3600.0
+_actor_emoji_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
 
 def _substitute_emoji_html(body_html: str, emoji_map: dict[str, str]) -> str:
@@ -216,6 +223,41 @@ def _display_name_html(raw_name: str, emoji_map: dict[str, str]) -> str:
     return _substitute_emoji_html(html.escape(raw_name), emoji_map)
 
 
+async def _emoji_map_with_actor_fallback(
+    request: Request, *, text: str, emoji_map: dict[str, str], actor_id: str | None
+) -> dict[str, str]:
+    """``emoji_map`` (from a Mastodon-API ``emojis`` list) as-is, unless
+    ``text`` still has a ``:shortcode:`` that map doesn't cover. A remote
+    account's OWN custom emoji are often missing from the ``emojis`` a
+    timeline/search response inlines for them -- the serving instance only
+    reliably knows its own local emoji set -- even though the raw
+    ``:shortcode:`` text in that account's display name/post body comes
+    through fine (confirmed live: a post's body resolved correctly while
+    its author's name, fetched the same way, didn't). Falls back to a
+    direct (cached, signed) AS2 actor-document fetch, which always carries
+    the account's real ``tag`` array, for just the codes still missing."""
+    if not actor_id:
+        return emoji_map
+    present = set(_EMOJI_SHORTCODE_RE.findall(text))
+    if present <= emoji_map.keys():
+        return emoji_map
+    cached = _actor_emoji_cache.get(actor_id)
+    if cached is not None and (time.monotonic() - cached[0]) < _ACTOR_EMOJI_CACHE_TTL:
+        as2_map = cached[1]
+    else:
+        try:
+            doc = await fetch_actor(request, actor_id)
+            as2_map = _as2_emoji_map(doc)
+        except RemoteActorFetchError:
+            as2_map = {}
+        _actor_emoji_cache[actor_id] = (time.monotonic(), as2_map)
+    if not as2_map:
+        return emoji_map
+    merged = dict(as2_map)
+    merged.update(emoji_map)
+    return merged
+
+
 async def _is_compatible(request: Request, domain: str) -> bool:
     name = await remote_software_name(request, domain)
     return name in _COMPATIBLE_SOFTWARE
@@ -242,7 +284,7 @@ async def _browse_family(request: Request, domain: str) -> str | None:
     return None
 
 
-def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[str, Any] | None:
+async def _normalize_status(request: Request, status: dict[str, Any], *, instance_domain: str) -> dict[str, Any] | None:
     """A Mastodon-API status -> the shape the widget frontend renders.
     ``None`` if it's too malformed to show at all (missing the basics)."""
     reblog = status.get("reblog")
@@ -286,7 +328,12 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
         })
     booster = status.get("account") if (reblog is not None and isinstance(status.get("account"), dict)) else None
     content_html = base.get("content") if isinstance(base.get("content"), str) else ""
-    content_html = _substitute_emoji_html(content_html, _mastodon_emoji_map(base.get("emojis")))
+    content_html = _substitute_emoji_html(
+        content_html,
+        await _emoji_map_with_actor_fallback(
+            request, text=content_html, emoji_map=_mastodon_emoji_map(base.get("emojis")), actor_id=account.get("uri")
+        ),
+    )
     author_name = account.get("display_name") or account.get("username") or "(unknown)"
     booster_name = (booster.get("display_name") or booster.get("username") or "") if booster is not None else ""
 
@@ -332,7 +379,12 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
         "author": {
             "actor_id": account.get("uri"),
             "display_name": author_name,
-            "display_name_html": _display_name_html(author_name, _mastodon_emoji_map(account.get("emojis"))),
+            "display_name_html": _display_name_html(
+                author_name,
+                await _emoji_map_with_actor_fallback(
+                    request, text=author_name, emoji_map=_mastodon_emoji_map(account.get("emojis")), actor_id=account.get("uri")
+                ),
+            ),
             "handle": account.get("acct") or account.get("username") or "",
             "avatar_url": account.get("avatar") or account.get("avatar_static"),
             "url": account.get("url"),
@@ -351,7 +403,12 @@ def _normalize_status(status: dict[str, Any], *, instance_domain: str) -> dict[s
             {
                 "actor_id": booster.get("uri"),
                 "display_name": booster_name,
-                "display_name_html": _display_name_html(booster_name, _mastodon_emoji_map(booster.get("emojis"))),
+                "display_name_html": _display_name_html(
+                    booster_name,
+                    await _emoji_map_with_actor_fallback(
+                        request, text=booster_name, emoji_map=_mastodon_emoji_map(booster.get("emojis")), actor_id=booster.get("uri")
+                    ),
+                ),
                 "handle": booster.get("acct") or "",
             }
             if booster is not None else None
@@ -602,7 +659,8 @@ async def _fetch_timeline(
         return [], None, False
     if not isinstance(raw, list):
         return [], None, False
-    posts = [p for p in (_normalize_status(s, instance_domain=domain) for s in raw if isinstance(s, dict)) if p is not None]
+    normalized = [await _normalize_status(request, s, instance_domain=domain) for s in raw if isinstance(s, dict)]
+    posts = [p for p in normalized if p is not None]
     next_max_id = raw[-1].get("id") if raw and isinstance(raw[-1], dict) else None
     return posts, (str(next_max_id) if len(raw) >= _PAGE_SIZE and next_max_id is not None else None), False
 
@@ -862,7 +920,12 @@ async def browse_search(request: Request, q: str, domain: str = "") -> JSONRespo
                 "actor_id": a.get("uri") or a.get("url"),
                 "handle": "@" + acct if "@" in acct else f"@{acct}@{domain}",
                 "display_name": display_name,
-                "display_name_html": _display_name_html(display_name, _mastodon_emoji_map(a.get("emojis"))),
+                "display_name_html": _display_name_html(
+                    display_name,
+                    await _emoji_map_with_actor_fallback(
+                        request, text=display_name, emoji_map=_mastodon_emoji_map(a.get("emojis")), actor_id=a.get("uri")
+                    ),
+                ),
                 "avatar_url": a.get("avatar") or a.get("avatar_static"),
             }
         )
