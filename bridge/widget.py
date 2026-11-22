@@ -1728,6 +1728,48 @@ _WIDGET_HTML = r"""<!doctype html>
   .nav-item .label { overflow: hidden; text-overflow: ellipsis; }
   #shell.collapsed .nav-item .label { display: none; }
   #shell.collapsed .nav-item { justify-content: center; }
+
+  /* -- mobile: sidebar becomes a full-page menu, not a rail --------------
+     Below the breakpoint the rail disappears entirely (there's no room
+     for it next to real content); #mobile-menu-open replaces it with a
+     full-screen menu page instead, reusing the exact same #sidebar DOM/
+     nav-item markup renderSidebar() already builds for desktop -- only
+     the CSS differs. A fixed-pixel cap (not a percentage) deliberately
+     mirrors the desktop collapse/expand split's own hard-pixel style.
+
+     The way back IN to that menu is a small floating circular button,
+     not a full-width bar -- same visual language (and same reasoning:
+     a persistent, out-of-flow affordance that doesn't compete with real
+     content) as #scroll-top-btn just below, which this app already uses
+     for exactly that pattern. Reusing it beats inventing a second one. */
+  .mobile-menu-btn {
+    display: none; position: fixed; top: 12px; left: 12px; width: 34px; height: 34px; border-radius: 50%;
+    border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 15px;
+    align-items: center; justify-content: center; cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15); z-index: 40;
+  }
+  .mobile-menu-btn:hover { background: var(--hover); }
+  @media (max-width: 720px) {
+    #sidebar { display: none; }
+    #shell.mobile-menu-open #sidebar {
+      display: flex; position: fixed; inset: 0; z-index: 50; width: 100%; height: 100vh; padding: 16px 12px;
+    }
+    #shell.mobile-menu-open .nav-item { justify-content: flex-start; padding: 14px 12px; font-size: 15px; }
+    #shell.mobile-menu-open .nav-item .label { display: inline; }
+    #shell.mobile-menu-open #sidebar-toggle { display: none; }
+    #shell.mobile-menu-open #content { display: none; }
+    .mobile-menu-btn { display: flex; }
+    /* Just enough clearance that the floating button never sits on top
+       of a card's own top-left corner/label -- every page starts flush
+       against #content's own 16px padding otherwise (confirmed live: a
+       bare 16px left it squarely over "BROWSE THE FEDIVERSE"'s own text). */
+    /* "body #content", not just "#content" -- same-specificity source
+       order would otherwise lose to #content's own later, unrelated
+       "padding: 16px" shorthand rule (confirmed live: the plain form was
+       silently overridden back to 16px, the button sat right on top of
+       the first card's own corner/label text). */
+    body #content { padding-top: 56px; }
+  }
   /* A hard, fixed-pixel cap (not a percentage) -- on a very wide monitor
      (not split side-by-side with anything else), nicecrew.digital's own
      timeline column stops growing well short of the full window and
@@ -1934,6 +1976,7 @@ _WIDGET_HTML = r"""<!doctype html>
   </div>
   <div id="toast" class="toast"></div>
   <button id="scroll-top-btn" class="scroll-top-btn" title="Scroll to top">^</button>
+  <button id="mobile-menu-btn" class="mobile-menu-btn" title="Menu" aria-label="Menu">&#9776;</button>
 
 <script>
 (function () {
@@ -2265,6 +2308,11 @@ _WIDGET_HTML = r"""<!doctype html>
   let sidebarCollapsed = (function () {
     try { return localStorage.getItem("fediverse-bridge-sidebar-collapsed") === "1"; } catch (e) { return false; }
   })();
+  // Below the mobile breakpoint, the sidebar is a full-page menu instead of
+  // a rail (see the #shell.mobile-menu-open CSS) -- this tracks whether
+  // that page is currently showing, in place of the rail. Not persisted
+  // (unlike sidebarCollapsed): it always starts closed on page load/reload.
+  let mobileMenuOpen = false;
 
   // -- modal ------------------------------------------------------------------
 
@@ -2441,9 +2489,19 @@ _WIDGET_HTML = r"""<!doctype html>
   function renderSidebar() {
     const shell = document.getElementById("shell");
     shell.classList.toggle("collapsed", sidebarCollapsed);
+    shell.classList.toggle("mobile-menu-open", mobileMenuOpen);
     const bar = document.getElementById("sidebar");
     bar.innerHTML = "";
     if (!ctx) return;
+    if (mobileMenuOpen) {
+      bar.appendChild(el("button", {
+        class: "nav-item", title: "Close menu",
+        onclick: () => { mobileMenuOpen = false; render(); },
+      }, [
+        el("span", { class: "icon", text: "✕" }),
+        el("span", { class: "label", text: "Close" }),
+      ]));
+    }
     const anyOverlayShowing = !!(profileView || threadView || createIdentityView || channelView || communityView || groupView);
     NAV_ITEMS.forEach((t) => {
       if (t.id === "admin" && !ctx.is_admin) return;
@@ -2457,6 +2515,7 @@ _WIDGET_HTML = r"""<!doctype html>
           currentTab = t.id;
           profileView = null; threadView = null; createIdentityView = false; channelView = null; communityView = null;
           groupView = null;
+          mobileMenuOpen = false;
           render();
         },
       }, [
@@ -5149,6 +5208,16 @@ _WIDGET_HTML = r"""<!doctype html>
     window.addEventListener("scroll", () => {
       btn.classList.toggle("visible", window.scrollY > 300);
     });
+  })();
+
+  // Opens the mobile full-page nav menu (see the #shell.mobile-menu-open
+  // CSS) -- a static, always-present button (hidden below the mobile
+  // breakpoint via CSS alone), same wiring convention as scroll-top-btn
+  // just above: one listener attached once here, not recreated by render().
+  (function initMobileMenuButton() {
+    const btn = document.getElementById("mobile-menu-btn");
+    if (!btn) return;
+    btn.addEventListener("click", () => { mobileMenuOpen = true; render(); });
   })();
 
   start();
