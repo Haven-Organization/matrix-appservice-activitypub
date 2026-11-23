@@ -11033,7 +11033,11 @@ async def _handle_allow(request: Request, *, sender: str, room_id: str, argument
             await _notice(request, room_id, f"{value} doesn't look like a valid MXID (e.g. @user:example.org).")
             return
         await repository.add_third_party_allow("mxid", value, tier, granted_by=sender)
-        await _notice(request, room_id, f"Allowed {value} to use this bridge at {tier} tier.")
+        from bridge.membership import accept_pending_knocks_for_allow_grant  # local: membership imports this module
+
+        accepted = await accept_pending_knocks_for_allow_grant(request, mxid=value)
+        note = f" Accepted {accepted} already-pending knock(s) of theirs on ghost profiles." if accepted else ""
+        await _notice(request, room_id, f"Allowed {value} to use this bridge at {tier} tier.{note}")
         return
 
     # homeserver -- confirmation-gated, see _ALLOW_HOMESERVER_WARNING_MARKER.
@@ -11119,7 +11123,13 @@ async def maybe_handle_allow_homeserver_confirmation(request: Request, event: di
             return True
         repository = request.app.state.repository
         await repository.add_third_party_allow("homeserver", homeserver, tier, granted_by=sender)
-        await _notice(request, room_id, f"Allowed every user on {homeserver} to use this bridge at {tier} tier.")
+        from bridge.membership import accept_pending_knocks_for_allow_grant  # local: membership imports this module
+
+        accepted = await accept_pending_knocks_for_allow_grant(request, homeserver=homeserver)
+        note = f" Accepted {accepted} already-pending knock(s) on ghost profiles from that homeserver." if accepted else ""
+        await _notice(
+            request, room_id, f"Allowed every user on {homeserver} to use this bridge at {tier} tier.{note}"
+        )
     finally:
         _command_relates_to_var.reset(token)
     return True

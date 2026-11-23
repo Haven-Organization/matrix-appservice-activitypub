@@ -95,6 +95,7 @@ from bridge.commands import (
 )
 from bridge.identity_resolution import resolve_acting_identity
 from bridge.matrix_links import matrix_to_room_link
+from bridge.shadow_identity import resolve_third_party_tier
 from bridge.note_mirroring import (
     resolve_actor_matrix_identity,
     resolve_old_ghost_room_owner,
@@ -376,8 +377,12 @@ async def maybe_handle_knock(request: Request, event: dict) -> bool:
     knock from anyone other than that room's intended local user is left
     untouched, since a DM/Chat room isn't a shared space like the other two
     kinds). Anything else is left untouched (no admin override here; a
-    knock is always the knocker acting for themselves). Deliberately does
-    NOT also establish an AP Follow -- see ``rejoin``'s identical reasoning,
+    knock is always the knocker acting for themselves). A knocker from
+    another homeserver is only auto-accepted if ``bridge.accept_federated_knocks``
+    is on (everyone) or they/their homeserver have their own ``;allow``
+    grant (mxid or homeserver tier, not a room grant -- see the inline
+    comment below). Deliberately does NOT also establish an AP Follow -- see
+    ``rejoin``'s identical reasoning,
     following only ever happens via the explicit ``follow`` command now."""
     if event.get("type") != "m.room.member":
         return False
@@ -399,16 +404,23 @@ async def maybe_handle_knock(request: Request, event: dict) -> bool:
     ):
         return False  # our own bot/ghosts -- or a sibling bridge's own ghost -- never knock
 
+    repository = request.app.state.repository
     knocker_server = knocker.partition(":")[2]
     if knocker_server != config.synapse.server_name and not config.bridge.accept_federated_knocks:
         # A knocker from ANOTHER homeserver: mirrored posts are public
         # fediverse content, but who gets auto-admitted into this server's
         # rooms is this server's call -- so federated knocks are ignored
         # (not rejected; someone already inside can still invite them
-        # manually) unless bridge.accept_federated_knocks opts in.
-        return False
+        # manually) unless bridge.accept_federated_knocks opts in wholesale,
+        # or this specific knocker (or their whole homeserver) has their own
+        # ;allow grant -- room_id="" so a room-scoped grant never counts,
+        # matching the command-dispatch gate's own reasoning: a room grant
+        # covers passive content FROM that room, not an action (like this)
+        # that hands them membership they could use anywhere.
+        tier = await resolve_third_party_tier(repository, mxid=knocker, homeserver=knocker_server, room_id="")
+        if tier is None:
+            return False
 
-    repository = request.app.state.repository
     remote_room = await resolve_old_remote_actor_room(request, room_id)
     if remote_room is not None:
         as_user_id = remote_room.ghost_user_id
@@ -424,6 +436,56 @@ async def maybe_handle_knock(request: Request, event: dict) -> bool:
     except SynapseError:
         logger.warning("Could not invite knocking user %s into %s", knocker, room_id, exc_info=True)
     return True
+
+
+async def accept_pending_knocks_for_allow_grant(
+    request: Request, *, mxid: str = "", homeserver: str = ""
+) -> int:
+    """Called right after a fresh ``;allow mxid``/``;allow homeserver``
+    grant is recorded, to retroactively accept any knock on a Remote User
+    Room (a ghost's own fediverse-actor room) that arrived BEFORE the
+    grant existed. ``maybe_handle_knock``'s federated-knock gate silently
+    ignores a knock it can't yet vouch for -- unlike a fresh knock, that
+    ignored one never re-fires on its own once the grant shows up, so
+    without this it would sit stuck forever even though the exact same
+    knock arriving a moment later would have been auto-accepted.
+
+    Pass exactly one of ``mxid`` (right after an ``mxid`` grant) or
+    ``homeserver`` (right after a ``homeserver`` grant, which can unblock
+    several different pending knockers on that domain at once). Returns
+    how many knocks were accepted."""
+    config = request.app.state.config
+    synapse = request.app.state.synapse
+    bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
+    accepted = 0
+    for room_id in await request.app.state.repository.list_all_remote_actor_room_ids():
+        try:
+            state_events = await synapse.get_full_room_state(room_id, as_user_id=bot_mxid)
+        except SynapseError:
+            continue
+        for member_event in state_events:
+            if member_event.get("type") != "m.room.member":
+                continue
+            if (member_event.get("content") or {}).get("membership") != "knock":
+                continue
+            knocker = member_event.get("state_key", "")
+            if not knocker:
+                continue
+            if mxid and knocker != mxid:
+                continue
+            if homeserver and knocker.partition(":")[2] != homeserver:
+                continue
+            remote_room = await resolve_old_remote_actor_room(request, room_id)
+            if remote_room is None:
+                continue
+            try:
+                await synapse.invite_user(room_id, knocker, as_user_id=remote_room.ghost_user_id)
+                accepted += 1
+            except SynapseError:
+                logger.warning(
+                    "Could not retroactively accept pending knock from %s in %s", knocker, room_id, exc_info=True
+                )
+    return accepted
 
 
 async def maybe_handle_join(request: Request, event: dict) -> bool:
