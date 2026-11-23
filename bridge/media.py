@@ -17,17 +17,23 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import io
 import logging
 import mimetypes
 
 import httpx
+import pillow_heif
+import pillow_jxl  # noqa: F401 -- side effect only, registers Pillow's JXL plugin on import
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import Request
+from PIL import Image, UnidentifiedImageError
 
 from bridge.activitypub.urls import media_url, resolve_own_media_proxy_mxc
 from bridge.repository import ActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
 from bridge.shared_encrypted_media import PROMPT_FIELD, announce_if_needed, ask_in_turn
+
+pillow_heif.register_heif_opener()
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +99,85 @@ def _sniff_content_type(data: bytes) -> str | None:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    # JPEG XL: either the ISOBMFF container signature, or the bare 2-byte
+    # raw-codestream marker some encoders emit instead.
+    if data.startswith(b"\x00\x00\x00\x0cJXL \r\n\x87\n") or data.startswith(b"\xff\x0a"):
+        return "image/jxl"
     if data[4:8] == b"ftyp":
+        # AVIF/HEIC share MP4's ISOBMFF container and the same "ftyp" box at
+        # the front -- only the brand right after it (the 4 bytes immediately
+        # following, not the box type) tells them apart from an actual MP4.
+        brand = data[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1"):
+            return "image/heic"
         return "video/mp4"
     if data.startswith(b"\x1a\x45\xdf\xa3"):
         return "video/webm"
     return None
+
+
+# Formats a remote server may serve that no mainstream Matrix client renders
+# inline, and that Synapse's own media repo can't thumbnail either (so there
+# isn't even a fallback preview) -- confirmed against Element and Haven/
+# Electron's bundled Chromium, both unable to decode JPEG XL even with
+# experimental flags on. Converted below to something every client can show
+# before upload, rather than mirrored as-is.
+_CONVERTIBLE_IMAGE_TYPES = {"image/jxl", "image/avif", "image/heic", "image/heif"}
+
+
+def _convert_unsupported_image(data: bytes, content_type: str) -> tuple[bytes, str, int | None, int | None] | None:
+    """If ``content_type`` is one of ``_CONVERTIBLE_IMAGE_TYPES``, decode
+    ``data`` and re-encode it as PNG (static, with alpha), WebP (animated),
+    or JPEG (static, no alpha) -- whichever of those three a plain Matrix
+    client can already show inline. Returns ``(new_bytes, new_content_type,
+    width, height)``, or ``None`` if ``content_type`` doesn't need
+    conversion, or the attempt itself failed (corrupt/truncated file, or a
+    real codec the installed libheif/libjxl build doesn't support) -- the
+    caller falls back to uploading the original bytes either way, same as
+    any other best-effort step in this module.
+
+    The width/height are a free side effect of decoding to convert at all,
+    not a second pass: ``_dimensions_with_fallback``'s own per-format byte
+    parsers have no entry for these formats anyway (nothing need recognize
+    JXL/AVIF/HEIC bytes there once they never reach Synapse in that shape),
+    so this is the only place dimensions for them ever come from."""
+    if content_type not in _CONVERTIBLE_IMAGE_TYPES:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            is_animated = getattr(image, "n_frames", 1) > 1
+            has_alpha = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+            width, height = image.size
+            out = io.BytesIO()
+            if is_animated:
+                frames = [frame.convert("RGBA" if has_alpha else "RGB") for frame in _iter_frames(image)]
+                frames[0].save(
+                    out, format="WEBP", save_all=True, append_images=frames[1:],
+                    duration=image.info.get("duration", 100), loop=image.info.get("loop", 0),
+                )
+                new_content_type = "image/webp"
+            elif has_alpha:
+                image.convert("RGBA").save(out, format="PNG")
+                new_content_type = "image/png"
+            else:
+                image.convert("RGB").save(out, format="JPEG", quality=90)
+                new_content_type = "image/jpeg"
+    except (UnidentifiedImageError, OSError, ValueError):
+        # Bad/truncated bytes, or a real encoding libheif/libjxl can't
+        # decode (e.g. a codec variant the installed build lacks) -- these
+        # come straight from a remote server's response body, so this is
+        # ordinary untrusted-input handling, not a bug to fix here.
+        logger.warning("Failed to convert %s image, uploading the original instead", content_type, exc_info=True)
+        return None
+    return out.getvalue(), new_content_type, width, height
+
+
+def _iter_frames(image: Image.Image):
+    for index in range(image.n_frames):
+        image.seek(index)
+        yield image.copy()
 
 
 async def _download_media(http_client: httpx.AsyncClient, url: str) -> httpx.Response | None:
@@ -117,13 +197,42 @@ def _resolved_content_type(response: httpx.Response) -> str:
     return content_type
 
 
-async def _upload_media(synapse: SynapseClient, response: httpx.Response, url: str, content_type: str) -> str | None:
+def retargeted_filename(filename: str, new_content_type: str) -> str:
+    """``filename``, with its extension (if any) swapped for one matching
+    ``new_content_type`` -- used after ``_convert_unsupported_image``
+    changes what's actually being uploaded (here, and again in
+    ``bridge.note_mirroring.merge_attachment_into_content`` for the
+    Matrix-message-facing ``filename``), so a converted file's name
+    doesn't keep claiming to be the original (now wrong) format."""
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return filename_with_extension(base, new_content_type)
+
+
+async def _upload_media(
+    synapse: SynapseClient, response: httpx.Response, url: str, content_type: str
+) -> tuple[str, str, int | None, int | None] | None:
+    """Uploads ``response``'s bytes to Synapse, converting first if
+    ``content_type`` is one no mainstream Matrix client can render (see
+    ``_convert_unsupported_image``). Returns ``(mxc_uri, content_type,
+    width, height)`` -- the content_type and dimensions reflect whatever
+    was ACTUALLY uploaded, which, after a conversion, is not what the
+    caller passed in; width/height are ``None`` unless a conversion
+    happened to determine them as a side effect (see
+    ``fetch_and_upload_media_with_dimensions``'s own byte-sniffing
+    fallback for the ordinary, unconverted case)."""
     filename = url.rsplit("/", 1)[-1] or "file"
+    data = response.content
+    width = height = None
+    converted = _convert_unsupported_image(data, content_type)
+    if converted is not None:
+        data, content_type, width, height = converted
+        filename = retargeted_filename(filename, content_type)
     try:
-        return await synapse.upload_media(response.content, content_type, filename)
+        mxc_uri = await synapse.upload_media(data, content_type, filename)
     except SynapseError:
         logger.warning("Failed to upload remote media %s", url, exc_info=True)
         return None
+    return mxc_uri, content_type, width, height
 
 
 async def fetch_and_upload_media(
@@ -134,7 +243,8 @@ async def fetch_and_upload_media(
     if response is None:
         return None
     content_type = _resolved_content_type(response)
-    return await _upload_media(synapse, response, url, content_type)
+    result = await _upload_media(synapse, response, url, content_type)
+    return result[0] if result else None
 
 
 _DIMENSIONS_PARSER_BY_CONTENT_TYPE = {}  # populated below, once the parsers themselves are defined
@@ -142,10 +252,18 @@ _DIMENSIONS_PARSER_BY_CONTENT_TYPE = {}  # populated below, once the parsers the
 
 async def fetch_and_upload_media_with_dimensions(
     http_client: httpx.AsyncClient, synapse: SynapseClient, url: str, *, public_base_url: str | None = None
-) -> tuple[str, int | None, int | None] | None:
-    """Like ``fetch_and_upload_media``, but also returns ``(width, height)``
-    for an image or video file it can determine them for -- ``(None,
-    None)`` for anything else, or if they couldn't be determined.
+) -> tuple[str, int | None, int | None, str] | None:
+    """Like ``fetch_and_upload_media``, but also returns ``(width, height,
+    content_type)``: width/height for an image or video file it can
+    determine them for (``None, None`` for anything else, or if they
+    couldn't be determined), and the content_type actually uploaded --
+    which, for a format no mainstream Matrix client can render (JPEG XL/
+    AVIF/HEIC; see ``_convert_unsupported_image``), is NOT ``url``'s own
+    declared type, since this converts those before upload. Callers that
+    put the result in a Matrix event's own ``info.mimetype`` must use this
+    returned content_type, not the source attachment's original one, or
+    the event ends up describing a file different from what it actually
+    points at.
     Pleroma's federated attachment objects don't carry a video's (or an
     image's) dimensions at all (confirmed against real ones), so a Matrix
     client has nothing to size a player/image with unless we work them out
@@ -167,7 +285,7 @@ async def fetch_and_upload_media_with_dimensions(
     same local post from N different remote accounts produced N distinct
     mxc:// copies of the identical video).
 
-    Returns None (not a 3-tuple) if the fetch/upload itself failed --
+    Returns None (not a 4-tuple) if the fetch/upload itself failed --
     ``fetch_and_upload_media``'s simpler ``str | None`` isn't reused for
     this because most callers (avatars, banners) never need dimensions and
     shouldn't have to unpack a tuple to get the one thing they want.
@@ -181,21 +299,28 @@ async def fetch_and_upload_media_with_dimensions(
             # Still worth reusing the mxc even if we couldn't re-fetch it
             # ourselves just now to work out dimensions -- better than
             # falling through to an unnecessary, un-deduplicated re-upload.
+            # Content-type unknown too (never re-fetched); already on our
+            # OWN homeserver, so it was converted already if that was ever
+            # going to happen -- nothing left for a caller to redo here.
             logger.warning("Could not re-fetch own media %s for dimensions", own_mxc, exc_info=True)
-            return own_mxc, None, None
+            return own_mxc, None, None, "application/octet-stream"
         width, height = _dimensions_with_fallback(download.content, download.content_type)
-        return own_mxc, width, height
+        return own_mxc, width, height, download.content_type
 
     response = await _download_media(http_client, url)
     if response is None:
         return None
     content_type = _resolved_content_type(response)
-    mxc_uri = await _upload_media(synapse, response, url, content_type)
-    if mxc_uri is None:
+    result = await _upload_media(synapse, response, url, content_type)
+    if result is None:
         return None
+    mxc_uri, uploaded_content_type, converted_width, converted_height = result
 
-    width, height = _dimensions_with_fallback(response.content, content_type)
-    return mxc_uri, width, height
+    if converted_width and converted_height:
+        width, height = converted_width, converted_height
+    else:
+        width, height = _dimensions_with_fallback(response.content, content_type)
+    return mxc_uri, width, height, uploaded_content_type
 
 
 def _dimensions_with_fallback(data: bytes, content_type: str) -> tuple[int | None, int | None]:

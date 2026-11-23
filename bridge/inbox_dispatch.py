@@ -2513,6 +2513,7 @@ async def _echo_reply_in_own_room(
     echo_mxc: str | None = None
     echo_width: int | None = None
     echo_height: int | None = None
+    echo_media_type: str | None = None
     if attachments:
         config = request.app.state.config
         bot_mxid = f"@{config.appservice.bot_localpart}:{config.synapse.server_name}"
@@ -2533,8 +2534,10 @@ async def _echo_reply_in_own_room(
                 info = existing_content.get("info") or {}
                 echo_width = info.get("w")
                 echo_height = info.get("h")
+                echo_media_type = info.get("mimetype")
     message_content, _ = await _attach_media_to_content(
         request, message_content, attachments, mxc_uri=echo_mxc, width=echo_width, height=echo_height,
+        media_type=echo_media_type,
     )
 
     federation_config = request.app.state.config.federation
@@ -2901,6 +2904,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     imported_attachment_mxc: str | None = None
     imported_attachment_width: int | None = None
     imported_attachment_height: int | None = None
+    imported_attachment_media_type: str | None = None
     if isinstance(original_author_id, str):
         # Reposting a reply is completely ordinary fediverse behavior --
         # without this, the reposted post's own import (right above) would
@@ -2923,6 +2927,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
         imported_attachment_mxc = imported.first_attachment_mxc
         imported_attachment_width = imported.first_attachment_width
         imported_attachment_height = imported.first_attachment_height
+        imported_attachment_media_type = imported.first_attachment_media_type
         if imported.federated_event is not None:
             imported_link = matrix_to_link(
                 imported.federated_event.room_id, imported.federated_event.event_id,
@@ -2966,6 +2971,7 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
     message_content, _ = await _attach_media_to_content(
         request, message_content, attachments, mxc_uri=imported_attachment_mxc,
         width=imported_attachment_width, height=imported_attachment_height,
+        media_type=imported_attachment_media_type,
     )
     if is_bare_msc4501_body and imported_link:
         message_content["body"] = imported_link

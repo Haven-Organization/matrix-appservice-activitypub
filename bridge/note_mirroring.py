@@ -61,6 +61,7 @@ from bridge.media import (
     fetch_and_upload_media_with_dimensions,
     filename_with_extension,
     matrix_msgtype_for_mimetype,
+    retargeted_filename,
 )
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.peertube import resolve_media_type
@@ -930,6 +931,7 @@ async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, 
 async def merge_attachment_into_content(
     request: Request, message_content: dict, attachment: dict, *,
     mxc_uri: str | None = None, width: int | None = None, height: int | None = None,
+    media_type: str | None = None,
 ) -> tuple[dict, str | None]:
     """Fold ``attachment`` into ``message_content`` -- switching its
     ``msgtype`` to the media type and adding ``url``/``info``/``filename`` --
@@ -944,14 +946,20 @@ async def merge_attachment_into_content(
     ``mxc_uri``, if given, is reused as-is rather than fetching/re-uploading
     the attachment's source URL again -- same reasoning as
     ``mirror_attachment``'s identical parameter. Since that path never
-    (re-)fetches the file, it has no way to work out ``width``/``height``
-    itself -- pass them in too (read back from the FIRST call's own
-    returned ``info.w``/``info.h``, e.g. via ``ImportedNote.first_attachment_width``/
-    ``_height``) if the caller has them, or they're silently dropped for
-    this copy (confirmed live 2026-07-10: a reposted video's confirmation
-    card was missing its dimensions entirely -- cut off in Element's
-    timeline -- because the reuse path here had no way to carry them over
-    before this parameter existed).
+    (re-)fetches the file, it has no way to work out ``width``/``height``/
+    ``media_type`` itself -- pass them in too (read back from the FIRST
+    call's own returned ``info.w``/``info.h``/``info.mimetype``, e.g. via
+    ``ImportedNote.first_attachment_width``/``_height``/``_media_type``)
+    if the caller has them, or they're silently dropped for this copy
+    (confirmed live 2026-07-10: a reposted video's confirmation card was
+    missing its dimensions entirely -- cut off in Element's timeline --
+    because the reuse path here had no way to carry them over before this
+    parameter existed). ``media_type`` matters more than it looks: if the
+    FIRST upload converted an unsupported format (JPEG XL/AVIF/HEIC; see
+    ``bridge.media._convert_unsupported_image``), ``attachment["media_type"]``
+    is still the ORIGINAL, no-longer-true AP-declared type -- the caller
+    must pass the real, already-converted one back in here instead of
+    letting it fall back to that.
 
     When no ``mxc_uri`` is given, a fresh fetch still recognizes -- and
     reuses without re-uploading -- an attachment URL that turns out to be
@@ -965,30 +973,41 @@ async def merge_attachment_into_content(
     to mirror the same attachment elsewhere without re-uploading it.
     """
     if mxc_uri is None:
-        # Any given width/height are meaningless for a fresh fetch of a
-        # DIFFERENT mxc_uri -- ignored in favor of whatever this fetch
-        # itself determines (image formats too, not just video -- see
+        # Any given width/height/media_type are meaningless for a fresh
+        # fetch of a DIFFERENT mxc_uri -- ignored in favor of whatever this
+        # fetch itself determines (image formats too, not just video -- see
         # fetch_and_upload_media_with_dimensions).
-        width = height = None
+        width = height = media_type = None
         result = await fetch_and_upload_media_with_dimensions(
             request.app.state.http_client, request.app.state.synapse, attachment["url"],
             public_base_url=request.app.state.config.bridge.public_base_url,
         )
         if result is None:
             return message_content, None
-        mxc_uri, width, height = result
+        mxc_uri, width, height, media_type = result
     if not mxc_uri:
         return message_content, None
+    # Falls back to the AP-declared type only when nothing more specific
+    # came back from an actual upload (freshly done above, or passed in by
+    # a reuse caller) -- see this function's own docstring for why that
+    # matters once a format gets converted before upload.
+    effective_media_type = media_type or attachment["media_type"]
     merged = dict(message_content)
-    merged["msgtype"] = matrix_msgtype_for_mimetype(attachment["media_type"])
+    merged["msgtype"] = matrix_msgtype_for_mimetype(effective_media_type)
     merged["url"] = mxc_uri
-    info = {"mimetype": attachment["media_type"]}
+    info = {"mimetype": effective_media_type}
     if width and height:
         info["w"] = width
         info["h"] = height
     merged["info"] = info
     raw_filename = attachment["name"] or attachment["url"].rsplit("/", 1)[-1] or "attachment"
-    merged["filename"] = filename_with_extension(raw_filename, attachment["media_type"])
+    if effective_media_type != attachment["media_type"]:
+        # A conversion actually happened -- raw_filename's own extension
+        # (if any) names the ORIGINAL, no-longer-true format, so it must be
+        # replaced, not just filled in when missing.
+        merged["filename"] = retargeted_filename(raw_filename, effective_media_type)
+    else:
+        merged["filename"] = filename_with_extension(raw_filename, effective_media_type)
     # A caption-less attachment (the common case for a plain image/video
     # post) otherwise leaves `body` blank -- real clients (confirmed
     # against Element's own outbound convention) always fall back to the
@@ -1004,6 +1023,7 @@ async def merge_attachment_into_content(
 async def attach_media_to_content(
     request: Request, message_content: dict, attachments: list[dict], *,
     mxc_uri: str | None = None, width: int | None = None, height: int | None = None,
+    media_type: str | None = None,
 ) -> tuple[dict, str | None]:
     """Attach ``attachments`` to ``message_content`` -- embedding only the
     FIRST as real Matrix media (see ``merge_attachment_into_content``) so an
@@ -1026,9 +1046,9 @@ async def attach_media_to_content(
     ``mxc_uri``, if given, is reused for the first attachment as-is rather
     than fetching/re-uploading it again -- same reasoning as
     ``merge_attachment_into_content``'s identical parameter, including
-    ``width``/``height`` needing to be passed in alongside it (see that
-    function's own docstring) since the reuse path can't work them out
-    itself.
+    ``width``/``height``/``media_type`` needing to be passed in alongside
+    it (see that function's own docstring) since the reuse path can't work
+    them out itself.
 
     Returns ``(content, mxc_uri)`` matching ``merge_attachment_into_content``'s
     own shape: the second element is the mxc:// URI the FIRST attachment
@@ -1045,6 +1065,7 @@ async def attach_media_to_content(
         return message_content, None
     merged, used_mxc_uri = await merge_attachment_into_content(
         request, message_content, attachments[0], mxc_uri=mxc_uri, width=width, height=height,
+        media_type=media_type,
     )
     extra = attachments[1:] if used_mxc_uri else attachments
     if not extra:
@@ -2434,20 +2455,26 @@ class ImportedNote:
     """Result of ``import_note``. ``first_attachment_mxc`` is the ``mxc://``
     URI the note's first (only embedded -- see ``attach_media_to_content``)
     attachment ended up uploaded as, if it had one (``first_attachment_width``/
-    ``_height`` alongside it, if they could be determined -- needed so a
-    caller reusing ``first_attachment_mxc`` can pass them straight through
-    to ``attach_media_to_content`` too, since THAT reuse path has no way to
-    work them out itself; see its own docstring), and ``author_avatar_mxc``
-    is the author's ghost/room avatar (if a new Remote User Room had to be
-    created for them) -- all exposed so a caller that separately builds its
-    own message referencing the same attachment/avatar (e.g.
-    ``_handle_announce``'s repost summary card) can reuse them instead of
-    re-uploading the same files to the homeserver."""
+    ``_height``/``_media_type`` alongside it, if they could be determined --
+    needed so a caller reusing ``first_attachment_mxc`` can pass them
+    straight through to ``attach_media_to_content`` too, since THAT reuse
+    path has no way to work them out itself; see its own docstring), and
+    ``author_avatar_mxc`` is the author's ghost/room avatar (if a new
+    Remote User Room had to be created for them) -- all exposed so a
+    caller that separately builds its own message referencing the same
+    attachment/avatar (e.g. ``_handle_announce``'s repost summary card)
+    can reuse them instead of re-uploading the same files to the
+    homeserver. ``first_attachment_media_type`` matters beyond just being
+    "the mimetype": once an unsupported format (JPEG XL/AVIF/HEIC) gets
+    converted before upload, it's the only place that still knows the
+    REAL, now-uploaded type -- the original AP attachment's own declared
+    one is stale by then."""
 
     federated_event: FederatedEvent | None
     first_attachment_mxc: str | None = None
     first_attachment_width: int | None = None
     first_attachment_height: int | None = None
+    first_attachment_media_type: str | None = None
     author_avatar_mxc: str | None = None
 
 
@@ -2976,6 +3003,7 @@ async def _import_note_locked(
         first_attachment_mxc: str | None = None
         first_attachment_width: int | None = None
         first_attachment_height: int | None = None
+        first_attachment_media_type: str | None = None
         try:
             existing_event = await synapse.get_event(existing.room_id, existing.event_id, as_user_id=bot_mxid)
         except SynapseError:
@@ -2991,9 +3019,11 @@ async def _import_note_locked(
                 info = existing_content.get("info") or {}
                 first_attachment_width = info.get("w")
                 first_attachment_height = info.get("h")
+                first_attachment_media_type = info.get("mimetype")
         return ImportedNote(
             federated_event=existing, first_attachment_mxc=first_attachment_mxc,
             first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
+            first_attachment_media_type=first_attachment_media_type,
         )
 
     remote_room, author_avatar_mxc = await ensure_remote_actor_room(
@@ -3085,6 +3115,7 @@ async def _import_note_locked(
     first_attachment_info = message_content.get("info") or {}
     first_attachment_width = first_attachment_info.get("w")
     first_attachment_height = first_attachment_info.get("h")
+    first_attachment_media_type = first_attachment_info.get("mimetype")
 
     config = request.app.state.config
     max_clock_skew = config.federation.max_clock_skew
@@ -3100,7 +3131,7 @@ async def _import_note_locked(
         return ImportedNote(
             federated_event=None, first_attachment_mxc=first_attachment_mxc,
             first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
-            author_avatar_mxc=author_avatar_mxc,
+            first_attachment_media_type=first_attachment_media_type, author_avatar_mxc=author_avatar_mxc,
         )
 
     new_event: FederatedEvent | None = None
@@ -3150,7 +3181,7 @@ async def _import_note_locked(
     return ImportedNote(
         federated_event=new_event, first_attachment_mxc=first_attachment_mxc,
         first_attachment_width=first_attachment_width, first_attachment_height=first_attachment_height,
-        author_avatar_mxc=author_avatar_mxc,
+        first_attachment_media_type=first_attachment_media_type, author_avatar_mxc=author_avatar_mxc,
     )
 
 
