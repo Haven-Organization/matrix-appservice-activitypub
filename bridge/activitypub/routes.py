@@ -62,12 +62,15 @@ from bridge.custom_emoji import apply_resolved_emoji
 from bridge.identity_settings import get_effective_setting
 from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPLY,
+    SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     build_repost_note_content,
     build_sibling_reply_note_content,
+    build_sibling_repost_note_content,
     resolve_cross_bridge_handle,
     split_repost_caption,
 )
+from bridge.profile_posts import _BARE_MATRIX_LINK_BODY_RE
 from bridge.activitypub.urls import (
     actor_url,
     featured_url,
@@ -756,16 +759,18 @@ def _reconstruct_note_body(
     else it's just the filename and is blanked.
 
     A sibling-bridge Profile Room reply (see ``bridge.profile_posts.
-    _maybe_handle_sibling_bridge_reply``) gets the same "reconstruct from
-    the Matrix event, don't trust a separately-cached copy" treatment --
-    its ``SOCIAL_RELATES_TO_FIELD`` lives directly on the event's own
-    content, same as the live send path reads it from, so this just
-    re-derives the identical header+link rather than falling through to
-    the ordinary body-only reconstruction below (which would silently
-    drop the "reply to X" framing on a re-fetch/outbox view). Uses
-    ``raw_event_content`` (the ORIGINAL, pre-edit content), same
-    raw-vs-effective split ``derive_in_reply_to`` already needs -- an
-    edit's ``m.new_content`` never carries this field either."""
+    _maybe_handle_sibling_bridge_reply``) or repost (see
+    ``bridge.profile_posts._maybe_handle_sibling_bridge_repost``) gets the
+    same "reconstruct from the Matrix event, don't trust a separately-
+    cached copy" treatment -- its ``SOCIAL_RELATES_TO_FIELD`` lives
+    directly on the event's own content, same as the live send path reads
+    it from, so this just re-derives the identical header+link rather
+    than falling through to the ordinary body-only reconstruction below
+    (which would silently drop the "reply to X"/"reposted X" framing on a
+    re-fetch/outbox view). Uses ``raw_event_content`` (the ORIGINAL,
+    pre-edit content), same raw-vs-effective split ``derive_in_reply_to``
+    already needs -- an edit's ``m.new_content`` never carries this field
+    either."""
     if federated.reposted_object_id:
         body = (event_content.get("body") or "").strip()
         caption = split_repost_caption(body)
@@ -780,6 +785,17 @@ def _reconstruct_note_body(
                 body = (event_content.get("body") or "").strip()
                 handle = resolve_cross_bridge_handle(relates_to_content, fallback=relates_to.get("displayname"))
                 content_html = build_sibling_reply_note_content(body, external_url, handle)
+                return body, content_html, None
+    if isinstance(relates_to, dict) and relates_to.get("rel_type") == SOCIAL_REL_TYPE_REPOST:
+        repost_sender = relates_to.get("sender") or ""
+        if is_foreign_bridge_user(repost_sender, config):
+            relates_to_content = relates_to.get("content") or {}
+            external_url = relates_to_content.get("external_url")
+            if isinstance(external_url, str) and external_url:
+                body = (event_content.get("body") or "").strip()
+                caption = "" if _BARE_MATRIX_LINK_BODY_RE.match(body) else body
+                handle = resolve_cross_bridge_handle(relates_to_content, fallback=relates_to.get("displayname"))
+                content_html = build_sibling_repost_note_content(caption, external_url, handle)
                 return body, content_html, None
     body = media_caption(event_content) if attachment is not None else (event_content.get("body") or "").strip()
     content_html = matrix_body_to_note_html(body, event_content.get("formatted_body")) if body else ""

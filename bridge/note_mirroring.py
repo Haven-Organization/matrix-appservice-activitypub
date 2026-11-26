@@ -835,6 +835,34 @@ def build_sibling_reply_note_content(
     return header + plain_text_to_note_html(body, mention_links)
 
 
+def build_sibling_repost_note_content(
+    caption: str, external_url: str, display_name: str | None, mention_links: dict[str, str] | None = None
+) -> str:
+    """The AP ``content`` HTML for a repost of a sibling bridge's ghost
+    (Bluesky/Nostr content mirrored in by ``matrix-appservice-atproto``/
+    ``matrix-appservice-nostr`` -- see
+    ``bridge.profile_posts._maybe_handle_sibling_bridge_repost``): a
+    "🔁 Reposted <display name>'s post:" line linking to ``external_url``,
+    then the reposter's own caption, if any.
+
+    Same reasoning as ``build_sibling_reply_note_content`` for why this is
+    plain embedded content rather than a protocol-level ``Announce``/
+    ``quoteUri`` relation (there's no real foreign AP object here at all),
+    and mirrors that function's header shape -- this just didn't exist
+    until now, so a cross-bridge repost federated to the fediverse with no
+    attribution at all while the exact same situation already gets one on
+    both the Nostr and Bluesky side (confirmed live 2026-11-26: a repost of
+    a poa.st post showed "🔁 reposted X's post" on its Nostr mirror but only
+    a bare "RT: <link>" on the fediverse side). Shared between the live
+    send (``bridge.reaction_bridge.send_cross_bridge_quote``) and
+    ``bridge.activitypub.routes``'s own reconstruction (see
+    ``_reconstruct_note_body``) so a re-fetched/outbox copy never drifts
+    from what was actually delivered."""
+    who = display_name or external_url
+    header = f'<p>\U0001F501 Reposted <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post:</p>'
+    return header + (plain_text_to_note_html(caption, mention_links) if caption else "")
+
+
 def split_repost_caption(echo_body: str) -> str:
     """Recovers just the caption typed into ``;repost <caption>`` from its
     own Matrix profile-room echo body (see ``bridge.commands.

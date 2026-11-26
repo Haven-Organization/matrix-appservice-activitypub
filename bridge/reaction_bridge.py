@@ -63,8 +63,8 @@ from bridge.note_mirroring import (
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
-    build_repost_note_content,
     build_sibling_reply_note_content,
+    build_sibling_repost_note_content,
     deliver_to_actor_or_followers,
     resolve_actor_matrix_identity,
     resolve_cross_bridge_handle,
@@ -648,9 +648,9 @@ async def send_cross_bridge_quote(
     maintain here, since nothing is actually being boosted.
 
     ``is_reply`` (False for a repost/``;repost``, True for an actual
-    reply) switches the Note's own content from "RT: <link>"
-    (``build_repost_note_content``) to "↩️ Reply to <handle>'s
-    post: <link>" (``build_sibling_reply_note_content``) -- same
+    reply) switches the Note's own content from "🔁 Reposted <handle>'s
+    post:" (``build_sibling_repost_note_content``) to "↩️ Reply to
+    <handle>'s post" (``build_sibling_reply_note_content``) -- same
     distinction the echo card's own wording below makes.
 
     Posts the usual "🔁 reposted X's post"/"↩️ replied to X's
@@ -741,11 +741,11 @@ async def send_cross_bridge_quote(
         await repository.mark_media_published(preview_full_content["url"])
 
     published = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    handle = None if original_handle == "a post" else original_handle
     if is_reply:
-        reply_handle = None if original_handle == "a post" else original_handle
-        note_html = build_sibling_reply_note_content(caption, link_for_note, reply_handle)
+        note_html = build_sibling_reply_note_content(caption, link_for_note, handle)
     else:
-        note_html = build_repost_note_content(caption, link_for_note)
+        note_html = build_sibling_repost_note_content(caption, link_for_note, handle)
     note = Note(
         id=note_id, attributed_to=own_actor_id, content=note_html, published=published,
         to=[AS_PUBLIC], cc=[followers_url(base, actor_record.username)],
