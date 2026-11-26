@@ -569,13 +569,23 @@ def is_foreign_bot_command(content: dict, config) -> bool:
       it won't appear in ordinary prose by coincidence.
     - Anything else is a short/punctuation-style prefix (``;``, ``]``,
       ``!``, ``nostr:``, ...), matched only at the very START of the
-      first line (same anchoring as ``_PREFIXED_COMMAND_RE``, just
-      without also requiring a recognized keyword after it -- there's no
-      way to know another bot's own keyword vocabulary). Anchoring
-      matters here specifically because a short prefix like ``;`` or
-      ``!`` is common enough in ordinary prose that matching it ANYWHERE
-      would silently swallow real posts that merely contain that
-      character.
+      first line (same anchoring as ``_PREFIXED_COMMAND_RE``) AND only
+      when the prefix is immediately followed by whitespace or the end
+      of the line -- same loose-but-deliberate heuristic as this
+      bridge's own ``_PREFIX_ADDRESS_RE`` (there's no way to know another
+      bot's own keyword vocabulary, so this is as close to "looks
+      command-shaped" as we can get without one). A bare
+      ``.startswith(prefix)`` used to be enough, which meant an ordinary
+      reply that merely started with a bracketed tag -- "[FREE] song x
+      ..." -- was indistinguishable from a real ``[``-addressed command
+      and got silently swallowed before it ever reached
+      ``bridge.reply_bridge`` (confirmed live 2026-11-26: a real reply to
+      a poa.st post never federated, no error, no notice, nothing
+      recorded). Requiring whitespace-or-end directly after the prefix
+      rules that out -- a tag's closing word runs right up against the
+      bracket with no space -- while still catching a genuine ``[``/``]``
+      command, a bare prefix with nothing else, or anything else actually
+      addressed the way this bridge's own prefix is.
 
     Checked everywhere ``message_addresses_bot`` already is (profile/
     reply/chat/channel/Lemmy post distribution) as an ADDITIONAL reason to
@@ -600,7 +610,7 @@ def is_foreign_bot_command(content: dict, config) -> bool:
         if _MXID_RE.match(prefix):
             if prefix in mentioned or prefix in body:
                 return True
-        elif first_line.startswith(prefix):
+        elif re.match(rf"^{re.escape(prefix)}(?:\s|$)", first_line):
             return True
     return False
 
