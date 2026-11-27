@@ -214,6 +214,11 @@ class ActorKeyCache:
         self._signing_key_id = signing_key_id
         self._signing_private_key_pem = signing_private_key_pem
 
+
+    def set_ttl(self, ttl_seconds: int) -> None:
+        """Change how long fetched keys stay cached (a
+        federation.actor_key_cache_ttl settings change)."""
+        self._ttl = ttl_seconds
     async def get(self, key_id: str) -> str:
         cached = self._cache.get(key_id)
         if cached is not None and (time.monotonic() - cached[0]) < self._ttl:

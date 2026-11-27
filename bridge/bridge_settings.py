@@ -31,6 +31,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import httpx
+
 from bridge.config import BridgeConfig
 from bridge.repository import ActorRepository
 
@@ -355,3 +357,21 @@ async def clear_override(repository: ActorRepository, key: str) -> None:
     if not definition.editable:
         raise SettingError(f'"{key}" can only be changed in config.yaml.')
     await repository.clear_bridge_setting(key)
+
+
+def apply_runtime_settings(state: Any, config: BridgeConfig) -> None:
+    """Push the settings that long-lived objects captured at startup into
+    those objects, so a database override takes effect at startup and on
+    every later change: the outbound HTTP timeout, the actor key cache TTL
+    and the log level."""
+    timeout = config.federation.request_timeout
+    http_client = getattr(state, "http_client", None)
+    if http_client is not None:
+        http_client.timeout = httpx.Timeout(timeout)
+    synapse = getattr(state, "synapse", None)
+    if synapse is not None:
+        synapse.set_timeout(timeout)
+    key_cache = getattr(state, "key_cache", None)
+    if key_cache is not None:
+        key_cache.set_ttl(config.federation.actor_key_cache_ttl)
+    logging.getLogger().setLevel(getattr(logging, config.logging.level.upper(), logging.INFO))

@@ -24,7 +24,7 @@ from bridge.activitypub.routes import router as activitypub_router
 from bridge.activitypub.signatures import ActorKeyCache
 from bridge.activitypub.urls import main_key_id
 from bridge.appservice_routes import router as appservice_router
-from bridge.bridge_settings import effective_config
+from bridge.bridge_settings import apply_runtime_settings, effective_config
 from bridge.commands import configure_command_prefix
 from bridge.config import BridgeConfig, ConfigError
 from bridge.ghosts import sync_bot_profile
@@ -186,6 +186,9 @@ def create_app(
             timeout=config.federation.request_timeout,
         )
         await _wait_for_synapse_ready(app.state.synapse, config.synapse.base_url)
+        # The HTTP clients, key cache and log level above were set up from
+        # config.yaml; apply any stored overrides to them now.
+        apply_runtime_settings(app.state, app.state.config)
 
         # app.state.config here, not the raw config object -- so a stored
         # bridge_settings override for either field (see

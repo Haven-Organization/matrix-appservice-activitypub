@@ -37,7 +37,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, media_url
 from bridge.backstage_space import ensure_backstage_space
-from bridge.bridge_settings import SettingError, apply_override, clear_override, effective_config, known_settings, value_of
+from bridge.bridge_settings import (
+    SettingError,
+    apply_override,
+    apply_runtime_settings,
+    clear_override,
+    effective_config,
+    known_settings,
+    value_of,
+)
 from bridge.ghosts import sync_bot_profile
 from bridge.commands import (
     _ALLOW_RULE_TYPES,
@@ -770,6 +778,7 @@ async def _refresh_effective_config(request: Request) -> None:
     own startup makes, safe to repeat any time either field changes)."""
     config = request.app.state.config = await effective_config(request.app.state.base_config, request.app.state.repository)
     configure_command_prefix(config.bridge.command_prefix)
+    apply_runtime_settings(request.app.state, config)
     await sync_bot_profile(
         request.app.state.synapse,
         server_name=config.synapse.server_name,

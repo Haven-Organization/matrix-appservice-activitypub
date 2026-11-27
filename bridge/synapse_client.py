@@ -79,6 +79,11 @@ class SynapseClient:
         # default doesn't change) -- see _resolve_room_version_for_creation.
         self._default_room_version: str | None = None
 
+    def set_timeout(self, timeout: float) -> None:
+        """Change the request timeout of the live client (a
+        federation.request_timeout settings change)."""
+        self._client.timeout = httpx.Timeout(timeout)
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
