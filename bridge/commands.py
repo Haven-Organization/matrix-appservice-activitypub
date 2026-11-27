@@ -339,6 +339,7 @@ from bridge.note_mirroring import (
     provision_ghost,
     push_profile_update,
     refresh_poll_tallies,
+    resolve_actor_display_name,
     resolve_actor_matrix_identity,
     resolve_event_ts,
     resolve_mention_pills,
@@ -2058,7 +2059,7 @@ async def _establish_remote_follow(
 
     remote_room = await repository.get_remote_actor_room(remote_actor_id)
     if remote_room is None:
-        display_name = actor_doc.get("name") or username
+        display_name = resolve_actor_display_name(actor_doc, username)
         icon_url = extract_icon_url(actor_doc)
         # Uploaded once and reused for both the ghost's own Matrix avatar and
         # the room's avatar below, rather than uploading the same image
@@ -5024,7 +5025,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
 
     remote_room = await repository.get_remote_actor_room(author_actor_id)
     if remote_room is None:
-        display_name = author_doc.get("name") or username
+        display_name = resolve_actor_display_name(author_doc, username)
         icon_url = extract_icon_url(author_doc)
         avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
         banner_url = extract_banner_url(author_doc)
@@ -5451,7 +5452,7 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     mxid = remote_room.ghost_user_id
     username = actor_doc.get("preferredUsername") or remote_actor_id.rstrip("/").rsplit("/", 1)[-1]
     domain = urlsplit(remote_actor_id).hostname or ""
-    display_name = actor_doc.get("name") or username
+    display_name = resolve_actor_display_name(actor_doc, username)
     icon_url = extract_icon_url(actor_doc)
     banner_url = extract_banner_url(actor_doc)
 
@@ -10381,7 +10382,7 @@ async def _replace_remote_actor_room(
 
     domain = urlsplit(remote_room.actor_id).hostname or ""
     username = actor_doc.get("preferredUsername") or remote_room.actor_id.rstrip("/").rsplit("/", 1)[-1]
-    display_name = actor_doc.get("name") or username
+    display_name = resolve_actor_display_name(actor_doc, username)
     # Same fallback-to-what-we-already-had convention as inbox_url below --
     # a failed re-fetch (actor_doc == {}) must NOT be read as "this actor has
     # no icon/banner now", or a transient fetch failure during ;replace room

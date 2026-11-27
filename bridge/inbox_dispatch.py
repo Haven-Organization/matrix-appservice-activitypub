@@ -3405,7 +3405,7 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     if remote_room is None:
         return  # we don't mirror this actor
 
-    new_name = obj.get("name") or obj.get("preferredUsername") or remote_room.display_name
+    new_name = (obj.get("name") or obj.get("preferredUsername") or remote_room.display_name).strip()
     new_icon_url = extract_icon_url(obj)
     new_banner_url = extract_banner_url(obj)
     name_changed = new_name != remote_room.display_name

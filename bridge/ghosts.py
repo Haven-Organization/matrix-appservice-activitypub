@@ -174,13 +174,23 @@ async def _sync_formatted_displayname_rooms(
     from scratch, so nothing else already on the member event is lost.
     ``formatted_body=None`` clears the field (the name no longer has any
     resolvable shortcode, or the feature was turned back off) rather than
-    leaving a stale value whose own emoji no longer match ``displayname``."""
-    room_ids: list[str] = []
-    remote_actor_room = await repository.get_remote_actor_room(actor_id)
-    if remote_actor_room is not None:
-        room_ids.append(remote_actor_room.room_id)
-    room_ids.extend(await repository.get_ghost_dm_room_ids_for_actor(actor_id))
-    room_ids.extend(await repository.get_ghost_chat_room_ids_for_actor(actor_id))
+    leaving a stale value whose own emoji no longer match ``displayname``.
+
+    Enumerated via ``synapse.get_joined_rooms(mxid)`` -- the real,
+    complete list of every room this ghost is actually in right now --
+    rather than ``_sync_room_avatars``'s own room-category bookkeeping
+    (Remote User Room + DM/Chat rooms only). Confirmed live 2026-11-27
+    (Haven): a ghost is routinely also a member of OTHER rooms entirely
+    (someone else's Remote User Room they replied in, a shared room, ...)
+    that this bridge never created FOR them and so has no bookkeeping
+    category for at all -- but per MSC4589 the field should travel
+    everywhere ``displayname`` does, which Synapse already does for
+    EVERY room a user is joined to, not just ones of a particular kind."""
+    try:
+        room_ids = await synapse.get_joined_rooms(mxid)
+    except SynapseError:
+        logger.debug("Could not list joined rooms for ghost %s", mxid, exc_info=True)
+        return
 
     for room_id in room_ids:
         try:

@@ -904,6 +904,27 @@ def split_repost_caption(echo_body: str) -> str:
     return echo_body.split(REPOST_CAPTION_MARKER, 1)[0]
 
 
+def resolve_actor_display_name(actor_doc: dict, fallback: str) -> str:
+    """``actor_doc``'s own ``name`` (falling back to ``fallback``, e.g. the
+    username), stripped -- the ONE place every ghost-display-name-setting
+    call site derives this string, so ``synapse.set_display_name``, the
+    MSC4589 ``formatted_displayname`` built from it, and ``m.room.name``
+    (see ``bridge.ghosts.sync_ghost_profile``'s own room-name sync) always
+    get byte-for-byte the SAME string.
+
+    Confirmed live 2026-11-27 (Haven): a remote actor's own ``name`` field
+    can carry trailing (or internal) whitespace a non-Matrix-aware remote
+    server never trims -- and MSC4589's own consistency rule requires
+    ``formatted_displayname``'s reconstructed text to be byte-for-byte the
+    plain ``displayname`` with NO tolerance at all, so even a single
+    trailing space anywhere this string flows through (but not through
+    SOME other copy of it) silently breaks the whole feature for that
+    ghost. Stripping ONCE, here, and reusing the result everywhere,
+    guarantees that rather than relying on every caller -- or Synapse
+    itself -- to normalize identically on their own."""
+    return (actor_doc.get("name") or "").strip() or fallback
+
+
 async def resolve_actor_matrix_identity(request: Request, actor_id: str) -> tuple[str, str, str | None]:
     """``(handle, display_name, mxid_or_None)`` for ``actor_id`` -- the
     shared lookup ``actor_html_with_avatar`` builds its pill from, factored
@@ -1672,7 +1693,7 @@ async def resolve_and_invite_ghost(request: Request, actor_id: str, room_id: str
         logger.info("Could not determine domain for actor %s; skipping ghost", actor_id)
         return None
     remote_username = actor_doc.get("preferredUsername") or actor_id.rstrip("/").rsplit("/", 1)[-1]
-    display_name = actor_doc.get("name") or remote_username
+    display_name = resolve_actor_display_name(actor_doc, remote_username)
     icon_url = extract_icon_url(actor_doc) if actor_doc else None
     localpart = ghost_localpart(config.appservice.user_prefix, remote_username, domain)
     mxid = ghost_mxid(config.appservice.user_prefix, remote_username, domain, config.synapse.server_name)
@@ -2059,7 +2080,7 @@ async def provision_ghost(request: Request, actor_id: str) -> tuple[str, dict, s
         logger.info("Could not determine domain for actor %s; skipping ghost", actor_id)
         return None
     username = actor_doc.get("preferredUsername") or actor_id.rstrip("/").rsplit("/", 1)[-1]
-    display_name = actor_doc.get("name") or username
+    display_name = resolve_actor_display_name(actor_doc, username)
     icon_url = extract_icon_url(actor_doc) if actor_doc else None
     localpart = ghost_localpart(config.appservice.user_prefix, username, domain)
     mxid = ghost_mxid(config.appservice.user_prefix, username, domain, config.synapse.server_name)
@@ -2979,7 +3000,7 @@ async def ensure_remote_actor_room(
     remote_room = await repository.get_remote_actor_room(author_actor_id)
     author_avatar_mxc: str | None = None
     if remote_room is None:
-        display_name = author_doc.get("name") or username
+        display_name = resolve_actor_display_name(author_doc, username)
         icon_url = extract_icon_url(author_doc)
         avatar_mxc = await fetch_and_upload_media(request.app.state.http_client, synapse, icon_url) if icon_url else None
         author_avatar_mxc = avatar_mxc
