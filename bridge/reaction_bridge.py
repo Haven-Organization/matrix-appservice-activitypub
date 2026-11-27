@@ -53,7 +53,7 @@ from bridge.activitypub.models import AS_PUBLIC, Activity, Note
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url
 from bridge.commands import is_foreign_bridge_user
 from bridge.shadow_identity import ensure_shadow_actor, is_third_party_still_allowed, shadow_created_notice
-from bridge.inbox_dispatch import _fetch_post_preview, build_preview_media_content, quote_block_html
+from bridge.inbox_dispatch import _fetch_post_preview, _notify_post_owner, build_preview_media_content, quote_block_html
 from bridge.matrix_links import matrix_to_link
 from bridge.media import build_ap_attachment
 from bridge.note_mirroring import (
@@ -586,6 +586,20 @@ async def send_repost(
             key_id=main_key_id(base, actor_record.username),
             private_key_pem=actor_record.private_key_pem,
         )
+        # When the reposted post is itself a LOCAL user's own post, the
+        # delivery above never reaches a real inbox to notify them through
+        # -- it loops back into our own inbound handler and is dropped
+        # (see deliver_to_actor_or_followers's own docstring), so unlike a
+        # remote repost (notified via the ordinary inbound Announce path,
+        # _handle_announce_locked's own _notify_post_owner call) a local
+        # target needs this called directly. _notify_post_owner already
+        # no-ops for anything but a genuinely local target, so this is
+        # safe to call unconditionally rather than re-deriving that check.
+        target_post = await repository.get_federated_event_by_ap_object(target_object_id)
+        if target_post is not None:
+            await _notify_post_owner(
+                request, target=target_post, actor_id=own_actor_id, actor_doc={}, verb_phrase="reposted your post",
+            )
 
     if matrix_event_id or notice_event_id:
         await repository.record_reaction(

@@ -798,6 +798,25 @@ async def _notify_post_owner(
     User Room instead (someone else's post, which nobody here owns).
     Best-effort -- same reasoning as ``_announce_new_follower``.
 
+    ``actor_id`` doesn't have to be a genuinely remote actor (added
+    2026-11-27): ``bridge.reaction_bridge.send_repost``,
+    ``bridge.commands._handle_repost``, and ``bridge.profile_posts.
+    _maybe_handle_msc4501_quote_post`` all call this directly for a LOCAL
+    reposter too, since reposting/quote-posting another local user's post
+    never produces a real inbound AP activity to notify through at all
+    (delivery loops back into our own inbox and is dropped -- see
+    ``deliver_to_actor_or_followers``). Resolved as a local actor first,
+    falling back to the ghost-construction path below only when it isn't
+    one -- and a no-op, same as every other early return here, when the
+    acting identity turns out to be the post's own owner (no self-notify).
+    ``verb_phrase="replied to your post"`` (also added 2026-11-27, from
+    ``_handle_create``'s live-reply branch -- never from
+    ``_mirror_note_as_reply``'s OTHER callers, which cover ancestor-chain
+    backfills, ``;import``, and mirrored Lemmy/group replies, where this
+    would notify about a possibly months-old reply instead of news) gets
+    its own leading emoji below, matching this bridge's own reply-header
+    convention.
+
     ``reaction_emoji``/``reaction_emoji_mxc`` (only set by
     ``_handle_like_or_emoji_react``, for an actual reaction -- i.e.
     ``activity.content`` was present, not a plain heart-less ``Like``) show
@@ -872,10 +891,32 @@ async def _notify_post_owner(
     if await is_silenced(repository, owner.username, actor_id):
         return  # ;mute/;block -- no notification about this specific actor's interactions
 
-    domain = urlsplit(actor_id).hostname or ""
-    reactor_username = actor_doc.get("preferredUsername") or actor_id.rstrip("/").rsplit("/", 1)[-1]
-    handle = f"@{reactor_username}@{domain}"
-    mxid = ghost_mxid(config.appservice.user_prefix, reactor_username, domain, config.synapse.server_name)
+    # The acting identity may be a LOCAL bridge user too -- reposting/
+    # reacting to another local user's post never produces a real inbound
+    # AP activity to notify through (see ``bridge.reaction_bridge.
+    # send_repost``'s own direct call to this function for that case), so
+    # ``actor_id`` isn't always a genuinely remote actor the way every
+    # OTHER caller of this function (all inbound activity handlers) can
+    # assume. Resolved the same local-vs-ghost distinction every other
+    # actor-id lookup in this bridge makes (see
+    # ``resolve_actor_matrix_identity``), rather than always ghost-
+    # constructing an mxid that would be wrong for a local reactor.
+    local_reactor_username = username_from_actor_url(config.bridge.public_base_url, actor_id)
+    if local_reactor_username == owner.username:
+        return  # reposted/reacted to their own post -- nothing to tell them
+    if local_reactor_username is not None:
+        reactor = await repository.get_local_actor(local_reactor_username)
+        if reactor is None or not reactor.matrix_user_id:
+            return
+        handle = f"@{local_reactor_username}@{config.bridge.domain}"
+        mxid = reactor.matrix_user_id
+        display_name = reactor.display_name or local_reactor_username
+    else:
+        domain = urlsplit(actor_id).hostname or ""
+        reactor_username = actor_doc.get("preferredUsername") or actor_id.rstrip("/").rsplit("/", 1)[-1]
+        handle = f"@{reactor_username}@{domain}"
+        mxid = ghost_mxid(config.appservice.user_prefix, reactor_username, domain, config.synapse.server_name)
+        display_name = actor_doc.get("name") or reactor_username
     link = matrix_to_link(target.room_id, target.event_id)
 
     preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(request, target)
@@ -898,11 +939,14 @@ async def _notify_post_owner(
     # (\U0001F514) get theirs at their own send sites, and a plain
     # heart-less Dislike gets \U0001F44E rather than falling through to the
     # generic \U0001F44D like default below it, so a dislike notification
-    # reads distinctly from a like one at a glance.
+    # reads distinctly from a like one at a glance. "replied to your post"
+    # (added 2026-11-27, see the reply-mirroring call site) gets the same
+    # ⤵️ this bridge's own reply headers use everywhere else.
     type_emoji = (
         "\U0001F501" if verb_phrase.startswith("reposted")
         else reaction_emoji if verb_phrase.startswith("reacted") and reaction_emoji
         else "\U0001F44E" if verb_phrase.startswith("disliked")
+        else "⤵️" if verb_phrase.startswith("replied")
         else "\U0001F44D"
     )
     body = f"{type_emoji} {handle} {verb_phrase}"
@@ -910,9 +954,7 @@ async def _notify_post_owner(
         body += f"\n> {preview_text}"
     body += f"\n{link}"
 
-    actor_html = notification_actor_html(
-        mxid=mxid, handle=handle, display_name=actor_doc.get("name") or reactor_username
-    )
+    actor_html = notification_actor_html(mxid=mxid, handle=handle, display_name=display_name)
     quote_html = quote_block_html(preview_text, preview_full_content)
 
     # "your post" is a literal substring of every verb_phrase this is ever
@@ -1807,6 +1849,22 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
             if parent is not None:
                 reply_event = await _mirror_note_as_reply(request, obj, parent, activity.actor)
                 if reply_event is not None:
+                    # Only for a genuinely fresh reply reaching this point
+                    # live -- not _backfill_ancestor_chain's own backfilled
+                    # ancestors, nor an ancestor-chain/;import/Lemmy/group
+                    # replay of _mirror_note_as_reply's OTHER call sites,
+                    # where notifying about a possibly months-old reply
+                    # would be noise rather than news. _notify_post_owner
+                    # already no-ops for anything but a genuinely local
+                    # target, so this is safe to call unconditionally.
+                    try:
+                        replier_actor_doc = await fetch_actor(request, activity.actor)
+                    except RemoteActorFetchError:
+                        replier_actor_doc = {}
+                    await _notify_post_owner(
+                        request, target=parent, actor_id=activity.actor, actor_doc=replier_actor_doc,
+                        verb_phrase="replied to your post",
+                    )
                     if imported_root:
                         # The reply's author previously had this post show up
                         # in their OWN room (as the severed standalone), so

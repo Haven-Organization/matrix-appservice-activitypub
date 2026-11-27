@@ -266,6 +266,7 @@ from bridge.inbox_dispatch import (
     _handle_create,
     _mirror_note_as_reply,
     _note_author,
+    _notify_post_owner,
     _render_reply_header,
     _resolve_ancestor_chain,
     _resolve_reply_header_context,
@@ -5957,6 +5958,17 @@ async def _handle_repost(
     # the original post. Falls back to `parent` in the (shouldn't-happen)
     # case that lookup somehow misses.
     preview_target = await repository.get_federated_event_by_ap_object(target_object_id) or parent
+    # Only ever reaches a real inbox to notify through when the target is
+    # genuinely remote -- a LOCAL target's "delivery" above loops back into
+    # our own inbound handler and is dropped (see
+    # deliver_to_actor_or_followers's own docstring), same reasoning as
+    # bridge.reaction_bridge.send_repost's own identical call.
+    # _notify_post_owner already no-ops for anything but a genuinely local
+    # target, so this is safe to call unconditionally.
+    if target_author_actor_id and target_author_actor_id != own_actor_id:
+        await _notify_post_owner(
+            request, target=preview_target, actor_id=own_actor_id, actor_doc={}, verb_phrase="reposted your post",
+        )
     preview_text, preview_full_content, preview_image, preview_video = await _fetch_post_preview(
         request, preview_target
     )

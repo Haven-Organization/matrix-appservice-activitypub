@@ -60,6 +60,7 @@ from bridge.media import (
     normalized_message_content,
     resolve_attachment_or_request_confirmation,
 )
+from bridge.inbox_dispatch import _notify_post_owner
 from bridge.mentions import resolve_pill_mentions, resolve_plaintext_mentions, resolve_plaintext_mxid_mentions
 from bridge.note_mirroring import (
     PER_MESSAGE_PROFILE_FIELD,
@@ -307,6 +308,19 @@ async def _maybe_handle_msc4501_quote_post(
         )
         for target_actor_id in recipients
     ))
+
+    # Only ever reaches a real inbox to notify through when the target is
+    # genuinely remote -- a LOCAL target's "delivery" above loops back into
+    # our own inbound handler and is dropped (see
+    # deliver_to_actor_or_followers's own docstring), same reasoning as
+    # bridge.reaction_bridge.send_repost's own identical call.
+    # _notify_post_owner already no-ops for anything but a genuinely local
+    # target, so this is safe to call unconditionally.
+    if target_author_actor_id and target_author_actor_id != own_actor_id:
+        target_post = await repository.get_federated_event_by_ap_object(target_object_id) or parent
+        await _notify_post_owner(
+            request, target=target_post, actor_id=own_actor_id, actor_doc={}, verb_phrase="reposted your post",
+        )
 
     await note_msc4501_native_repost(
         request, reposter_matrix_user_id=actor_record.matrix_user_id, reposted_event_id=reposted_event_id,
