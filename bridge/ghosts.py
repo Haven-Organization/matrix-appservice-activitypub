@@ -258,6 +258,31 @@ async def sync_ghost_profile(
         except SynapseError:
             logger.debug("Could not set display name for ghost %s", mxid, exc_info=True)
 
+        # Keep the Remote User Room's own m.room.name in EXACT sync with
+        # the ghost's displayname too -- MSC4501's Profile Rooms section
+        # (amended 2026-11-27) lets an MSC4589-aware client show the
+        # owner's formatted display name in place of the room name, but
+        # only when the two are byte-for-byte identical. bridge.inbox_
+        # dispatch._handle_update and bridge.commands._handle_refresh
+        # already keep this in sync for the paths that explicitly
+        # re-fetch a profile -- this function is the one that picks up a
+        # name change via an ORDINARY interaction (a reply, a reaction)
+        # when the remote server never sends an Update activity at all,
+        # so without this the room name could drift out of sync
+        # indefinitely, silently breaking the substitution rule for
+        # exactly those ghosts. Unconditional on
+        # formatted_displayname_enabled, same as those other two paths
+        # -- keeping the plain name in sync is correct either way, not
+        # just when the formatted feature happens to be on.
+        remote_actor_room = await repository.get_remote_actor_room(actor_id)
+        if remote_actor_room is not None:
+            try:
+                await synapse.send_state_event(
+                    remote_actor_room.room_id, "m.room.name", "", {"name": display_name}, as_user_id=mxid,
+                )
+            except SynapseError:
+                logger.debug("Could not update room name for ghost %s", mxid, exc_info=True)
+
         if formatted_displayname_enabled:
             formatted_body = await build_formatted_displayname(http_client, synapse, repository, display_name, tag or [])
             if formatted_body is not None:
