@@ -249,6 +249,15 @@ def strip_to_matrix_message(
     return plain, safe_html
 
 
+def html_to_plain_text(content_html: str | None) -> str:
+    """The plain text of an HTML fragment such as an actor's ``summary``:
+    tags dropped and entities decoded (``&#39;`` becomes ``'``), for
+    plain-text Matrix fields like ``m.room.topic``."""
+    if not content_html:
+        return ""
+    return strip_to_matrix_message(content_html)[0]
+
+
 _BARE_URL_RE = re.compile(r'https?://[^\s<>"]+')
 # Trimmed off the end of a matched URL if there's no earlier, unmatched
 # opening character to justify it -- otherwise a URL immediately followed by

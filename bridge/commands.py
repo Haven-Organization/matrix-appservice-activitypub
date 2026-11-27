@@ -225,7 +225,7 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import strip_reply_fallback, strip_to_matrix_message
+from bridge.activitypub.sanitize import html_to_plain_text, strip_reply_fallback, strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url, username_from_actor_url
 from bridge.activitypub.webfinger import (
     WebfingerError,
@@ -2090,7 +2090,7 @@ async def _establish_remote_follow(
         new_room_id = await synapse.create_room(
             as_user_id=mxid,
             name=display_name or f"{username}@{domain}",
-            topic=actor_doc.get("summary") or f"Fediverse posts from {username}@{domain}",
+            topic=html_to_plain_text(actor_doc.get("summary")) or f"Fediverse posts from {username}@{domain}",
             # The bot is invited into every Remote User Room too (not just
             # its own ghost), so bridge commands work from inside it without
             # needing the bot to already be a member for some other reason
@@ -5052,7 +5052,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         new_room_id = await synapse.create_room(
             as_user_id=mxid,
             name=display_name or f"{username}@{domain}",
-            topic=author_doc.get("summary") or f"Fediverse posts from {username}@{domain}",
+            topic=html_to_plain_text(author_doc.get("summary")) or f"Fediverse posts from {username}@{domain}",
             # See _handle_follow's identical reasoning: the bot is invited
             # into every Remote User Room, not just its own ghost -- and
             # made admin there too.
@@ -10446,7 +10446,7 @@ async def _replace_remote_actor_room(
         new_room_id = await synapse.create_room(
             as_user_id=mxid,
             name=display_name or f"{username}@{domain}",
-            topic=actor_doc.get("summary") or f"Fediverse posts from {username}@{domain}",
+            topic=html_to_plain_text(actor_doc.get("summary")) or f"Fediverse posts from {username}@{domain}",
             invite=[sender, bot_mxid, *extra_invitees],
             avatar_mxc=avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,

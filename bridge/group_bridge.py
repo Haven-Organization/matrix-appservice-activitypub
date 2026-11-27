@@ -66,7 +66,7 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import matrix_body_to_note_html, plain_text_to_note_html, strip_to_matrix_message
+from bridge.activitypub.sanitize import html_to_plain_text, matrix_body_to_note_html, plain_text_to_note_html, strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url, username_from_actor_url
 from bridge.backstage_space import room_creation_join_kwargs
 from bridge.crypto import generate_keypair
@@ -205,7 +205,7 @@ async def ensure_group_room(
         room_id = await synapse.create_room(
             as_user_id=bot_mxid,
             name=display_name,
-            topic=actor_doc.get("summary") or f"Group: {display_name}",
+            topic=html_to_plain_text(actor_doc.get("summary")) or f"Group: {display_name}",
             avatar_mxc=avatar_mxc,
             **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=KNOCK_JOIN_RULE),
         )

@@ -42,7 +42,7 @@ from bridge.activitypub.remote_actor import (
     fetch_actor,
     resolve_actor_inbox,
 )
-from bridge.activitypub.sanitize import mention_pill_key, plain_text_to_note_html, strip_to_matrix_message
+from bridge.activitypub.sanitize import html_to_plain_text, mention_pill_key, plain_text_to_note_html, strip_to_matrix_message
 from bridge.backstage_space import ensure_ghost_access, room_creation_join_kwargs
 from bridge.custom_emoji import inline_custom_emoji, resolve_and_persist_emoji
 from bridge.activitypub.urls import (
@@ -3031,7 +3031,7 @@ async def ensure_remote_actor_room(
         new_room_id = await synapse.create_room(
             as_user_id=mxid,
             name=display_name or f"{username}@{domain}",
-            topic=author_doc.get("summary") or f"Fediverse posts from {username}@{domain}",
+            topic=html_to_plain_text(author_doc.get("summary")) or f"Fediverse posts from {username}@{domain}",
             # See _handle_follow's identical reasoning: the bot is invited
             # into every Remote User Room, not just its own ghost -- and
             # made admin there too (not just the ghost that created it), so
