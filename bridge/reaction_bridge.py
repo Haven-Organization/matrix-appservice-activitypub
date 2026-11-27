@@ -60,6 +60,7 @@ from bridge.note_mirroring import (
     PER_MESSAGE_PROFILE_FIELD,
     SOCIAL_BODY_FIELD,
     SOCIAL_FORMATTED_BODY_FIELD,
+    SOCIAL_REL_TYPE_REPLY,
     SOCIAL_REL_TYPE_REPOST,
     SOCIAL_RELATES_TO_FIELD,
     actor_html_with_avatar,
@@ -648,12 +649,16 @@ async def send_cross_bridge_quote(
     maintain here, since nothing is actually being boosted.
 
     ``is_reply`` (False for a repost/``;repost``, True for an actual
-    reply) switches the Note's own content from "🔁 Reposted <handle>'s
-    post:" (``build_sibling_repost_note_content``) to "↩️ Reply to
-    <handle>'s post" (``build_sibling_reply_note_content``) -- same
-    distinction the echo card's own wording below makes.
+    reply) switches the Note's own content from "🔁 reposted <handle>'s
+    post:" (``build_sibling_repost_note_content``) to "⤵️ Reply to
+    <handle>'s post:" (``build_sibling_reply_note_content``) -- same
+    distinction the echo card's own wording below makes, and the same
+    canonical wording/emoji every other repost/reply rendering in this
+    bridge uses (one MSC4501 ``social.relates_to``/``social.body`` pair is
+    also attached to the echo card now, same convention as those other
+    renderings -- see the echo-card code below).
 
-    Posts the usual "🔁 reposted X's post"/"↩️ replied to X's
+    Posts the usual "🔁 reposted X's post"/"⤵️ Reply to X's
     post" echo card into ``actor_record``'s own Profile Room, same
     convention as ``send_repost``/``bridge.commands._handle_repost``'s
     identical cards (including their own ``external_url``, for the same
@@ -774,10 +779,14 @@ async def send_cross_bridge_quote(
             )
         return True
 
-    verb = "replied to" if is_reply else "reposted"
-    emoji = "↩️" if is_reply else "\U0001F501"
+    # "Reply to"/"reposted" -- same canonical header wording as every other
+    # repost/reply rendering in this bridge (_build_repost_message,
+    # _echo_reply_in_own_room, send_repost, bridge.commands._handle_repost),
+    # so a cross-bridge echo looks the same as a native one.
+    header_phrase = "Reply to" if is_reply else "reposted"
+    emoji = "⤵️" if is_reply else "\U0001F501"
     quote_html = quote_block_html(preview_text, preview_full_content)
-    plain_body = f"{emoji} {verb} {original_handle}'s post:"
+    plain_body = f"{emoji} {header_phrase} {original_handle}'s post:"
     if preview_text:
         plain_body += f"\n> {preview_text}"
     plain_body += f"\n{post_link}"
@@ -787,13 +796,45 @@ async def send_cross_bridge_quote(
     caption_html = f"<p>{html.escape(caption)}</p>" if caption else ""
     formatted_caption = (
         caption_html
-        + f"<p>{emoji} {verb} {html.escape(original_handle)}'s {post_pill_html}</p>{quote_html}"
+        + f"<p>{emoji} {header_phrase} {html.escape(original_handle)}'s {post_pill_html}</p>{quote_html}"
     )
     echo_content = build_preview_media_content(
         plain_body=plain_body, formatted_caption=formatted_caption,
         preview_image=preview_image, preview_video=preview_video,
     )
     echo_content["external_url"] = link_for_note
+
+    # MSC4501 structured relation -- every other repost/reply path in this
+    # bridge already sets this on its own echo card; this cross-bridge one
+    # was the sole exception (confirmed 2026-11-27). ``sender`` is the
+    # relation's one mandatory field, so this is skipped entirely (same
+    # convention as every other caller of social_relates_to) when the
+    # target event's own sender can't be refetched.
+    target_sender = None
+    if config.bridge.set_msc4501_relates_to:
+        try:
+            target_event = await synapse.get_event(target_room_id, target_event_id, as_user_id=bot_mxid)
+        except SynapseError:
+            target_event = None
+        target_sender = target_event.get("sender") if target_event else None
+    if target_sender:
+        echo_content[SOCIAL_RELATES_TO_FIELD] = social_relates_to(
+            SOCIAL_REL_TYPE_REPLY if is_reply else SOCIAL_REL_TYPE_REPOST,
+            event_id=target_event_id, room_id=target_room_id, sender=target_sender,
+            content=preview_full_content, displayname=handle, via=[config.synapse.server_name],
+        )
+        # A compliant client's replacement for body/formatted_body: just the
+        # reposter's/replier's own real commentary, no header -- same
+        # SOCIAL_BODY_FIELD convention as every native-AP path. For a
+        # caption-less repost there's no commentary of its own, so this
+        # carries the reposted post's own text instead, same as
+        # _build_repost_message's identical caption-less case.
+        social_text = caption if caption else ("" if is_reply else preview_text)
+        if social_text:
+            echo_content[SOCIAL_BODY_FIELD] = social_text
+            echo_content[SOCIAL_FORMATTED_BODY_FIELD] = (
+                caption_html if caption else f"<p>{html.escape(social_text)}</p>"
+            )
     echo_event_id: str | None = None
     if actor_record.room_id:
         try:

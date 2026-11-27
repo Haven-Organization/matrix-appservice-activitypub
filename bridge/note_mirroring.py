@@ -617,6 +617,21 @@ def mirrored_post_event_type(config) -> str:
     return SOCIAL_POST_EVENT_TYPE if config.bridge.use_msc4501_post_event_type else "m.room.message"
 
 
+def strip_social_body_for_post_event_type(content: dict, event_type: str) -> None:
+    """MSC4501: ``social.body``/``social.formatted_body`` MUST NOT be set on
+    ``social.post``-typed events -- a dedicated post has no non-compliant
+    room timeline to accommodate, so there's nothing for them to duplicate
+    away from. Every caller that sets these fields also chooses its event
+    type via ``mirrored_post_event_type`` independently of that, so this is
+    called right before sending, once ``content`` is otherwise finished,
+    to strip them back out for the one event type that must never carry
+    them. A no-op (and safe to call unconditionally) when neither field is
+    actually present."""
+    if event_type == SOCIAL_POST_EVENT_TYPE:
+        content.pop(SOCIAL_BODY_FIELD, None)
+        content.pop(SOCIAL_FORMATTED_BODY_FIELD, None)
+
+
 # No stable Matrix state event exists yet for a room's "banner"/header image
 # (distinct from m.room.avatar) as of 2026-07 -- MSC4221 ("Room Banners":
 # https://github.com/matrix-org/matrix-spec-proposals/pull/4221) proposes
@@ -817,9 +832,14 @@ def build_sibling_reply_note_content(
     bridge's ghost (Bluesky/Nostr content mirrored in by
     ``matrix-appservice-atproto``/``matrix-appservice-nostr`` -- see
     ``bridge.profile_posts._maybe_handle_sibling_bridge_reply``): a
-    "↩️ Reply to <display name>'s post" line linking to
+    "⤵️ Reply to <display name>'s post:" line linking to
     ``external_url`` (the sibling bridge's own stamped permalink for the
-    ghost's mirrored content), then the replier's own text.
+    ghost's mirrored content), then the replier's own text. Same emoji/
+    wording/colon as every other reply header in this bridge
+    (``_echo_reply_in_own_room``, ``_render_reply_header``,
+    ``bridge.reaction_bridge.send_cross_bridge_quote``'s own Matrix-side
+    echo card for this exact interaction) -- confirmed drifted (↩️, no
+    colon) until 2026-11-27.
 
     There's no real AP object to set ``inReplyTo``/``quoteUri`` to here --
     the replied-to post isn't ActivityPub content at all -- so, like
@@ -831,7 +851,7 @@ def build_sibling_reply_note_content(
     from what was actually delivered."""
     who = display_name or external_url
     header = (
-        f'<p>↩️ Reply to <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post</p>'
+        f'<p>⤵️ Reply to <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post:</p>'
     )
     return header + plain_text_to_note_html(body, mention_links)
 
@@ -843,8 +863,10 @@ def build_sibling_repost_note_content(
     (Bluesky/Nostr content mirrored in by ``matrix-appservice-atproto``/
     ``matrix-appservice-nostr`` -- see
     ``bridge.profile_posts._maybe_handle_sibling_bridge_repost``): a
-    "🔁 Reposted <display name>'s post:" line linking to ``external_url``,
-    then the reposter's own caption, if any.
+    "🔁 reposted <display name>'s post:" line linking to ``external_url``,
+    then the reposter's own caption, if any -- same lowercase "reposted"
+    + colon as every other repost header in this bridge (confirmed
+    drifted to a capitalized "Reposted" until 2026-11-27).
 
     Same reasoning as ``build_sibling_reply_note_content`` for why this is
     plain embedded content rather than a protocol-level ``Announce``/
@@ -860,7 +882,7 @@ def build_sibling_repost_note_content(
     ``_reconstruct_note_body``) so a re-fetched/outbox copy never drifts
     from what was actually delivered."""
     who = display_name or external_url
-    header = f'<p>\U0001F501 Reposted <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post:</p>'
+    header = f'<p>\U0001F501 reposted <a href="{html.escape(external_url)}">{html.escape(who)}</a>\'s post:</p>'
     return header + (plain_text_to_note_html(caption, mention_links) if caption else "")
 
 
@@ -3187,10 +3209,12 @@ async def _import_note_locked(
     config = request.app.state.config
     max_clock_skew = config.federation.max_clock_skew
     max_backdate_days = config.federation.max_backdate_days
+    import_event_type = mirrored_post_event_type(config)
+    strip_social_body_for_post_event_type(message_content, import_event_type)
     try:
         event_id = await synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
-            event_type=mirrored_post_event_type(config),
+            event_type=import_event_type,
             ts=resolve_event_ts(note, max_clock_skew=max_clock_skew, max_backdate_days=max_backdate_days),
         )
     except SynapseError:

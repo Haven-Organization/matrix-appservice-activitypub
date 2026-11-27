@@ -103,6 +103,7 @@ from bridge.note_mirroring import (
     mirror_chat_message,
     mirror_direct_message,
     mirrored_post_event_type,
+    strip_social_body_for_post_event_type,
     note_is_direct_message,
     note_mentions_local_actor,
     notify_mentioned_locals,
@@ -2067,10 +2068,12 @@ async def _handle_create(request: Request, username: str, activity: Activity, *,
     )
 
     federation_config = request.app.state.config.federation
+    create_event_type = mirrored_post_event_type(request.app.state.config)
+    strip_social_body_for_post_event_type(message_content, create_event_type)
     try:
         event_id = await request.app.state.synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
-            event_type=mirrored_post_event_type(request.app.state.config),
+            event_type=create_event_type,
             ts=resolve_event_ts(
                 obj, max_clock_skew=federation_config.max_clock_skew,
                 max_backdate_days=federation_config.max_backdate_days,
@@ -2541,10 +2544,12 @@ async def _echo_reply_in_own_room(
     )
 
     federation_config = request.app.state.config.federation
+    echo_event_type = mirrored_post_event_type(request.app.state.config)
+    strip_social_body_for_post_event_type(message_content, echo_event_type)
     try:
         event_id = await request.app.state.synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=profile.mxid,
-            event_type=mirrored_post_event_type(request.app.state.config),
+            event_type=echo_event_type,
             ts=resolve_event_ts(
                 note, max_clock_skew=federation_config.max_clock_skew,
                 max_backdate_days=federation_config.max_backdate_days,
@@ -2978,10 +2983,12 @@ async def _handle_announce_locked(request: Request, username: str, activity: Act
 
     synapse = request.app.state.synapse
     federation_config = request.app.state.config.federation
+    repost_event_type = mirrored_post_event_type(request.app.state.config)
+    strip_social_body_for_post_event_type(message_content, repost_event_type)
     try:
         event_id = await synapse.send_message_event(
             remote_room.room_id, message_content, as_user_id=remote_room.ghost_user_id,
-            event_type=mirrored_post_event_type(request.app.state.config),
+            event_type=repost_event_type,
             # The Announce's OWN published time (when the repost happened),
             # not the reposted post's -- this message represents "X reposted
             # this", so that's the moment it belongs at in the timeline,
