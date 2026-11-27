@@ -14,6 +14,7 @@ Setting the bridge up, natively or in Docker. For what the bridge does, see [REA
 ## Requirements
 
 - Python 3.11 or newer, or Docker.
+- `ffmpeg` on the `PATH` (optional, already in the Docker image): bridged videos get a poster-frame thumbnail, size and duration. Without it they're bridged without a thumbnail.
 - A reverse proxy (nginx in the example) in front of the bridge, if you want its ActivityPub surface public on the same domain as your homeserver (recommended; see step 2).
 
 ## 1. Install and configure

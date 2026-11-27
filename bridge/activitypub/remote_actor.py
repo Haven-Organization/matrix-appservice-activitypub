@@ -172,11 +172,22 @@ def extract_attachments(obj: dict) -> list[dict]:
             url = url.get("href") or url.get("url")
         if not isinstance(url, str) or not url:
             continue
-        results.append(
-            {
-                "url": url,
-                "media_type": item.get("mediaType") or "application/octet-stream",
-                "name": item.get("name") or "",
-            }
-        )
+        attachment = {
+            "url": url,
+            "media_type": item.get("mediaType") or "application/octet-stream",
+            "name": item.get("name") or "",
+        }
+        # Mastodon sends a video's thumbnail (generated or uploaded) as the
+        # attachment's `icon`; used as the Matrix event's thumbnail_url.
+        icon = item.get("icon")
+        if isinstance(icon, list):
+            icon = icon[0] if icon else None
+        icon_url = icon.get("url") if isinstance(icon, dict) else icon
+        if isinstance(icon_url, list):
+            icon_url = icon_url[0] if icon_url else None
+        if isinstance(icon_url, dict):
+            icon_url = icon_url.get("href") or icon_url.get("url")
+        if isinstance(icon_url, str) and icon_url:
+            attachment["icon_url"] = icon_url
+        results.append(attachment)
     return results

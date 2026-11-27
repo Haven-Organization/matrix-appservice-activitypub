@@ -32,6 +32,7 @@ from bridge.activitypub.urls import media_url, resolve_own_media_proxy_mxc
 from bridge.repository import ActorRepository
 from bridge.synapse_client import SynapseClient, SynapseError
 from bridge.shared_encrypted_media import PROMPT_FIELD, announce_if_needed, ask_in_turn
+from bridge.video_thumbnails import video_info_fields
 
 pillow_heif.register_heif_opener()
 
@@ -305,6 +306,10 @@ async def fetch_and_upload_media_with_dimensions(
             logger.warning("Could not re-fetch own media %s for dimensions", own_mxc, exc_info=True)
             return own_mxc, None, None, "application/octet-stream"
         width, height = _dimensions_with_fallback(download.content, download.content_type)
+        if download.content_type.startswith("video/"):
+            # Warms bridge.video_thumbnails' cache from the bytes already in
+            # hand, for merge_attachment_into_content to add to the event.
+            await video_info_fields(synapse, own_mxc, download.content)
         return own_mxc, width, height, download.content_type
 
     response = await _download_media(http_client, url)
@@ -320,6 +325,9 @@ async def fetch_and_upload_media_with_dimensions(
         width, height = converted_width, converted_height
     else:
         width, height = _dimensions_with_fallback(response.content, content_type)
+    if uploaded_content_type.startswith("video/"):
+        # See the own-media branch above.
+        await video_info_fields(synapse, mxc_uri, response.content)
     return mxc_uri, width, height, uploaded_content_type
 
 

@@ -39,6 +39,7 @@
 ## Media
 
 - Incoming attachments (image, video, audio, document) are downloaded and re-uploaded as real Matrix media. Extra attachments beyond the first are appended as links, since one ActivityPub post maps to exactly one Matrix event.
+- Incoming videos carry a thumbnail (`thumbnail_url`/`thumbnail_info`), `size` and `duration`, so clients show a poster frame before playback. The source's own thumbnail is used when it sends one (Mastodon's attachment `icon`, a PeerTube video's `icon`); otherwise the bridge decodes a frame with ffmpeg, which handles codecs a client may not (e.g. H.264 4:4:4).
 - Outgoing Matrix media becomes an ActivityPub `attachment` pointing at the bridge's own public media proxy (`/media/{server}/{id}`), never your homeserver directly, since remote servers have no Matrix access token. Only media explicitly published this way is ever served.
 
 ## Follows and moderation

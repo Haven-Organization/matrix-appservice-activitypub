@@ -68,6 +68,7 @@ from bridge.peertube import resolve_media_type
 from bridge.repository import ActorRecord, ActorRepository, FederatedEvent, GhostProfile, RemoteActorRoom
 from bridge.room_widget import add_bridge_widget
 from bridge.synapse_client import SynapseError
+from bridge.video_thumbnails import cached_source_thumbnail, remember_source_thumbnail, video_info_fields
 
 logger = logging.getLogger(__name__)
 
@@ -956,6 +957,33 @@ async def actor_html_with_avatar(request: Request, actor_id: str) -> tuple[str, 
     return handle, name_html
 
 
+async def _source_thumbnail_fields(request: Request, video_mxc: str, icon_url: str) -> dict:
+    """``thumbnail_url``/``thumbnail_info`` from a thumbnail image the
+    source server sent alongside a video, re-hosted on Synapse (once per
+    ``icon_url``, so a reused video doesn't re-upload it); empty if it
+    couldn't be fetched or isn't an image."""
+    cached = cached_source_thumbnail(icon_url)
+    if cached is not None:
+        return dict(cached)
+    result = await fetch_and_upload_media_with_dimensions(
+        request.app.state.http_client, request.app.state.synapse, icon_url,
+        public_base_url=request.app.state.config.bridge.public_base_url,
+    )
+    if result is None:
+        return {}
+    thumbnail_mxc, width, height, content_type = result
+    if not content_type.startswith("image/"):
+        logger.info("Ignoring a non-image thumbnail (%s) for %s", content_type, video_mxc)
+        return {}
+    thumbnail_info: dict = {"mimetype": content_type}
+    if width and height:
+        thumbnail_info["w"] = width
+        thumbnail_info["h"] = height
+    fields = {"thumbnail_url": thumbnail_mxc, "thumbnail_info": thumbnail_info}
+    remember_source_thumbnail(icon_url, fields)
+    return dict(fields)
+
+
 async def merge_attachment_into_content(
     request: Request, message_content: dict, attachment: dict, *,
     mxc_uri: str | None = None, width: int | None = None, height: int | None = None,
@@ -1027,6 +1055,15 @@ async def merge_attachment_into_content(
     if width and height:
         info["w"] = width
         info["h"] = height
+    if merged["msgtype"] == "m.video":
+        # Poster frame, size and duration (bridge.video_thumbnails): already
+        # worked out during a fresh upload above, or fetched back for a
+        # reused mxc_uri. The source's own thumbnail, when it sent one
+        # (Mastodon's attachment `icon`, PeerTube's video `icon`), wins over
+        # a decoded frame.
+        info.update(await video_info_fields(request.app.state.synapse, mxc_uri))
+        if attachment.get("icon_url"):
+            info.update(await _source_thumbnail_fields(request, mxc_uri, attachment["icon_url"]))
     merged["info"] = info
     raw_filename = attachment["name"] or attachment["url"].rsplit("/", 1)[-1] or "attachment"
     if effective_media_type != attachment["media_type"]:
@@ -2815,6 +2852,8 @@ async def import_video(
             attachment = {
                 "url": media_link["href"], "media_type": media_link.get("mediaType") or "video/mp4", "name": name,
             }
+            if icon is not None:
+                attachment["icon_url"] = icon["url"]
             message_content, embed_mxc = await attach_media_to_content(request, message_content, [attachment])
             used_video_embed = embed_mxc is not None
 
