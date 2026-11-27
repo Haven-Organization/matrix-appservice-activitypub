@@ -76,9 +76,15 @@ from bridge.activitypub.remote_actor import (
 from bridge.activitypub.sanitize import strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, main_key_id, username_from_actor_url
 from bridge.matrix_links import matrix_to_link, room_pill_html
-from bridge.custom_emoji import emoji_img_html, inline_custom_emoji, resolve_custom_emoji_image
+from bridge.custom_emoji import (
+    FORMATTED_DISPLAYNAME_FIELD,
+    build_formatted_displayname,
+    emoji_img_html,
+    inline_custom_emoji,
+    resolve_custom_emoji_image,
+)
 from bridge.media import fetch_and_upload_media, filename_with_extension, unresolvable_encrypted_attachment_mxc
-from bridge.ghosts import ghost_mxid
+from bridge.ghosts import _sync_formatted_displayname_rooms, ghost_mxid
 from bridge.notifications import notification_actor_html, notify_user
 from bridge.note_mirroring import (
     EXTERNAL_HANDLE_FIELD,
@@ -3420,12 +3426,28 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
         )
 
     synapse = request.app.state.synapse
+    config = request.app.state.config
     try:
         if name_changed:
             await synapse.send_state_event(
                 remote_room.room_id, "m.room.name", "", {"name": new_name}, as_user_id=remote_room.ghost_user_id
             )
             await synapse.set_display_name(remote_room.ghost_user_id, new_name)
+            if config.bridge.use_msc4589_formatted_displayname:
+                formatted_body = await build_formatted_displayname(
+                    request.app.state.http_client, synapse, repository, new_name, obj.get("tag") or [],
+                )
+                if formatted_body is not None:
+                    await synapse.set_profile_field(
+                        remote_room.ghost_user_id, FORMATTED_DISPLAYNAME_FIELD,
+                        {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
+                    )
+                else:
+                    await synapse.delete_profile_field(remote_room.ghost_user_id, FORMATTED_DISPLAYNAME_FIELD)
+                await _sync_formatted_displayname_rooms(
+                    synapse, repository, actor_id=remote_room.actor_id, mxid=remote_room.ghost_user_id,
+                    display_name=new_name, formatted_body=formatted_body,
+                )
         if icon_changed and avatar_mxc:
             await synapse.send_state_event(
                 remote_room.room_id, "m.room.avatar", "", {"url": avatar_mxc}, as_user_id=remote_room.ghost_user_id

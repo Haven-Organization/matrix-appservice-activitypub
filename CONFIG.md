@@ -42,6 +42,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
     - [Quote-post import policy (`bridge.quote_import_policy`)](#bridge-quote_import_policy)
     - [MSC4501 post event type (`bridge.use_msc4501_post_event_type`)](#bridge-use_msc4501_post_event_type)
     - [MSC4144 per-message profiles (`bridge.msc4144_per_message_profiles`)](#bridge-msc4144_per_message_profiles)
+    - [MSC4589 formatted displaynames (`bridge.use_msc4589_formatted_displayname`)](#bridge-use_msc4589_formatted_displayname)
     - [MSC4501 profile room (`bridge.set_msc4501_profile_room`)](#bridge-set_msc4501_profile_room)
     - [MSC4503 external handle (`bridge.msc4503_external_handle`)](#bridge-msc4503_external_handle)
     - [MSC4027 custom reactions (`bridge.msc4027_custom_reactions`)](#bridge-msc4027_custom_reactions)
@@ -328,6 +329,16 @@ Mirror a remote account's posts using `org.matrix.msc4501.social.post` as the ev
 **Default:** `true`
 
 Adds an MSC4144 per-message profile (id/displayname/avatar_url from the user's Profile Room) to a bridge-sent message acting on their behalf, like the repost card, so it visually reads as their own action. Ignored by clients that don't know MSC4144.
+
+---
+
+<a id="bridge-use_msc4589_formatted_displayname"></a>
+
+#### MSC4589 formatted displaynames (`bridge.use_msc4589_formatted_displayname`)
+
+**Default:** `false`
+
+Set `org.matrix.msc4589.formatted_displayname` (still a draft MSC) on a ghost whose fediverse name has a `:shortcode:` custom emoji with a matching image, so a compliant client can render it inline instead of the literal text. The plain `displayname` keeps that literal text either way. Off by default since no client supports this MSC yet, and setting it costs an extra write per room the ghost is in.
 
 ---
 

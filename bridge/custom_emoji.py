@@ -39,6 +39,13 @@ _SHORTCODE_RE = re.compile(r":[\w+-]+:")
 _IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"([^"]*)"')
 
+# MSC4589 (Formatted Display Names, draft): the field name, and the
+# limits its own text puts on a formatted_body value -- see
+# build_formatted_displayname.
+FORMATTED_DISPLAYNAME_FIELD = "org.matrix.msc4589.formatted_displayname"
+_MSC4589_MAX_BYTES = 1024
+_MSC4589_MAX_IMAGES = 10
+
 
 async def resolve_custom_emoji_image(
     http_client: httpx.AsyncClient, synapse: SynapseClient, repository: ActorRepository, tag: list[dict], key: str
@@ -149,6 +156,59 @@ async def resolve_and_persist_emoji(
         mxc = await resolve_custom_emoji_image(http_client, synapse, repository, tag, shortcode)
         if mxc:
             await repository.record_resolved_emoji(subject_id, shortcode, mxc)
+
+
+async def build_formatted_displayname(
+    http_client: httpx.AsyncClient, synapse: SynapseClient, repository: ActorRepository,
+    display_name: str, tag: list[dict],
+) -> str | None:
+    """The MSC4589 ``formatted_displayname`` HTML for ``display_name``, if
+    it carries at least one ``:shortcode:`` with a matching image in
+    ``tag`` -- None if there's nothing to add, or if building it would
+    exceed the MSC's own 1024-byte/10-image limits. Sending an
+    over-budget value is worse than not setting the field at all: a
+    compliant client's own consistency check (reconstruct plain text by
+    replacing each ``<img>`` with its ``alt``, MUST equal ``display_name``)
+    would just make it ignore the field anyway, so there's nothing to gain
+    by sending something invalid.
+
+    No formatting markup at all here, unlike an ordinary message's
+    ``formatted_body`` -- a display name is never itself bold/italic HTML,
+    just emoji -- and each resolved emoji's own ``<img>`` carries ONLY
+    ``data-mx-emoticon``/``src``/``alt``/``title``, no ``width``/``height``/
+    ``style`` the way ``emoji_img_html``'s message-body ``<img>`` has:
+    MSC4589's allow-list for this field is stricter than an ordinary
+    message's. ``alt``/``title`` are the shortcode WITH its colons, same
+    as everywhere else in this module, so the plain-text reconstruction a
+    compliant client does exactly matches ``display_name`` back out."""
+    matches = list(_SHORTCODE_RE.finditer(display_name))
+    if not matches:
+        return None
+    pieces: list[str] = []
+    last_end = 0
+    images = 0
+    for match in matches:
+        shortcode = match.group(0)
+        mxc = await resolve_custom_emoji_image(http_client, synapse, repository, tag, shortcode)
+        if mxc is None:
+            continue
+        images += 1
+        if images > _MSC4589_MAX_IMAGES:
+            return None  # over budget -- bail rather than send a truncated/invalid name
+        pieces.append(html.escape(display_name[last_end:match.start()]))
+        escaped_code = html.escape(shortcode)
+        pieces.append(
+            f'<img data-mx-emoticon src="{html.escape(mxc, quote=True)}" '
+            f'alt="{escaped_code}" title="{escaped_code}">'
+        )
+        last_end = match.end()
+    if not pieces:
+        return None  # no shortcode in display_name actually resolved to an image
+    pieces.append(html.escape(display_name[last_end:]))
+    formatted_body = "".join(pieces)
+    if len(formatted_body.encode("utf-8")) > _MSC4589_MAX_BYTES:
+        return None
+    return formatted_body
 
 
 def apply_resolved_emoji(html_text: str, resolved: dict[str, str]) -> str:

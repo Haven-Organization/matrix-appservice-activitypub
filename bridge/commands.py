@@ -236,8 +236,9 @@ from bridge.activitypub.webfinger import (
 )
 from bridge.config import BridgeConfig
 from bridge.crypto import generate_keypair
-from bridge.custom_emoji import extract_outbound_emoji_tags
+from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, extract_outbound_emoji_tags
 from bridge.ghosts import (
+    _sync_formatted_displayname_rooms,
     ensure_ghost_user,
     ghost_localpart,
     ghost_mxid,
@@ -5477,6 +5478,24 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
             await synapse.set_display_name(mxid, display_name)
         except SynapseError:
             logger.info("Could not refresh display name for %s", mxid, exc_info=True)
+        if config.bridge.use_msc4589_formatted_displayname:
+            formatted_body = await build_formatted_displayname(
+                http_client, synapse, repository, display_name, actor_doc.get("tag") or [],
+            )
+            try:
+                if formatted_body is not None:
+                    await synapse.set_profile_field(
+                        mxid, FORMATTED_DISPLAYNAME_FIELD,
+                        {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
+                    )
+                else:
+                    await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
+            except SynapseError:
+                logger.info("Could not refresh formatted display name for %s", mxid, exc_info=True)
+            await _sync_formatted_displayname_rooms(
+                synapse, repository, actor_id=remote_actor_id, mxid=mxid,
+                display_name=display_name, formatted_body=formatted_body,
+            )
     if avatar_mxc:
         try:
             await synapse.set_avatar_url(mxid, avatar_mxc)

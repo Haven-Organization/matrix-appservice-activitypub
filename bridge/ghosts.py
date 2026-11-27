@@ -12,7 +12,7 @@ import re
 
 import httpx
 
-from bridge.custom_emoji import resolve_and_persist_emoji
+from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, resolve_and_persist_emoji
 from bridge.media import fetch_and_upload_media
 from bridge.repository import ActorRepository, GhostProfile
 from bridge.synapse_client import SynapseClient, SynapseError
@@ -157,6 +157,52 @@ async def _sync_room_avatars(
             logger.debug("Could not update room avatar for %s in %s", actor_id, room_id, exc_info=True)
 
 
+async def _sync_formatted_displayname_rooms(
+    synapse: SynapseClient, repository: ActorRepository, *,
+    actor_id: str, mxid: str, display_name: str, formatted_body: str | None,
+) -> None:
+    """Pushes ``FORMATTED_DISPLAYNAME_FIELD`` into every room this ghost is
+    a member of, as a sibling of its own ``displayname`` in that room's
+    ``m.room.member`` content -- per MSC4589, unlike every OTHER MSC4133
+    custom profile field (see ``set_profile_field``), this one is NOT
+    auto-replicated by the homeserver into member events the way plain
+    ``displayname``/``avatar_url`` are, so it has to be pushed explicitly,
+    room by room, same room set ``_sync_room_avatars`` already enumerates.
+
+    Reads each room's CURRENT member content first and only adds/removes
+    this one field -- never reconstructing ``membership``/``avatar_url``
+    from scratch, so nothing else already on the member event is lost.
+    ``formatted_body=None`` clears the field (the name no longer has any
+    resolvable shortcode, or the feature was turned back off) rather than
+    leaving a stale value whose own emoji no longer match ``displayname``."""
+    room_ids: list[str] = []
+    remote_actor_room = await repository.get_remote_actor_room(actor_id)
+    if remote_actor_room is not None:
+        room_ids.append(remote_actor_room.room_id)
+    room_ids.extend(await repository.get_ghost_dm_room_ids_for_actor(actor_id))
+    room_ids.extend(await repository.get_ghost_chat_room_ids_for_actor(actor_id))
+
+    for room_id in room_ids:
+        try:
+            current = await synapse.get_room_state(room_id, "m.room.member", mxid, as_user_id=mxid)
+        except SynapseError:
+            continue  # not actually a member here (anymore) -- nothing to update
+        if current.get("membership") != "join":
+            continue
+        content = dict(current)
+        content["displayname"] = display_name
+        if formatted_body is not None:
+            content[FORMATTED_DISPLAYNAME_FIELD] = {
+                "format": "org.matrix.custom.html", "formatted_body": formatted_body,
+            }
+        else:
+            content.pop(FORMATTED_DISPLAYNAME_FIELD, None)
+        try:
+            await synapse.send_state_event(room_id, "m.room.member", mxid, content, as_user_id=mxid)
+        except SynapseError:
+            logger.debug("Could not update formatted displayname for %s in %s", actor_id, room_id, exc_info=True)
+
+
 async def sync_ghost_profile(
     synapse: SynapseClient,
     http_client: httpx.AsyncClient,
@@ -169,6 +215,7 @@ async def sync_ghost_profile(
     icon_url: str | None,
     handle: str | None = None,
     tag: list[dict] | None = None,
+    formatted_displayname_enabled: bool = False,
 ) -> str:
     """Like ``ensure_ghost_user``, but only actually touches the ghost's
     Matrix display name/avatar when the remote actor's own value has changed
@@ -210,6 +257,23 @@ async def sync_ghost_profile(
             await synapse.set_display_name(mxid, display_name)
         except SynapseError:
             logger.debug("Could not set display name for ghost %s", mxid, exc_info=True)
+
+        if formatted_displayname_enabled:
+            formatted_body = await build_formatted_displayname(http_client, synapse, repository, display_name, tag or [])
+            try:
+                if formatted_body is not None:
+                    await synapse.set_profile_field(
+                        mxid, FORMATTED_DISPLAYNAME_FIELD,
+                        {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
+                    )
+                else:
+                    await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
+            except SynapseError:
+                logger.debug("Could not set formatted display name for ghost %s", mxid, exc_info=True)
+            await _sync_formatted_displayname_rooms(
+                synapse, repository, actor_id=actor_id, mxid=mxid,
+                display_name=display_name, formatted_body=formatted_body,
+            )
 
     if display_name and tag:
         # Unconditional on whether the name actually changed (unlike the

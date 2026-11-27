@@ -115,6 +115,14 @@ class BridgeSection:
     # owner's own action instead of the generic bridge bot. On by default;
     # purely additive, ignored by a client that's never heard of MSC4144.
     msc4144_per_message_profiles: bool = True
+    # Whether to set org.matrix.msc4589.formatted_displayname (MSC4589,
+    # still a draft with no known client support) on a ghost whose
+    # fediverse name has a :shortcode: emoji with a matching image, so a
+    # compliant client can render it instead of the literal text. Off by
+    # default: this also means an extra write per room the ghost is in
+    # (see bridge.ghosts._sync_formatted_displayname_rooms), for no
+    # benefit until a client actually renders it.
+    use_msc4589_formatted_displayname: bool = False
     # Whether to set org.matrix.msc4501.social.relates_to (rel_type-tagged,
     # same convention as Matrix's own m.relates_to) on every mirrored repost
     # (Announce), quote-post, and cross-posted reply echo -- see
@@ -646,6 +654,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         msc4503_external_handle=msc4503_external_handle,
         msc4027_custom_reactions=bool(bridge_raw.get("msc4027_custom_reactions", False)),
         msc4144_per_message_profiles=bool(bridge_raw.get("msc4144_per_message_profiles", True)),
+        use_msc4589_formatted_displayname=bool(bridge_raw.get("use_msc4589_formatted_displayname", False)),
         set_msc4501_relates_to=bool(bridge_raw.get("set_msc4501_relates_to", True)),
         use_msc4501_content_inline=bool(bridge_raw.get("use_msc4501_content_inline", True)),
         quote_import_policy=quote_import_policy,

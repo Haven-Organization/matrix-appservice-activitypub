@@ -1689,6 +1689,7 @@ async def resolve_and_invite_ghost(request: Request, actor_id: str, room_id: str
             icon_url=icon_url,
             handle=f"@{remote_username}@{domain}",
             tag=actor_doc.get("tag") if actor_doc else None,
+            formatted_displayname_enabled=config.bridge.use_msc4589_formatted_displayname,
         )
         inviter = await _inviter_for_room(request, room_id)
         await synapse.invite_user(room_id, mxid, as_user_id=inviter)
@@ -2069,6 +2070,7 @@ async def provision_ghost(request: Request, actor_id: str) -> tuple[str, dict, s
         server_name=config.synapse.server_name, localpart=localpart, actor_id=actor_id,
         display_name=display_name, icon_url=icon_url, handle=f"@{username}@{domain}",
         tag=actor_doc.get("tag") if actor_doc else None,
+        formatted_displayname_enabled=config.bridge.use_msc4589_formatted_displayname,
     )
     return mxid, actor_doc, display_name, avatar_mxc
 
