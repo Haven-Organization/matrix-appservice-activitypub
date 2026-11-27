@@ -5482,20 +5482,35 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
             formatted_body = await build_formatted_displayname(
                 http_client, synapse, repository, display_name, actor_doc.get("tag") or [],
             )
-            try:
-                if formatted_body is not None:
+            if formatted_body is not None:
+                try:
                     await synapse.set_profile_field(
                         mxid, FORMATTED_DISPLAYNAME_FIELD,
                         {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
                     )
-                else:
-                    await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
-            except SynapseError:
-                logger.info("Could not refresh formatted display name for %s", mxid, exc_info=True)
-            await _sync_formatted_displayname_rooms(
-                synapse, repository, actor_id=remote_actor_id, mxid=mxid,
-                display_name=display_name, formatted_body=formatted_body,
-            )
+                except SynapseError:
+                    logger.info("Could not refresh formatted display name for %s", mxid, exc_info=True)
+                await _sync_formatted_displayname_rooms(
+                    synapse, repository, actor_id=remote_actor_id, mxid=mxid,
+                    display_name=display_name, formatted_body=formatted_body,
+                )
+            else:
+                # Only bother clearing a stale value if one might actually
+                # exist -- see sync_ghost_profile's identical reasoning in
+                # bridge.ghosts.
+                try:
+                    current_profile = await synapse.get_profile(mxid)
+                except SynapseError:
+                    current_profile = {}
+                if FORMATTED_DISPLAYNAME_FIELD in current_profile:
+                    try:
+                        await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
+                    except SynapseError:
+                        logger.info("Could not clear formatted display name for %s", mxid, exc_info=True)
+                    await _sync_formatted_displayname_rooms(
+                        synapse, repository, actor_id=remote_actor_id, mxid=mxid,
+                        display_name=display_name, formatted_body=None,
+                    )
     if avatar_mxc:
         try:
             await synapse.set_avatar_url(mxid, avatar_mxc)

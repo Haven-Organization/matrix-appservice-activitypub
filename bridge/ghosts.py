@@ -260,20 +260,42 @@ async def sync_ghost_profile(
 
         if formatted_displayname_enabled:
             formatted_body = await build_formatted_displayname(http_client, synapse, repository, display_name, tag or [])
-            try:
-                if formatted_body is not None:
+            if formatted_body is not None:
+                try:
                     await synapse.set_profile_field(
                         mxid, FORMATTED_DISPLAYNAME_FIELD,
                         {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
                     )
-                else:
-                    await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
-            except SynapseError:
-                logger.debug("Could not set formatted display name for ghost %s", mxid, exc_info=True)
-            await _sync_formatted_displayname_rooms(
-                synapse, repository, actor_id=actor_id, mxid=mxid,
-                display_name=display_name, formatted_body=formatted_body,
-            )
+                except SynapseError:
+                    logger.debug("Could not set formatted display name for ghost %s", mxid, exc_info=True)
+                await _sync_formatted_displayname_rooms(
+                    synapse, repository, actor_id=actor_id, mxid=mxid,
+                    display_name=display_name, formatted_body=formatted_body,
+                )
+            else:
+                # Nothing to set now -- but the name change might be exactly
+                # what dropped the last shortcode from a PREVIOUSLY formatted
+                # name (e.g. went plaintext-only), in which case the stale
+                # field needs clearing everywhere it was pushed. Checked via
+                # one profile GET rather than unconditionally DELETE-ing and
+                # sweeping every room on every single name change: cheap for
+                # the common case (most actors never use custom emoji in
+                # their name at all, so there's never anything to clear),
+                # correct for the migration case (the field really is still
+                # there from before).
+                try:
+                    current_profile = await synapse.get_profile(mxid)
+                except SynapseError:
+                    current_profile = {}
+                if FORMATTED_DISPLAYNAME_FIELD in current_profile:
+                    try:
+                        await synapse.delete_profile_field(mxid, FORMATTED_DISPLAYNAME_FIELD)
+                    except SynapseError:
+                        logger.debug("Could not clear formatted display name for ghost %s", mxid, exc_info=True)
+                    await _sync_formatted_displayname_rooms(
+                        synapse, repository, actor_id=actor_id, mxid=mxid,
+                        display_name=display_name, formatted_body=None,
+                    )
 
     if display_name and tag:
         # Unconditional on whether the name actually changed (unlike the

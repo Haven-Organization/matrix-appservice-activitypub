@@ -3442,12 +3442,24 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
                         remote_room.ghost_user_id, FORMATTED_DISPLAYNAME_FIELD,
                         {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
                     )
+                    await _sync_formatted_displayname_rooms(
+                        synapse, repository, actor_id=remote_room.actor_id, mxid=remote_room.ghost_user_id,
+                        display_name=new_name, formatted_body=formatted_body,
+                    )
                 else:
-                    await synapse.delete_profile_field(remote_room.ghost_user_id, FORMATTED_DISPLAYNAME_FIELD)
-                await _sync_formatted_displayname_rooms(
-                    synapse, repository, actor_id=remote_room.actor_id, mxid=remote_room.ghost_user_id,
-                    display_name=new_name, formatted_body=formatted_body,
-                )
+                    # Only bother clearing a stale value if one might
+                    # actually exist -- see sync_ghost_profile's identical
+                    # reasoning in bridge.ghosts.
+                    try:
+                        current_profile = await synapse.get_profile(remote_room.ghost_user_id)
+                    except SynapseError:
+                        current_profile = {}
+                    if FORMATTED_DISPLAYNAME_FIELD in current_profile:
+                        await synapse.delete_profile_field(remote_room.ghost_user_id, FORMATTED_DISPLAYNAME_FIELD)
+                        await _sync_formatted_displayname_rooms(
+                            synapse, repository, actor_id=remote_room.actor_id, mxid=remote_room.ghost_user_id,
+                            display_name=new_name, formatted_body=None,
+                        )
         if icon_changed and avatar_mxc:
             await synapse.send_state_event(
                 remote_room.room_id, "m.room.avatar", "", {"url": avatar_mxc}, as_user_id=remote_room.ghost_user_id
