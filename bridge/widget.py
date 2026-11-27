@@ -4919,8 +4919,8 @@ _WIDGET_HTML = r"""<!doctype html>
       }
       backstageBody.appendChild(el("div", { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;" }, [
         el("span", { style: "font-weight:600;word-break:break-all;", text: data.room_id || "(not created yet)" }),
-        plainButton("", "Get invited, grants direct join access to every room that trusts this space, not just visibility into it",
-          withConfirm("Joining grants direct join access to every room that trusts this space, not just visibility into it.", (btn) => {
+        plainButton("", "Receive Invite",
+          withConfirm("Receive an invite to the backstage space?", (btn) => {
             return api("/widget/api/admin/backstage_space/invite", { method: "POST", body: {} })
               .then(() => toast("Invited, check your invites.", true))
               .catch((err) => toast(err.message, false))
