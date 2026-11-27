@@ -1707,7 +1707,7 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   h1 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
-  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; word-break: break-all; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; word-break: break-word; }
   .badge {
     display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
     background: var(--accent); color: var(--accent-text); font-weight: 600;
@@ -1722,7 +1722,7 @@ _WIDGET_HTML = r"""<!doctype html>
   button.danger { color: var(--danger); border-color: var(--danger); }
   button:disabled { opacity: .5; cursor: default; }
   button:not(:disabled):hover { background: var(--hover); }
-  button.primary:not(:disabled):hover { filter: brightness(1.08); }
+  button.primary:not(:disabled):hover { filter: brightness(1.08); background: var(--accent); }
   button:not(:disabled):active { transform: translateY(1px); }
   input[type=text], input[type=number], input[type=password], select {
     font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
@@ -1730,11 +1730,11 @@ _WIDGET_HTML = r"""<!doctype html>
   }
   .toast {
     position: fixed; left: 16px; right: 16px; bottom: 16px; padding: 10px 14px; border-radius: var(--radius-inner);
-    font-size: 13px; font-weight: 600; display: none; z-index: 10;
+    font-size: 13px; font-weight: 600; display: none; z-index: 60;
   }
   .toast.ok { background: var(--ok-bg); color: var(--ok-text); display: block; }
   .toast.err { background: var(--danger-bg); color: var(--danger); display: block; }
-  .kv { display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; }
+  .kv { display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; gap: 12px; }
   .kv span:first-child { color: var(--muted); }
   .list { display: flex; flex-direction: column; gap: 6px; }
   .list-item {
@@ -1930,7 +1930,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .account-card { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-inner); }
   .account-card .meta { flex: 1; min-width: 0; }
   .account-card .name { font-weight: 600; font-size: 13px; }
-  .account-card .handle { color: var(--muted); font-size: 12px; }
+  .account-card .handle { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .scope-toggle { display: flex; gap: 2px; background: var(--hover); border-radius: var(--radius-inner); padding: 2px; }
   .scope-toggle button { border: none; background: none; }
   .scope-toggle button.active { background: var(--card); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
@@ -1939,7 +1939,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .identity-card {
     display: flex; align-items: center; gap: 8px; padding: 8px; margin-top: auto;
     border-radius: var(--radius-inner); cursor: pointer; position: relative; width: 100%;
-    border: none; background: none; text-align: left;
+    border: none; background: none; text-align: left; color: var(--text); font: inherit;
   }
   .identity-card:hover { background: var(--hover); }
   .identity-card .avatar { width: 28px; height: 28px; }
@@ -1988,7 +1988,7 @@ _WIDGET_HTML = r"""<!doctype html>
     border: none; background: none; color: var(--text); font-weight: 600; font-size: 13px;
     cursor: pointer; padding: 4px 0 12px; display: block;
   }
-  .back-link:hover { color: var(--accent); }
+  .back-link:hover { color: var(--accent); background: none; }
   .profile-page { max-width: 700px; }
   .profile-banner-wrap {
     position: relative; width: 100%; height: 180px; border-radius: var(--radius-card);
@@ -1999,7 +1999,7 @@ _WIDGET_HTML = r"""<!doctype html>
   .banner-edit-btn {
     position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; border-radius: 50%;
     border: none; background: rgba(0,0,0,.55); color: #fff; cursor: pointer; font-size: 14px;
-    display: flex; align-items: center; justify-content: center;
+    display: flex; align-items: center; justify-content: center; padding: 0;
   }
   .profile-header-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
   .profile-avatar-xl {
@@ -2009,10 +2009,10 @@ _WIDGET_HTML = r"""<!doctype html>
   .profile-stats { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; padding-bottom: 8px; }
   .profile-stat { color: var(--muted); font-size: 13px; }
   .profile-name { font-size: 20px; font-weight: 700; margin: 4px 0 0; }
-  .profile-handle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin: 2px 0 10px; }
+  .profile-handle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; margin: 2px 0 10px; overflow-wrap: anywhere; }
   .copy-btn { border: none; background: none; color: var(--muted); cursor: pointer; padding: 2px; font-size: 12px; }
   .copy-btn:hover { color: var(--text); }
-  .profile-bio { font-size: 14px; line-height: 1.5; margin-bottom: 10px; }
+  .profile-bio { font-size: 14px; line-height: 1.5; margin-bottom: 10px; overflow-wrap: break-word; }
 
   /* -- scroll-to-top (Element/Haven style: a round "^" button, top right) */
   .scroll-top-btn {
