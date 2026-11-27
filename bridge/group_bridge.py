@@ -68,6 +68,7 @@ from bridge.activitypub.remote_actor import (
 )
 from bridge.activitypub.sanitize import matrix_body_to_note_html, plain_text_to_note_html, strip_to_matrix_message
 from bridge.activitypub.urls import actor_url, followers_url, main_key_id, media_url, username_from_actor_url
+from bridge.backstage_space import room_creation_join_kwargs
 from bridge.crypto import generate_keypair
 from bridge.identity_resolution import resolve_acting_identity
 from bridge.note_mirroring import (
@@ -206,7 +207,7 @@ async def ensure_group_room(
             name=display_name,
             topic=actor_doc.get("summary") or f"Group: {display_name}",
             avatar_mxc=avatar_mxc,
-            join_rule=KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=KNOCK_JOIN_RULE),
         )
     except SynapseError:
         logger.warning("Could not create Group room for %s", group_actor_id, exc_info=True)

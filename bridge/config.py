@@ -182,9 +182,10 @@ class BridgeSection:
     # remote fediverse account) -- "knock" (default) lets anyone locked
     # out (e.g. after a `;replace room`) ask their way back in without an
     # admin, see bridge.membership.maybe_handle_knock. "invite"/"public"
-    # are the only other values this bridge actually supports without
-    # further plumbing -- "restricted"/"knock_restricted" need a space
-    # membership condition this bridge never sets up.
+    # are the other supported values. When bridge.backstage_space_enabled
+    # is also on, "knock"/"invite" rooms of this type additionally get a
+    # space-restriction allow-list layered on top (knock_restricted/
+    # restricted) so ghosts can self-join, see bridge.backstage_space.
     ghost_room_join_rule: str = "knock"
     # Same as ghost_room_join_rule, but for a local user's own Profile
     # Room (`;create profile`/`;link profile`/`;replace room`). Separate
@@ -342,6 +343,14 @@ class BridgeSection:
     # other. Off by default, same reasoning as every other *_enabled flag
     # here.
     groups_enabled: bool = False
+    # Whether the bridge maintains a single "backstage" Matrix space that
+    # every ghost joins once, then points Remote User Room/local Profile
+    # Room/Group room/Lemmy community room join_rules at (restricted or
+    # knock_restricted) so ghosts can self-join those rooms directly
+    # instead of needing an invite every time, see bridge.backstage_space.
+    # Off by default. DM/Chat/Notification rooms are never touched by this,
+    # regardless of this setting, they stay invite-gated permanently.
+    backstage_space_enabled: bool = False
     # Whether a remote actor's reply into a conversation that's ALREADY
     # tracked here also gets an annotated "⤵️ Reply to X's post" copy
     # posted into THEIR OWN Remote User Room (not just threaded into the
@@ -678,6 +687,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> BridgeConfig:
         ),
         lemmy_community_hosting_enabled=bool(bridge_raw.get("lemmy_community_hosting_enabled", False)),
         groups_enabled=bool(bridge_raw.get("groups_enabled", False)),
+        backstage_space_enabled=bool(bridge_raw.get("backstage_space_enabled", False)),
         custom_identities_enabled=bool(bridge_raw.get("custom_identities_enabled", False)),
         max_identities_per_user=int(bridge_raw.get("max_identities_per_user", 5)),
         reserved_usernames=[

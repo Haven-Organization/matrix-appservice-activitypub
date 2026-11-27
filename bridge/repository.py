@@ -1455,6 +1455,15 @@ class ActorRepository(Protocol):
         """Record ``space_room_id`` as ``matrix_user_id``'s Fediverse space."""
         ...
 
+    async def get_backstage_space(self) -> str | None:
+        """The room ID of the bridge's single, global backstage space (see
+        ``bridge.backstage_space``), or None if it hasn't been created yet."""
+        ...
+
+    async def register_backstage_space(self, space_room_id: str) -> None:
+        """Record ``space_room_id`` as the bridge's backstage space."""
+        ...
+
     async def get_bot_dm_room(self, matrix_user_id: str) -> str | None:
         """The room ID of the bot's 1:1 direct-message room with
         ``matrix_user_id`` (see ``bridge.notifications``), or None if one
@@ -1670,6 +1679,7 @@ class InMemoryActorRepository:
         self._resolved_emoji: dict[str, dict[str, str]] = {}  # subject_id -> {shortcode: mxc_url}
         self._ghost_profiles: dict[str, GhostProfile] = {}
         self._user_spaces: dict[str, str] = {}
+        self._backstage_space: str | None = None
         self._bot_dm_rooms: dict[str, str] = {}
         self._ghost_dm_rooms: dict[tuple[str, str], str] = {}
         self._ghost_dm_room_ids: set[str] = set()
@@ -2371,6 +2381,12 @@ class InMemoryActorRepository:
 
     async def register_user_space(self, matrix_user_id: str, space_room_id: str) -> None:
         self._user_spaces[matrix_user_id] = space_room_id
+
+    async def get_backstage_space(self) -> str | None:
+        return self._backstage_space
+
+    async def register_backstage_space(self, space_room_id: str) -> None:
+        self._backstage_space = space_room_id
 
     async def get_bot_dm_room(self, matrix_user_id: str) -> str | None:
         return self._bot_dm_rooms.get(matrix_user_id)

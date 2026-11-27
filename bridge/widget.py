@@ -36,6 +36,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from bridge.activitypub.sanitize import plain_text_to_note_html
 from bridge.activitypub.urls import actor_url, media_url
+from bridge.backstage_space import ensure_backstage_space
 from bridge.bridge_settings import SettingError, apply_override, clear_override, effective_config, known_settings, value_of
 from bridge.ghosts import sync_bot_profile
 from bridge.commands import (
@@ -709,6 +710,52 @@ async def widget_admin_rooms(request: Request) -> JSONResponse:
             "room_id": m.room_id, "kind": m.kind, "maps_to": m.maps_to, "owner_matrix_id": m.owner_matrix_id,
         })
     return JSONResponse({"rooms": rooms}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/widget/api/admin/backstage_space")
+async def widget_admin_backstage_space(request: Request) -> JSONResponse:
+    """The bridge's single backstage space (see ``bridge.backstage_space``)
+    for the Admin page's Rooms view, its room ID (created on first call if
+    the feature is enabled and it doesn't exist yet) plus whether
+    ``bridge.backstage_space_enabled`` is currently on. Same admin-gating
+    pattern as ``widget_admin_grants``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can view the backstage space.")
+    config = request.app.state.config
+    repository = request.app.state.repository
+    room_id = (
+        await ensure_backstage_space(request.app.state.synapse, repository, config)
+        if config.bridge.backstage_space_enabled
+        else await repository.get_backstage_space()
+    )
+    return JSONResponse(
+        {"enabled": config.bridge.backstage_space_enabled, "room_id": room_id},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/widget/api/admin/backstage_space/invite")
+async def widget_admin_backstage_space_invite(request: Request) -> JSONResponse:
+    """Invite the calling admin into the backstage space, on request only,
+    never done automatically, since membership there grants direct join
+    access to every room that trusts the space, not just visibility into
+    it (the widget's own button spells that consequence out before calling
+    this). Same admin-gating pattern as ``widget_admin_grants``."""
+    matrix_user_id = _session_user(request)
+    if not await _is_matrix_admin(request, matrix_user_id):
+        raise HTTPException(403, "Only a Matrix server admin can do this.")
+    config = request.app.state.config
+    repository = request.app.state.repository
+    synapse = request.app.state.synapse
+    room_id = await ensure_backstage_space(synapse, repository, config)
+    if room_id is None:
+        raise HTTPException(409, "The backstage space doesn't exist yet, enable bridge.backstage_space_enabled first.")
+    try:
+        await synapse.invite_user(room_id, matrix_user_id, as_user_id=_bot_mxid(config))
+    except SynapseError as exc:
+        raise HTTPException(502, "The homeserver rejected that invite, try again.") from exc
+    return JSONResponse({"ok": True, "room_id": room_id})
 
 
 async def _refresh_effective_config(request: Request) -> None:
@@ -4847,6 +4894,31 @@ _WIDGET_HTML = r"""<!doctype html>
     }
 
     filterInput.addEventListener("input", renderList);
+
+    const backstageBody = el("div", { class: "muted", text: "Loading…" });
+    app.appendChild(el("div", { class: "card" }, [
+      el("h2", { text: "Backstage space" }),
+      el("div", { class: "sub", text: "A single shared space every ghost joins once, so eligible rooms (Remote User/Profile/Group/Lemmy community, never DM/Chat/Notifications) can let them self-join instead of being invited every time." }),
+      backstageBody,
+    ]));
+
+    api("/widget/api/admin/backstage_space").then((data) => {
+      backstageBody.innerHTML = "";
+      if (!data.enabled) {
+        backstageBody.appendChild(el("div", { class: "muted", text: "Disabled (bridge.backstage_space_enabled is off)." + (data.room_id ? " Room ID from before it was disabled: " + data.room_id : "") }));
+        return;
+      }
+      backstageBody.appendChild(el("div", { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;" }, [
+        el("span", { style: "font-weight:600;word-break:break-all;", text: data.room_id || "(not created yet)" }),
+        plainButton("", "Get invited, grants direct join access to every room that trusts this space, not just visibility into it",
+          withConfirm("Joining grants direct join access to every room that trusts this space, not just visibility into it.", (btn) => {
+            return api("/widget/api/admin/backstage_space/invite", { method: "POST", body: {} })
+              .then(() => toast("Invited, check your invites.", true))
+              .catch((err) => toast(err.message, false))
+              .finally(() => { btn.disabled = false; });
+          })),
+      ]));
+    }).catch(() => { backstageBody.innerHTML = ""; backstageBody.appendChild(el("div", { class: "muted", text: "Couldn't load." })); });
 
     app.appendChild(el("div", { class: "card" }, [
       el("h2", { text: "Mapped rooms" }),

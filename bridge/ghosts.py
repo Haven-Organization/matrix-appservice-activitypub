@@ -12,6 +12,7 @@ import re
 
 import httpx
 
+from bridge.backstage_space import join_ghost_to_backstage_space
 from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, resolve_and_persist_emoji
 from bridge.media import fetch_and_upload_media
 from bridge.repository import ActorRepository, GhostProfile
@@ -61,6 +62,8 @@ def third_party_username_from_mxid(mxid: str) -> str:
 
 async def ensure_ghost_user(
     synapse: SynapseClient,
+    repository: ActorRepository,
+    config,
     *,
     server_name: str,
     localpart: str,
@@ -92,6 +95,7 @@ async def ensure_ghost_user(
         except SynapseError:
             logger.debug("Could not set avatar for ghost %s", mxid, exc_info=True)
 
+    await join_ghost_to_backstage_space(synapse, repository, config, mxid)
     return mxid
 
 
@@ -115,6 +119,13 @@ async def sync_bot_profile(
     has no startup-only state -- safe to call again any time either field
     changes live (see ``bridge.bridge_settings``), not just once per
     process lifetime.
+
+    Doesn't delegate to ``ensure_ghost_user`` (even though the bot is also
+    technically an AS-namespace user), this manages the BOT's own
+    profile, not a ghost's, and has no ``repository``/``config`` to pass
+    along; joining the bot itself to the backstage space would be
+    meaningless (it already has unrestricted access everywhere) and
+    ``ensure_ghost_user``'s signature requires both now.
     """
     if not display_name and not avatar_mxc:
         return
@@ -123,13 +134,16 @@ async def sync_bot_profile(
         bot_profile = await synapse.get_profile(mxid)
     except SynapseError:
         bot_profile = {}
-    if (display_name and bot_profile.get("displayname") != display_name) or (
-        avatar_mxc and bot_profile.get("avatar_url") != avatar_mxc
-    ):
-        await ensure_ghost_user(
-            synapse, server_name=server_name, localpart=localpart,
-            display_name=display_name, avatar_mxc=avatar_mxc,
-        )
+    if display_name and bot_profile.get("displayname") != display_name:
+        try:
+            await synapse.set_display_name(mxid, display_name)
+        except SynapseError:
+            logger.debug("Could not set display name for bot %s", mxid, exc_info=True)
+    if avatar_mxc and bot_profile.get("avatar_url") != avatar_mxc:
+        try:
+            await synapse.set_avatar_url(mxid, avatar_mxc)
+        except SynapseError:
+            logger.debug("Could not set avatar for bot %s", mxid, exc_info=True)
 
 
 async def _sync_room_avatars(
@@ -217,6 +231,7 @@ async def sync_ghost_profile(
     synapse: SynapseClient,
     http_client: httpx.AsyncClient,
     repository: ActorRepository,
+    config,
     *,
     server_name: str,
     localpart: str,
@@ -255,6 +270,7 @@ async def sync_ghost_profile(
     except SynapseError as exc:
         if exc.errcode != "M_USER_IN_USE":
             raise
+    await join_ghost_to_backstage_space(synapse, repository, config, mxid)
 
     cached = await repository.get_ghost_profile(actor_id)
     cached_display_name = cached.display_name if cached else None

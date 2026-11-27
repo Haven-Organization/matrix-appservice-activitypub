@@ -234,6 +234,7 @@ from bridge.activitypub.webfinger import (
     resolve_invite_code,
     resolve_remote_actor_id,
 )
+from bridge.backstage_space import maybe_upgrade_join_rule, room_creation_join_kwargs
 from bridge.config import BridgeConfig
 from bridge.crypto import generate_keypair
 from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, extract_outbound_emoji_tags
@@ -2073,6 +2074,8 @@ async def _establish_remote_follow(
 
         await ensure_ghost_user(
             synapse,
+            repository,
+            config,
             server_name=config.synapse.server_name,
             localpart=localpart,
             display_name=display_name,
@@ -2096,7 +2099,7 @@ async def _establish_remote_follow(
             invite=[sender, bot_mxid],
             avatar_mxc=avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # bot_mxid kept at the same level as the ghost creator,
             # regardless of room version -- see SynapseClient.create_room's
             # own additional_creators docstring for how it handles pre-v12
@@ -5033,6 +5036,8 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
 
         await ensure_ghost_user(
             synapse,
+            repository,
+            config,
             server_name=config.synapse.server_name,
             localpart=localpart,
             display_name=display_name,
@@ -5054,7 +5059,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
             invite=[sender, bot_mxid],
             avatar_mxc=avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # bot_mxid kept at the same level as the ghost creator -- see
             # _establish_remote_follow's identical reasoning. events'
             # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches that same
@@ -6343,7 +6348,7 @@ async def _handle_create_profile(
             invite=[sender],
             avatar_mxc=matrix_avatar_mxc,
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # sender is 99, not 100 -- one level below the bot (the
             # creator, as_user_id above -- deliberately NOT listed here;
             # room v12 rejects m.room.power_levels outright if the creator
@@ -6558,7 +6563,7 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
             name=display_name,
             invite=[sender],
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # sender is 99, not 100 -- same reasoning as _handle_create_profile's
             # identical override: one level below the bot (the room's real
             # creator under room v12), so sender is never locked out of
@@ -6672,7 +6677,7 @@ async def _handle_create_community(request: Request, *, sender: str, room_id: st
             name=display_name,
             invite=[sender],
             room_type=_SOCIAL_GROUP_ROOM_TYPE,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # The creator becomes the community's first MODERATOR (power
             # level 50), not a near-admin owner -- a Lemmy community has no
             # single all-powerful owner, see LemmyCommunityRecord's own
@@ -6859,6 +6864,8 @@ async def _execute_link_community(request: Request, *, sender: str, room_id: str
         display_name=display_name, summary=summary, icon_mxc=icon_mxc, banner_mxc=banner_mxc,
     )
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id)
+    # Best-effort, see _execute_link_profile's identical call/comment.
+    await maybe_upgrade_join_rule(synapse, repository, config, room_id)
 
     await _notice(
         request, room_id,
@@ -6992,7 +6999,7 @@ async def _handle_create_group(request: Request, *, sender: str, room_id: str, a
             # specifically denotes a Lemmy-style forum-of-posts shape (see
             # bridge.group_bridge's own module docstring). A plain room,
             # same as a DM/Chat ghost room.
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # The creator becomes the group's first moderator (power level
             # 50) -- any member can post, not just the owner, same "no
             # single all-powerful owner" framing as a Lemmy community.
@@ -7167,6 +7174,8 @@ async def _execute_link_group(request: Request, *, sender: str, room_id: str, gr
         display_name=display_name, summary=summary, icon_mxc=icon_mxc, banner_mxc=banner_mxc,
     )
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id)
+    # Best-effort, see _execute_link_profile's identical call/comment.
+    await maybe_upgrade_join_rule(synapse, repository, config, room_id)
 
     await _notice(
         request, room_id, f"Linked! This room now publishes as the group {group_id}@{config.bridge.domain}.",
@@ -8613,6 +8622,12 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
         # notifications room -- make sure that's actually still true.
         await ensure_bot_dm_invite(request, matrix_user_id=sender)
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=room_id, order=PROFILE_ROOM_SPACE_ORDER)
+    # Best-effort: this is a pre-existing room the bridge didn't create, so
+    # unlike every other room type it's genuinely unknown whether the bridge
+    # has enough power here to touch m.room.join_rules at all, see
+    # maybe_upgrade_join_rule's own docstring for the "mods never granted
+    # it" fallback this silently leaves in place.
+    await maybe_upgrade_join_rule(synapse, repository, config, room_id)
 
     # Best-effort: this requires the bot to have a high enough power level in
     # the user's room, which it won't by default unless granted one. Same
@@ -10319,7 +10334,7 @@ async def _replace_profile_room(
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
             room_version=_REPLACE_ROOM_VERSION,
             predecessor=predecessor,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # owner is 99, not 100, and bot_mxid (the creator) is omitted
             # entirely -- see _handle_create_profile's identical reasoning,
             # including for the events override below.
@@ -10400,6 +10415,8 @@ async def _replace_remote_actor_room(
 
     await ensure_ghost_user(
         synapse,
+        repository,
+        config,
         server_name=config.synapse.server_name,
         localpart=localpart,
         display_name=display_name,
@@ -10435,7 +10452,7 @@ async def _replace_remote_actor_room(
             room_type=_SOCIAL_PROFILE_ROOM_TYPE,
             room_version=_REPLACE_ROOM_VERSION,
             predecessor=predecessor,
-            join_rule=_KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=_KNOCK_JOIN_RULE),
             # bot_mxid is kept at the SAME level as the ghost creator, same
             # as every non-replace Remote User Room path (see
             # _establish_remote_follow) -- under v11 that was a plain

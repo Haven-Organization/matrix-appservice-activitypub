@@ -266,6 +266,7 @@ class SynapseClient:
         predecessor: dict[str, Any] | None = None,
         join_rule: str | None = None,
         restricted_to_room_id: str | None = None,
+        knock_restricted: bool = False,
         power_level_content_override: dict[str, Any] | None = None,
         additional_creators: list[str] | None = None,
     ) -> str:
@@ -334,6 +335,13 @@ class SynapseClient:
         ``allow`` list is meaningless (falls back to invite-only per spec).
         Mutually exclusive with ``join_rule`` above -- pass at most one.
 
+        ``knock_restricted``, only meaningful together with
+        ``restricted_to_room_id``, swaps the emitted join_rule from
+        ``"restricted"`` to ``"knock_restricted"`` (MSC3787, stable since
+        room v10): same ``allow`` condition, but someone who ISN'T a member
+        of ``restricted_to_room_id`` can still knock instead of being
+        rejected outright.
+
         ``power_level_content_override`` is applied on top of the preset's
         normally-computed ``m.room.power_levels`` content (per the C-S API
         spec), not a full replacement -- e.g. ``{"users": {mxid: 99}}``
@@ -385,7 +393,7 @@ class SynapseClient:
             initial_state.append({
                 "type": "m.room.join_rules", "state_key": "",
                 "content": {
-                    "join_rule": "restricted",
+                    "join_rule": "knock_restricted" if knock_restricted else "restricted",
                     "allow": [{"type": "m.room_membership", "room_id": restricted_to_room_id}],
                 },
             })
@@ -770,6 +778,19 @@ class SynapseClient:
             f"/_synapse/admin/v1/deactivate/{user_id}",
             token=self._admin_token,
             json_body={"erase": erase},
+        )
+
+    async def admin_join_room(self, room_id: str, user_id: str) -> None:
+        """Force ``user_id`` to join ``room_id`` via the Admin API, bypassing
+        that room's own ``join_rules`` entirely for this one membership
+        change, used by ``bridge.backstage_space`` to get a ghost into the
+        bridge's own backstage space without an invite round-trip, when
+        ``bridge.use_synapse_admin_api`` is on."""
+        await self._request(
+            "POST",
+            f"/_synapse/admin/v1/join/{room_id}",
+            token=self._admin_token,
+            json_body={"user_id": user_id},
         )
 
     async def admin_is_server_admin(self, user_id: str) -> bool:

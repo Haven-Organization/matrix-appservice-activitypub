@@ -43,6 +43,7 @@ from bridge.activitypub.remote_actor import (
     resolve_actor_inbox,
 )
 from bridge.activitypub.sanitize import mention_pill_key, plain_text_to_note_html, strip_to_matrix_message
+from bridge.backstage_space import ensure_ghost_access, room_creation_join_kwargs
 from bridge.custom_emoji import inline_custom_emoji, resolve_and_persist_emoji
 from bridge.activitypub.urls import (
     actor_url,
@@ -1703,6 +1704,7 @@ async def resolve_and_invite_ghost(request: Request, actor_id: str, room_id: str
             synapse,
             http_client,
             repository,
+            config,
             server_name=config.synapse.server_name,
             localpart=localpart,
             actor_id=actor_id,
@@ -1712,8 +1714,9 @@ async def resolve_and_invite_ghost(request: Request, actor_id: str, room_id: str
             tag=actor_doc.get("tag") if actor_doc else None,
             formatted_displayname_enabled=config.bridge.use_msc4589_formatted_displayname,
         )
-        inviter = await _inviter_for_room(request, room_id)
-        await synapse.invite_user(room_id, mxid, as_user_id=inviter)
+        if not await ensure_ghost_access(synapse, repository, config, room_id=room_id, ghost_mxid=mxid):
+            inviter = await _inviter_for_room(request, room_id)
+            await synapse.invite_user(room_id, mxid, as_user_id=inviter)
     except SynapseError:
         logger.info("Could not invite ghost %s into %s", mxid, room_id, exc_info=True)
     return mxid, actor_doc
@@ -2087,7 +2090,7 @@ async def provision_ghost(request: Request, actor_id: str) -> tuple[str, dict, s
     avatar_mxc = await fetch_and_upload_media(http_client, synapse, icon_url) if icon_url else None
 
     await sync_ghost_profile(
-        synapse, http_client, repository,
+        synapse, http_client, repository, config,
         server_name=config.synapse.server_name, localpart=localpart, actor_id=actor_id,
         display_name=display_name, icon_url=icon_url, handle=f"@{username}@{domain}",
         tag=actor_doc.get("tag") if actor_doc else None,
@@ -3009,6 +3012,8 @@ async def ensure_remote_actor_room(
 
         await ensure_ghost_user(
             synapse,
+            repository,
+            config,
             server_name=config.synapse.server_name,
             localpart=localpart,
             display_name=display_name,
@@ -3034,7 +3039,9 @@ async def ensure_remote_actor_room(
             invite=[inviter, bot_mxid] if inviter else [bot_mxid],
             avatar_mxc=avatar_mxc,
             room_type=SOCIAL_PROFILE_ROOM_TYPE,
-            join_rule=config.bridge.ghost_room_join_rule,
+            **await room_creation_join_kwargs(
+                synapse, repository, config, base_join_rule=config.bridge.ghost_room_join_rule
+            ),
             # bot_mxid kept at the same level as the ghost creator -- see
             # ensure_ghost_dm_room's identical reasoning. events'
             # SOCIAL_PROFILE_USER_ID_STATE_TYPE override matches every

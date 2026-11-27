@@ -26,6 +26,7 @@ The bridge reads `config.yaml` once, at startup, so restart it after a change. T
     - [World-readable remote rooms (`bridge.world_readable_remote_rooms`)](#bridge-world_readable_remote_rooms)
     - [Accept federated knocks (`bridge.accept_federated_knocks`)](#bridge-accept_federated_knocks)
     - [Default backfill count (`bridge.backfill_default_count`)](#bridge-backfill_default_count)
+    - [Backstage space enabled (`bridge.backstage_space_enabled`)](#bridge-backstage_space_enabled)
   - [Replies](#replies)
     - [Reply cross-posting (`bridge.reply_cross_post_mode`)](#bridge-reply_cross_post_mode)
   - [Posts and polls](#posts-and-polls)
@@ -171,6 +172,16 @@ Whether a knock from a user on a DIFFERENT homeserver is auto-accepted the same 
 **Default:** `15`
 
 How many posts `;backfill` pulls with no explicit count given. A Matrix server admin can override this per-use with an explicit argument.
+
+---
+
+<a id="bridge-backstage_space_enabled"></a>
+
+#### Backstage space enabled (`bridge.backstage_space_enabled`)
+
+**Default:** `false`
+
+Whether the bridge maintains a single shared "backstage" Matrix space that every ghost joins once, then points Remote User Room/Profile Room/Group room/Lemmy community room join rules at (`restricted`/`knock_restricted`) so ghosts can self-join those rooms instead of needing an invite every time. Rooms already created before this is turned on, and rooms the bridge doesn't fully control (e.g. linked in via `;link profile`/`;link community`/`;link group`), get upgraded lazily the first time a ghost would otherwise have been invited into them, in place of that invite, `adhoc_backfill_backstage_space.py` can also convert everything up front instead of waiting for that. DM, Chat, and Notification rooms are never touched by this, regardless of this setting.
 
 ---
 

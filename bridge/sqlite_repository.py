@@ -246,6 +246,13 @@ CREATE TABLE IF NOT EXISTS user_spaces (
     space_room_id TEXT NOT NULL
 );
 
+-- Single-row table (the CHECK pins id to 1), there is only ever one
+-- backstage space, global across the whole bridge; see bridge.backstage_space.
+CREATE TABLE IF NOT EXISTS backstage_space (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    space_room_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS bot_dm_rooms (
     matrix_user_id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL
@@ -2444,6 +2451,28 @@ class SqliteActorRepository:
 
     async def register_user_space(self, matrix_user_id: str, space_room_id: str) -> None:
         await self._run(self._register_user_space, matrix_user_id, space_room_id)
+
+    # -- backstage space -----------------------------------------------------
+
+    def _get_backstage_space(self) -> str | None:
+        row = self._conn.execute("SELECT space_room_id FROM backstage_space WHERE id = 1").fetchone()
+        return row["space_room_id"] if row else None
+
+    async def get_backstage_space(self) -> str | None:
+        return await self._run(self._get_backstage_space)
+
+    def _register_backstage_space(self, space_room_id: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO backstage_space (id, space_room_id) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET space_room_id = excluded.space_room_id
+            """,
+            (space_room_id,),
+        )
+        self._conn.commit()
+
+    async def register_backstage_space(self, space_room_id: str) -> None:
+        await self._run(self._register_backstage_space, space_room_id)
 
     # -- Shoot guild/channel bridging ----------------------------------------
 

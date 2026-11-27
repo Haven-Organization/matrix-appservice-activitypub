@@ -78,6 +78,7 @@ from bridge.activitypub.urls import (
     moderators_url,
     username_from_actor_url,
 )
+from bridge.backstage_space import room_creation_join_kwargs
 from bridge.crypto import generate_keypair
 from bridge.identity_resolution import resolve_acting_identity
 from bridge.note_mirroring import (
@@ -226,7 +227,7 @@ async def ensure_lemmy_community_room(
             topic=actor_doc.get("summary") or f"Lemmy community: {display_name}",
             avatar_mxc=avatar_mxc,
             room_type=SOCIAL_GROUP_ROOM_TYPE,
-            join_rule=KNOCK_JOIN_RULE,
+            **await room_creation_join_kwargs(synapse, repository, config, base_join_rule=KNOCK_JOIN_RULE),
         )
     except SynapseError:
         logger.warning("Could not create community room for %s", community_actor_id, exc_info=True)

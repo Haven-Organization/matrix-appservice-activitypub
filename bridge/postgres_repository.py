@@ -273,6 +273,14 @@ _SCHEMA_STATEMENTS = [
         space_room_id TEXT NOT NULL
     )
     """,
+    # Single-row table (the CHECK pins id to 1), there is only ever one
+    # backstage space, global across the whole bridge; see bridge.backstage_space.
+    """
+    CREATE TABLE IF NOT EXISTS backstage_space (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        space_room_id TEXT NOT NULL
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS bot_dm_rooms (
         matrix_user_id TEXT PRIMARY KEY,
@@ -1893,6 +1901,21 @@ class PostgresActorRepository:
             ON CONFLICT (matrix_user_id) DO UPDATE SET space_room_id = EXCLUDED.space_room_id
             """,
             matrix_user_id, space_room_id,
+        )
+
+    # -- backstage space -----------------------------------------------------
+
+    async def get_backstage_space(self) -> str | None:
+        row = await self._pool.fetchrow("SELECT space_room_id FROM backstage_space WHERE id = 1")
+        return row["space_room_id"] if row else None
+
+    async def register_backstage_space(self, space_room_id: str) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO backstage_space (id, space_room_id) VALUES (1, $1)
+            ON CONFLICT (id) DO UPDATE SET space_room_id = EXCLUDED.space_room_id
+            """,
+            space_room_id,
         )
 
     # -- Shoot guild/channel bridging ----------------------------------------
