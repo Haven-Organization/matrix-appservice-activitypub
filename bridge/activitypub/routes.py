@@ -1652,7 +1652,7 @@ async def get_outbox(request: Request, username: str) -> JSONResponse:
             # remote server that has never followed us (or is only now
             # resolving us for the first time) reads THIS collection, not
             # that history -- confirmed live 2026-10-19: a real post
-            # existed, but https://poa.st/@haven@glowers.club still showed
+            # existed, but a remote instance's view of the profile still showed
             # no posts at all, since this previously returned permanently
             # empty. See _fetch_community_outbox_items for what it actually
             # covers (local-member posts only, for now).

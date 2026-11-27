@@ -9,7 +9,7 @@ problem was ours, not theirs -- no coincidence of individually flaky remote
 servers explains dozens of them all failing at the same moment (confirmed
 live 2026-08-13: 66+ distinct destinations all showed Synapse's own
 ``failure_ts`` within the same ~15-minute window during a real multi-hour
-outage of glowers.club's own network reachability). Read straight from
+outage of this homeserver's own network reachability). Read straight from
 Synapse's own ``/_synapse/admin/v1/federation/destinations`` (not a
 bridge-side heartbeat) specifically because a heartbeat can't tell "the
 process was down" apart from "the process stayed up but the network path

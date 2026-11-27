@@ -1182,7 +1182,7 @@ async def maybe_federate_reaction_removal(request: Request, event: dict) -> bool
     # too, since they're the one with permission to redact the bot's post
     # there) means "undo this." A redaction from anyone ELSE must never be
     # read as the reactor's own intent -- confirmed live 2026-10-26: a
-    # sibling bridge's own bot (@nostr:glowers.club, sharing the room for
+    # sibling bridge's own bot (e.g. @nostr:example.org, sharing the room for
     # its own cross-bridge mirroring) redacted a user's 🔁 reaction event
     # for reasons unrelated to that user's wishes, and this function, with
     # no sender check at all, treated it exactly like the user un-reacting
