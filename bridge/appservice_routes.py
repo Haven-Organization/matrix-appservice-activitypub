@@ -80,6 +80,7 @@ from bridge.group_bridge import (
     maybe_handle_owned_group_name_change,
     maybe_handle_owned_group_topic_change,
 )
+from bridge.ghosts import maybe_add_formatted_displayname_on_join
 from bridge.lemmy_bridge import (
     maybe_distribute_community_message,
     maybe_distribute_owned_community_message,
@@ -338,6 +339,9 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
     every follower -- would have re-run in full on every single retry once
     that other bug stopped making delivery fail outright.
     """
+    # Never claims the event: a ghost's join just gets its MSC4589
+    # formatted displayname copied onto the new member event.
+    await maybe_add_formatted_displayname_on_join(request.app.state.synapse, request.app.state.config, event)
     handled_as_invite = await maybe_accept_invite(request, event)
     if handled_as_invite:
         return

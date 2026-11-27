@@ -227,6 +227,47 @@ async def _sync_formatted_displayname_rooms(
             logger.debug("Could not update formatted displayname for %s in %s", actor_id, room_id, exc_info=True)
 
 
+async def maybe_add_formatted_displayname_on_join(synapse: SynapseClient, config, event: dict) -> None:
+    """When one of the bridge's ghosts joins a room, copy its MSC4589
+    formatted displayname from its global profile onto that new member
+    event. Synapse fills a join's ``displayname`` from the global profile
+    but not this field, so without this every room a ghost joins after its
+    last name change (a reply thread, the backstage space, a room it
+    self-joins) would be missing it. Never claims the event; does nothing
+    unless the feature is on, the joiner is a ghost, the field is missing,
+    and the profile's plain name still matches the member event's."""
+    if not config.bridge.use_msc4589_formatted_displayname or event.get("type") != "m.room.member":
+        return
+    content = event.get("content") or {}
+    mxid = event.get("state_key") or ""
+    room_id = event.get("room_id")
+    if (
+        content.get("membership") != "join"
+        or event.get("sender") != mxid
+        or FORMATTED_DISPLAYNAME_FIELD in content
+        or not room_id
+        or not mxid.startswith(f"@{config.appservice.user_prefix}")
+        or not mxid.endswith(f":{config.synapse.server_name}")
+    ):
+        return
+    try:
+        profile = await synapse.get_profile(mxid)
+    except SynapseError:
+        return
+    formatted = profile.get(FORMATTED_DISPLAYNAME_FIELD)
+    if not formatted or profile.get("displayname") != content.get("displayname"):
+        return
+    try:
+        current = await synapse.get_room_state(room_id, "m.room.member", mxid, as_user_id=mxid)
+        if current.get("membership") != "join" or FORMATTED_DISPLAYNAME_FIELD in current:
+            return
+        await synapse.send_state_event(
+            room_id, "m.room.member", mxid, {**current, FORMATTED_DISPLAYNAME_FIELD: formatted}, as_user_id=mxid,
+        )
+    except SynapseError:
+        logger.debug("Could not add the formatted displayname for %s in %s", mxid, room_id, exc_info=True)
+
+
 async def sync_ghost_profile(
     synapse: SynapseClient,
     http_client: httpx.AsyncClient,
@@ -347,6 +388,29 @@ async def sync_ghost_profile(
                         synapse, repository, actor_id=actor_id, mxid=mxid,
                         display_name=display_name, formatted_body=None,
                     )
+    elif formatted_displayname_enabled and display_name and tag and ":" in display_name:
+        # The name hasn't changed, but a ghost last renamed before MSC4589
+        # was turned on (or whose emoji couldn't be resolved then) never got
+        # a formatted name at all. One profile read, only for names that
+        # contain a shortcode, fills it in.
+        try:
+            current_profile = await synapse.get_profile(mxid)
+        except SynapseError:
+            current_profile = None
+        if current_profile is not None and FORMATTED_DISPLAYNAME_FIELD not in current_profile:
+            formatted_body = await build_formatted_displayname(http_client, synapse, repository, display_name, tag)
+            if formatted_body is not None:
+                try:
+                    await synapse.set_profile_field(
+                        mxid, FORMATTED_DISPLAYNAME_FIELD,
+                        {"format": "org.matrix.custom.html", "formatted_body": formatted_body},
+                    )
+                except SynapseError:
+                    logger.debug("Could not set formatted display name for ghost %s", mxid, exc_info=True)
+                await _sync_formatted_displayname_rooms(
+                    synapse, repository, actor_id=actor_id, mxid=mxid,
+                    display_name=display_name, formatted_body=formatted_body,
+                )
 
     if display_name and tag:
         # Unconditional on whether the name actually changed (unlike the
