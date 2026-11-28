@@ -278,10 +278,13 @@ async def _add_formatted_room_name(
     synapse: SynapseClient, room_id: str, mxid: str, display_name: str, formatted_body: str,
 ) -> None:
     """Give a ghost's room its formatted name (MSC4591), only while the
-    room is still named exactly after the ghost and doesn't have it yet."""
+    room is still named after the ghost and doesn't have it yet. A room
+    named before names were stripped (``resolve_actor_display_name``) may
+    still carry extra whitespace: it counts as the same name, and is set
+    to the clean one."""
     try:
         current = await synapse.get_room_state(room_id, "m.room.name", as_user_id=mxid) or {}
-        if current.get("name") != display_name or FORMATTED_ROOM_NAME_FIELD in current:
+        if (current.get("name") or "").strip() != display_name.strip() or FORMATTED_ROOM_NAME_FIELD in current:
             return
         await synapse.send_state_event(
             room_id, "m.room.name", "", {**current, **room_name_content(display_name, formatted_body)}, as_user_id=mxid,
@@ -317,9 +320,10 @@ async def maybe_add_formatted_room_name(synapse: SynapseClient, config, event: d
     except SynapseError:
         return
     formatted = (profile.get(FORMATTED_DISPLAYNAME_FIELD) or {}).get("formatted_body")
-    if not formatted or profile.get("displayname") != content.get("name"):
+    displayname = profile.get("displayname") or ""
+    if not formatted or displayname.strip() != content["name"].strip():
         return
-    await _add_formatted_room_name(synapse, room_id, sender, content["name"], formatted)
+    await _add_formatted_room_name(synapse, room_id, sender, displayname, formatted)
 
 
 async def sync_ghost_profile(
