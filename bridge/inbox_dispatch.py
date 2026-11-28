@@ -82,6 +82,7 @@ from bridge.custom_emoji import (
     emoji_img_html,
     inline_custom_emoji,
     resolve_custom_emoji_image,
+    room_name_content,
 )
 from bridge.media import fetch_and_upload_media, filename_with_extension, unresolvable_encrypted_attachment_mxc
 from bridge.ghosts import _sync_formatted_displayname_rooms, ghost_mxid
@@ -3429,10 +3430,8 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
     config = request.app.state.config
     try:
         if name_changed:
-            await synapse.send_state_event(
-                remote_room.room_id, "m.room.name", "", {"name": new_name}, as_user_id=remote_room.ghost_user_id
-            )
             await synapse.set_display_name(remote_room.ghost_user_id, new_name)
+            formatted_body = None
             if config.bridge.use_msc4589_formatted_displayname:
                 formatted_body = await build_formatted_displayname(
                     request.app.state.http_client, synapse, repository, new_name, obj.get("tag") or [],
@@ -3460,6 +3459,12 @@ async def _handle_update(request: Request, username: str, activity: Activity) ->
                             synapse, repository, actor_id=remote_room.actor_id, mxid=remote_room.ghost_user_id,
                             display_name=new_name, formatted_body=None,
                         )
+            # After the formatted name is known, so the room's name and its
+            # MSC4591 formatted name change in one event.
+            await synapse.send_state_event(
+                remote_room.room_id, "m.room.name", "", room_name_content(new_name, formatted_body),
+                as_user_id=remote_room.ghost_user_id,
+            )
         if icon_changed and avatar_mxc:
             await synapse.send_state_event(
                 remote_room.room_id, "m.room.avatar", "", {"url": avatar_mxc}, as_user_id=remote_room.ghost_user_id

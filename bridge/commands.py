@@ -237,7 +237,12 @@ from bridge.activitypub.webfinger import (
 from bridge.backstage_space import maybe_upgrade_join_rule, room_creation_join_kwargs
 from bridge.config import BridgeConfig
 from bridge.crypto import generate_keypair
-from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, extract_outbound_emoji_tags
+from bridge.custom_emoji import (
+    FORMATTED_DISPLAYNAME_FIELD,
+    build_formatted_displayname,
+    extract_outbound_emoji_tags,
+    room_name_content,
+)
 from bridge.ghosts import (
     _sync_formatted_displayname_rooms,
     ensure_ghost_user,
@@ -5479,6 +5484,7 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     )
 
     # Ghost's own Matrix profile.
+    formatted_body = None
     if name_changed:
         try:
             await synapse.set_display_name(mxid, display_name)
@@ -5527,7 +5533,7 @@ async def _handle_refresh(request: Request, *, sender: str, room_id: str, argume
     if name_changed:
         try:
             await synapse.send_state_event(
-                remote_room.room_id, "m.room.name", "", {"name": display_name}, as_user_id=mxid
+                remote_room.room_id, "m.room.name", "", room_name_content(display_name, formatted_body), as_user_id=mxid
             )
         except SynapseError:
             logger.info("Could not refresh room name for %s", remote_room.room_id, exc_info=True)
@@ -8649,7 +8655,12 @@ async def _execute_link_profile(request: Request, *, sender: str, room_id: str) 
         except SynapseError:
             pass
         if not existing_name:
-            await synapse.send_state_event(room_id, "m.room.name", "", {"name": display_name})
+            # Named after the user, so it carries their formatted display
+            # name too (MSC4591) when they have one that matches.
+            formatted_body = None
+            if config.bridge.use_msc4589_formatted_displayname and matrix_display_name == display_name:
+                formatted_body = (profile.get(FORMATTED_DISPLAYNAME_FIELD) or {}).get("formatted_body")
+            await synapse.send_state_event(room_id, "m.room.name", "", room_name_content(display_name, formatted_body))
 
         if matrix_avatar_mxc:
             existing_avatar = ""

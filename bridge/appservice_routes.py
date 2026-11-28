@@ -80,7 +80,7 @@ from bridge.group_bridge import (
     maybe_handle_owned_group_name_change,
     maybe_handle_owned_group_topic_change,
 )
-from bridge.ghosts import maybe_add_formatted_displayname_on_join
+from bridge.ghosts import maybe_add_formatted_displayname_on_join, maybe_add_formatted_room_name
 from bridge.lemmy_bridge import (
     maybe_distribute_community_message,
     maybe_distribute_owned_community_message,
@@ -342,6 +342,8 @@ async def _dispatch_single_event(request: Request, event: dict) -> None:
     # Never claims the event: a ghost's join just gets its MSC4589
     # formatted displayname copied onto the new member event.
     await maybe_add_formatted_displayname_on_join(request.app.state.synapse, request.app.state.config, event)
+    # Same for a ghost naming a room after itself: MSC4591 formatted name.
+    await maybe_add_formatted_room_name(request.app.state.synapse, request.app.state.config, event)
     handled_as_invite = await maybe_accept_invite(request, event)
     if handled_as_invite:
         return

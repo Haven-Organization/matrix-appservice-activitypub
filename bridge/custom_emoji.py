@@ -43,8 +43,22 @@ _HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"([^"]*)"')
 # limits its own text puts on a formatted_body value -- see
 # build_formatted_displayname.
 FORMATTED_DISPLAYNAME_FIELD = "org.matrix.msc4589.formatted_displayname"
+# MSC4591 (Formatted Room Names, draft): the same formatted object inside
+# m.room.name content. A profile room named after its owner carries the
+# owner's formatted display name, under the same setting as MSC4589.
+FORMATTED_ROOM_NAME_FIELD = "org.matrix.msc4591.formatted_name"
 _MSC4589_MAX_BYTES = 1024
 _MSC4589_MAX_IMAGES = 10
+
+
+def room_name_content(name: str, formatted_body: str | None) -> dict:
+    """``m.room.name`` content for a profile room named after its owner:
+    the plain name, plus the owner's formatted display name (MSC4591) when
+    there is one. Sending it without the field clears any earlier one."""
+    content: dict = {"name": name}
+    if formatted_body is not None:
+        content[FORMATTED_ROOM_NAME_FIELD] = {"format": "org.matrix.custom.html", "formatted_body": formatted_body}
+    return content
 
 
 async def resolve_custom_emoji_image(

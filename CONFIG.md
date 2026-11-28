@@ -349,7 +349,7 @@ Adds an MSC4144 per-message profile (id/displayname/avatar_url from the user's P
 
 **Default:** `false`
 
-Set `org.matrix.msc4589.formatted_displayname` (still a draft MSC) on a ghost whose fediverse name has a `:shortcode:` custom emoji with a matching image, so a compliant client can render it inline instead of the literal text. The plain `displayname` keeps that literal text either way. Off by default since no client supports this MSC yet, and setting it costs an extra write per room the ghost is in.
+Set `org.matrix.msc4589.formatted_displayname` (still a draft MSC) on a ghost whose fediverse name has a `:shortcode:` custom emoji with a matching image, so a compliant client can render it inline instead of the literal text. The plain `displayname` keeps that literal text either way. The same setting gives a profile room named after its owner (a Remote User Room, or a local user's Profile Room) the matching formatted room name, `org.matrix.msc4591.formatted_name` in `m.room.name` (draft MSC4591), so the displayname and the room name are formatted together or not at all. Off by default since no client supports this MSC yet, and setting it costs an extra write per room the ghost is in.
 
 ---
 

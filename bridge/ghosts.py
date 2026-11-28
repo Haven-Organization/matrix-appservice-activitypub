@@ -13,7 +13,13 @@ import re
 import httpx
 
 from bridge.backstage_space import join_ghost_to_backstage_space
-from bridge.custom_emoji import FORMATTED_DISPLAYNAME_FIELD, build_formatted_displayname, resolve_and_persist_emoji
+from bridge.custom_emoji import (
+    FORMATTED_DISPLAYNAME_FIELD,
+    FORMATTED_ROOM_NAME_FIELD,
+    build_formatted_displayname,
+    resolve_and_persist_emoji,
+    room_name_content,
+)
 from bridge.media import fetch_and_upload_media
 from bridge.repository import ActorRepository, GhostProfile
 from bridge.synapse_client import SynapseClient, SynapseError
@@ -268,6 +274,54 @@ async def maybe_add_formatted_displayname_on_join(synapse: SynapseClient, config
         logger.debug("Could not add the formatted displayname for %s in %s", mxid, room_id, exc_info=True)
 
 
+async def _add_formatted_room_name(
+    synapse: SynapseClient, room_id: str, mxid: str, display_name: str, formatted_body: str,
+) -> None:
+    """Give a ghost's room its formatted name (MSC4591), only while the
+    room is still named exactly after the ghost and doesn't have it yet."""
+    try:
+        current = await synapse.get_room_state(room_id, "m.room.name", as_user_id=mxid) or {}
+        if current.get("name") != display_name or FORMATTED_ROOM_NAME_FIELD in current:
+            return
+        await synapse.send_state_event(
+            room_id, "m.room.name", "", {**current, **room_name_content(display_name, formatted_body)}, as_user_id=mxid,
+        )
+    except SynapseError:
+        logger.debug("Could not add the formatted room name in %s", room_id, exc_info=True)
+
+
+async def maybe_add_formatted_room_name(synapse: SynapseClient, config, event: dict) -> None:
+    """When one of the bridge's ghosts names a room after itself (a Remote
+    User Room being made, or a rename from any path) without the MSC4591
+    formatted name, add the ghost's formatted display name from its global
+    profile, so the room name and the displayname are formatted together.
+    Never claims the event; does nothing unless the feature is on, the
+    sender is a ghost, the name is exactly its displayname, and the field
+    is missing."""
+    if not config.bridge.use_msc4589_formatted_displayname or event.get("type") != "m.room.name":
+        return
+    content = event.get("content") or {}
+    sender = event.get("sender") or ""
+    room_id = event.get("room_id")
+    if (
+        event.get("state_key") != ""
+        or FORMATTED_ROOM_NAME_FIELD in content
+        or not content.get("name")
+        or not room_id
+        or not sender.startswith(f"@{config.appservice.user_prefix}")
+        or not sender.endswith(f":{config.synapse.server_name}")
+    ):
+        return
+    try:
+        profile = await synapse.get_profile(sender)
+    except SynapseError:
+        return
+    formatted = (profile.get(FORMATTED_DISPLAYNAME_FIELD) or {}).get("formatted_body")
+    if not formatted or profile.get("displayname") != content.get("name"):
+        return
+    await _add_formatted_room_name(synapse, room_id, sender, content["name"], formatted)
+
+
 async def sync_ghost_profile(
     synapse: SynapseClient,
     http_client: httpx.AsyncClient,
@@ -325,31 +379,7 @@ async def sync_ghost_profile(
         except SynapseError:
             logger.debug("Could not set display name for ghost %s", mxid, exc_info=True)
 
-        # Keep the Remote User Room's own m.room.name in EXACT sync with
-        # the ghost's displayname too -- MSC4501's Profile Rooms section
-        # (amended 2026-11-27) lets an MSC4589-aware client show the
-        # owner's formatted display name in place of the room name, but
-        # only when the two are byte-for-byte identical. bridge.inbox_
-        # dispatch._handle_update and bridge.commands._handle_refresh
-        # already keep this in sync for the paths that explicitly
-        # re-fetch a profile -- this function is the one that picks up a
-        # name change via an ORDINARY interaction (a reply, a reaction)
-        # when the remote server never sends an Update activity at all,
-        # so without this the room name could drift out of sync
-        # indefinitely, silently breaking the substitution rule for
-        # exactly those ghosts. Unconditional on
-        # formatted_displayname_enabled, same as those other two paths
-        # -- keeping the plain name in sync is correct either way, not
-        # just when the formatted feature happens to be on.
-        remote_actor_room = await repository.get_remote_actor_room(actor_id)
-        if remote_actor_room is not None:
-            try:
-                await synapse.send_state_event(
-                    remote_actor_room.room_id, "m.room.name", "", {"name": display_name}, as_user_id=mxid,
-                )
-            except SynapseError:
-                logger.debug("Could not update room name for ghost %s", mxid, exc_info=True)
-
+        formatted_body = None
         if formatted_displayname_enabled:
             formatted_body = await build_formatted_displayname(http_client, synapse, repository, display_name, tag or [])
             if formatted_body is not None:
@@ -388,6 +418,19 @@ async def sync_ghost_profile(
                         synapse, repository, actor_id=actor_id, mxid=mxid,
                         display_name=display_name, formatted_body=None,
                     )
+        # The Remote User Room's name follows the ghost's displayname, with
+        # its formatted version (MSC4591) when there is one, in one event:
+        # this is the path that picks up a rename through an ordinary
+        # interaction when the remote server never sends an Update.
+        remote_actor_room = await repository.get_remote_actor_room(actor_id)
+        if remote_actor_room is not None:
+            try:
+                await synapse.send_state_event(
+                    remote_actor_room.room_id, "m.room.name", "", room_name_content(display_name, formatted_body),
+                    as_user_id=mxid,
+                )
+            except SynapseError:
+                logger.debug("Could not update room name for ghost %s", mxid, exc_info=True)
     elif formatted_displayname_enabled and display_name and tag and ":" in display_name:
         # The name hasn't changed, but a ghost last renamed before MSC4589
         # was turned on (or whose emoji couldn't be resolved then) never got
@@ -411,6 +454,11 @@ async def sync_ghost_profile(
                     synapse, repository, actor_id=actor_id, mxid=mxid,
                     display_name=display_name, formatted_body=formatted_body,
                 )
+                remote_actor_room = await repository.get_remote_actor_room(actor_id)
+                if remote_actor_room is not None:
+                    await _add_formatted_room_name(
+                        synapse, remote_actor_room.room_id, mxid, display_name, formatted_body,
+                    )
 
     if display_name and tag:
         # Unconditional on whether the name actually changed (unlike the
