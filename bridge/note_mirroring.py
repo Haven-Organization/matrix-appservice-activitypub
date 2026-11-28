@@ -1221,8 +1221,6 @@ async def send_bridge_info(
     *,
     room_id: str,
     actor_id: str,
-    display_name: str | None,
-    avatar_mxc: str | None,
     as_user_id: str,
 ) -> None:
     """Tag a freshly-created room (a Remote User Room mirroring someone
@@ -1239,11 +1237,9 @@ async def send_bridge_info(
     so relying on ``m.bridge`` alone leaves the tab empty in that client."""
     config = request.app.state.config
     bot_mxid = _bot_mxid(config)
+    # The channel is only its ID: a name or avatar here would go stale,
+    # and keeping it current costs state events on every profile edit.
     channel: dict = {"id": actor_id}
-    if display_name:
-        channel["displayname"] = display_name
-    if avatar_mxc:
-        channel["avatar_url"] = avatar_mxc
     protocol: dict = {"id": "activitypub", "displayname": "ActivityPub"}
     if config.appservice.bot_avatar_mxc:
         # The bot's own Matrix avatar doubles as the ActivityPub protocol
@@ -2230,7 +2226,7 @@ async def ensure_ghost_dm_room(
         await repository.register_ghost_dm_room(actor_id, matrix_user_id, dm_room_id, local_username=local_username)
         await send_bridge_info(
             request, room_id=dm_room_id, actor_id=actor_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+            as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=dm_room_id)
     else:
@@ -2464,7 +2460,7 @@ async def ensure_ghost_chat_room(
         )
         await send_bridge_info(
             request, room_id=chat_room_id, actor_id=actor_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+            as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=chat_room_id)
     else:
@@ -3063,7 +3059,7 @@ async def ensure_remote_actor_room(
         await repository.register_remote_actor_room(remote_room)
         await send_bridge_info(
             request, room_id=new_room_id, actor_id=author_actor_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+            as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await sync_remote_room_history_visibility(request, room_id=new_room_id)

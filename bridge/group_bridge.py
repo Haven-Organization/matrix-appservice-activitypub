@@ -222,8 +222,7 @@ async def ensure_group_room(
     )
     await repository.register_group_room(record)
     await send_bridge_info(
-        request, room_id=room_id, actor_id=group_actor_id, display_name=display_name,
-        avatar_mxc=avatar_mxc, as_user_id=bot_mxid,
+        request, room_id=room_id, actor_id=group_actor_id, as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=room_id)
     return record
@@ -563,7 +562,7 @@ async def mint_owned_group(
     await repository.register_group(record)
     await send_bridge_info(
         request, room_id=room_id, actor_id=actor_url(base, group_id),
-        display_name=display_name, avatar_mxc=icon_mxc, as_user_id=bot_mxid,
+        as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=room_id)
     return record

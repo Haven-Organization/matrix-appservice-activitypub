@@ -2140,7 +2140,7 @@ async def _establish_remote_follow(
         await repository.register_remote_actor_room(remote_room)
         await _send_bridge_info(
             request, room_id=new_room_id, actor_id=remote_actor_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+            as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _sync_remote_room_history_visibility(request, room_id=new_room_id)
@@ -5086,7 +5086,7 @@ async def _handle_import(request: Request, *, sender: str, room_id: str, url: st
         await repository.register_remote_actor_room(remote_room)
         await _send_bridge_info(
             request, room_id=new_room_id, actor_id=author_actor_id,
-            display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+            as_user_id=mxid,
         )
         await add_bridge_widget(request, room_id=new_room_id)
         await _sync_remote_room_history_visibility(request, room_id=new_room_id)
@@ -6409,7 +6409,7 @@ async def _handle_create_profile(
     base = config.bridge.public_base_url
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=actor_url(base, username),
-        display_name=display_name, avatar_mxc=matrix_avatar_mxc, as_user_id=bot_mxid,
+        as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=sender, as_user_id=bot_mxid)
@@ -6595,7 +6595,7 @@ async def _handle_create_channel(request: Request, *, sender: str, room_id: str,
     base = config.bridge.public_base_url
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=actor_url(base, channel_id),
-        display_name=display_name, avatar_mxc=None, as_user_id=bot_mxid,
+        as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await add_room_to_space(request, matrix_user_id=sender, child_room_id=new_room_id)
@@ -10366,7 +10366,7 @@ async def _replace_profile_room(
     base = config.bridge.public_base_url
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=actor_url(base, actor_record.username),
-        display_name=display_name, avatar_mxc=matrix_avatar_mxc, as_user_id=bot_mxid,
+        as_user_id=bot_mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _set_profile_user_id(request, room_id=new_room_id, matrix_user_id=owner, as_user_id=bot_mxid)
@@ -10500,7 +10500,7 @@ async def _replace_remote_actor_room(
     await repository.register_remote_actor_room(new_remote_room)
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=remote_room.actor_id,
-        display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+        as_user_id=mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
     await _sync_remote_room_history_visibility(request, room_id=new_room_id)
@@ -10635,7 +10635,7 @@ async def _replace_dm_room(
     await repository.register_ghost_dm_room(actor_id, matrix_user_id, new_room_id)
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=actor_id,
-        display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+        as_user_id=mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
 
@@ -10729,7 +10729,7 @@ async def _replace_chat_room(
     await repository.register_ghost_chat_room(actor_id, matrix_user_id, new_room_id)
     await _send_bridge_info(
         request, room_id=new_room_id, actor_id=actor_id,
-        display_name=display_name, avatar_mxc=avatar_mxc, as_user_id=mxid,
+        as_user_id=mxid,
     )
     await add_bridge_widget(request, room_id=new_room_id)
 
