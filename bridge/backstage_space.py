@@ -224,10 +224,11 @@ async def maybe_upgrade_join_rule(synapse: SynapseClient, repository: ActorRepos
             return True
         allow.append(condition)
         new_rule = current_rule
-    elif current_rule == "invite":
-        new_rule, allow = "restricted", [condition]
-    elif current_rule == "knock":
-        new_rule, allow = "knock_restricted", [condition]
+    elif current_rule in ("invite", "knock"):
+        # Keep any allow list left over from a restricted form, so other
+        # bridges' backstage spaces aren't dropped.
+        allow = [c for c in current.get("allow") or [] if c != condition] + [condition]
+        new_rule = "restricted" if current_rule == "invite" else "knock_restricted"
     else:
         return False  # public/public_chat/unrecognized, never tighten or guess
 
